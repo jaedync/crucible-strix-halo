@@ -15,10 +15,14 @@ These tests use recorded token scripts, not model quality or GPU performance tes
 - Token count: `POST /v1/messages/count_tokens` takes an Anthropic Messages body and returns `{"input_tokens": N}`,
   the prompt size that Chat Completions prefills for the same conversation. It does no generation. The field
   mapping (system, text, thinking, `tool_use`, `tool_result`, tools, `tool_choice`, thinking and effort) is in
-  `server/README.md`. Generation stays on Chat Completions; `POST /v1/messages` is not supported.
+  `server/README.md`. It never applies the thinking skip, so its count can differ from what a served request
+  prefills.
+  Generation stays on Chat Completions; `POST /v1/messages` is not supported.
 
 - Tokenize and template: `POST /tokenize` (also `/v1/tokenize`) and `POST /apply-template` use the OpenAI-compatible
   shapes. They return the prompt IDs or the prompt text of a request and do no generation. See `server/README.md`.
+
+- Readiness: `GET /health` returns `{"status":"ok"}` when the engine is ready, and HTTP 503 after it stops.
 
 The server does not authenticate requests.
 Keep it on loopback and do not expose it to an untrusted network.
@@ -72,6 +76,8 @@ With `--stream-tool-calls off`, each call comes complete at the end of the outpu
 ## Token limits and stop sequences
 
 Use `max_tokens` or `max_completion_tokens`, but not both.
+A request that sends neither field takes the server default (see `server/README.md`, "Server defaults").
+Send one when you need a specific limit.
 The prompt and requested output must fit the server context.
 The finish reason is `stop`, `length`, or `tool_calls`.
 
@@ -96,6 +102,38 @@ A full or failed engine queue returns HTTP 503.
 Invalid generated function calls come back as content with `usage.tool_call_fallback` (see server/README.md, "Tool calls").
 The Responses API, multiple output choices, and full JSON Schema constraints are not supported.
 Images need `--vision`. Without it, an image part returns HTTP 400.
+
+## Accepted and refused request fields
+
+The sampling fields are `temperature`, `top_k`, `top_p`, `min_p`, and `seed`.
+The thinking fields are `enable_thinking`, `chat_template_kwargs`, and `reasoning_effort`.
+`chat_template_kwargs` takes `enable_thinking`, `preserve_thinking`, and `reasoning_effort` only.
+`stream_options` takes `include_usage` only.
+The thinking budget field is `max_thinking_tokens`.
+`thinking_budget_tokens`, `thinking_budget`, and `thinking_token_budget` are aliases.
+
+`server/README.md` "Supported request options" gives the accepted values and the thinking rules for these fields.
+Its "Server defaults" subsection gives the flags that set a default.
+
+The server refuses an unknown request field with HTTP 400.
+The error names that field.
+An unknown key inside `chat_template_kwargs` or `stream_options` also returns HTTP 400.
+The error names the object and the keys that the object accepts.
+The server refuses a field that it cannot apply instead of ignoring it, because the field could change the prompt.
+A field that another OpenAI-compatible server accepts can fail here.
+`presence_penalty` and `frequency_penalty` do not follow this rule.
+The server accepts them at `0` or null, and they have no effect.
+Any other value returns HTTP 400.
+The server refuses `response_format` and `user` at any value, so a client or a proxy must remove both before it
+sends the request.
+The thinking on/off field has one accepted name: `enable_thinking`.
+A different name, such as `think`, returns HTTP 400.
+
+The server can drop thinking from a chat request that asks for it, so do not assume that `reasoning_content` is
+present.
+It does that when thinking is on, no thinking budget is set, and the room left for thinking is small.
+Detect a drop with `usage.completion_tokens_details.reasoning_skipped_by`, which is `min_thinking_tokens`.
+`server/README.md`, `--min-thinking-tokens`, gives the threshold, the exact rule, and the ways to turn it off.
 
 ## Pi coding agent
 
