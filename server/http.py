@@ -16,6 +16,7 @@ from .api import DEFAULTS, LEGACY_MODEL, MTP_WINDOW, ApiError, validate_request
 from .hosts import REFUSED, host_allowed
 from .response import CompletionResponse
 from .think_budget import SKIPPED_BY, skips_thinking, think_cap
+from .version import server_commit, server_version
 
 # While no event comes, the handler polls the client this often, so a disconnect cancels the job between chunks.
 POLL_SECONDS = 0.25
@@ -38,8 +39,8 @@ DRAIN_LIMIT_BYTES = 256 * 1024 * 1024
 # SH-3: the access log names only these methods, versions and paths; any other request line is client text.
 LOGGED_METHODS = ("GET", "POST")
 LOGGED_VERSIONS = ("HTTP/1.0", "HTTP/1.1")
-LOGGED_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/models", "/v1/crucible/trace", COUNT_TOKENS_PATH,
-                "/tokenize", "/v1/tokenize", "/apply-template", "/health")
+LOGGED_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/models", "/v1/crucible/trace", "/v1/crucible/version",
+                COUNT_TOKENS_PATH, "/tokenize", "/v1/tokenize", "/apply-template", "/health")
 # Fixed client texts for the protocol errors that BaseHTTPRequestHandler raises before a method handler runs.
 PROTOCOL_ERRORS = {400: "The request line or headers are malformed.", 414: "The request line is too long.",
                    431: "The request headers are too large or too many.",
@@ -422,6 +423,10 @@ def handler_for(service):
                 if path == "/v1/crucible/trace":
                     self.send_json(200, dict(object="crucible.trace", data=service.backend.trace.since(trace_since(query))))
                     return
+                if path == "/v1/crucible/version":
+                    self.send_json(200, dict(object="crucible.version", version=server_version(),
+                                             commit=server_commit()))
+                    return
                 if path == "/health":
                     # The server binds only after the engine is ready, so an answer means ready. llama-swap polls this.
                     if getattr(service.backend, "fatal", None):
@@ -430,8 +435,9 @@ def handler_for(service):
                     return
                 if self.path != "/v1/models":
                     raise ApiError("This endpoint is not supported.", status=404)
-                self.send_json(200, dict(object="list", data=[dict(id=service.model, object="model",
-                                                                  created=0, owned_by="crucible")]))
+                self.send_json(200, dict(object="list", crucible_version=server_version(),
+                                         data=[dict(id=service.model, object="model", created=0, owned_by="crucible",
+                                                    crucible_version=server_version())]))
             except ApiError as error:
                 self.send_api_error(error)
 
@@ -519,8 +525,15 @@ def handler_for(service):
             while True:
                 token = service.validate_event(event, output.ids, len(job_prompt), request, first_id)
                 if token is None:
-                    break
+                    resumed = self.resume_bounded(request, prompt_ids, output, job, first_id, event, options)
+                    if resumed is None:
+                        break
+                    job, job_prompt, first_id = self.jobs[-1], resumed, len(output.ids)
+                    event = self.wait_event(job, first=True)
+                    continue
                 output.token(token, event.get("crucible_t"))
+                if getattr(request, "top_logprobs", 0) and "logprobs" in event:
+                    output.scores = event["logprobs"]
                 if cap and not first_id and not output.think.thinking and getattr(job, "think_cap", None) is not None:
                     # The model closed its own think block: no continuation comes, so the batch worker must not
                     # hold new chunks for one at the cap token.
@@ -546,13 +559,25 @@ def handler_for(service):
                 event = self.opened_count(event, prompt_ids)
             output.finish(event)
 
+        def resume_bounded(self, request, prompt_ids, output, job, first_id, event, options):
+            """The serial worker stops a first job at the think cap (backend.Job.bounded_at). If the model closed its own
+            think block before the cap, the answer goes on in a new job from the prompt and the output so far.
+            Returns the new job's prompt, or None when the reply ends here."""
+            room = request.max_tokens - len(output.ids)
+            if (first_id or getattr(job, "bounded_at", None) != len(output.ids) or room < 1 or output.think.thinking or
+                    event.get("finish_reason") != "length"):
+                return None
+            continuation = prompt_ids + output.ids
+            self.jobs.append(service.backend.submit(continuation, replace(request, max_tokens=room), **options))
+            return continuation
+
         def opened_count(self, event, prompt_ids):
             """event with the first job's restore as cached_tokens, for a reply with no done event of that job (a
             continuation, no room after the cap, a stop string). The batch engine names the restore in the opened
             event. Without that count the reply omits it."""
             event = {key: value for key, value in event.items() if key != "cached_tokens"}
             opened = (getattr(self.jobs[0], "turn", None) or {}).get("opened_cached")
-            if type(opened) is int and 0 <= opened < len(prompt_ids):
+            if type(opened) is int and 0 <= opened <= len(prompt_ids):  # == len: an End resume
                 event["cached_tokens"] = opened
             return event
 
@@ -569,10 +594,13 @@ def handler_for(service):
                           finish_reason=event.get("finish_reason"))
             if len(self.jobs) == 1:
                 done = event if event.get("event") == "done" else counts
-                metrics.emit(metrics.request_line(first, done))
+                metrics.emit_turn(metrics.request_line(first, done), first)
+            elif output.closed is None:
+                # resume_bounded: the model closed its own block, so the line names no close, only the client's counts.
+                metrics.emit_turn(metrics.request_line(first, counts), first)
             else:
                 cont = getattr(self.jobs[-1], "turn", None) or metrics.new_turn()
-                metrics.emit(metrics.request_line(first, counts, output.closed or cap, cont, event))
+                metrics.emit_turn(metrics.request_line(first, counts, output.closed or cap, cont, event), first)
 
         def close_thinking(self, request, prompt_ids, output, cap, options):
             """Force the close text after cap.tokens generated tokens, then continue on a new engine job.
@@ -589,6 +617,10 @@ def handler_for(service):
             if len(written) == len(close):
                 output.closed = cap  # the usage names a close only when the whole close text was written
             room = request.max_tokens - len(output.ids)
+            turn = getattr(first, "turn", None)
+            if isinstance(turn, dict):
+                # The client's count when the continuation starts: its crucible_decode lines go on from here.
+                turn["closed_count"] = len(output.ids)
             if room < 1:
                 first.cancelled.set()
                 return None

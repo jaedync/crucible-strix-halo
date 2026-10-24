@@ -64,6 +64,24 @@ def test_load_fields_are_numbers_from_the_turns():
                           stall_s=0.75, think_tokens=6, tool_tokens=1, answer_tokens=3)
 
 
+def test_the_stage_reply_of_the_first_job_is_a_turn_field():
+    """An earlier change: the turn line names its last stage reply, so a log check links each turn to its disk read."""
+    first, cont = metrics.new_turn(1), metrics.new_turn(2)
+    first.update(state_disk="ready", state_disk_wait_s=1.5, state_disk_reason="start", state_disk_polls=3,
+                 state_disk_tokens=110592, state_disk_tag=4, state_disk_job=9)
+    cont.update(state_disk="none", state_disk_reason="floor", state_disk_polls=1, state_disk_job=10)
+    fields = metrics.load_fields((first, cont))
+    # Fix 2 (cause.md item 10): state_disk_job is the tag on the engine's stage and host_evict lines.
+    assert {key: fields[key] for key in fields if key.startswith("state_disk")} == dict(
+        state_disk="ready", state_disk_wait_s=1.5, state_disk_reason="start", state_disk_polls=3,
+        state_disk_tokens=110592, state_disk_tag=4, state_disk_job=9)
+    # Only fixed words: a bad state or reason is left out.
+    bad = metrics.new_turn(1)
+    bad.update(state_disk="none", state_disk_reason="Some Text")
+    assert metrics.load_fields((bad,)) == dict(state_disk="none")
+    assert "state_disk" not in metrics.load_fields((dict(metrics.new_turn(1), state_disk="other"),))
+
+
 def test_engine_id_must_be_a_short_hex_string():
     turn = metrics.new_turn(1)
     turn["engine_id"] = "SECRET text with spaces"

@@ -125,7 +125,8 @@ class SerialFlagRefusalTest(unittest.TestCase):
         text = " ".join(out.getvalue().split())
         self.assertNotIn("Requests must use spec=0", text)
         self.assertIn("--serial", text)
-        self.assertIn("Rollback", text)
+        self.assertIn("Serve with the serial worker", text)
+        self.assertNotIn("removed in train", text)
 
 
 class SerialOnlyOptionTest(unittest.TestCase):

@@ -2,12 +2,14 @@
 // parallel loader. Everything lives in a few large device arenas.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <functional>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -22,6 +24,7 @@
 #include "ple_host.h"
 #include "../../exl3/row_policy.h"
 #include "weight_validation.h"
+#include "load_plan.h"
 #include "../../gfx1151/warmup.h"
 #include "../../exl3/static_layout.h"
 #include "../../switches.h"
@@ -77,7 +80,9 @@ struct Ple {
   float *nk1 = nullptr, *nq1 = nullptr, *nc1 = nullptr, *conv = nullptr;
   uint16_t* table = nullptr;  // [rows][1 + 10*K], including the row scale; null with host
   std::shared_ptr<PleHostTable> host;  // CRUCIBLE_PLE_HOST=1: gathered on the CPU
+  bool bf16 = false;                   // CRUCIBLE_PLE_BF16: host rows are BF16, not the pack's K-bit rows
   int K = 0;
+  int RowWords() const { return bf16 ? kPleRowDim : 10 * K + 1; }
   __half* head_bias = nullptr;
   int64_t mult[3], vocab[16], offset[16];
 };
@@ -189,29 +194,15 @@ class Loader {
   }
 
   // Dense attention and head tiles load in front order (exact, no extra
-  // memory). Each group's split follows the decode plan (DecodeTarget).
+  // memory). Each group's split follows the decode plan (DecodeSplits).
   std::vector<int> FrontSplits(const std::vector<std::string>& prefixes) {
-    std::vector<int> splits(prefixes.size(), 0);
-    std::vector<std::pair<int, int>> io;
-    int k6 = 0;
-    for (const auto& p : prefixes) {
-      const auto& shape = ck_.Info(p + ".trellis").shape;
-      io.push_back({(int)shape[0] * 16, (int)shape[1] * 16});
-      k6 += shape[2] == 6 * 16;
-    }
-    // The fused prefill GEMM, the only prefill reader of the front order,
-    // takes K3..5 or K6 groups but not both (PrefillLinear::Build); a mixed
-    // group runs as one launch per width class in engine tile order.
+    std::vector<std::vector<int64_t>> trellis;
+    for (const auto& p : prefixes) trellis.push_back(ck_.Info(p + ".trellis").shape);
     front_total_ += prefixes.size();
-    if (k6 > 0 && k6 < (int)prefixes.size()) return splits;
-    front_count_ += prefixes.size();
-    const int target = DecodeTarget(io);
-    for (size_t i = 0; i < io.size(); ++i) {
-      splits[i] = SplitFor(io[i].first / 16, target);
-      if (!FrontFitsShape(io[i].first / 16, io[i].second / 16, splits[i]))
-        Die("front tile order does not fit " + prefixes[i]);
-    }
-    return splits;
+    const FrontLoad front = FrontLoadSplits(trellis);
+    if (front.bad >= 0) Die("front tile order does not fit " + prefixes[front.bad]);
+    if (front.splits[0] > 0) front_count_ += prefixes.size();
+    return front.splits;
   }
 
   void LayerW(const std::string& L, Layer& y, bool attn) {
@@ -372,6 +363,32 @@ class Loader {
     std::fprintf(stderr, "weight payload %zu bytes, arena reserved %zu bytes, staging peak %zu bytes\n",
                  m.bytes, arena_.reserved() + static_arena.reserved(), stage_peak_.load());
     std::fprintf(stderr, "front tile order: %d of %d dense matrices\n", front_count_, front_total_);
+    PrintWidths(m);
+  }
+
+  // One line of the loaded EXL3 widths (each set of K values), so a run log shows which pack loaded.
+  static void PrintWidths(const Model& m) {
+    // Sorted by width (35 = K3.5 sorts between K3 and K4).
+    auto list = [](const std::set<int>& seen) {
+      std::vector<int> order(seen.begin(), seen.end());
+      std::sort(order.begin(), order.end(), [](int a, int b) { return WidthHalves(a) < WidthHalves(b); });
+      std::string text;
+      for (const int k : order) text += (text.empty() ? "K" : ",K") + KName(k);
+      return text;
+    };
+    std::set<int> routed, shared, dense;
+    for (int l = 0; l <= kLayers; ++l) {
+      const Layer& y = l < kLayers ? m.L[l] : m.mtp.L;
+      for (const ExpertPtrs& e : y.moe.experts)
+        for (const int k : e.K) routed.insert(k);
+      shared.insert(y.moe.sg.K);
+      for (const Lin* lin : {&y.qsa.q, &y.qsa.k, &y.qsa.v, &y.qsa.idx, &y.qsa.o, &y.gdn.qkv, &y.gdn.z, &y.gdn.out})
+        if (lin->tiles) dense.insert(lin->K);
+    }
+    const std::string ple = m.ple.bf16 ? "BF16" : "K" + std::to_string(m.ple.K);
+    std::fprintf(stderr, "EXL3 widths: routed %s, shared %s, dense %s, head K%d, mtp fc K%d, PLE rows %s\n",
+                 list(routed).c_str(), list(shared).c_str(), list(dense).c_str(), m.head.K, m.mtp.fe.K,
+                 ple.c_str());
   }
 
  private:
@@ -455,12 +472,12 @@ class Loader {
     if (ti.dtype != "I16" || ti.shape.size() != 3) Die(prefix);
     if (ck_.Has(prefix + ".mcg") || !ck_.Has(prefix + ".mul1")) Die("not mul1: " + prefix);
     const int A = (int)ti.shape[0], B = (int)ti.shape[1];
-    K = (int)ti.shape[2] / 16;
-    if (ti.shape[2] % 16 || K < 2 || K > 6) Die("unsupported linear K: " + prefix);
+    K = TrellisK(ti.shape[2]);
+    if (K == 0) Die("unsupported linear K: " + prefix);
     I = A * 16;
     O = B * 16;
     const uint8_t* src = Src(prefix + ".trellis");
-    const size_t T = 8 * K, o = off;
+    const size_t T = TileDwords(K), o = off;  // 8 K dwords; a half width: lane_window.h
     fills.push_back([=](uint8_t* buf) {
       uint32_t* out = reinterpret_cast<uint32_t*>(buf + o);
       for (int b = 0; b < B; ++b)
@@ -580,6 +597,7 @@ class Loader {
     std::memcpy(e.offset, Src(N + "head_offsets"), sizeof(e.offset));
     e.head_bias = Concat16({N + "head_bias"});
     size_t total = 0;
+    int64_t rows = 0;
     std::vector<std::string> shards;
     if (ck_.Has(N + "trellis")) shards.push_back(N + "trellis");
     else
@@ -588,12 +606,16 @@ class Loader {
     if (shards.empty()) Die("missing PLE table");
     for (const auto& s : shards) {
       const auto& ti = Info(s);
-      if (ti.dtype != "I16" || ti.shape.size() != 2 ||
-          (ti.shape[1] != 51 && ti.shape[1] != 61)) Die("unsupported PLE row: " + s);
-      const int K = (ti.shape[1] - 1) / 10;
+      if (ti.dtype != "I16" || ti.shape.size() != 2 || PleRowK(ti.shape[1]) == 0) Die("unsupported PLE row: " + s);
+      const int K = PleRowK(ti.shape[1]);
       if (e.K && e.K != K) Die("mixed PLE row widths");
       e.K = K;
       total += ti.end - ti.begin;
+      rows += ti.shape[0];
+    }
+    if (const char* bf16 = PleBf16()) {
+      HostPleBf16(bf16, p + "ple_embedding.ngram_embedding.weight", e, rows);
+      return;
     }
     if (PleHost()) {
       HostPle(shards, e, total);
@@ -617,6 +639,31 @@ class Loader {
       Die(error.what());
     }
     return false;
+  }
+
+  static const char* PleBf16() {
+    try {
+      return PleBf16Path(crucible::SwitchText("CRUCIBLE_PLE_BF16"), PleHost());
+    } catch (const std::invalid_argument& error) {
+      Die(error.what());
+    }
+    return nullptr;
+  }
+
+  // The original BF16 rows replace the pack's K-bit rows, so the page cache holds only BF16 rows: the
+  // pack's table file is mapped for its header and small tensors, and no row of it is read. The
+  // head bias stays loaded (the static layout counts it); the BF16 kernel does not read it.
+  void HostPleBf16(const std::string& path, const std::string& tensor, Ple& e, int64_t rows) {
+    try {
+      const PleBf16File f = CheckPleBf16File(path, tensor, rows);
+      e.host = std::make_shared<PleHostTable>(path, kPleBf16RowBytes, std::vector<PleSegment>{{0, f.rows, f.offset}});
+    } catch (const std::exception& error) {
+      Die(error.what());
+    }
+    e.bf16 = true;
+    std::fprintf(stderr, "PLE table on host: BF16, %llu bytes not resident, %zu segment(s), %s\n",
+                 (unsigned long long)(uint64_t(rows) * kPleBf16RowBytes), e.host->Segments(),
+                 std::filesystem::path(path).filename().c_str());
   }
 
   // The shards stay in the checkpoint file; ple_host.h maps it read-only.

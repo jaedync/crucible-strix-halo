@@ -62,8 +62,9 @@ class RegistryTests(unittest.TestCase):
                 self.assertTrue(s.default and s.module and s.note)
                 self.assertGreaterEqual(s.issue, 0)
                 if s.kind in ('exact-speed', 'layout'):
-                    # At decide_by the switch becomes the code default or goes (at most two trains after train 18).
-                    self.assertTrue(18 <= s.decide_by <= 20, s.decide_by)
+                    # At decide_by the switch becomes the code default or goes (at most two trains after its train:
+                    # train 18 for the old rows, train 23 for the later re-send fixes).
+                    self.assertTrue(18 <= s.decide_by <= (25 if s.issue == 276 else 20), s.decide_by)
                 if s.kind == 'build':
                     self.assertFalse(s.serve or s.record)
 
@@ -86,7 +87,10 @@ class RegistryTests(unittest.TestCase):
         value = re.search(r'kDefaultPrefillLaunchRows\s*=\s*(\d+)', code)
         self.assertIsNotNone(value)
         row = self.by_name['CRUCIBLE_PF_LAUNCH_ROWS']
-        self.assertEqual((row.kind, row.default, row.issue, row.decide_by), ('exact-speed', value[1], 24, 20))
+        join = re.search(r'kDefaultPrefillJoinRows\s*=\s*(\d+)', code)
+        self.assertIsNotNone(join)
+        # X4 (x4-tail): the default is the daily value "8192+128".
+        self.assertEqual((row.kind, row.default, row.issue, row.decide_by), ('exact-speed', f'{value[1]}+{join[1]}', 24, 20))
 
     def test_counts(self):
         result = reg.counts(self.switches)

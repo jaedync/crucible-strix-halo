@@ -45,8 +45,11 @@ int main() {
         # packed passes, padded last shared chunk); its gates run against
         # crucible-t12. Repinned on purpose by dead-kern104: the bench-only
         # kernels and their helpers moved to bench/kernels/moe_rows.h; every
-        # remaining kernel keeps its ISA.
-        expected="bdcf9b27f251fdfcc67f56f9b5f91930bf60de84e48f52827c568eb10a5032db"
+        # remaining kernel keeps its ISA. Repinned on purpose
+        # by packs: MoeFusedKernelWide (KS 7/8) and TileDwords; isa_same against train 23
+        # shows every MoeFusedKernel unchanged. Repinned on purpose by packs
+        # (KS 6 in MoeFusedKernelWide for 2.18 and 2.68).
+        expected="3ea916587068bbe6f02c6d26497625c8f3f76149fc7408a3dfd7f99931d72685"
         self.assertEqual(hashlib.sha256((ROOT/"engine/layers/moe_rows.h").read_bytes()).hexdigest(),expected)
 
 

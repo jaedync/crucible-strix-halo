@@ -280,6 +280,45 @@ class R2Test(unittest.TestCase):
         failed = dict(passed, verdict="FAIL")
         self.assertEqual(soak.apply_memory_floor(failed, 1024, 5, 12288, cache)["failures"], [])  # the first cause stays
 
+    def test_the_pinned_pool_bytes_replace_the_entry_high_water(self):
+        # frontier-copy: the engine keeps freed and expected-tail chunks
+        # pinned inside the budget, and they already lower MemAvailable. cache_pinned_bytes counts every pinned chunk
+        # once, so the rule uses its maximum instead of the entry bytes.
+        log = (self.LOG.replace('"cache_bytes": 20610000000,', '"cache_bytes": 20610000000, "cache_pinned_bytes": 22000000000,')
+               .replace('"cache_bytes": 13000000000}', '"cache_bytes": 13000000000, "cache_pinned_bytes": 24000000000}'))
+        record = soak.cache_record(log)
+        self.assertEqual(record, dict(budget_bytes=26843545600, checkpoint_bytes=1824669696,
+                                      high_water_bytes=24000000000, pinned_counted=True))
+        self.assertNotIn("pinned_counted", soak.cache_record(self.LOG))  # an old log keeps today's rule and record
+        passed = soak.check(turns([(20000, 0), (21000, 20000)]))
+        memory = soak.apply_memory_floor(passed, 18108 * 1024, 10, 12288, record)["memory"]
+        self.assertEqual(memory["unfilled_mib"], (26843545600 - 1824669696 - 24000000000) >> 20)
+        self.assertIs(memory["pinned_counted"], True)
+        # entries that share chunks count each chunk at full size, so cache_bytes can be more
+        # than the pinned memory. The pinned bytes decide, so the shared chunks do not raise the projection.
+        shared = log.replace('"cache_bytes": 13000000000,', '"cache_bytes": 25000000000,')
+        self.assertEqual(soak.cache_record(shared)["high_water_bytes"], 24000000000)
+
+    def test_the_a4v_budgets_count_the_pinned_pool_once(self):
+        # a4v reruns: one fill at budgets of 11,100 and 10,400 MiB. The pool keeps chunks pinned up to the budget, so
+        # the lowest MemAvailable already holds the 700 MiB difference. With the pinned bytes the projections differ
+        # by that 700 MiB; the old rule (entry bytes) takes the unfilled budget off again, so they differ by 1,400.
+        mib = 1 << 20
+        checkpoints, live, other = 1824669696, 6000 * mib, 30000
+
+        def run(budget_mib, pinned):
+            fill = budget_mib * mib - checkpoints
+            lines = (f"conversation cache: {budget_mib * mib} bytes budget, host reserve 8192 MiB\n"
+                     f"slot checkpoints: 3 per slot, 152055808 bytes each, {checkpoints} bytes from the cache budget\n"
+                     f'crucible_turn {{"request_id": 1, "cache_bytes": {live}' +
+                     (f', "cache_pinned_bytes": {fill}' if pinned else "") + "}\n")
+            report = soak.apply_memory_floor(soak.check(turns([(20000, 0)])), (other - fill // mib) * 1024, 10, 12288,
+                                             soak.cache_record(lines))
+            return report["memory"]["projected_memavailable_mib"]
+
+        self.assertLessEqual(abs(run(10400, True) - run(11100, True) - 700), 1)
+        self.assertLessEqual(abs(run(10400, False) - run(11100, False) - 1400), 1)
+
     def test_image_size_needs_width_x_height(self):
         self.assertEqual(soak.image_size("2560x1440"), "2560x1440")
         for bad in ("2560", "0x10", "ax1", "10x"):

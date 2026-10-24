@@ -29,6 +29,8 @@ struct BatchedServeSettings {
   // SSD wear guard: GiB that the tier may write in one local day (0: it only reads).
   int state_write_gib_per_day=300;
   bool state_write_set=false;
+  int state_write_delay_ms=0;  // the same-second GPU test only (an earlier change): each state write waits this long
+  bool state_write_delay_set=false;
   // The server's default MTP window (serve --mtp-window). It sizes each slot's MTP cache (draft_warmup.h MtpSlotRows,
   // an earlier change); 0 (the whole prompt) keeps the context. Requests still choose their own window.
   int mtp_window=kDefaultMtpPrefix;
@@ -92,6 +94,12 @@ inline BatchedServeSettings ParseBatchedServeSettings(std::span<const std::strin
       if (result.state_write_gib_per_day<0 || result.state_write_gib_per_day>65536)
         throw std::invalid_argument("state-disk-write-gib-per-day must be in [0,65536]");
     }
+    else if (key=="--state-disk-write-delay-ms") {
+      result.state_write_delay_ms=ServeNumber<int>(value);
+      result.state_write_delay_set=true;
+      if (result.state_write_delay_ms<0 || result.state_write_delay_ms>60000)
+        throw std::invalid_argument("state-disk-write-delay-ms must be in [0,60000]");
+    }
     else if (key=="--mtp-window") {
       result.mtp_window=ServeNumber<int>(value);
       if (result.mtp_window<0 || result.mtp_window>262144) throw std::invalid_argument("mtp-window must be in [0,262144]");
@@ -120,8 +128,8 @@ inline BatchedServeSettings ParseBatchedServeSettings(std::span<const std::strin
     throw std::invalid_argument("session replay needs --conversation-cache-mib");
   if (!result.state_dir.empty() && !result.session_replay)
     throw std::invalid_argument("state-dir needs --session-replay 1 and a conversation cache");
-  if ((result.state_disk_gib_set || result.state_write_set) && result.state_dir.empty())
-    throw std::invalid_argument("state-disk-gib and state-disk-write-gib-per-day need --state-dir");
+  if ((result.state_disk_gib_set || result.state_write_set || result.state_write_delay_set) && result.state_dir.empty())
+    throw std::invalid_argument("state-disk-gib, state-disk-write-gib-per-day and state-disk-write-delay-ms need --state-dir");
   // Slot 0 keeps the full context, so every request that fits --ctx has a slot.
   if (result.short_streams<0 || result.short_streams>=result.streams ||
       (result.short_streams ? result.short_ctx<1 || result.short_ctx>=result.ctx : result.short_ctx!=0))

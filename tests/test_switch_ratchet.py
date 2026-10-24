@@ -17,7 +17,8 @@ REGISTRY = 'engine/switches.h'
 RAW_READ = re.compile(r'\b(?:secure_)?getenv\s*\(\s*([^()]*?)\s*\)|\b(environ)\b')
 
 # Lower it when a switch name leaves engine/ and kernels/. Never raise it. Target: 65 or fewer (user, Oct 10).
-SWITCH_CEILING = 55  # merge rule: retire-pf19 left 54, CRUCIBLE_DEBUG_NONFINITE adds one
+SWITCH_CEILING = 56  # merge rule: retire-pf19 left 54, CRUCIBLE_DEBUG_NONFINITE adds one,
+# CRUCIBLE_PLE_BF16 (16-bit n-gram table) adds one
 
 # (file, argument of the raw read): number of reads. Delete entries as reads move to engine/switches.h.
 RAW_READS = {}
@@ -28,9 +29,6 @@ BENCH_SUFFIXES = ('.h', '.hip', '.cpp', '.cc', '.inc')
 BENCH_RAW_READS = {
     ('bench/batch_spec_trials.h', '"CRUCIBLE_PROFILE"'): 1,
     ('bench/compact_transition_gate.hip', '"CRUCIBLE_COMPACT_STATE"'): 1,
-    ('bench/explore/host_evict.hip', '"HOST_EVICT_CHUNK_MB"'): 1,
-    ('bench/explore/host_evict.hip', '"HSA_USERPTR_FOR_PAGED_MEM"'): 1,
-    ('bench/explore/startup_trace.h', '"CRUCIBLE_PROBE_EAGER"'): 1,
     ('bench/forward_rows.hip', '"FORWARD_ROWS_PROFILE"'): 1,
     ('bench/gdn_scan_pf.hip', '"GDN_HEADS"'): 2,
     ('bench/packed_rows.hip', '"VERIFY_SPLITS"'): 1,

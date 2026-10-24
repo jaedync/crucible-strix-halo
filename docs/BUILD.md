@@ -29,6 +29,11 @@ make
 ```
 
 The output is `build/engine/crucible`.
+The device code compiles in parallel parts, and an edit rebuilds only the parts it touches.
+The number of parallel compiles follows `make -j` (default 1). On the test machine, build with `make -j 1` only.
+The ISA is the same as with plain `hipcc`. Run `make SPLIT=0` for plain `hipcc`.
+After a kernel change, run `make isa-check`.
+Before you add a kernel, read the comment above the `isa-check` target in the Makefile.
 The same binary provides `gen`, `serve`, and `pfbench` commands.
 Experimental batching uses options on `gen`, not a separate `batch` command.
 The HTTP frontend runs as `python -m server`. It needs no separate compilation.

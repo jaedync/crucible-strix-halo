@@ -39,6 +39,7 @@ engine/draft_overlap.h	engine/runtime/draft_overlap.h	runtime	Fragment in engine
 engine/draft_policy.h	engine/runtime/draft_policy.h	runtime	CPU proposal helpers.	
 engine/draft_value.h	engine/runtime/draft_value.h	runtime	Value-aware draft length.	
 engine/runtime/draft_accept.h	engine/runtime/draft_accept.h	runtime	Draft acceptance prior from the MTP margin (moved down from cli).	
+engine/runtime/draft_stop.h	engine/runtime/draft_stop.h	runtime	No draft row after a stop ID or past the token limit.	
 engine/runtime/gen_options.h	engine/runtime/gen_options.h	runtime	Generation options and draft selection rules (moved down from cli).	
 engine/runtime/prefill_rows.h	engine/runtime/prefill_rows.h	runtime	Prefill row limits (moved down from engine.hip).	
 engine/draft_vocab.h	engine/runtime/draft_vocab.h	runtime	Embedded draft vocabulary selection.	
@@ -90,6 +91,7 @@ engine/prefill_launch.h	engine/model/flashnext/prefill_launch.h	model/flashnext	
 engine/prefill_linear.h	engine/exl3/prefill_linear.h	exl3	Batched EXL3 prefill plans.	
 engine/prefill_moe.h	engine/layers/prefill_moe.h	layers	Prefill MoE transforms and combine.	
 engine/layers/prefill_moe_pair.h	engine/layers/prefill_moe_pair.h	layers	Prefill MoE M1: gate/up and the mid step in one kernel.	New file.
+engine/layers/prefill_moe_kset.h	engine/layers/prefill_moe_kset.h	layers	Prefill MoE M1: the K sets of the pair path (host only).	New file.
 engine/prefill_plan_budget.h	engine/runtime/prefill_plan_budget.h	runtime	Prefill plan eviction rule.	
 engine/prefill_ple.h	engine/layers/prefill_ple.h	layers	Prefill PLE mix.	
 engine/prefill_prune.h	engine/runtime/prefill_prune.h	runtime	Partial last-layer pruning.	
@@ -109,7 +111,7 @@ engine/serve.h	engine/serve/serve.h	serve	Serial serve loop (retires in train 19
 engine/serve_protocol.h	engine/serve/serve_protocol.h	serve	JSON-line request parsing.	
 engine/serve_settings.h	engine/serve/serve_settings.h	serve	Serve startup switches.	
 engine/serve/slot_base.h	engine/serve/slot_base.h	serve	Per-slot base snapshot of an incremental tail save.	New in tail-incr; tests/tail_incr_test.cpp SlotBaseLifecycle.
-engine/sha256.h	engine/runtime/sha256.h	runtime	SHA-256 for image and state digests. A leaf: standard library only.	Decision (Oct 10): a leaf that any file may include.
+engine/sha256.h	engine/runtime/sha256.h	runtime	SHA-256 for image and state digests. A leaf: standard library only (and <immintrin.h> on x86 hosts, for the SHA extensions).	Decision (Oct 10): a leaf that any file may include.
 engine/slot_checkpoint_io.h	engine/runtime/slot_checkpoint_io.h	runtime	Fragment after class Engine: slot checkpoint copies.	
 engine/slot_checkpoints.h	engine/runtime/slot_checkpoints.h	runtime	In-slot resume points.	
 engine/snapshot_bytes.h	engine/runtime/snapshot_bytes.h	runtime	Pinned snapshot chunk pool.	
@@ -166,3 +168,12 @@ engine/runtime/README.md	engine/runtime/README.md	runtime	Module charter; the mo
 engine/serve/README.md	engine/serve/README.md	serve	Module charter; the move puts it in place.	
 engine/cli/README.md	engine/cli/README.md	cli	Module charter; the move puts it in place.	
 engine/serve/draft_tally.h	engine/serve/draft_tally.h	serve	Per-position and per-token draft acceptance counters of batched serve.	
+engine/runtime/state_blocks.h	engine/runtime/state_blocks.h	runtime	Block plan, range copies and block digests of the NVMe tier.	New file (ssd-blocks); tests/state_blocks_test.cpp.
+engine/runtime/tenant.h	engine/runtime/tenant.h	runtime	Tenant key of a request and of every cached state.	New file (w1-key); tests/tenant_test.cpp.
+engine/runtime/state_format.h	engine/runtime/state_format.h	runtime	File formats of the NVMe tier: checksums, state and block headers.	New file (ssd-blocks): moved out of state_disk.h.
+engine/exl3/kernels/lane_window.h	engine/exl3/kernels/lane_window.h	exl3/kernels	Lane geometry and trellis state extraction of DecodeLane, host-visible for tests/lane_window_test.cpp (K7, K8, K3.5).	New file (packs).
+engine/layers/ple_row_codec.h	engine/layers/ple_row_codec.h	layers	N-gram row codec of PleGatherKernel (8-bit n-gram table), host-visible for tests/ple_row_codec_test.cpp.	New file (packs).
+engine/model/flashnext/load_plan.h	engine/model/flashnext/load_plan.h	model/flashnext	Pure load decisions of the Loader: matrix width, dense front order, n-gram row width (tests/load_plan_test.cpp).	New file (packs).
+engine/serve/logprobs.h	engine/serve/logprobs.h	serve	Top-N log-probabilities of the scoring position (opt-in).	
+engine/layers/moe_stage.h	engine/layers/moe_stage.h	layers	R=1 MoE stage in one launch: route, map, input transform, experts and combine (decode-fuse).	
+engine/cli/version.h	engine/cli/version.h	cli	The text of crucible --version. Plain host text, not a compiler flag, so no device code object changes.	New file (release-versioning); tests/cli_version_test.cpp.

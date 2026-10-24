@@ -41,7 +41,7 @@ class TokenizerTests(unittest.TestCase):
         self.assertEqual(following[:len(prompt) + len(output)], prompt + output)
 
     def test_closed_think_turn_extends_to_the_next_prompt(self):
-        # soak405: a 4.05 soak lost replay because the model wrote ":" then "<" where the tokenizer makes ":<". A
+        # an earlier soak run: a 4.05 soak lost replay because the model wrote ":" then "<" where the tokenizer makes ":<". A
         # reasoning cut after a newline also merges with the close's "\n\n" when the client sends the text back.
         import json
         from server.tests.serve_fixtures import invoke

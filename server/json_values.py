@@ -35,7 +35,7 @@ def history_arguments(value, field):
     """Arguments of an assistant tool call in the history. A streamed call that the server later judged invalid
     reaches the client as a prefix of its JSON object: "", or a cut after a value or inside a string value (the
     stream sends a key, a value, or an escaped string piece at a time and never a duplicate key). A client that
-    joins the deltas sends that prefix back, and refusing it stopped the session (train-13 soak S5). So close
+    joins the deltas sends that prefix back, and refusing it stopped the session (an earlier soak run). So close
     exactly these prefixes; anything else still needs valid JSON."""
     if isinstance(value, str) and value and not value.startswith("{"):
         return json_arguments(value, field)

@@ -76,9 +76,11 @@ inline int Serve(const std::string& ckpt, const ServeSettings& settings) {
           options.lookup, options.lookup_min, options.sampling.temperature > 0,
           options.draft_dense, AdaptiveDraft(options), options.last_head != 0, options.overlap != 0,
           std::bit_cast<uint32_t>(options.draft_margin), std::bit_cast<uint32_t>(options.draft_q), draft_selection,
-          options.head_auto != 0, options.mtp_prefix};
-      // Session replay keys tails by tokens only (as batch serve does): the draft policy changes only speed.
-      const ConversationPolicy tail_policy = ConversationTailPolicy(eng.PrefillRows(), options.chunk);
+          options.head_auto != 0, options.mtp_prefix, request.tenant};
+      // Session replay keys tails by tokens only (as batch serve does): the draft policy changes only speed. The
+      // tenant stays: a tail matches only inside its tenant.
+      ConversationPolicy tail_policy = ConversationTailPolicy(eng.PrefillRows(), options.chunk);
+      tail_policy.tenant = request.tenant;
       const bool enabled = cache_budget && request.cache_control != "bypass";
       const int rows = eng.PrefillRows() > 0 ? eng.PrefillRows() : options.chunk;
       const auto admission = ConversationAdmission::ForPrompt(request.ids.size(), request.cache_prefix_tokens,
@@ -130,7 +132,7 @@ inline int Serve(const std::string& ckpt, const ServeSettings& settings) {
           if (state.prompt_only ? hooks.continue_tail || !admission.Allows(state.length) : !settings.session_replay)
             return;
           const size_t bytes = ConversationStateIO::Bytes(eng, eng.ActiveSequence(), state, stk, carry) +
-                               sizeof(policy) + policy.draft_selection.size() * sizeof(int);
+                               crucible::kConversationPolicyBytes + policy.draft_selection.size() * sizeof(int);
           if (bytes > cache.Budget()) return;
           std::ifstream memory("/proc/meminfo");
           std::string key; size_t available = 0, value; std::string unit;

@@ -13,6 +13,9 @@ namespace crucible {
 // Widest EXL3 K the prefill GEMM bodies handle. K6 (the 4.05 checkpoint) uses
 // separate kernel instantiations, so K3..5 keep their register budgets.
 constexpr int kPrefillMaxK = 6;
+// K7 and K8 (the h6_ng8 packs) run in groups of one width through the fused dense kernel
+// (PrefillGemmOutWideKernel) and the KMAX 7 and 8 MoE kernels (prefill_moe.h).
+inline bool PrefillWidthSupported(int K) { return (K >= 3 && K <= kPrefillMaxK) || K == 7 || K == 8; }
 // Row tiles per GEMM item: 2, 4, 8 or 16; other values fall back to 2.
 inline int ParseRows(int n) { return n == 4 || n == 8 || n == 16 ? n : 2; }
 template<class T> inline T* PrefillUpload(const std::vector<T>& values) {
@@ -144,10 +147,11 @@ struct PrefillTileWalk {
 // + r] instead of partial. HALF_OUT stores the partial as fp16 (round to
 // nearest even; magnitudes above 65504 saturate, NaN stays NaN). FRONT reads
 // tiles in the front order (j.front_s > 0); the WMMA sequence is the same, so
-// the results are bitwise equal.
-template<int K,int RM,int NB,bool EARLY_A=true,bool SKIP=true,bool ORDER=SKIP,bool HALF_OUT=false,bool FRONT=false> __device__ __forceinline__ void PrefillWideBody(const Exl3GemmJob& j,
+// the results are bitwise equal. COPY > 0 only makes a separate instantiation (the same code): see
+// PrefillMoeGemmBody.
+template<int K,int RM,int NB,bool EARLY_A=true,bool SKIP=true,bool ORDER=SKIP,bool HALF_OUT=false,bool FRONT=false,int COPY=0> __device__ __forceinline__ void PrefillWideBody(const Exl3GemmJob& j,
     const Exl3GemmItem& it, uint32_t* ws, GemmF8* keep=nullptr) {
-  constexpr int T=8*K;
+  constexpr int T=TileDwords(K);
   const int lane=threadIdx.x&31, wave=__builtin_amdgcn_readfirstlane(threadIdx.x>>5);
   const int b=it.b0+wave*NB;
   if (b*16>=j.O) return;
@@ -341,6 +345,70 @@ __global__ void __launch_bounds__(32 * kFusedWaves / NB) PrefillGemmOutKernel(co
   }
 }
 
+// PrefillGemmOutKernel for groups whose jobs all have the width KW (7 or 8, the h6_ng8 packs); one
+// width per instantiation, as for K6. A copy of PrefillGemmOutKernel, not a shared inline store
+// function: that refactor changed the code of the train 23 kernels (isa_same).
+template <int RM, int NB, bool EARLY, int KW, bool FRONT = false, class... EPI>
+__global__ void __launch_bounds__(32 * kFusedWaves / NB) PrefillGemmOutWideKernel(const LinJob* __restrict__ lin,
+    const Exl3GemmJob* __restrict__ jobs, const Exl3GemmItem* __restrict__ items, int n, EPI... epi) {
+  static_assert(sizeof...(EPI) <= 1 && (KW == 7 || KW == 8));
+  constexpr int kWaves = kFusedWaves / NB;
+  static_assert(kWaves * kGemmWaveWords <= 16 * kFusedPad);
+  __shared__ float stage[16 * kFusedPad];
+  if ((int)blockIdx.x >= n) return;
+  const Exl3GemmItem it = items[blockIdx.x];
+  const Exl3GemmJob j = jobs[it.job];
+  const LinJob& L = lin[it.job];
+  uint32_t* ws = reinterpret_cast<uint32_t*>(stage);
+  GemmF8 acc[NB * RM];
+  PrefillWideBody<KW,RM,NB,EARLY,false,false,false,FRONT>(j,it,ws,acc);
+  const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, c = it.b0 * 16 + lane * 4;
+  float svh[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) svh[i] = __half2float(L.svh[c + i]);
+#pragma unroll
+  for (int r = 0; r < RM; ++r) {
+    const int row0 = it.m0 + r * 16;
+    if (row0 >= j.M) break;
+    __syncthreads();  // B exchanges and earlier readers are done with stage
+#pragma unroll
+    for (int nb = 0; nb < NB; ++nb)
+#pragma unroll
+      for (int z = 0; z < 8; ++z)
+        stage[(2 * z + (lane >> 4)) * kFusedPad + (wave * NB + nb) * 16 + (lane & 15)] = acc[nb * RM + r][z];
+    __syncthreads();
+#pragma unroll
+    for (int h = 0; h < 16 / kWaves; ++h) {
+      const int lr = wave * (16 / kWaves) + h, row = row0 + lr;
+      if (row >= j.M) break;
+      float v[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) v[i] = 0.f + stage[lr * kFusedPad + lane * 4 + i];
+      Wht128(v);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) v[i] *= kHadNorm * svh[i];
+      if (L.epi == kEpiStore) {
+        float* d = L.dst + (size_t)row * L.ldd + c;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) d[i] = v[i];
+      } else {
+#pragma unroll
+        for (int s = 0; s < kStreams; ++s) {
+          const float g = L.aux[row * kStreams + s];
+          float* d = L.dst + (size_t)row * (L.ldd ? L.ldd : kWide) + s * kHidden + c;
+#pragma unroll
+          for (int i = 0; i < 4; ++i) d[i] += g * v[i];
+        }
+      }
+    }
+  }
+  if constexpr (sizeof...(EPI) == 1) {
+    static_assert(NB == 2, "GdnPrepEpi is built and tested with NB 2 only");
+    __syncthreads();  // the block's stores are visible to the whole block
+    (epi.Run(L.dst, L.ldd, it.m0, min(it.m0 + RM * 16, j.M), it.b0 * 16), ...);
+  }
+}
+
 // front: every job of the group has front-order tiles (default body only).
 template <class... EPI>
 inline void LaunchPrefillGemmOut(int rm, const LinJob* lin, const Exl3GemmJob* jobs,
@@ -377,6 +445,22 @@ inline void LaunchPrefillGemmOut(int rm, const LinJob* lin, const Exl3GemmJob* j
   else if (rm == 8) go(std::integral_constant<int,8>{});
   else if (rm == 4) go(std::integral_constant<int,4>{});
   else go(std::integral_constant<int,2>{});
+}
+
+// A group of one wide width kw (7 or 8), engine tile order, RM 2, 4 or 8 (as K6).
+template <class... EPI>
+inline void LaunchPrefillGemmOutWide(int kw, int rm, const LinJob* lin, const Exl3GemmJob* jobs,
+                                     const Exl3GemmItem* items, int count, const EPI&... epi) {
+  auto go = [&](auto kc) {
+    constexpr int KW = decltype(kc)::value;
+    if (rm == 8) PrefillGemmOutWideKernel<8, 2, true, KW, false, EPI...><<<count, 32 * kFusedWaves / 2>>>(lin, jobs, items, count, epi...);
+    else if (rm == 4) PrefillGemmOutWideKernel<4, 2, true, KW, false, EPI...><<<count, 32 * kFusedWaves / 2>>>(lin, jobs, items, count, epi...);
+    else if (rm == 2) PrefillGemmOutWideKernel<2, 2, true, KW, false, EPI...><<<count, 32 * kFusedWaves / 2>>>(lin, jobs, items, count, epi...);
+    else { std::fprintf(stderr, "K%d fused output GEMM supports RM 2, 4 and 8\n", KW); std::abort(); }
+  };
+  if (kw == 7) go(std::integral_constant<int, 7>{});
+  else if (kw == 8) go(std::integral_constant<int, 8>{});
+  else { std::fprintf(stderr, "internal error: wide prefill GEMM with K%d\n", kw); std::abort(); }
 }
 
 // Per-group GEMM shapes. By default they follow the chunk rows, as measured by
@@ -422,6 +506,7 @@ struct PrefillLinear {
   bool front = false;        // tiles in the front order (fused path only)
   bool k6 = false;           // every job has K6 (fused output kernels take one width class)
   bool split = false;        // K6 and K3..5 jobs: one fused launch per width class
+  int wide = 0;              // 7 or 8: every job has that width (PrefillGemmOutWideKernel)
 
   size_t DeviceBytes() const {
     return jobs.size() * (sizeof(LinJob) + sizeof(Exl3GemmJob)) +
@@ -450,6 +535,11 @@ struct PrefillLinear {
     for (const LinJob& job : source) widths.push_back(job.K);
     const PrefillFusedClasses classes = PrefillFusedClassesOf(widths.data(), (int)widths.size(), fusable);
     fused = classes.fused; k6 = classes.k6; split = classes.split;
+    wide = PrefillWideKOf(widths.data(), (int)widths.size());
+    if (wide < 0 || (wide > 0 && !fused)) {
+      std::fprintf(stderr,"prefill GEMM: K7 and K8 need groups of one width with the fused packed GEMM\n");
+      std::exit(2);
+    }
     const int step = fused ? kFusedWaves : 4;
     // Packed input transforms derive their items (PrefillInItem) when every
     // job has the same R and I; LinInKernel and mixed groups read a list.
@@ -461,8 +551,8 @@ struct PrefillLinear {
     std::vector<XfItem> in, out;
     for (size_t j = 0; j < source.size(); ++j) {
       LinJob job = source[j];
-      if (job.K<3 || job.K>kPrefillMaxK) {
-        std::fprintf(stderr,"prefill GEMM supports EXL3 K3..%d only\n",kPrefillMaxK);std::abort();
+      if (!PrefillWidthSupported(job.K)) {
+        std::fprintf(stderr,"prefill GEMM supports EXL3 K3..8 only\n");std::abort();
       }
       job.S = 1; job.partial = partial+po; job.xh = xh+xo;
       po += (size_t)job.R*job.O; xo += (size_t)job.R*job.I;
@@ -472,7 +562,7 @@ struct PrefillLinear {
         std::fprintf(stderr,"prefill linear group mixes front and engine tile orders\n"); std::exit(2);
       }
       front = fs > 0;
-      if (front && (!fused || !FrontFitsShape(job.I/16,job.O/16,fs))) {
+      if (front && (!fused || wide || !FrontFitsShape(job.I/16,job.O/16,fs))) {
         std::fprintf(stderr,"front tile order needs the fused packed prefill GEMM\n"); std::exit(2);
       }
       gj.push_back({job.tiles,repack ? repack : job.xh,job.partial,nullptr,job.I,job.O,job.R,1,job.K,job.R,fs});
@@ -526,7 +616,9 @@ struct PrefillLinear {
     if (fused && transform_output) {
       // A split group (4.05 QSA input) ran unfused with LinOutKernel before
       // same values, 27 ms more per 4,096 rows.
-      if (split) {
+      if (wide) {
+        LaunchPrefillGemmOutWide(wide,shape.rm,linear,gemm,items,count,epi...);
+      } else if (split) {
         LaunchPrefillGemmOut(shape.rm,linear,gemm,items,count6,true,front,epi...);
         LaunchPrefillGemmOut(shape.rm,linear,gemm,items+count6,count-count6,false,front,epi...);
       } else LaunchPrefillGemmOut(shape.rm,linear,gemm,items,count,k6,front,epi...);

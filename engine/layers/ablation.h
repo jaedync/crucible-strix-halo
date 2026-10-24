@@ -41,6 +41,11 @@ inline constexpr AblationPin kAblationPins[] = {
     // The ablated path must then reproduce stock dumps bit for bit.
     {"3d126e01a7d905d49a075af976ced80a632a840a8a7dc8b14315c2dfcd345f93",
      "identity test sidecar (b = 0)", 3, 5},
+    // The andrevp tensors unchanged; only the metadata names the 4.05 pack.
+    {"1bb0d4132a5798d2a7da7820b65af1e5d37e39a0cf5726f1986be924f2678baa",
+     "andrevp/Qwen3.8-Flash-Next-exl3-3.05bpw-heretic@da2b870f01da36c6601557bc386d0d45c51b36fc "
+     "abliteration.safetensors, 4.05 metadata copy (pack 4.05bpw_h6_ng6)",
+     4, 6},
 };
 
 // A sidecar is under 1 MB; the cap bounds the read of a wrong path.

@@ -136,10 +136,10 @@ class ThinkingHttpTest(unittest.TestCase):
         cls.service = Service(cls.backend, cls.tokenizer)
         handler = handler_for(cls.service)
         handler.log_message = lambda *args: None
-        cls.server = ThreadingHTTPServer(("127.0.0.1", 8790), handler)
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)  # a free port: two sessions may run the tests at once
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
-        cls.client = openai.OpenAI(api_key="crucible-local", base_url="http://127.0.0.1:8790/v1", max_retries=0,
+        cls.client = openai.OpenAI(api_key="crucible-local", base_url=f"http://127.0.0.1:{cls.server.server_address[1]}/v1", max_retries=0,
                                   timeout=5, http_client=openai.DefaultHttpxClient(trust_env=False))
 
     @classmethod

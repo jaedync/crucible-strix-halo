@@ -42,6 +42,9 @@ std::vector<int> ParseIds(const std::string& text) { return ParseDraftSelection(
 
 struct Engine {
   int ctx, prefill_rows, mtp_calls = 0, last_prefill_rows = 0;
+  // Every token the target and the draft head predict, and the rows of each Forward call (the verify rows).
+  int forward_token = 0, mtp_token = 0;
+  std::vector<std::vector<int>> forwards;
   std::vector<int> history;
   std::vector<float> hidden = std::vector<float>(64 * kWide);
   std::vector<float> snapshots = std::vector<float>(64 * kWide);
@@ -81,8 +84,9 @@ struct Engine {
     assert(ContextRowsFit(int(history.size()), rows, ctx, kMaxRows));
     assert(retained.Forward(rows, replay, commit).empty());
     touched = true;
+    forwards.emplace_back(tokens, tokens + rows);
     history.insert(history.end(), tokens, tokens + rows);
-    return std::vector<int>(rows, 0);
+    return std::vector<int>(rows, forward_token);
   }
   std::vector<int> Prefill(const int* tokens, int rows, const std::string& = "", bool = true, const void* = nullptr,
                            int = 0) {
@@ -91,7 +95,7 @@ struct Engine {
     touched = true;
     history.insert(history.end(), tokens, tokens + rows);
     last_prefill_rows = rows;
-    return {0};
+    return {forward_token};
   }
   // The real engine keeps bulk stacks in its padded buffer; this fake keeps them in hidden.
   void CopyPrefillStacks(float* dst, int first, int rows) {
@@ -101,7 +105,7 @@ struct Engine {
   std::vector<int> Mtp(const float*, const int*, int rows, int pos, bool = true, bool = false) {
     assert(ContextRowsFit(pos, rows, ctx, kMaxRows));
     ++mtp_calls;
-    return std::vector<int>(rows, 0);
+    return std::vector<int>(rows, mtp_token);
   }
   float DraftMargin() const { return 2; }
   int DraftVocabulary() const { return 101; }

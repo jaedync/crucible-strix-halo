@@ -127,8 +127,15 @@ int main() {
     SnapshotBytes live(2 * kChunk);  // takes the idle chunk and one new chunk
     { SnapshotBytes held(2 * kChunk); assert(pinned.size() == 4 && pool.IdleBytes() == 0); }
     assert(pinned.size() == 3 && pool.IdleBytes() == kChunk);
+    // frontier-copy (soak memory rule): PinnedBytes counts every pinned chunk once, in use and idle.
+    assert(pool.PinnedBytes() == 3 * kChunk);
+    // A transient snapshot (a frontier copy that lives for one open): when it ends, the chunks in use (pinned less
+    // idle) are the old count again.
+    const size_t in_use = pool.PinnedBytes() - pool.IdleBytes();
+    { SnapshotBytes transient(kChunk); assert(pool.PinnedBytes() - pool.IdleBytes() == in_use + kChunk); }
+    assert(pool.PinnedBytes() - pool.IdleBytes() == in_use && pool.PinnedBytes() == 3 * kChunk);
   }
-  assert(pinned.size() == 3 && pool.IdleBytes() == 3 * kChunk);
+  assert(pinned.size() == 3 && pool.IdleBytes() == 3 * kChunk && pool.PinnedBytes() == 3 * kChunk);
   {
     // a full cache of three 2-chunk states (limit 6 chunks). Each save evicts the oldest to a
     // disk write that holds it while the new state fills, then the write ends. Pinned memory passes the limit by one

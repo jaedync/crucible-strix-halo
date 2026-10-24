@@ -21,6 +21,7 @@ struct Engine {
   std::vector<int> history;
   std::vector<float> hidden = std::vector<float>(kMaxRows * kWide);
   std::vector<float> target, draft;
+  std::vector<std::pair<size_t, std::vector<int>>> verifies;  // (history length before, rows) of each Forward
   RetainedPrefix retained;
   int Context() const { return context; }
   int Vocabulary() const { return 3; }
@@ -38,6 +39,7 @@ struct Engine {
   }
   std::vector<int> Forward(const int* tokens, int rows, int replay, int commit, const std::string& = "") {
     assert(retained.Forward(rows, replay, commit).empty());
+    verifies.emplace_back(history.size(), std::vector<int>(tokens, tokens + rows));
     history.insert(history.end(), tokens, tokens + rows);
     target.clear();
     for (int r = 0; r < rows; ++r) {
@@ -115,6 +117,29 @@ int main() {
   const auto stop = GenerateSampled(engine, prompt, options, stacks.data(), carry.data(), copy, emit, metrics);
   assert(stop.stopped && stop.ids.size() == 1 && emitted == stop.ids);
   options.stop_ids.clear();
+  {
+    // Draft stop (draft_stop.h): no verify row follows a stop ID or needs a token past the limit, and the IDs equal
+    // the run without the stop for as long as it lasts. Copies (lookup) and MTP chains both pass here.
+    for (const int stop_id : {0, 1, 2}) {
+      for (const int n : {2, 3, 5, 9, 50}) {
+        options.n = n; options.lookup = 7; options.spec = 7; options.stop_ids = {};
+        const auto plain = GenerateSampled(engine, prompt, options, stacks.data(), carry.data(), copy, [](int) {}, metrics);
+        options.stop_ids = {stop_id};
+        engine.verifies.clear();
+        const auto cut = GenerateSampled(engine, prompt, options, stacks.data(), carry.data(), copy, [](int) {}, metrics);
+        size_t keep = plain.ids.size();
+        for (size_t i = 0; i < plain.ids.size(); ++i) if (plain.ids[i] == stop_id) { keep = i + 1; break; }
+        assert(cut.ids == std::vector<int>(plain.ids.begin(), plain.ids.begin() + keep));
+        for (const auto& [before, rows] : engine.verifies) {
+          if (before < prompt.size()) continue;  // prompt prefill
+          const size_t committed = before - prompt.size() + 1;
+          assert(rows.size() <= size_t(n) - committed);
+          for (size_t i = 0; i + 1 < rows.size(); ++i) assert(rows[i] != stop_id);
+        }
+      }
+    }
+    options.stop_ids.clear();
+  }
   std::vector<std::vector<float>> trace;
   options.n = 24;
   options.target_trace = [&](std::span<const float> logits) { trace.emplace_back(logits.begin(), logits.end()); };

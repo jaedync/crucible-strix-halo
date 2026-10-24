@@ -73,6 +73,25 @@ inline size_t MissingMtpCacheBytes(int mtp_rows, bool compact, bool has_mtp) {
 inline size_t QsaRawSnapshotBytes(int slots, size_t length) {
   return length ? size_t(slots ? slots : length) * kQsaRawDim * sizeof(float) : 0;
 }
+// The K (and V) bytes of one position in KV layout `kvl` (0: fp16 rows of 512 halves). The only K/V size formula of a
+// snapshot: a new layout adds its size here (kv-h9-store section 5).
+inline size_t KvqPositionBytes(int kvl) {
+  if (kvl != 0) throw std::invalid_argument("unknown KV layout");
+  return 512 * 2;
+}
+// One span of a QSA layer in a conversation snapshot: `bytes` in all; each `unit_rows` positions take `unit_bytes`, in
+// position order (0: the span does not grow by position, as the compact raw ring).
+struct QsaSnapshotSpan { size_t bytes, unit_rows, unit_bytes; };
+// The four spans of one QSA layer with `rows` positions, in Save order: K, V, raw keys, pool. ConversationStateIO::Spans
+// and the block plan of the NVMe tier (state_blocks.h) both use it, so they cannot disagree.
+inline std::array<QsaSnapshotSpan, 4> QsaSnapshotSpans(int kvl, int raw_slots, size_t rows) {
+  const size_t kv = KvqPositionBytes(kvl), pool = 4096 * sizeof(float);
+  const size_t raw_unit = raw_slots ? 0 : kQsaRawDim * sizeof(float);
+  return {{{rows * kv, 1, kv},
+           {rows * kv, 1, kv},
+           {QsaRawSnapshotBytes(raw_slots, rows), raw_slots ? size_t(0) : size_t(1), raw_unit},
+           {(rows + 127) / 128 * pool, 128, pool}}};
+}
 
 template<class Caches, class Clear>
 bool ResetQsaCache(const Caches& caches, int layer, int context, Clear clear) {

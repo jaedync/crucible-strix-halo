@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One short kernel batch: the engine select entry point (SGPR scores) against
-# QsaScoreKernel + LaunchQsaTop. an earlier change deleted the blocked-score A/B switch.
+# QsaScoreKernel + LaunchQsaTop. A later change deleted the blocked-score A/B switch.
 set -euo pipefail
 . "$(dirname "$0")/../tools/work_paths.sh"
 bin=${1:?binary}

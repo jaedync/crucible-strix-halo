@@ -56,6 +56,21 @@ class SamplingDefaultsTest(unittest.TestCase):
         request = validate_request(CHAT, "chat", "crucible", vocab=1000, defaults=ServerDefaults(top_k=5000))
         self.assertEqual(request.top_k, 1000)
 
+    def test_scoring_request_without_temperature_stays_greedy(self):
+        body = dict(max_tokens=1, logprobs=True, top_logprobs=3)
+        request = check(body, kind="completion", temperature=0.6, top_p=0.95)
+        self.assertEqual((request.temperature, request.top_logprobs, request.top_p), (0, 3, 0.95))
+        request = check(dict(max_tokens=1, top_logprobs=0), kind="completion", temperature=0.6)
+        self.assertEqual((request.temperature, request.top_logprobs), (0, 1))
+
+    def test_scoring_request_with_its_own_temperature_is_still_refused(self):
+        with self.assertRaises(ApiError):
+            check(dict(max_tokens=1, logprobs=True, temperature=0.5), kind="completion", temperature=0.6)
+
+    def test_logprobs_off_uses_the_default(self):
+        request = check(dict(max_tokens=1, logprobs=False), kind="completion", temperature=0.6)
+        self.assertEqual(request.temperature, 0.6)
+
     def test_checked_defaults(self):
         self.assertEqual(ServerDefaults.checked(temperature=0.6, top_k=20, top_p=0.95, min_p=0.0, max_tokens="max"),
                          ServerDefaults(0.6, 20, 0.95, 0.0, "max"))
@@ -90,6 +105,10 @@ class DefaultMaxTokensTest(unittest.TestCase):
     def test_max_marks_the_request(self):
         request = check(max_tokens="max")
         self.assertTrue(request.max_tokens_all)
+
+    def test_logprobs_without_a_count_is_refused_as_before(self):
+        with self.assertRaises(ApiError):
+            check(dict(logprobs=True), kind="completion", max_tokens="max")
 
 
 class FakeBackend:

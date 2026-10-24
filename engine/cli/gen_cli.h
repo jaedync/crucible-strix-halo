@@ -10,6 +10,7 @@
 #include "../gfx1151/runtime_memory_policy.h"
 #include "../runtime/draft_accept.h"
 #include "../runtime/gen_options.h"
+#include "version.h"
 
 struct GenResult {
   std::vector<int> gen;
@@ -330,11 +331,13 @@ GenResult RunGen(Engine& eng, const GenOptions& o, const std::vector<int>& block
       const double head_step_start = Now();
       const bool full_head = o.head_auto && res.head_policy.UseFull();
       st.Begin();
+      // No draft past the token limit or after a stop ID can commit a token (draft_stop.h).
+      const int room = DraftRoom(size_t(n) - gen.size());
       std::vector<int> drafts{eng.Mtp(stk, ctoks.data(), rc, mpos, true, full_head)[rc - 1]};
       st.End(SpecSteps::kMtpFirst, rc);
       st.Margin(0, eng.DraftMargin());
       mpos += rc;
-      const std::vector<int> copied = history.Draft(std::min(lookup, limit));
+      std::vector<int> copied = history.Draft(std::min({lookup, limit, room}));
       const bool use_lookup = copied.size() > 1 && copied.front() == drafts.front();
       if (use_lookup) {
         st.Margin(0, -1.f);  // lookup drafts carry no MTP margin
@@ -344,7 +347,7 @@ GenResult RunGen(Engine& eng, const GenOptions& o, const std::vector<int>& block
         // --draft-q: q is the estimated chance that every draft so far is
         // accepted. A draft row pays only while q stays above the threshold.
         float q = DraftAcceptProb(eng.DraftMargin());
-        for (int k = 1; k < std::min(spec, limit); ++k) {
+        for (int k = 1; k < std::min({spec, limit, room}) && ChainMayGrow(drafts, o.stop_ids, room); ++k) {
           if (o.draft_q > 0.f ? q * kDraftNextPrior < o.draft_q : eng.DraftMargin() < o.draft_margin) break;
           st.Begin();
           CopyRows(eng, stk, kMaxRows, k == 1 ? rc - 1 : 0, 1);
@@ -359,6 +362,7 @@ GenResult RunGen(Engine& eng, const GenOptions& o, const std::vector<int>& block
           drafts.push_back(next);
         }
       }
+      TrimDrafts(drafts, o.stop_ids, room);
       const int depth = (int)drafts.size();
       res.proposed += depth;
       std::vector<int> rows{gen.back()};
@@ -515,6 +519,11 @@ inline int GenJobsCommand(int argc, char** argv) {
 #define ENGINE_CLI_ENTRY main
 #endif
 int ENGINE_CLI_ENTRY(int argc, char** argv) {
+  // Before any HIP setup: the version needs no GPU and no checkpoint.
+  if (crucible::IsVersionRequest(argc, argv)) {
+    std::printf("%s\n", crucible::VersionLine().c_str());
+    return 0;
+  }
   // Apply before dispatch: serve and pfbench also initialize HIP below.
   if (!SetRuntimeMemoryDefaults()) {
     std::perror("cannot set HIP host allocation policy");

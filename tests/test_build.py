@@ -58,7 +58,8 @@ class BuildTests(unittest.TestCase):
         for directory in ("tests", "bench/suite"):
             self.assertIn("discover -s " + directory, commands)
         # serve-tests 44850fd runs the server suite with pytest (parametrized cases).
-        self.assertIn("pytest -q server/tests", commands)
+        # -n runs the files in parallel (pytest-xdist; make test-cpu and test-server).
+        self.assertRegex(commands, r"pytest -q -n \d+ server/tests")
         self.assertIn("tests/data/draft/blocks65536.txt", commands)
 
     def test_every_binary_has_a_build_target(self):

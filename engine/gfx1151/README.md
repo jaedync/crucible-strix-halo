@@ -11,7 +11,9 @@ Rank 0 (lowest) of the engine layers.
   stream handoff (`lds_stream_ring.h`).
 - Host memory and queues: pinned buffers and allocator, page-migration
   warm-up and waits, SVM policy (`pinned_*.h`, `warmup.h`,
-  `migration_wait.h`, `runtime_memory_policy.h`).
+  `migration_wait.h`, `runtime_memory_policy.h`). The engine never calls
+  `hipSetDeviceFlags`: a run-time change of the scheduling mode loses CLR
+  completion handlers.
 
 ## Invariants
 

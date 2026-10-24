@@ -267,10 +267,23 @@ __device__ __forceinline__ void LinGemvBody(const LinJob& job, const GemvItem& i
 }
 
 // The CPU-visible capability list also instantiates every accepted decode width.
+// MaxK 8 (the h6_ng8 packs) adds K7 and K8 (kWideDecodeK) in front of the list; the kernels with
+// MaxK <= 6 keep their code.
 template <int R, size_t N = 0, int MaxK = 6, bool Front = false, bool Sched = false>
 __device__ __forceinline__ void DispatchLinGemv(int K, const LinJob& job,
                                                const GemvItem& item, uint32_t* xs, bool in = false) {
-  if (K == kSupportedDecodeK[N]) {
+  if constexpr (MaxK > kMaxNarrowDecodeK) {
+    static_assert(N == 0 && MaxK == kMaxWideDecodeK);
+    if (K == 7) {
+      if (job.cache_policy == 4) LinGemvBody<7, R, 4, Front, Sched>(job, item, xs, in);
+      else LinGemvBody<7, R, 0, Front, Sched>(job, item, xs, in);
+    } else if (K == 8) {
+      if (job.cache_policy == 4) LinGemvBody<8, R, 4, Front, Sched>(job, item, xs, in);
+      else LinGemvBody<8, R, 0, Front, Sched>(job, item, xs, in);
+    } else {
+      DispatchLinGemv<R, 0, kMaxNarrowDecodeK, Front, Sched>(K, job, item, xs, in);
+    }
+  } else if (K == kSupportedDecodeK[N]) {
     if (job.cache_policy == 4) LinGemvBody<kSupportedDecodeK[N], R, 4, Front, Sched>(job, item, xs, in);
     else LinGemvBody<kSupportedDecodeK[N], R, 0, Front, Sched>(job, item, xs, in);
   } else if constexpr (N + 1 < kSupportedDecodeK.size()) {
@@ -317,7 +330,12 @@ __global__ void __launch_bounds__(256) LinPolicyKernel(const LinJob* __restrict_
 template <int R, size_t N = 0, int MaxK = 6, bool Front = false>
 __device__ __forceinline__ void DispatchLinBaseline(int K, const LinJob& job,
                                                    const GemvItem& item, uint32_t* xs) {
-  if (K == kSupportedDecodeK[N]) LinGemvBody<kSupportedDecodeK[N], R, 0, Front>(job, item, xs);
+  if constexpr (MaxK > kMaxNarrowDecodeK) {
+    static_assert(N == 0 && MaxK == kMaxWideDecodeK);
+    if (K == 7) LinGemvBody<7, R, 0, Front>(job, item, xs);
+    else if (K == 8) LinGemvBody<8, R, 0, Front>(job, item, xs);
+    else DispatchLinBaseline<R, 0, kMaxNarrowDecodeK, Front>(K, job, item, xs);
+  } else if (K == kSupportedDecodeK[N]) LinGemvBody<kSupportedDecodeK[N], R, 0, Front>(job, item, xs);
   else if constexpr (N + 1 < kSupportedDecodeK.size()) {
     if constexpr (kSupportedDecodeK[N + 1] <= MaxK)
       DispatchLinBaseline<R, N + 1, MaxK, Front>(K, job, item, xs);

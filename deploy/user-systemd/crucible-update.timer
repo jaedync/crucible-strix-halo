@@ -1,0 +1,12 @@
+# Template. Off until you install it (see "Updates" in the README).
+[Unit]
+Description=Check for a newer Crucible release once a day
+
+[Timer]
+# Pick a time when the server is idle. Change it if you like.
+OnCalendar=*-*-* 04:00
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

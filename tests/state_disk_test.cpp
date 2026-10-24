@@ -410,13 +410,31 @@ void QueueLimitAndMemory() {
   std::weak_ptr<TestSnapshot> weak = first;
   Spill(disk, first);
   while (waiting == 0) std::this_thread::yield();
-  // The writer holds the first state; a second one would pass the queue limit.
-  Spill(disk, Make(Tokens(11), 6000, 2), Policy(), false, "busy");
+  // The writer holds the first state. The limit counts only the states that wait, so one more state waits beside
+  // it (a full-size tail must not find the queue full while the writer writes the last one); a third one would pass
+  // the limit.
+  assert(disk.QueuedBytes() == 6000 && !disk.QueueFull(6000));
+  // The salts give each state its own branch (a waiting prefix of the new state gives its place, below).
+  auto second = Make(Tokens(11, 1), 6000, 2);
+  std::weak_ptr<TestSnapshot> second_weak = second;
+  Spill(disk, second);
+  second.reset();
+  assert(disk.QueueFull(6000) && !disk.QueueFull(4000));
+  Spill(disk, Make(Tokens(12, 2), 6000, 3), Policy(), false, "busy");
+  // Fix 3: a newer state of the waiting state's own branch takes its place. The
+  // waiting state leaves the queue and host memory; the state in the writer stays.
+  assert(disk.QueueFull(6000, Tokens(12, 2), Policy(), false) && !disk.QueueFull(6000, Tokens(13, 1), Policy(), false));
+  assert(disk.QueueFull(6000, Tokens(13, 0), Policy(), false));  // it extends only the state in the writer
+  Spill(disk, Make(Tokens(13, 1), 6000, 4));
+  assert(second_weak.expired() && disk.QueuedBytes() == 12000);
+  assert(logs.Has("state_disk queue_drop tokens=11 bytes=6000 reason=superseded by=13"));
+  assert(!disk.Waiting(Tokens(11, 1), Policy(), false) && disk.Waiting(Tokens(13, 1), Policy(), false));
   first.reset();
   assert(!weak.expired());  // the queue keeps the evicted bytes until the write completes
   release.set_value();
   assert(disk.Drain(30));
-  assert(weak.expired() && disk.Entries() == 1);
+  assert(weak.expired() && disk.Entries() == 2 && disk.QueuedBytes() == 0);
+  assert(disk.Present(Tokens(13, 1), Policy(), false) && !disk.Present(Tokens(11, 1), Policy(), false));
 }
 
 // the writer holds an evicted state in host memory until the write ends. The cache passes the room that its
@@ -483,6 +501,45 @@ void IdentityText() {
     assert(std::find_if(settings_with.begin(), settings_with.end(),
                         [](const std::string& item) { return item.rfind("mtp_sidecar_sha256=", 0) == 0; }) !=
            settings_with.end());
+    fs::remove(file);
+  }
+  // The BF16 n-gram table enters by size, modification time, inode and ctime: a replaced file at the same path must
+  // miss.
+  {
+    const fs::path file = Root() / "ngram_bf16.safetensors";
+    const std::string path_entry = "CRUCIBLE_PLE_BF16=" + file.string();
+    const char* bf16_env[] = {path_entry.c_str(), "CRUCIBLE_PLE_HOST=1", nullptr};
+    const auto identity = [&] {
+      return StateDiskIdentityFor(b1, c1, StateDiskSettings(const_cast<char**>(bf16_env), 4096, false));
+    };
+    const auto missing = identity();
+    { std::ofstream(file, std::ios::binary | std::ios::trunc) << "table one"; }
+    const auto one = identity();
+    assert(one.sha == identity().sha && one.sha != missing.sha);
+    { std::ofstream(file, std::ios::binary | std::ios::trunc) << "table one, longer"; }
+    assert(identity().sha != one.sha);
+    // A replacement with the same size and modification time (touch -r) must also miss: a rename
+    // gives a new inode, and an in-place rewrite gives a new ctime, which no user tool can set back.
+    const auto same_size_and_mtime = [&](const fs::path& target, const char* content) {
+      struct stat before{};
+      assert(::stat(file.c_str(), &before) == 0);
+      { std::ofstream(target, std::ios::binary | std::ios::trunc) << content; }
+      const struct timespec times[2] = {before.st_atim, before.st_mtim};
+      assert(::utimensat(AT_FDCWD, target.c_str(), times, 0) == 0);
+      if (target != file) fs::rename(target, file);
+      struct stat after{};
+      assert(::stat(file.c_str(), &after) == 0);
+      assert(after.st_size == before.st_size && after.st_mtim.tv_sec == before.st_mtim.tv_sec &&
+             after.st_mtim.tv_nsec == before.st_mtim.tv_nsec);
+    };
+    { std::ofstream(file, std::ios::binary | std::ios::trunc) << "table one"; }
+    const auto base = identity();
+    same_size_and_mtime(Root() / "ngram_bf16.next", "table two");  // made while the old file exists: a new inode
+    const auto renamed = identity();
+    assert(renamed.sha != base.sha);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));  // past a coarse timestamp tick
+    same_size_and_mtime(file, "table 3!!");
+    assert(identity().sha != renamed.sha);
     fs::remove(file);
   }
   // The checkpoint identity also names each weights file by size and modification time.
@@ -652,6 +709,58 @@ void DirectoryModes() {
   assert(created.Enabled() && Mode(fresh.root) == 0700 && Mode(fresh.root.parent_path()) == 0700);
 }
 
+// Fix 3 (review rev-f3 items 2 and 4): a new state takes the queue place of the first waiting prefix of its branch, and
+// every waiting prefix of that branch leaves at once (12 and 16 tokens). A job behind them stays and keeps its order.
+// The same 16-token key with another policy, storage mode or tenant is another branch: it stays.
+void QueueDropsPrefixesInPlace() {
+  Logs logs;
+  auto options = Options("y", logs, "states-f3");
+  options.queue_bytes = 6500;
+  std::promise<void> release;
+  std::shared_future<void> gate = release.get_future().share();
+  std::atomic<int> waiting = 0;
+  options.before_write = [&] { ++waiting; gate.wait(); };
+  Disk disk(options);
+  Spill(disk, Make(Tokens(10, 9), 1000, 1));  // the writer holds another branch
+  while (waiting == 0) std::this_thread::yield();
+  const auto b = Tokens(30, 3);
+  const std::vector<int> b12(b.begin(), b.begin() + 12), b16(b.begin(), b.begin() + 16);
+  Spill(disk, Make(b12, 1000, 2));
+  Spill(disk, Make(b16, 1000, 3));
+  const auto behind = Tokens(20, 5);
+  Spill(disk, Make(behind, 1000, 4));
+  ConversationPolicy tenant_policy = Policy();  // the policy holds the tenant
+  tenant_policy.tenant[0] = 1;
+  const auto kp = Make(b16, 1000, 5), kc = Make(b16, 1000, 6), kt = Make(b16, 1000, 7);
+  assert(disk.Spill(b16, Policy(8), false, false, false, kp, *kp).empty());
+  assert(disk.Spill(b16, Policy(), true, false, false, kc, *kc).empty());
+  assert(disk.Spill(b16, tenant_policy, false, false, false, kt, *kt).empty());
+  // 6,000 bytes wait: a 1,500-byte state passes the limit unless both prefixes leave.
+  assert(disk.QueueFull(1500) && !disk.QueueFull(1500, b, Policy(), false));
+  Spill(disk, Make(b, 1500, 8, true));
+  assert(logs.Has("state_disk queue_drop tokens=12 bytes=1000 reason=superseded by=30"));
+  assert(logs.Has("state_disk queue_drop tokens=16 bytes=1000 reason=superseded by=30"));
+  assert(disk.QueuedBytes() == 1000 + 1500 + 4 * 1000);
+  assert(!disk.Waiting(b12, Policy(), false) && !disk.Waiting(b16, Policy(), false) && disk.Waiting(b, Policy(), false));
+  assert(disk.Waiting(behind, Policy(), false) && disk.Waiting(b16, Policy(8), false));
+  assert(disk.Waiting(b16, Policy(), true) && disk.Waiting(b16, tenant_policy, false));
+  release.set_value();
+  assert(disk.Drain(30) && disk.QueuedBytes() == 0);
+  assert(disk.Present(b, Policy(), false) && !disk.Present(b12, Policy(), false) && !disk.Present(b16, Policy(), false));
+  assert(disk.Present(behind, Policy(), false) && disk.Present(b16, Policy(8), false));
+  assert(disk.Present(b16, Policy(), true) && disk.Present(b16, tenant_policy, false));
+  // The writer order: the new state in the place of the 12-token prefix, before the job behind it.
+  const auto written = [&](const std::string& tokens) {
+    std::lock_guard lock(logs.mutex);
+    const auto found = std::find_if(logs.lines.begin(), logs.lines.end(), [&](const std::string& line) {
+      return line.rfind("state_disk spill tokens=" + tokens + " ", 0) == 0 && line.find("result=written") != std::string::npos;
+    });
+    assert(found != logs.lines.end());
+    return found - logs.lines.begin();
+  };
+  assert(written("30") < written("20"));
+}
+
 void FlushIgnoresQueueLimit() {
   Logs logs;
   auto options = Options("p", logs);
@@ -663,13 +772,28 @@ void FlushIgnoresQueueLimit() {
   Disk disk(options);
   Spill(disk, Make(Tokens(10), 4096, 1));
   while (waiting == 0) std::this_thread::yield();
-  const auto second = Make(Tokens(11), 4096, 2);
-  Spill(disk, second, Policy(), false, "busy");
-  assert(disk.Spill(second->hist, Policy(), false, false, false, second, *second, true).empty());  // a stop flush
+  Spill(disk, Make(Tokens(11, 1), 4096, 2));  // waits beside the state in the writer (another branch)
+  const auto third = Make(Tokens(12, 2), 4096, 3);
+  Spill(disk, third, Policy(), false, "busy");
+  assert(disk.Spill(third->hist, Policy(), false, false, false, third, *third, true).empty());  // a stop flush
   release.set_value();
-  assert(disk.Drain(30) && disk.Entries() == 2);
+  assert(disk.Drain(30) && disk.Entries() == 3);
 }
 
+uint64_t Field(const fs::path& path, std::streamoff offset) {
+  uint64_t value = 0;
+  std::ifstream in(path, std::ios::binary);
+  in.seekg(offset);
+  in.read(reinterpret_cast<char*>(&value), 8);
+  return value;
+}
+void Flip(const fs::path& path, uint64_t offset) {
+  std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
+  file.seekg(std::streamoff(offset));
+  const char c = char(file.get());
+  file.seekp(std::streamoff(offset));
+  file.put(char(c ^ 0x10));
+}
 void SizeAndHeaderChecks() {
   Logs logs;
   fs::path path;
@@ -684,21 +808,15 @@ void SizeAndHeaderChecks() {
     assert(StageWait(disk, *meta).state == StageState::Failed);
     Spill(disk, Make(Tokens(10), 3 * 4096, 1));
     assert(disk.Drain(30));
+    // Version 2: a changed checksum of the last payload chunk is in the resume section, which only a read
+    // checks. The read fails and the state leaves.
+    Flip(path, Field(path, 24) - 9);
+    assert(StageWait(disk, *meta).reason == "header" && disk.Entries() == 0);
+    Spill(disk, Make(Tokens(10), 3 * 4096, 1));
+    assert(disk.Drain(30));
   }
-  // A changed checksum of the last payload chunk: only the header checksum finds it at the next start.
-  uint64_t used = 0;
-  {
-    std::ifstream in(path, std::ios::binary);
-    in.seekg(24);
-    in.read(reinterpret_cast<char*>(&used), 8);
-  }
-  {
-    std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
-    file.seekg(std::streamoff(used - 9));
-    const char c = char(file.get());
-    file.seekp(std::streamoff(used - 9));
-    file.put(char(c ^ 0x10));
-  }
+  // A changed byte of the index section: the header checksum finds it at the next start.
+  Flip(path, Field(path, 48) - 9);
   Disk disk(Options("q", logs));
   assert(disk.Entries() == 0);
 }
@@ -838,6 +956,17 @@ void IoErrorsNameErrno() {
   const auto meta = disk.Best(Tokens(21), Policy(), false, Any);
   assert(meta && StageWait(disk, *meta).state == StageState::Failed);
   assert(logs.Has("result=failed reason=io errno=14") && disk.Entries() == 1);
+  // an open error of the state file that is not ENOENT (EACCES here, EMFILE or EIO in service) is
+  // an I/O error: the state stays. (As root the open does not fail.)
+  fault = 0;
+  const fs::path path = disk.Directory() / meta->name;
+  fs::permissions(path, fs::perms::none);
+  if (geteuid() != 0) {
+    assert(StageWait(disk, *meta).state == StageState::Failed);
+    assert(logs.Has("result=failed reason=io errno=13") && disk.Entries() == 1 && fs::exists(path));
+  }
+  fs::permissions(path, fs::perms::owner_read | fs::perms::owner_write);
+  assert(StageWait(disk, *meta).state == StageState::Ready);
 }
 
 // One thread reuses its bounce buffer, so the buffer holds the full chunks before the last partial chunk. The padding
@@ -938,6 +1067,7 @@ int main() {
   DamagedHeaderLeaves();
   BudgetAndFullDisk();
   QueueLimitAndMemory();
+  QueueDropsPrefixesInPlace();
   HostRoom();
   LogsHoldNoTokens();
   IdentityText();

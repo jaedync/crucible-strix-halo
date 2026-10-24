@@ -53,7 +53,7 @@ class ChooseTest(unittest.TestCase):
         self.assertEqual(choose(34.8, [], pending, 0, 1000), ("prefill", 5))
 
     def test_think_cap_continuation_goes_before_aged_turns(self):
-        # A continuation's client already has its first token; aged peers waited up to 30 s for it (soak405, a2).
+        # A continuation's client already has its first token; aged peers waited up to 30 s for it.
         pending = [PendingPrefill(5, 16384, 1.0), PendingPrefill(6, 26, 40.0, continuation=True),
                    PendingPrefill(7, 256, 1.2)]
         self.assertEqual(choose(40.0, [], pending, 0, 1000), ("prefill", 6))
@@ -77,7 +77,7 @@ class ChooseTest(unittest.TestCase):
         backend.active = {1: first}
         self.assertTrue(backend._awaiting_continuation())
         # continue_job cancels the first job after it queues the continuation. Until _cancelled closes that job and
-        # opens the continuation on its slot, a new turn's chunk must still wait (the soak's race).
+        # opens the continuation on its slot, a new turn's chunk must still wait.
         first.job.cancelled.set()
         self.assertTrue(backend._awaiting_continuation())
         backend.active = {1: LiveRequest(Job(payload=dict(ids=[1])), capped_at=time.monotonic() - 1.0)}

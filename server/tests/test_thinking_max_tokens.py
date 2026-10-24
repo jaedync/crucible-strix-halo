@@ -154,6 +154,50 @@ class SerialMaxTokensTest(CountGuard, unittest.TestCase):
             with self.subTest(max_tokens=max_tokens, close_after=close_after, **fields):
                 self.check(backend, close_after, max_tokens, **fields)
 
+    def test_serial_engine_stops_at_the_cap(self):
+        """The serial engine generates no more than max_tokens tokens for one capped request (as the batch worker).
+
+        The serial protocol has no cancel, so today the first job runs on to max_tokens after the server closed the
+        think block, and the continuation waits behind it: the stream stalls for max_tokens - cap tokens of decode.
+        """
+        backend = start_serial()
+        self.addCleanup(backend.close)
+        generated = []
+        engine_next = backend._next
+
+        def counting_next(*args, **kwargs):
+            event = engine_next(*args, **kwargs)
+            if isinstance(event, dict) and event.get("event") == "token":
+                generated.append(event["id"])
+            return event
+
+        backend._next = counting_next
+        count, usage, finish = ask(backend, 3000, max_tokens=2000, spec=0)
+        self.assertEqual((count, usage["completion_tokens"], finish), (2000, 2000, ["length"]))
+        self.assertLessEqual(len(generated), 2000)
+
+    def test_serial_answer_goes_on_past_the_cap(self):
+        """The serial engine stops the first job at the cap; when the model closed its own block before, the answer
+        goes on in a second job, with the same IDs as one job and no forced close."""
+        backend = start_serial()
+        self.addCleanup(backend.close)
+        # The serial fake engine is slow, so this runs the points around the cap only (cap 976).
+        for close_after, stream in itertools.product((5, 975, 976, 977, 2001), (False, True)):
+            with self.subTest(close_after=close_after, stream=stream):
+                self.check(backend, close_after, 2000, stream=stream, spec=0)
+        for close_after in (5, 975):
+            with self.subTest(close_after=close_after):
+                body = dict(messages=[dict(role="user", content="hi")], enable_thinking=True, return_token_ids=True,
+                            max_tokens=2000, spec=0)
+                lines = []
+                with patch("server.metrics.emit", side_effect=lines.append):
+                    reply = json.loads(invoke(backend, Tokenizer(close_after), body).body)
+                first = END - close_after + 1
+                self.assertEqual(reply["choices"][0]["token_ids"], list(range(first, first + 2000)))
+                self.assertNotIn("reasoning_closed_at", reply["usage"]["completion_tokens_details"])
+                turns = [json.loads(line.split(" ", 1)[1]) for line in lines if line.startswith("crucible_turn ")]
+                self.assertEqual([(turn["completion_tokens"], "think_closed_at" in turn) for turn in turns], [(2000, False)])
+
 
 if __name__ == "__main__":
     unittest.main()

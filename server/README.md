@@ -44,8 +44,15 @@ curl -sS -N http://127.0.0.1:8790/v1/chat/completions \
 
 Set `stream` to `false` for one JSON response.
 Use `GET /v1/models` to get the loaded model ID.
+Use `GET /v1/crucible/version` to get the Crucible version and the git commit. `GET /v1/models` also has
+`crucible_version`.
+The server tells you at start when a newer release exists (one request a day to GitHub). Turn it off with
+`--no-update-check` or `CRUCIBLE_NO_UPDATE_CHECK=1`.
 Use `GET /health` for a readiness check: it answers `{"status":"ok"}` (HTTP 503 if the engine has stopped).
 Use `/v1/completions` with a `prompt` string for plain text.
+A completion can return the log-probabilities of its one next token. Set `logprobs` to true or `top_logprobs` to an
+integer from 0 to 20, with `max_tokens` 1, `temperature` 0 and `stream` false. The reply has `token_id`, `logprob` and
+the top candidates in `choices[0].logprobs.content`. A request that breaks one of these limits gets HTTP 400.
 A completion prompt can also contain one list of token IDs.
 Batches are not supported.
 
@@ -198,8 +205,10 @@ The server protects itself against a bad client:
   no effect, because the engine has no penalty sampler. Any other value gets HTTP 400.
 - `max_tokens` or `max_completion_tokens`: a positive integer. The default is 128 when the request has neither field.
   The flag `--default-max-tokens N|max` changes the default (see [Server defaults](#server-defaults)).
-  A thinking request with a `max_tokens` below 1280 is served with thinking off. This includes a request with no count
-  under the default of 128. See `--min-thinking-tokens` below.
+  With thinking on, the server keeps room for the answer (see below). A thinking request with a `max_tokens` below 1280
+  is served with thinking off. This includes a request with no count under the default of 128.
+  See `--min-thinking-tokens` below. Send a large value, for example 8192, for real
+  thinking.
 - `stop`: one string or at most four strings, each with 1 to 4096 UTF-8 bytes.
   Null, an empty list, or an omitted field disables text stops.
 - `stream`: `true` or `false`.
@@ -300,6 +309,23 @@ so a log collector can join it to its own request record. `think_closed_at`, `th
 second job. `crucible_metrics` in the reply describes the second job.
 Every `crucible_turn` line also carries numbers about the engine, the decode passes, the stall and the token
 classes.
+
+Two stderr lines show a turn while it runs. They hold counts only, never token IDs or text.
+
+- `crucible_prefill`: one line after each prompt chunk of the batch worker. Fields: `request_id`, `done` (prompt
+  rows prefilled), `total` (prompt rows), `elapsed_s` (from the job's first device command). The continuation job
+  of a closed think turn also writes `turn_request_id` (the first job's `request_id`), so a reader can pair it with
+  the turn.
+- `crucible_decode`: the draft counters of a speculative turn during decode.
+  Fields: `request_id`, `completion_tokens`, `spec_rounds`, `draft_proposed`, `draft_accepted`, `elapsed_s` (from
+  the first token). All counts are cumulative for the turn.
+  The batch worker writes at most one line a second for each turn, and one more line when the turn ends.
+  The last line has the values of the turn's `crucible_turn` line (`elapsed_s` is its `decode_s`).
+  A turn without speculation writes no `crucible_decode` line. A turn without the engine's step counters
+  (an older engine) writes no `crucible_decode` line. No line comes after the final line.
+  The two jobs of a closed think turn write their lines with the first job's `request_id`, which is also the
+  `request_id` of the `crucible_turn` line. Their counts are cumulative over both jobs, and `completion_tokens` is
+  the count that the client sees.
 The reply has no `prompt_tokens_details`: the first job stops before it reports its cache count, and the second
 job's count describes only the snapshot that the first job wrote.
 
@@ -324,8 +350,7 @@ A 256K-token conversation of code can need more than 1 MiB.
 Without `--streams`, the server uses the batch worker with one stream (`--streams 1`).
 It processes one request at a time. The remaining requests wait in a queue.
 `--streams N` (1 to 8) runs up to N requests at once.
-`--serial` selects the old serial worker for one train, as a rollback (removed in train 20).
-Do not use `--serial` with `--streams`. The old worker has a FIFO queue with a limit of 64 waiting requests.
+`--serial` selects the serial worker. Do not use `--serial` with `--streams`. The serial worker has a FIFO queue with a limit of 64 waiting requests.
 The batch worker refuses `draft_head` `full`, `draft_adapt` 1 and `draft_q` 0 with HTTP 400. Only `--serial` accepts them.
 A full queue returns HTTP 503.
 A streamed request gets its HTTP 200 headers when the server accepts it, before the prefill starts.
@@ -367,6 +392,9 @@ A field in the request always wins over a server default.
 - A prompt that fills the context fails as before, with HTTP 400.
 - A response that uses the whole room ends with `finish_reason` `length`. The usage counts show the tokens that
   the model made.
+- A completion request with `logprobs` or `top_logprobs` needs temperature 0. If it sends no temperature, the
+  server uses 0 for it and ignores `--temperature`. If it sends a temperature above 0, the server refuses it, as before.
+  A scoring request also needs `max_tokens` 1, so `--default-max-tokens` does not apply to it.
 - `--top-k` accepts 0 to 248320. If the value is larger than the vocabulary of the loaded model, the server uses
   the vocabulary size. This filters nothing.
 - With `--default-max-tokens max`, a request that sends `"max_tokens": null` gets HTTP 400. Leave the field out.
@@ -508,6 +536,9 @@ In batch mode, a file that fails its check after the open ends only its request:
 Each image needs (height/32) x (width/32) image pad tokens (`248056`) at its offset.
 In batch mode, the `opened` event of an image request has `vision_slices`: the next that many `prefill` commands
 each run one encoder slice (about 0.1 s or less), so other sessions can decode between them.
+In batch mode, the first `token` event of a speculative request in each `spec_step` or `verify_step` has the
+request's cumulative `draft_proposed`, `draft_accepted` and `spec_steps` after that step (counters only). The
+other `token` events and all events of plain requests do not change.
 Only stdout carries protocol events.
 The engine writes diagnostics to stderr.
 
@@ -562,8 +593,7 @@ It records readiness, time to first token, and decode speed under `results/`.
   `BatchedEngineBackend` talk to the engine's JSON-line protocol
   (`engine/serve/serve_protocol.h`, `engine/serve/batched_serve_protocol.h`).
 - **Invariants:** binds to `127.0.0.1` unless `--host` says otherwise. A request's output depends only
-  on the request. The serial backend is behind `--serial` in train 19 (rollback)
-  and retires in train 20 with the serial engine serve.
+  on the request. The serial backend is behind `--serial`.
 - **Allowed dependencies:** `requirements-cpu.txt` and the engine binary.
   Model metadata comes from the engine's `ready` event, not from new
   literals.

@@ -103,7 +103,7 @@ class ModelTokenizer:
         return self._think_close
 
     def closed_think_ids(self, reasoning, ids=()):
-        """The reasoning and forced close as the next turn renders them (soak405).
+        """The reasoning and forced close as the next turn renders them.
 
         The template trims reasoning_content and writes "\\n</think>\\n\\n" after it. The tokenizer can split that
         text in another way than the model did (":" "<" against ":<", or a cut after a newline that joins the close's

@@ -10,6 +10,13 @@ struct BatchedServeCommand {
   std::vector<uint64_t> request_ids;
   std::optional<ServeRequest> request;
   int every = 0;  // interleaved prefill: a verify pass for request_ids after every `every` layers of the chunk
+  // W1: the request's tenant field was bad. `request` is then empty: an open is refused (recoverable), a
+  // stage reads nothing. The text is ServeTenantError's fixed message.
+  std::optional<std::string> refusal;
+  // stage: the turn's place among the server's waiting long turns, and whether it may start a read.
+  size_t position = 0;
+  bool read = true;
+  uint64_t job = 0;  // the server's tag of the staging turn (log lines only; 0: an older server)
 };
 
 inline BatchedServeCommand ParseBatchCommand(const std::string& line, int context) {
@@ -34,7 +41,21 @@ inline BatchedServeCommand ParseBatchCommand(const std::string& line, int contex
       // Batch requests must state spec; a missing field keeps the invalid -1 and fails the policy check.
       DecodePolicy explicit_spec;
       explicit_spec.spec = -1;
-      command.request = ParseServeRequest(line.substr(start, scanner.pos() - start), context, explicit_spec);
+      try {
+        command.request = ParseServeRequest(line.substr(start, scanner.pos() - start), context, explicit_spec);
+      } catch (const ServeTenantError& error) {
+        command.refusal = error.what();
+      }
+    } else if (key == "position") {
+      const uint64_t position = scanner.Uint();
+      if (position > 4096) throw std::runtime_error("stage position must be at most 4096");
+      command.position = size_t(position);
+    } else if (key == "read") {
+      const uint64_t read = scanner.Uint();  // 0 or 1 (the scanner reads no JSON literals)
+      if (read > 1) throw std::runtime_error("stage read must be 0 or 1");
+      command.read = read == 1;
+    } else if (key == "job") {
+      command.job = scanner.Uint();
     } else if (key == "request_ids") {
       scanner.Expect('[');
       while (!scanner.Peek(']')) {
@@ -50,7 +71,7 @@ inline BatchedServeCommand ParseBatchCommand(const std::string& line, int contex
   scanner.Finish();
   if (command.op == "open") {
     if (fields != std::set<std::string>{"op", "request_id", "request"} || !command.request_id ||
-        !command.request)
+        (!command.request && !command.refusal))
       throw std::runtime_error("open requires a positive request ID and an explicit spec request");
   } else if (command.op == "step" || command.op == "verify_step") {
     const auto& ids = command.request_ids;
@@ -67,7 +88,11 @@ inline BatchedServeCommand ParseBatchCommand(const std::string& line, int contex
       throw std::runtime_error("interleaved prefill requires its request ID, other unique decoders, and every");
   } else if (command.op == "stage") {
     // The disk tier (state_disk.h): start the read of a disk state for this request before its open.
-    if (fields != std::set<std::string>{"op", "request"} || !command.request)
+    // `position`, `read` and `job` are optional (an older server sends none: the next turn, may read, no tag).
+    fields.erase("position");
+    fields.erase("read");
+    fields.erase("job");
+    if (fields != std::set<std::string>{"op", "request"} || (!command.request && !command.refusal))
       throw std::runtime_error("stage requires a request and no request ID");
   } else if (command.op == "close" || command.op == "prefill" || command.op == "spec_step") {
     if (fields != std::set<std::string>{"op", "request_id"} || !command.request_id)

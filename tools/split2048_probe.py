@@ -40,7 +40,7 @@ def adapt_prompt(source):
     body = body.replace(SIGNATURE, '    const ConversationResume& resume, ConversationHooks* conversation,\n'
                         '    const std::vector<int>& schedule) {\n  size_t call = 0;', 1)
     body = body.replace(ROWS, '    int R = schedule.at(call++);\n'
-                        '    if (R <= 0 || R > step || i + R > ids.size()) throw std::runtime_error("invalid probe schedule");', 1)
+                        '    if (R <= 0 || R > EngineLaunchRows(eng) || i + R > ids.size()) throw std::runtime_error("invalid probe schedule");', 1)
     return '#pragma once\nnamespace crucible {\n' + body + '}\n'
 
 

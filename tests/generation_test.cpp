@@ -53,6 +53,15 @@ struct FakePrefillEngine : FakeEngine {
 };
 static_assert(HasGemmPrefill<FakePrefillEngine> && !HasGemmPrefill<FakeEngine>);
 
+// Records the rows of each Forward call (the verify rows) for the draft-stop checks.
+struct RecordingEngine : FakeEngine {
+  std::vector<std::vector<int>> calls;
+  std::vector<int> Forward(const int* t, int R, int replay, int commit, const std::string& dump = "") {
+    calls.emplace_back(t, t + R);
+    return FakeEngine::Forward(t, R, replay, commit, dump);
+  }
+};
+
 int main() {
   std::vector<float> stk((kMaxRows + 1) * kWide), carry(kWide);
   auto copy = [](float* d, const float* s, size_t n) { std::memcpy(d, s, n * sizeof(float)); };
@@ -95,6 +104,23 @@ int main() {
       assert(got.ids == want.ids && p.prefill_calls == 3);
       if (spec) assert(p.mtp_rows >= 11);
       else assert(p.mtp_rows == 0);
+    }
+  }
+  {
+    // Draft stop (draft_stop.h): the fake engine drafts the true continuation 5, 6, 7, 8, 9, ... after the first token 4.
+    // A verify row never follows a stop ID, and no row passes the token limit; the committed IDs equal serial IDs.
+    e.ctx = 64; e.reject_draft = false;
+    RecordingEngine at_stop;
+    const auto cut = GenerateExact(at_stop, prompt, 20, 8, 7, stop, "", stk.data(), carry.data(), copy, [](int){});
+    assert(cut.ids == stopped.ids);
+    assert((at_stop.calls.back() == std::vector<int>{4, 5, 6, 7, 8}));
+    for (const auto& call : at_stop.calls)
+      for (size_t i = 0; i + 1 < call.size(); ++i) assert(call[i] != 8);
+    for (const int limit : {2, 3, 4, 9}) {
+      RecordingEngine budget;
+      const auto got = GenerateExact(budget, prompt, limit, 8, 7, {}, "", stk.data(), carry.data(), copy, [](int){});
+      assert(got.ids == std::vector<int>(serial.ids.begin(), serial.ids.begin() + limit));
+      assert(int(budget.calls.back().size()) == std::min(limit - 1, 8));
     }
   }
   try {

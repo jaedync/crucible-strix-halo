@@ -52,7 +52,7 @@ These percentages are model ratios, not hardware utilization measurements.
 
 Bulk chat IDs differ from the earlier `e0bf131` small-row chat IDs.
 The other three short outputs remain equal. Do not claim cross-path bitwise equality or an exact chat speedup.
-[Raw main evidence](../bench/suite/results/2026-10-03-main-c286bda/README.md) includes commands, hashes, complete IDs, and logs.
+Raw main evidence (`bench/suite/results/2026-10-03-main-c286bda/README.md`) includes commands, hashes, complete IDs, and logs.
 
 ## Three-repetition spread: published main 093fc4c
 
@@ -87,7 +87,7 @@ The model still uses the 27.41 ms R=3 floor and representative expert union of 2
 These are model ratios, not hardware utilization measurements.
 The short TTFT spread includes isolated increases above five percent. Do not treat one sample as stable performance.
 
-Raw repeated evidence preserves every measurement and source hash.
+Raw repeated evidence (`bench/suite/results/2026-10-03-main-093fc4c-three/README.md`, in the tag `archive/pre-reset-2026-10-22`) preserves every measurement and source hash.
 The repaired spread tool rejects renamed copies as independent samples.
 It also protects primary inputs and rechecks their hashes before publication.
 
@@ -113,7 +113,7 @@ Values use **min / median / max**.
 
 The 4K range is wide. Do not use one sample as a stable performance claim.
 Percentages are analytical model ratios, not measured hardware utilization.
-Raw frozen evidence preserves all six sessions and source verification.
+Raw frozen evidence (`bench/suite/results/2026-10-03-main-45c3f0e-three/README.md`, in the tag `archive/pre-reset-2026-10-22`) preserves all six sessions and source verification.
 Fresh `c5dfa33` suite binaries are built. Their three-repetition device results remain pending.
 
 ## Post-push regression check
@@ -129,7 +129,7 @@ The exact published `a60dfe2` regression also returns zero and passes all five c
 Its two serial rates increase by 1.73% and 2.00%. Its two spec2 rates increase by 2.85% and 1.09%.
 Its 4K prefill rate increases by 12.42%, with an 11.04% lower compute TTFT.
 All five complete ID sequences match the frozen published baseline.
-Raw regression evidence includes the outer exit code.
+Raw regression evidence (`bench/suite/results/2026-10-03-regression-main-a60dfe2/README.md`, in the tag `archive/pre-reset-2026-10-22`) includes the outer exit code.
 This performance check does not replace the mandatory correctness gates.
 
 ## Historical engine measurements
@@ -176,7 +176,7 @@ One checkpoint load serves all 16 requests, including warmups.
 Load plus plan preparation takes 33.97 seconds. The checkpoint loader itself reports 22.2 seconds.
 The run uses `HSA_USERPTR_FOR_PAGED_MEM=0`.
 
-Raw JSON, timings, and source hashes
+Raw JSON, timings, and source hashes (`bench/suite/results/2026-10-03-spec444/results.json`, in the tag `archive/pre-reset-2026-10-22`)
 provide the evidence. The adjacent Markdown table includes prefill rates.
 These short-prefill rates are not the bulk prefill measurements above.
 The separate ceiling annotation applies the representative R=3 route model to measured acceptance.
@@ -191,7 +191,7 @@ It preserves the original raw report and records its SHA-256.
 
 These are weight-read estimates, not measured hardware utilization.
 The two full-head drafts and R=3 verification give a 27.41 ms step floor.
-Ceiling evidence includes every model input and source hash.
+Ceiling evidence (`bench/suite/results/2026-10-03-spec444/ceiling-estimates.json`, in the tag `archive/pre-reset-2026-10-22`) includes every model input and source hash.
 
 The published main table above contains the completed 4K, 16K, and 64K bulk measurements.
 The 64K small-row case remains not run under the 300-second execution limit.

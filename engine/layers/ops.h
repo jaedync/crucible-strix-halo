@@ -7,6 +7,7 @@
 #include "cache_storage.h"
 #include "packed_state.h"
 #include "nonfinite_probe.h"
+#include "ple_row_codec.h"
 
 namespace crucible {
 
@@ -499,10 +500,16 @@ __device__ __forceinline__ void CNormLds(float* x, int n, const float* w1, float
   __syncthreads();
 }
 
+__device__ __forceinline__ float QsaRawValue(const QsaArgs& a, int position, int dimension);
+template <int R>
+__device__ __forceinline__ void QsaPoolTail(const QsaArgs& a, float own, float* x, float* red);
+
 // Blocks (unit, r): units 0..23 query heads, 24..25 key heads, 26..27 value
 // heads, 28..31 indexer query heads, 32 indexer raw key. U0 = 24 runs the
 // cache units only (grid x 9), for the prefill query kernel.
-template <class Args = QsaArgs, int U0 = 0>
+// Tail (R = 1 decode): unit 32 also runs QsaPoolKernel and,
+// at short context, QsaTopKernel's result, so neither is launched.
+template <class Args = QsaArgs, int U0 = 0, bool Tail = false>
 __global__ void __launch_bounds__(256) QsaPrepKernel(Args args) {
   const QsaArgs a = QsaSpanArgs(args, blockIdx.z);
   if constexpr (kPackedQsa<Args>) if ((int)blockIdx.y >= a.R) return;
@@ -534,6 +541,11 @@ __global__ void __launch_bounds__(256) QsaPrepKernel(Args args) {
     CNormLds(x, kIdxDim, a.iq_norm1, red);
     RopeAt(x, a.mrope, p);
     if (j < kIdxDim) iq[j] = x[j];
+  } else if constexpr (Tail) {
+    // QsaRawUsesChunk is false at R = 1 (kQsaRawDecodeRows), so the raw key always goes to the cache.
+    const float own = j < kIdxDim ? a.idx[512 + j] : 0.f;
+    if (j < kIdxDim) a.c.ik_raw[QsaRawOffset(a.c.raw_slots, p, j)] = own;
+    QsaPoolTail<1>(a, own, x, red);
   } else if (j < kIdxDim && !QsaRawUsesChunk(a.c.raw_slots, a.R)) {
     a.c.ik_raw[QsaRawOffset(a.c.raw_slots, p, j)] = a.idx[(size_t)r * kQsaIdxWidth + 512 + j];
   }
@@ -583,6 +595,30 @@ __global__ void __launch_bounds__(256) QsaPoolKernel(Args args) {
   }
 }
 
+// QsaPoolKernel's row and QsaTopKernel's short-context result for a one-row
+// forward, in Prep's unit-32 block. own: this thread's raw key value at pos0,
+// which the pool reads from the cache in QsaPoolKernel (the same float).
+template <int R>
+__device__ __forceinline__ void QsaPoolTail(const QsaArgs& a, float own, float* x, float* red) {
+  static_assert(R == 1, "rows of other blocks are not visible here");
+  const int j = threadIdx.x, p = a.pos0;
+  if (j == 0 && (p + 1) / 4 <= kSelBlocks) a.nsel[0] = -1;
+  if ((p + 1) % 4 != 0) return;
+  const int blk = p / 4;
+  __syncthreads();  // x, red: the unit-32 block has not used them yet; keeps the pool's barrier pattern
+  if (j < kIdxDim) {
+    float m = 0.f;
+#pragma unroll
+    for (int t = 0; t < 3; ++t) m += QsaRawValue(a, blk * 4 + t, j);
+    m += own;  // t = 3 is position p
+    x[j] = RoundH(m * 0.25f);
+  }
+  __syncthreads();
+  CNormLds(x, kIdxDim, a.ik_norm1, red);
+  RopeAt(x, a.mrope, blk * 4);
+  if (j < kIdxDim) a.c.ik_pool[QsaPoolOffset(blk, j)] = x[j];
+}
+
 // ---- MoE ------------------------------------------------------------------------
 
 struct ExpertPtrs {
@@ -628,8 +664,7 @@ __global__ void __launch_bounds__(512) MoeRouteKernel(const float* __restrict__ 
 
 // ---- PLE (layer 1) ------------------------------------------------------------
 
-// The row codec packs symbols LSB-first, unlike the linear tile codec.
-// A state contains the current symbol, then older symbols, truncated to 16 bits.
+// The row codec (ple_row_codec.h) packs symbols LSB-first, unlike the linear tile codec.
 // Packed: table holds the gathered rows in [R][16] order (CRUCIBLE_PLE_HOST).
 template <int K, bool Packed = false>
 __global__ void __launch_bounds__(160) PleGatherKernel(const uint16_t* __restrict__ table,
@@ -637,22 +672,10 @@ __global__ void __launch_bounds__(160) PleGatherKernel(const uint16_t* __restric
                                                        const __half* __restrict__ head_bias,
                                                        float* __restrict__ out) {
   const int hd = blockIdx.x, r = blockIdx.y, i = threadIdx.x;
-  static_assert(K == 5 || K == 6);
   constexpr int Words = 10 * K;
   const size_t index = Packed ? (size_t)r * 16 + hd : (size_t)rows[r * 16 + hd];
   const uint16_t* row = table + index * (Words + 1);
-  auto sym = [&](int jj) -> uint32_t {
-    const int j = (jj + 160) % 160;
-    const int bit = j * K, w = bit >> 4, sh = bit & 15;
-    uint32_t v = row[1 + w];
-    if (w + 1 < Words) v |= (uint32_t)row[2 + w] << 16;
-    return (v >> sh) & ((1u << K) - 1);
-  };
-  uint32_t state;
-  if constexpr (K == 5)
-    state = sym(i) | (sym(i - 1) << 5) | (sym(i - 2) << 10) | ((sym(i - 3) & 1u) << 15);
-  else
-    state = sym(i) | (sym(i - 1) << 6) | ((sym(i - 2) & 15u) << 12);
+  const uint32_t state = PleRowState<K>(row, i);
   const uint32_t p = state * kMul1;
   const uint32_t bs = (p & 255) + ((p >> 8) & 255) + ((p >> 16) & 255) + (p >> 24);
   const __half hv = __hfma(__ushort_as_half((unsigned short)(0x6400 + bs)), __ushort_as_half(0x1eee),
@@ -660,6 +683,17 @@ __global__ void __launch_bounds__(160) PleGatherKernel(const uint16_t* __restric
   const float scale = __half2float(__ushort_as_half(row[0]));
   out[(size_t)r * kHidden + hd * 160 + i] =
       RoundH(__half2float(hv) * scale + __half2float(head_bias[hd * 160 + i]));
+}
+
+// CRUCIBLE_PLE_BF16: table holds the gathered BF16 rows of the original weights in [R][16] order.
+// The original model adds no head bias (head_bias belongs to the quantizer's row codec), so a value
+// is the BF16 number. The fp16 rounding keeps the values that the packed prefill GEMM reads as fp16,
+// as in the quantized kernel, so decode and prefill rows stay equal.
+__global__ void __launch_bounds__(kPleRowDim) PleBf16GatherKernel(const uint16_t* __restrict__ table,
+                                                                  float* __restrict__ out) {
+  const int hd = blockIdx.x, r = blockIdx.y, i = threadIdx.x;
+  const uint32_t bits = (uint32_t)table[((size_t)r * kPleHeads + hd) * kPleRowDim + i] << 16;
+  out[(size_t)r * kHidden + hd * kPleRowDim + i] = RoundH(__uint_as_float(bits));
 }
 
 struct PleArgs {

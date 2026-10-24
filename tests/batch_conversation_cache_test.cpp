@@ -1,4 +1,6 @@
 #include "../engine/serve/batch_conversation_cache.h"
+#include "../engine/runtime/sha256.h"
+#include <cstdio>
 #include <cassert>
 #include <numeric>
 using namespace crucible;
@@ -33,11 +35,11 @@ struct Cache {
     });
   }
   bool Tail(const std::vector<int>& ids, size_t length, bool trusted = false, bool guarded = false,
-            bool resident = false, uint64_t available = uint64_t(9) << 30) {
+            bool resident = false, uint64_t available = uint64_t(9) << 30, size_t prompt = 0) {
     return cache.CaptureTail(std::span<const int>(ids.data(), length), policy, 64, available, [&] {
       auto s = std::make_shared<Snapshot>(); s->hist.assign(ids.begin(), ids.begin() + length);
       s->resume.length = length; return std::shared_ptr<const Snapshot>(s);
-    }, trusted, guarded, resident);
+    }, trusted, guarded, resident, {}, {}, prompt);
   }
   size_t HitTail(const std::vector<int>& ids) {
     const auto entry = cache.FindTail(ids, policy);
@@ -178,7 +180,7 @@ static void SessionRules() {
   }
 }
 
-// Session replay diagnostic (soak405): a prompt that leaves the newest tail saved after its restored entry
+// Session replay diagnostic: a prompt that leaves the newest tail saved after its restored entry
 // names where, in numbers only. Only that tail is compared, and a prompt not longer than it (a retry) is apart.
 static void MissedTail() {
   Cache c;
@@ -254,7 +256,7 @@ static void ResidentRules() {
     // a live resume point. A copy itself takes only free room or superseded entries.
     Cache c;
     assert(c.Capture(x, 16, S) && c.Capture(y, 16, S) && c.Tail(z, 21, true, false, true));
-    c.cache.SetResident(0, std::span<const int>(z.data(), 21), 0);
+    c.cache.SetResident(0, std::span<const int>(z.data(), 21), 0, c.policy);
     assert(c.cache.CopyBytes() == 64 && c.cache.HoldsTail(std::span<const int>(z.data(), 21), c.policy, 0));
     assert(!c.cache.HoldsTail(std::span<const int>(z.data(), 21), c.policy, 1));
     assert(!c.Tail(w, 21, false, false, true) && c.cache.Status().last.refused == "resident");
@@ -265,7 +267,7 @@ static void ResidentRules() {
     // When the slot moves on, the entry is the only copy again and keeps its protection.
     Cache c;
     assert(c.Capture(x, 16, S) && c.Capture(y, 16, S) && c.Tail(z, 21, true, false, true));
-    c.cache.SetResident(0, std::span<const int>(z.data(), 21), 0);
+    c.cache.SetResident(0, std::span<const int>(z.data(), 21), 0, c.policy);
     c.cache.ClearResident(0);
     assert(!c.Capture(w, 16, S) && c.cache.Status().last.refused == "protected" && c.HitTail(z) == 21);
   }
@@ -314,7 +316,7 @@ static void ImageKeys() {
   assert(!cache.FindTail(ids, policy));
 }
 
-// A header frontier (the grid point past the stable boundary, crucible-t13 soak S5) is speculative: only a next turn
+// A header frontier (the grid point past the stable boundary, an earlier soak run) is speculative: only a next turn
 // that repeats the header uses it. It supersedes nothing until a hit confirms it, so a retry of the same prompt and
 // a next turn that drops the reasoning keep the own frontier (a review: budget 2, rows 8, prompt 25,
 // boundary 22).
@@ -419,7 +421,7 @@ static void SpillRoom() {
     cache.SetSpill(hook);
     assert(save(cache, x, 64, 1 << 20) && save(cache, y, 64, 1 << 20) && save(cache, z, 64, 1 << 20) && rooms.empty());
     // The budget evicts x. The save leaves 74 bytes above the reserve with x held: x's write fits.
-    assert(save(cache, w, 64, reserve + 74) && rooms == std::vector<uint64_t>{74} && tiers == std::vector<int>{8});
+    assert(save(cache, w, 64, reserve + 74) && rooms == std::vector<uint64_t>{74} && tiers == std::vector<int>{9});
     // The host is 30 bytes short: y's 64 bytes make the room, and only 34 stay above the reserve. y is not held.
     rooms.clear();
     assert(save(cache, v, 64, reserve + 34) && rooms == std::vector<uint64_t>{34} && cache.Bytes() == 64 * 3);
@@ -472,7 +474,7 @@ static void SpillHook() {
     Cache c;
     c.cache.SetSpill(hook);
     assert(c.Capture(x, 16, S) && c.Capture(y, 16, S) && c.Tail(z, 21, true, false, true));
-    c.cache.SetResident(0, std::span<const int>(z.data(), 21), 0);
+    c.cache.SetResident(0, std::span<const int>(z.data(), 21), 0, c.policy);
     assert(c.Capture(w, 16, S) && spilled.empty());
     // A stopping engine writes what the host holds: every entry with its key and its superseded mark.
     // The most recently used first: x after its hit.
@@ -592,7 +594,7 @@ static void SlotOnlySession() {
   assert(c.Capture(x, 16, S) && c.Hit(x) == 16);
   assert(c.Tail(x, 30, true) && c.HitTail(Tokens(1, 33)) == 30);
   assert(c.Tail(x, 35, false, false, true));
-  c.cache.SetResident(0, std::span<const int>(x.data(), 35), 0);
+  c.cache.SetResident(0, std::span<const int>(x.data(), 35), 0, c.policy);
   for (int minute = 5; minute <= 40; minute += 5) {
     now += 300;
     c.cache.Touch(std::span<const int>(x.data(), 38), c.policy);
@@ -721,7 +723,373 @@ static void SlotFrontiers() {
   }
 }
 
+// W1 LocalTenantUnchanged: a fixed trace of captures, tails, finds, touches and slot marks under budget
+// pressure, with probation and slot frontiers on. Its decision log is the log of train 23 (7b3106e8): with the local
+// tenant only, the tenant key changes no decision. A changed log prints it.
+// An earlier change moved the digest on purpose: the newest state of a recent conversation now leaves last
+// (kNewest). With that rank off, this trace gives the digest of train 23, ede7ee6b...69ce5, so the tenant key still
+// changes no decision.
+static const std::string kLocalTrace23 = "a9ac1f406282eee975ff2d0ab5208e728ea3b05f76cdddc601ddabab9e6894f6";
+static void LocalTenantUnchanged() {
+  BatchConversationCache<Snapshot> cache(64 * 7, {}, 3, kDefaultHostReserve, true);
+  cache.SetSlotFrontiers(true);
+  ConversationPolicy policy;
+  policy.prefill_rows = 8;
+  uint32_t seed = 124;
+  const auto next = [&] { seed = seed * 1103515245u + 12345u; return (seed >> 16) & 0x7fffu; };
+  std::vector<std::vector<int>> sessions(5);
+  std::vector<std::string> trace;
+  const auto log = [&](const std::string& what, size_t value) {
+    trace.push_back(what + "=" + std::to_string(value) + " entries=" + std::to_string(cache.Status().entries) +
+                    " bytes=" + std::to_string(cache.Bytes()) + " evicted=" + std::to_string(cache.Evictions()) +
+                    " refused=" + cache.Status().last.refused);
+  };
+  const auto make = [](std::span<const int> ids, bool prompt) {
+    auto s = std::make_shared<Snapshot>();
+    s->hist.assign(ids.begin(), ids.end());
+    s->resume.length = ids.size();
+    s->resume.prompt_only = prompt;
+    s->resume.prompt_boundary = prompt ? ids.size() : 0;
+    return std::shared_ptr<const Snapshot>(s);
+  };
+  for (int step = 0; step < 400; ++step) {
+    const size_t s = next() % sessions.size();
+    auto& ids = sessions[s];
+    if (ids.empty() || ids.size() > 120) ids = Tokens(int(s % 2) * 1000 + 1, 16 + next() % 8);
+    if (next() % 4 == 0 && ids.size() > 9) ids.resize(ids.size() - next() % 8);
+    auto more = Tokens(int(next() % 5000) + 2000, 3 + next() % 20);
+    ids.insert(ids.end(), more.begin(), more.end());
+    const size_t boundary = ids.size() - 1 - next() % 4;
+    switch (next() % 9) {
+      case 0: case 1: {
+        for (const auto& frontier : BatchCacheFrontiers(ids.size(), boundary, 8, s % 2 ? 16 : 0))
+          log("capture", cache.Capture(ids, policy, frontier, 64, size_t(9) << 30,
+                                       [&] { return make(std::span<const int>(ids).first(frontier.position), true); },
+                                       ids));
+        break;
+      }
+      case 2: case 3: {
+        const bool trusted = next() % 2, guarded = next() % 3 == 0, resident = next() % 3 == 0;
+        log("tail", cache.CaptureTail(ids, policy, 64, size_t(9) << 30, [&] { return make(ids, false); }, trusted,
+                                      guarded, resident, ids));
+        if (resident) cache.SetResident(int(s % 3), ids, 0, policy);
+        break;
+      }
+      case 4: {
+        const auto tail = cache.FindTail(ids, policy);
+        log("find_tail", tail ? tail->snapshot->hist.size() : 0);
+        const auto entry = cache.Find(ids, policy, boundary, ids.size() - 1, 8);
+        log("find", entry ? entry->snapshot->hist.size() : 0);
+        break;
+      }
+      case 5:
+        log("peek", cache.PeekFind(ids, policy, boundary, ids.size() - 1, 8) + 1000 * cache.PeekTail(ids, policy));
+        log("peek_state", cache.PeekTailState(ids, policy).first);
+        break;
+      case 6:
+        cache.Touch(ids, policy);
+        log("touch", cache.HoldsTail(ids, policy, 0));
+        break;
+      case 7: {
+        const size_t below = ids.size() / 8 * 8;
+        log("proven", cache.ProvenBelow(std::span<const int>(ids).first(below), policy));
+        cache.KeepInSlot(std::span<const int>(ids).first(below), policy, next() % 2);
+        log("keep", below);
+        break;
+      }
+      default:
+        cache.ClearResident(int(next() % 3));
+        log("copy_bytes", cache.CopyBytes());
+        break;
+    }
+  }
+  crucible::Sha256 hash;
+  for (const auto& line : trace) {
+    hash.Update(reinterpret_cast<const uint8_t*>(line.data()), line.size());
+    hash.Update(reinterpret_cast<const uint8_t*>("\n"), 1);
+  }
+  const std::string digest = hash.HexDigest();
+  if (digest != kLocalTrace23) {
+    for (const auto& line : trace) std::printf("%s\n", line.c_str());
+    std::printf("trace digest %s\n", digest.c_str());
+    std::fflush(stdout);
+  }
+  assert(digest == kLocalTrace23);
+}
+
+// TenantsNeverShareRam (W1, design section 3.5): two tenants with the same tokens. Find, FindTail, PeekFind,
+// PeekTail, PeekTailState, HoldsTail, Proven and ProvenBelow of tenant B never see an entry of tenant A. B's calls
+// (Touch, KeepInSlot, a slot mark, saves and a trusted tail that would supersede A's branch) change none of A's
+// entries: A's later hits, evictions and spills are the same as when B sends other tokens. A spill carries the
+// entry's own policy, so a state of A goes to disk as A's.
+static void TenantsNeverShareRam() {
+  const auto x = Tokens(1, 40), y = Tokens(101, 40), w = Tokens(201, 40), other = Tokens(301, 40);
+  ConversationPolicy a, b;
+  a.prefill_rows = b.prefill_rows = 8;
+  a.tenant[0] = 1;
+  b.tenant[31] = 2;
+  constexpr auto S = CacheRetention::Session;
+  const auto make = [](std::span<const int> ids, bool prompt) {
+    auto s = std::make_shared<Snapshot>();
+    s->hist.assign(ids.begin(), ids.end());
+    s->resume.length = ids.size();
+    s->resume.prompt_only = prompt;
+    s->resume.prompt_boundary = prompt ? ids.size() : 0;
+    return std::shared_ptr<const Snapshot>(s);
+  };
+  // A's turns with B's calls between them; B sends `bx`. Returns what A finds at the end and A's spills.
+  const auto run = [&](const std::vector<int>& bx) {
+    BatchConversationCache<Snapshot> cache(64 * 5, {}, 2, kDefaultHostReserve, false);
+    std::vector<std::pair<std::vector<int>, ConversationPolicy>> spilled;
+    cache.SetSpill([&](std::span<const int> key, const ConversationPolicy& policy, const auto&, int, uint64_t) {
+      assert(policy == a || policy == b);
+      spilled.emplace_back(std::vector<int>(key.begin(), key.end()), policy);
+      return true;
+    });
+    const auto capture = [&](const ConversationPolicy& p, const std::vector<int>& ids, size_t at) {
+      return cache.Capture(ids, p, {at, S}, 64, size_t(9) << 30,
+                           [&] { return make(std::span<const int>(ids).first(at), true); }, ids);
+    };
+    const auto tail = [&](const ConversationPolicy& p, const std::vector<int>& ids, size_t length, bool trusted) {
+      return cache.CaptureTail(std::span<const int>(ids).first(length), p, 64, size_t(9) << 30,
+                               [&] { return make(std::span<const int>(ids).first(length), false); }, trusted);
+    };
+    assert(capture(a, x, 16) && tail(a, x, 21, false) && cache.FindTail(x, a));
+    // B repeats A's tokens: no hit, no peek, no tail state, no proof, no held tail.
+    assert(!cache.Find(bx, b, 39, 39, 8) && !cache.FindTail(bx, b) && cache.PeekFind(bx, b, 39, 39, 8) == 0);
+    assert(cache.PeekTail(bx, b) == 0 && cache.PeekTailState(bx, b).first == 0 && !cache.ProvenBelow(bx, b));
+    assert(!cache.HoldsTail(std::span<const int>(bx).first(21), b, 0) && !cache.Proven(std::span<const int>(bx).first(16), b));
+    cache.Touch(bx, b);
+    cache.KeepInSlot(std::span<const int>(bx).first(16), b, false);
+    cache.SetResident(0, std::span<const int>(bx).first(21), 0, b);
+    assert(cache.CopyBytes() == 0);  // B's slot mark makes no copy of A's tail
+    // B saves: its own entries; its trusted tail supersedes none of A's.
+    assert(capture(b, bx, 16) && tail(b, bx, 24, true));
+    assert(cache.PeekTail(x, a) == 21 && cache.PeekTail(bx, b) == 24 && cache.FindTail(bx, b));
+    cache.ClearResident(0);
+    // Pressure: A's later captures evict.
+    capture(a, y, 16);
+    capture(a, w, 16);
+    capture(a, y, 32);
+    for (int session = 0; session < 4; ++session) {
+      const auto more = Tokens(1000 + 100 * session, 40);
+      capture(a, more, 16);
+      tail(a, more, 21, false);
+    }
+    const std::vector<size_t> found{cache.PeekFind(x, a, 39, 39, 8), cache.PeekTail(x, a),
+                                    cache.PeekFind(y, a, 39, 39, 8), cache.PeekFind(w, a, 39, 39, 8)};
+    std::vector<std::vector<int>> of_a;
+    for (const auto& [key, policy] : spilled)
+      if (policy == a) of_a.push_back(key);
+    return std::pair{found, of_a};
+  };
+  const auto same = run(x), apart = run(other);
+  assert(same == apart && !same.second.empty());
+}
+
+// An earlier change: a turn that cached nothing names its cause and the state nearest to its prompt (the turn line's
+// miss_reason, closest_shared_tokens, closest_age_s and closest_outcome). Numbers and fixed words only.
+static void Diagnosis() {
+  const auto x = Tokens(1, 40), y = Tokens(101, 40), z = Tokens(201, 40);
+  const auto S = CacheRetention::Session;
+  const auto diagnose = [](Cache& c, const std::vector<int>& ids, size_t boundary, size_t warmup, int rows) {
+    return c.cache.Diagnose(ids, c.policy, boundary, warmup, rows, false);
+  };
+  {
+    // An empty cache: nothing shares the prompt's first token (a new conversation, or a fresh engine).
+    Cache c;
+    const auto d = diagnose(c, x, 39, 40, 8);
+    assert(std::string_view(d.miss) == "new" && d.shared == 0 && !d.outcome);
+  }
+  {
+    // The nearest state shares 8 tokens and then the prompt differs (the client forked its conversation).
+    Cache c;
+    assert(c.Capture(x, 16, S));
+    const auto d = diagnose(c, Fork(x, 8, 300), 39, 40, 8);
+    assert(std::string_view(d.miss) == "diverged" && d.shared == 8);
+    assert(std::string_view(d.outcome) == "prompt_differs");
+  }
+  {
+    // The shared part reaches the tokens that the earlier turn generated: the reply differs, not the prompt.
+    Cache c;
+    assert(c.Tail(Tokens(1, 45), 45, false, false, false, uint64_t(9) << 30, 40));
+    const auto d = diagnose(c, Fork(Tokens(1, 45), 42, 700), 44, 45, 8);
+    assert(std::string_view(d.miss) == "diverged" && d.shared == 42);
+    assert(std::string_view(d.outcome) == "reply_differs");
+  }
+  {
+    // A state of the whole prompt: one prompt row must run to give the first token, and a state off the grid.
+    Cache c;
+    assert(c.Capture(x, 16, S));
+    const auto limited = diagnose(c, x, 39, 8, 8);
+    assert(std::string_view(limited.miss) == "above_limit" && limited.shared == 16);
+    assert(std::string_view(limited.outcome) == "all");
+    assert(std::string_view(diagnose(c, x, 39, 40, 5).miss) == "off_grid");
+  }
+  {
+    // The state left the cache: the miss names it, with its length and its age.
+    Cache c(1, 2);
+    assert(c.Capture(x, 16, S) && c.Capture(y, 16, S) && c.Capture(z, 16, S));
+    assert(c.cache.Evictions() == 1 && c.Hit(x) == 0);
+    const auto d = diagnose(c, x, 39, 40, 8);
+    assert(std::string_view(d.miss) == "evicted" && d.shared == 16 && std::string_view(d.outcome) == "all");
+    assert(d.age_s >= 0);
+  }
+  {
+    // A save of the state was refused: the cause of a later miss of the same conversation.
+    Cache c;
+    c.cache.NoteRefused(std::span<const int>(x.data(), 16), c.policy, 16);
+    const auto d = diagnose(c, x, 39, 40, 8);
+    assert(std::string_view(d.miss) == "not_saved" && d.shared == 16 && std::string_view(d.outcome) == "all");
+  }
+}
+
+// An earlier change: per-tier counters (lookup, hit, reused tokens) for the slot, host and disk tiers. The restore hook counts
+// the host and disk tiers; the session counts the slot tier (BatchCacheHooks::slot_served, batch_session_test).
+static void TierCounters() {
+  BatchCacheCounters counters;
+  counters.Count(BatchCacheTier::Host, 0);
+  counters.Count(BatchCacheTier::Host, 100);
+  counters.Count(BatchCacheTier::Disk, 300);
+  assert(counters.host.lookups == 2 && counters.host.hits == 1 && counters.host.tokens == 100);
+  assert(counters.disk.lookups == 1 && counters.disk.hits == 1 && counters.disk.tokens == 300);
+  assert(counters.slot.lookups == 0 && counters.slot.hits == 0 && counters.slot.tokens == 0);
+  counters.Count(BatchCacheTier::Slot, 40);
+  assert(counters.slot.lookups == 1 && counters.slot.hits == 1 && counters.slot.tokens == 40);
+  counters.Count(BatchCacheTier::Slot, 0);  // a slot that held nothing: a lookup, not a hit
+  assert(counters.slot.lookups == 2 && counters.slot.hits == 1 && counters.slot.tokens == 40);
+}
+
+// An earlier change: the eviction rule keeps the newest saved state of a conversation that had a turn recently. An older
+// entry of that conversation, or another session's idle state, can go instead.
+static void NewestStateKept() {
+  const auto x = Tokens(1, 40), y = Tokens(101, 40), w = Tokens(5000, 40);
+  const auto S = CacheRetention::Session;
+  // Filler sessions move the cache's own clock, so that y is idle after its one use. They are recent (kWaiting).
+  const auto fillers = int(BatchConversationCache<Snapshot>::kIdleRounds) + 1;
+  const auto others = [&](Cache& c) {
+    for (int k = 0; k < fillers; ++k) {
+      const auto other = Tokens(1000 + 100 * k, 40);
+      assert(c.Capture(other, 16, S) && c.Hit(other) == 16);
+    }
+  };
+  {
+    // The recent session x saved a frontier and then its tail. Its older frontier leaves instead of the tail.
+    Cache c(1, size_t(fillers) + 3, true);
+    assert(c.Capture(y, 16, S) && c.Hit(y) == 16);
+    assert(c.Capture(x, 16, S) && c.Tail(x, 21));
+    others(c);
+    assert(c.Capture(w, 16, S));  // the cache is full: one entry leaves
+    assert(c.HitTail(x) == 21 && c.Hit(x) == 0 && c.Hit(y) == 16);
+  }
+  {
+    // The recent session x holds only its tail: the idle session's state leaves instead.
+    Cache c(1, size_t(fillers) + 2, true);
+    assert(c.Capture(y, 16, S) && c.Hit(y) == 16);
+    assert(c.Tail(x, 21));
+    others(c);
+    assert(c.Capture(w, 16, S));
+    assert(c.HitTail(x) == 21 && c.Hit(y) == 0);
+  }
+  {
+    // The rule protects a recent conversation only: an old one-time state is not protected, so a session's tail that
+    // a request saved after it leaves the old state's room.
+    double now = 1000;
+    Cache c(1, size_t(fillers) + 2, true);
+    c.cache.SetClock([&] { return now; });
+    assert(c.Capture(y, 16, S));  // a one-time prompt, then nothing for longer than the idle time
+    now += BatchConversationCache<Snapshot>::kDefaultIdleSeconds + 1;
+    assert(c.Tail(x, 21));
+    others(c);
+    assert(c.Capture(w, 16, S));
+    assert(c.HitTail(x) == 21 && c.Hit(y) == 0);
+  }
+}
+
+// Review M2: a burst of one-time requests must not protect every state that it saves; only the newest `live_` unproven
+// states join the protected set (a conversation's first state and a one-time state look the same until the next turn).
+static void NewestBound() {
+  const auto x = Tokens(1, 40), y = Tokens(101, 40), z = Tokens(201, 40), w = Tokens(301, 40);
+  const auto S = CacheRetention::Session;
+  Cache c(1, 3, true);  // one live session: the bound is one unproven state; three entries fit
+  assert(c.Capture(x, 16, S) && c.Capture(y, 16, S) && c.Capture(z, 16, S));
+  assert(c.cache.LastNewestStates() == 0);  // no plan yet
+  assert(c.Capture(w, 16, S));              // the cache is full: one entry leaves, and the plan runs
+  assert(c.cache.LastNewestStates() == 1);  // x, y and z are unproven: only the newest of them is protected
+  assert(c.cache.NewestStates() == 0);      // L1: the set lives inside Admit only
+  assert(c.Hit(x) == 0 && c.Hit(y) == 16 && c.Hit(z) == 16 && c.Hit(w) == 16);
+}
+
+// Review L4: a state larger than 64 Ki tokens is named too (the record keeps a fingerprint, never the key). The shared
+// length of a lost state is the whole length when the keys are equal, else the last grid point that matched.
+static void LostFingerprint() {
+  // A 65,544-token state: the whole-key copy of the first version kept nothing above 65,536 tokens, so this is the case
+  // that the fingerprint adds (the daily profile holds 32K to 130K states).
+  const auto x = Tokens(1, 70000), y = Tokens(100000, 70000), z = Tokens(200000, 70000);
+  const auto S = CacheRetention::Session;
+  Cache c(1, 2);
+  assert(c.Capture(x, 65544, S) && c.Capture(y, 65544, S) && c.Capture(z, 65544, S));
+  assert(c.Hit(x) == 0);  // x left the cache
+  const auto same = c.cache.Diagnose(x, c.policy, 69999, 70000, 8, false);
+  assert(std::string_view(same.miss) == "evicted" && same.shared == 65544);
+  auto forked = x;
+  forked[40000] += 7;  // inside the 256-token block that starts at 39,936
+  const auto near = c.cache.Diagnose(forked, c.policy, 69999, 70000, 8, false);
+  assert(std::string_view(near.miss) == "evicted" && near.shared == 39936);
+  assert(std::string_view(near.outcome) == "prompt_differs");
+}
+
+// Review L9: only a save that the host had room to keep but did not take is a loss. A refused state of the whole prompt
+// ("policy") or one larger than the cache ("budget") is never recorded as "not_saved".
+static void RefusalWords() {
+  const auto x = Tokens(1, 40);
+  const auto S = CacheRetention::Session;
+  Cache c(1, 3);
+  assert(c.cache.Status().last.refused.empty());
+  // A budget refusal: one byte more than the whole cache.
+  assert(!c.cache.CaptureTail(std::span<const int>(x.data(), 16), c.policy, 64 * 3 + 1, size_t(9) << 30, [&] {
+    auto s = std::make_shared<Snapshot>();
+    s->hist.assign(x.begin(), x.begin() + 16); s->resume.length = 16; s->resume.prompt_only = false;
+    return std::shared_ptr<const Snapshot>(s);
+  }));
+  assert(c.cache.LastRefusal() == std::string("budget"));
+  c.cache.NoteRefused(std::span<const int>(x.data(), 16), c.policy, 16);
+  assert(std::string_view(c.cache.Diagnose(x, c.policy, 39, 40, 8, false).miss) == "new");
+  // A host refusal: the reserve cannot be met even with every entry gone (the whole-key state is 3 entries wide).
+  c.cache.NoteRefused(std::span<const int>(x.data(), 16), c.policy, 16);  // the refusal word is still "budget"
+  assert(std::string_view(c.cache.Diagnose(x, c.policy, 39, 40, 8, false).miss) == "new");
+  (void)S;
+}
+
+// Review 2 (L10): the word of a refusal is the word of the latest one. A save that the budget refused must not shadow a
+// later read's refusal (the stage path names the wrong reason, batched_serve.h:511).
+static void LatestRefusal() {
+  const auto a = Tokens(2001, 40), b = Tokens(2101, 40);
+  Cache c(2, 2);  // two live resume points fill the budget; no probation
+  const uint64_t memory = uint64_t(64) << 30;
+  assert(c.Capture(a, 16, CacheRetention::Session) && c.Capture(b, 16, CacheRetention::Session));
+  // A save of the whole budget plus one byte: the budget refuses it before any eviction.
+  assert(!c.cache.CaptureTail(std::span<const int>(a.data(), 16), c.policy, 129, size_t(9) << 30, [&] {
+    auto s = std::make_shared<Snapshot>();
+    s->hist.assign(a.begin(), a.begin() + 16); s->resume.length = 16; s->resume.prompt_only = false;
+    return std::shared_ptr<const Snapshot>(s);
+  }));
+  assert(c.cache.LastRefusal() == std::string("budget"));
+  // A read needs room and the two live points are protected: the latest word is that refusal, not the save's.
+  assert(!c.cache.MakeRoom(64, memory));
+  assert(c.cache.LastRefusal() == std::string("protected"));
+}
+
 int main() {
+  TenantsNeverShareRam();
+  LocalTenantUnchanged();
+  Diagnosis();
+  LatestRefusal();
+  LostFingerprint();
+  RefusalWords();
+  NewestBound();
+  TierCounters();
+  NewestStateKept();
   SlotFrontiers();
   SharedSaveRoom();
   SlotOnlySession();
@@ -781,7 +1149,7 @@ int main() {
     assert(BatchCacheFrontiers(40, 39, 8, 35).front().retention == CacheRetention::Shared);
     assert(BatchCacheFrontiers(40, 39, 8, 5).size() == 1);   // below one chunk: nothing to share
     assert(BatchCacheFrontiers(40, 12, 8, 30).front().position == 8);  // never beyond the stable boundary
-    // A grid point inside the generation prompt (crucible-t13 soak S5: prompt 57,345 = 14 x 4096 + 1, boundary
+    // A grid point inside the generation prompt (an earlier soak run: prompt 57,345 = 14 x 4096 + 1, boundary
     // 57,341). The next turn repeats the header up to its last token, so the 57,344 state is saved too.
     const auto header = BatchCacheFrontiers(57345, 57341, 4096);
     assert(header.size() == 2 && header[0].position == 53248 && header[1].position == 57344);

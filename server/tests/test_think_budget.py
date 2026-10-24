@@ -186,6 +186,13 @@ class TurnLogTest(unittest.TestCase):
         self.assertEqual(reply["choices"][0]["finish_reason"], "stop")
         self.assertEqual(reply["usage"]["prompt_tokens_details"], dict(cached_tokens=2))
 
+    def test_stop_string_reply_reports_a_whole_prompt_restore(self):
+        # Re-send fix A: an identical re-send restores every prompt token (an End resume).
+        backend = SequenceBackend(([ANSWER, ANSWER, IM_END], "stop", 0, 3))
+        reply, _ = logged(backend, chat(max_tokens=2048, enable_thinking=False, stop=["ok"]))
+        self.assertEqual(reply["usage"]["prompt_tokens"], len(backend.submissions[0][0]))
+        self.assertEqual(reply["usage"]["prompt_tokens_details"], dict(cached_tokens=len(backend.submissions[0][0])))
+
     def test_stop_string_after_a_continuation_reports_the_first_jobs_restore(self):
         # The continuation restored 9 (the first job's snapshot); the client's restore is the first job's 2.
         backend = SequenceBackend(([REASON] * 1500, "length", 0, 2), ([ANSWER, ANSWER, IM_END], "stop", 9, 9))
@@ -261,7 +268,7 @@ class CloseTest(unittest.TestCase):
                          dict(reasoning_tokens=1024 + 2, reasoning_closed_at=1024, reasoning_closed_by="answer_room"))
 
     def test_continuation_prefills_the_close_as_the_next_turn_renders_it(self):
-        # soak405: the model wrote a token split that the tokenizer does not make, so the next turn's prompt left the
+        # an earlier soak run: the model wrote a token split that the tokenizer does not make, so the next turn's prompt left the
         # replay tail inside the reasoning. The continuation prefills the reasoning again anyway, so it uses the
         # tokenizer's IDs of the text that the client sends back. The client still sees the generated tokens.
         class Canonical(BudgetTokenizer):

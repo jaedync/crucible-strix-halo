@@ -42,6 +42,7 @@
 #include "layers/expert_count.h"
 #include "runtime/prefill_prune.h"
 #include "layers/moe_rows.h"
+#include "layers/moe_stage.h"
 #include "layers/moe_shared_first.h"
 #include "layers/dense_rows.h"
 #include "exl3/exl3_ring.h"
@@ -105,16 +106,22 @@ class Engine {
     Loader(dir).Load(m_, streaming);
     // Decide the prefill path before the row-sized buffers.
     prefill_rows_ = ChoosePrefillRows(prefill_rows);
-    pf_launch_rows_ = PrefillLaunchSetting(crucible::SwitchText("CRUCIBLE_PF_LAUNCH_ROWS"), prefill_rows_);
+    const char* launch_value = crucible::SwitchText("CRUCIBLE_PF_LAUNCH_ROWS");
+    pf_launch_rows_ = PrefillLaunchSetting(launch_value, prefill_rows_);
     if (pf_launch_rows_ < 0) {
       std::fprintf(stderr, "CRUCIBLE_PF_LAUNCH_ROWS must be a multiple of the prefill rows (%d) up to %d, "
-                   "and above them only for prefill rows that are a multiple of %d\n",
-                   prefill_rows_, kMaxPrefillLaunchRows, kPrefillLaunchCoreRows);
+                   "and above them only for prefill rows that are a multiple of %d; a \"+T\" suffix (join rows, "
+                   "x4-tail) needs launch rows above the prefill rows, T from 1 to the prefill rows less 1, and the "
+                   "sum at most %d\n",
+                   prefill_rows_, kMaxPrefillLaunchRows, kPrefillLaunchCoreRows, kMaxPrefillLaunchRows);
       std::exit(2);
     }
+    // x4-tail: join rows only with "L+T"; else 0, and the row buffers hold the launch rows as before.
+    pf_join_rows_ = PrefillJoinSetting(launch_value, prefill_rows_);
+    pf_room_rows_ = PrefillRoomRows(pf_launch_rows_, pf_join_rows_);
     lookahead_.Init(m_.static_base, m_.static_bytes, streaming);
-    // Row buffers hold a packed verify pass (kPackedRows) or one bulk launch (PrefillLaunchRows() rows).
-    const int capacity = std::max(kPackedRows, pf_launch_rows_);
+    // Row buffers hold a packed verify pass (kPackedRows) or one bulk launch with its join rows (PrefillRoomRows).
+    const int capacity = std::max(kPackedRows, pf_room_rows_);
     // Padding avoids cache conflicts. CRUCIBLE_PF_PAD_H=0 keeps tight storage for A/B checks.
     const char* pad_h = crucible::SwitchText("CRUCIBLE_PF_PAD_H");
     pf_pad_h_ = prefill_rows_ > 0 && (!pad_h || std::string(pad_h) == "1");
@@ -131,8 +138,12 @@ class Engine {
     tok_ = Zeros<int>(capacity);
     rows_ = Zeros<int64_t>(capacity * 16);
     if (m_.ple.host) {
-      ple_packed_ = Zeros<uint16_t>((size_t)capacity * 16 * (10 * m_.ple.K + 1));
-      ple_stage_ = std::make_unique<PinnedInputBuffer<uint16_t, kMaxPrefillRows * 16 * 61>>();
+      ple_packed_ = Zeros<uint16_t>((size_t)capacity * 16 * m_.ple.RowWords());
+      // A BF16 row (160 words) does not fit the K-bit stage, which keeps its size.
+      if (m_.ple.bf16) ple_stage16_ = std::make_unique<PinnedInputBuffer<uint16_t, kMaxPrefillRows * 16 * kPleRowDim>>();
+      // An 8-bit row (the h6_ng8 table) has 81 words.
+      else if (m_.ple.RowWords() > 61) ple_stage8_ = std::make_unique<PinnedInputBuffer<uint16_t, kPleStageRows * 16 * 81>>();
+      else ple_stage_ = std::make_unique<PinnedInputBuffer<uint16_t, kPleStageRows * 16 * 61>>();
     }
     ids_ = Zeros<int>(kPackedRows);
     choice_ = Zeros<DraftChoice>(kMaxRows);
@@ -157,6 +168,8 @@ class Engine {
     mapj_ = Zeros<int>(kPackedRows * kTopK);
     rowl_ = Zeros<int>(MoeExpertJobs(kPackedRows) * kMaxRows);
     moe_done_ = Zeros<unsigned>(MoeExpertJobs(kPackedRows));
+    moe_sync_ = Zeros<unsigned>(kMoeStageWords);
+    qsa_sync_ = Zeros<unsigned>(4);
     hcw_ = HcWAlloc();
     LoadAblation(capacity);
     if (prefill_rows_) InitPrefill();
@@ -604,7 +617,7 @@ class Engine {
   uint64_t VisionReserveBytes(const std::vector<int>& slot_contexts) const {
     if (!vision_) return 0;
     static_assert(kMaxRows == 8, "VisionReserveRows takes 8 rows without bulk prefill");
-    const int chunk = VisionReserveRows(PrefillRows(), PrefillLaunchRows());
+    const int chunk = VisionReserveRows(PrefillRows(), pf_room_rows_);
     uint64_t bytes = VisionEncoder::ScratchBytesFor(kVisionMaxPixels / 256, size_t(kVisionMaxPixels) * 3);
     bytes -= std::min<uint64_t>(bytes, vision_->ScratchBytes());
     for (const int context : slot_contexts) bytes += VisionSlotBytes(context, chunk, kHidden);
@@ -666,8 +679,18 @@ class Engine {
   int PrefillRows() const { return prefill_rows_; }
   // Most rows of one Prefill call: whole PrefillRows() chunks that a caller merges
   // (PrefillLaunchRows in prefill_launch.h); CRUCIBLE_PF_LAUNCH_ROWS, default 8192 for the 4,096-row grid
-  // (kDefaultPrefillLaunchRows), else PrefillRows().
+  // (kDefaultPrefillLaunchRows, with kDefaultPrefillJoinRows join rows), else PrefillRows().
   int PrefillLaunchRows() const { return pf_launch_rows_; }
+  // x4-tail: rows that the prompt's last partial chunk may add to a launch; 0 without
+  // "+T" in CRUCIBLE_PF_LAUNCH_ROWS.
+  int PrefillJoinRows() const { return pf_join_rows_; }
+  // x4-tail: the next Prefill call sets the retained ledger of the plan without joins and copies the slot's state at
+  // the cut (section 5). Only an engine with join rows takes a spec, and only one per call.
+  void SetPrefillJoin(crucible::PrefillJoinSpec spec) {
+    if (pf_join_rows_ <= 0 || pf_join_set_) std::abort();
+    pf_join_ = std::move(spec);
+    pf_join_set_ = true;
+  }
   // PrefillRows() trunk stacks for MTP prompt pairing (nullptr without prefill).
   float* PromptStacks() const { return pf_prompt_stacks_; }
 
@@ -768,7 +791,7 @@ class Engine {
   // and the scratch is dead before the next layer or an interleaved decode pass starts. About 281 KB a prefill row
   // (1.15 GB at 4096 rows). CRUCIBLE_PF_STAGE_SHARE=0 keeps two separate regions.
   void AllocateStageArena(int capacity) {
-    const size_t launch = (size_t)pf_launch_rows_, rows = launch * kSlots;
+    const size_t launch = (size_t)pf_room_rows_, rows = launch * kSlots;
     auto attention = [&](StageView& v) {
       qkv_ = v.Take<float>((size_t)capacity * kGdnQkvWidth);
       z_ = v.Take<float>((size_t)capacity * kGdnValueWidth);
@@ -832,6 +855,11 @@ class Engine {
   struct LayerGroups {
     Group a_in, a_out, gu, dn;
     int kr = 3;  // routed expert K; the shared expert has kr + 2
+    // The shared expert's width: kr + 2 on the K3..6 packs, 7 or 8 on the h6_ng8 packs.
+    int ks = 5;
+    // R = 1: the gate/up items again in 8-block items (MoeStageKernel).
+    GemvItem* d_gu8 = nullptr;
+    int n_gu8 = 0;
     bool moe_chunk_fits = false;  // every expert split span is whole kMoeChunk stages
     int state_cache = 0;
   };
@@ -868,10 +896,10 @@ class Engine {
         if (p) HIP_OK(hipFree(p));
       group.reset();
     }
-    draft_head_ = block_head_->Weights();
+    draft_head_ = block_head_->Front();
     draft_blocks_ = block_head_->Mapping();
     Build(draft_group_, {Job(draft_head_, x_, kHidden, logits_, draft_head_.O,
-                              kEpiStore, nullptr, 1)}, 1, true);
+                              kEpiStore, nullptr, 1)}, 1, true, 0, {draft_head_.front_s});
   }
 
   // front_s: one entry per job for dense decode groups that may use the front
@@ -881,8 +909,8 @@ class Engine {
              const std::vector<int>& front_s = {}, int item_blocks = 8, int shared_job = -1) {
     std::vector<std::pair<int, int>> io;
     for (const LinJob& j : jobs) io.push_back({j.I, j.O});
-    const int target = fixedS ? 0 : DecodeTarget(io);
-    for (LinJob& j : jobs) j.S = fixedS ? 1 : SplitFor(j.I / 16, target);
+    const std::vector<int> splits = fixedS ? std::vector<int>(jobs.size(), 1) : DecodeSplits(io);
+    for (size_t ji = 0; ji < jobs.size(); ++ji) jobs[ji].S = splits[ji];
     const RowPolicy policy = ResolveRowPolicy(R, m_.head.K, m_.L[0].moe.experts[0].K[0]);
     g.fuse = fixedS ? 0 : policy.fuse;
     g.cache = policy.cache;
@@ -917,6 +945,7 @@ class Engine {
     }
     g.jobs = jobs;
     g.has_k6 = std::any_of(jobs.begin(), jobs.end(), [](const LinJob& j) { return j.K == 6; });
+    g.wide = std::any_of(jobs.begin(), jobs.end(), [](const LinJob& j) { return WideDecodeK(j.K); });
     g.d_jobs = Upload(jobs);
     const bool loaded_front = !front_s.empty() && front_s[0] > 0;
     for (size_t i = 0; loaded_front && i < jobs.size(); ++i)
@@ -942,8 +971,9 @@ class Engine {
 
   // The tile order GemvR reads for this group.
   bool ReadsFront(const Group& g) const { return g.d_front != nullptr; }
+  // The ring kernels hold K <= 6 only, so a wide group keeps verify passes at kMaxRows rows.
   bool PackedFits(const Group& g) const {
-    return PackedGroupFits({g.jobs[0].dst != nullptr, ReadsFront(g), g.aligned_chunk});
+    return !g.wide && PackedGroupFits({g.jobs[0].dst != nullptr, ReadsFront(g), g.aligned_chunk});
   }
 
   static LinJob Job(const Lin& L, const float* src, int lds, float* dst, int ldd, int epi,
@@ -1076,7 +1106,14 @@ class Engine {
   void BlockMoe(int li, const Layer& L, const LayerGroups& G, int R) {
     HcRead(L.hcm, R, true);
     Mark("hc_mix");
+    // The stage has the K3 and K4 instances only (MoeFusedKernelWide keeps the h6_ng8 packs).
+    const bool stage = MoeStageOn(li, R) && G.gu.cache == 4 && NarrowMoeWidths({G.kr, G.ks});
     LaunchDense(L.moe.router, kExperts + 1, kHidden, x_, kHidden, rlog_, kExperts + 1, R);
+    if (stage) {
+      MoeStage(L, G);
+      Mark("moe_gateup");
+      return;
+    }
     MoeRouteKernel<<<R, 512>>>(rlog_, sel_moe_, wts_);
     if (route_dump_ && li < kLayers) DumpRoutes(li, R);
     if (ecount_) CountExpertsKernel<<<1, 32>>>(sel_moe_, R, ecount_ + (li == kLayers ? 2 * (kPackedRows + 1) : 0));
@@ -1106,10 +1143,64 @@ class Engine {
     Mark("moe_combine");
   }
 
+  // The route, map, input transform and combine inside the expert launch (moe_stage.h). The route dump, the
+  // expert counts and the ablation read or replace the separate kernels' outputs, so they keep them.
+  bool MoeStageOn(int li, int R) const {
+#if CRUCIBLE_DEBUG_NONFINITE & 1
+    return false;  // the probes sit in MoeRouteKernel
+#endif
+    return R == 1 && !route_dump_ && !ecount_ && !AblMlp(li);
+  }
+
+  // 8-block gate/up items (G.d_gu8). Only the cache policy of the tuned row policy (4) has instances; another
+  // policy keeps the separate kernels.
+  void MoeStage(const Layer& L, const LayerGroups& G) {
+    const MoeStageArgs a{G.gu.d_jobs, G.d_gu8, G.n_gu8, G.dn.d_jobs, G.dn.d_items, G.dn.nitems,
+                         rlog_, L.moe.d_experts, post_, H_, moe_sync_};
+    const auto kernel = G.kr == 4 ? MoeStageKernel<1, 4, kMoePf, 4> : MoeStageKernel<1, 3, kMoePf, 4>;
+    const int grid = G.n_gu8 + G.dn.nitems;
+    hipLaunchKernelGGL(kernel, dim3(grid), dim3(256), MoeFusedLds(1, 0, G.gu.lds, G.dn.lds), 0, a);
+  }
+
   template <int R>
   void MoeFusedR(const LayerGroups& G) {
-    if (G.kr == 4) MoeFusedLaunch<R, 4>(G);
-    else MoeFusedLaunch<R, 3>(G);
+    if (NarrowMoeWidths({G.kr, G.ks})) {
+      if (G.kr == 4) MoeFusedLaunch<R, 4>(G);
+      else MoeFusedLaunch<R, 3>(G);
+    } else {
+      MoeFusedWideR<R>(G);
+    }
+  }
+
+  // One MoeFusedKernelWide launch for each pair of kWideMoeWidths (moe_widths_test checks the list).
+  template <int R, size_t N = 0>
+  void MoeFusedWideR(const LayerGroups& G) {
+    if constexpr (N < kWideMoeWidths.size()) {
+      constexpr MoeWidths w = kWideMoeWidths[N];
+      if (G.kr == w.kr && G.ks == w.ks) MoeFusedWideLaunch<R, w.kr, w.ks>(G);
+      else MoeFusedWideR<R, N + 1>(G);
+    } else {
+      // ValidateLayer admits no other set of widths.
+      std::fprintf(stderr, "internal error: MoE widths routed %d shared %d\n", G.kr, G.ks);
+      std::abort();
+    }
+  }
+
+  // MoeFusedLaunch for the h6_ng8 packs (MoeFusedKernelWide), with the same chunk rule; K2, K2.5 and
+  // K3.5 routed experts (codes 25, 35) stage in chunks as K3 does (not measured against full staging).
+  template <int R, int KR, int KS>
+  void MoeFusedWideLaunch(const LayerGroups& G) {
+    bool chunk = false;
+    auto kernel = G.gu.cache == 4 ? MoeFusedKernelWide<R, KR, KS, kMoePf, 4> : MoeFusedKernelWide<R, KR, KS>;
+    if constexpr (R > 1 && (KR == 2 || KR == 25 || KR == 3 || KR == 35)) {
+      chunk = G.moe_chunk_fits;
+      if (chunk)
+        kernel = G.gu.cache == 4 ? MoeFusedKernelWide<R, KR, KS, kMoePf, 4, kMoeCols, kMoeChunk>
+                                 : MoeFusedKernelWide<R, KR, KS, kMoePf, 0, kMoeCols, kMoeChunk>;
+    }
+    const size_t lds = MoeFusedLds(R, chunk ? kMoeChunk : 0, G.gu.lds, G.dn.lds);
+    hipLaunchKernelGGL(kernel, dim3(G.gu.nitems + G.dn.nitems), dim3(256), lds, 0,
+        G.gu.d_jobs, G.gu.d_items, G.gu.nitems, G.dn.d_jobs, G.dn.d_items, G.dn.nitems, moe_done_);
   }
 
   template <int R, int KR>
@@ -1218,6 +1309,7 @@ class Engine {
       dn.push_back(Job(sh ? L.moe.sd : rd, nullptr, 0, nullptr, 0, kEpiStore, nullptr, nr));
     }
     G.kr = e0.K[0];
+    G.ks = L.moe.sg.K;
     // MoeFusedKernel<..., kMoeCols> items span kMoeItemBlocks columns.
     const int ib = kMoeItemBlocks<kMoeCols>;
     const bool shared_first=R>1;
@@ -1225,6 +1317,18 @@ class Engine {
     if (G.gu.nitems != (int)gu.size() / 2 * kMoeGuItems<kMoeCols>) {
       std::fprintf(stderr, "MoE gate/up items do not match the down-item wait count\n");
       std::exit(1);
+    }
+    if (R == 1) {
+      std::vector<GemvItem> items;
+      for (size_t ji = 0; ji < G.gu.jobs.size(); ++ji)
+        for (int b0 = 0; b0 < G.gu.jobs[ji].O / 16; b0 += kMoeItemBlocks<1>)
+          items.push_back({(int)ji, 0, b0, std::min(kMoeItemBlocks<1>, G.gu.jobs[ji].O / 16 - b0)});
+      if (items.size() != gu.size() / 2 * kMoeGuItems<1>) {
+        std::fprintf(stderr, "MoE 8-block gate/up items do not match the down-item wait count\n");
+        std::exit(1);
+      }
+      G.d_gu8 = Upload(items);
+      G.n_gu8 = (int)items.size();
     }
     // MoeFusedKernel reads gate/up partials while down items already write
     // theirs, so the two groups need disjoint partial scratch.
@@ -1275,7 +1379,7 @@ class Engine {
     if constexpr (R == 1) {
       // Expert jobs have no destination. Their fused schedule remains unchanged.
       const bool ring = ring_mode_ == kRingOn || (ring_mode_ == kRingFront && front);
-      if (ring && g.jobs[0].dst) {
+      if (ring && g.jobs[0].dst && !g.wide) {
         // LinRingFlowKernel: no barrier between items and fused transforms.
         const int grid = std::min(kRingBlocks, g.nitems), words = (int)(g.lds / 4);
         if (front) LinRingFlowKernel<true><<<grid, 320, 2 * g.lds>>>(jobs, g.d_items, g.nitems, words, in, out);
@@ -1287,15 +1391,17 @@ class Engine {
       // R > 1 front-order dense groups through the ring (ring_rows.h): 3.05 dense groups 9.7-10.5 ms against
       // 10.7-12.5 ms for LinPolicyKernel at R=2..8, and each whole verify forward is faster with the lookahead
       // kept.
-      if (front && g.jobs[0].dst) {
+      if (front && g.jobs[0].dst && !g.wide) {
         if (in) LinInKernel<<<(g.nin + 7) / 8, 256>>>(g.d_jobs, g.d_in, g.nin);
         LinRingRowsKernel<R><<<std::min(kRingBlocks, g.nitems), 320>>>(jobs, g.d_items, g.nitems, out);
         return;
       }
     }
     if constexpr (R > kMaxRows) {
-      // A full-span activation stage for 16 rows needs 80 KB of LDS, so
-      // packed passes read engine-order groups (4.05) through the ring too.
+      // A full-span activation stage for 16 rows needs 80 KB of LDS, so a
+      // packed pass reads an engine-order group through the ring too. Since
+      // qsa-front both stock packs load every dense group in front order
+      // (the front branch above), so this is the fallback for other packs.
       // MaxPassRows admits a packed pass only when every group fits.
       if (!PackedFits(g)) {
         std::fprintf(stderr, "internal error: a %d-row pass reached a group that MaxPassRows rejects\n", R);
@@ -1303,6 +1409,16 @@ class Engine {
       }
       if (in) LinInKernel<<<(g.nin + 7) / 8, 256>>>(g.d_jobs, g.d_in, g.nin);
       LinRingRowsKernel<R, false><<<std::min(kRingBlocks, g.nitems), 320>>>(jobs, g.d_items, g.nitems, out);
+    } else if (g.wide) {
+      // K7 and K8 (the h6_ng8 packs) have their own instantiations, so K3..6 keep their code.
+      if (g.fuse || g.cache) {
+        if (front) LinPolicyKernel<R, kMaxWideDecodeK, true><<<g.nitems, 256, g.lds>>>(jobs, g.d_items, g.nitems, in, out);
+        else LinPolicyKernel<R, kMaxWideDecodeK><<<g.nitems, 256, g.lds>>>(jobs, g.d_items, g.nitems, in, out);
+      } else if (front) {
+        LinGemvKernel<R, kMaxWideDecodeK, true><<<g.nitems, 256, g.lds>>>(jobs, g.d_items, g.nitems);
+      } else {
+        LinGemvKernel<R, kMaxWideDecodeK><<<g.nitems, 256, g.lds>>>(jobs, g.d_items, g.nitems);
+      }
     } else {
     // Keep K6 register pressure out of both lower-width dispatch variants.
     if (g.fuse || g.cache) {
@@ -1476,9 +1592,10 @@ class Engine {
     ple_host_rows_.assign(host, host + count);
     ple_gather_start_ = std::chrono::steady_clock::now();
     ple_host_count_ = count;
-    // A launch above the pinned stage's kMaxPrefillRows rows is gathered in pieces by GatherPle.
-    if (count > kMaxPrefillRows * 16) return;
-    uint16_t* out = ple_stage_->Begin((size_t)count * (10 * m_.ple.K + 1));
+    // A launch above the pinned stage's rows is gathered in pieces by GatherPle.
+    if (count > PleStageRows() * 16) return;
+    uint16_t* out = nullptr;
+    WithPleStage([&](auto& stage) { out = stage.Begin((size_t)count * m_.ple.RowWords()); });
     m_.ple.host->Start(ple_host_rows_.data(), (size_t)count, reinterpret_cast<uint8_t*>(out));
   }
 
@@ -1499,19 +1616,23 @@ class Engine {
       std::abort();
     }
     const auto waited = std::chrono::steady_clock::now();
-    const size_t per_row = 16 * (10 * m_.ple.K + 1);
-    if (R <= kMaxPrefillRows) {
+    const size_t per_row = 16 * m_.ple.RowWords();
+    const int stage_rows = PleStageRows();
+    if (R <= stage_rows) {
       FinishPleGather();
       ple_host_count_ = 0;
-      ple_stage_->Commit(ple_packed_, (size_t)R * per_row);
+      WithPleStage([&](auto& stage) { stage.Commit(ple_packed_, (size_t)R * per_row); });
     } else {
-      // The pinned stage holds kMaxPrefillRows rows; a longer launch (CRUCIBLE_PF_LAUNCH_ROWS) started no
-      // gather in PleRowsUploaded and fills the stage once a piece.
+      // A launch above the stage rows (CRUCIBLE_PF_LAUNCH_ROWS) started no gather in PleRowsUploaded and fills
+      // the stage once a piece. Each piece after the first waits for the previous piece's copy, which runs
+      // after layer 0 on the stream, so the device idles while the host gathers the next piece.
       ple_host_count_ = 0;
-      for (int o = 0; o < R; o += kMaxPrefillRows) {
-        const int n = std::min(kMaxPrefillRows, R - o);
-        ple_stage_->FillTo(ple_packed_ + (size_t)o * per_row, (size_t)n * per_row, [&](uint16_t* out) {
-          m_.ple.host->Gather(ple_host_rows_.data() + (size_t)o * 16, (size_t)n * 16, reinterpret_cast<uint8_t*>(out));
+      for (int o = 0; o < R; o += stage_rows) {
+        const int n = std::min(stage_rows, R - o);
+        WithPleStage([&](auto& stage) {
+          stage.FillTo(ple_packed_ + (size_t)o * per_row, (size_t)n * per_row, [&](uint16_t* out) {
+            m_.ple.host->Gather(ple_host_rows_.data() + (size_t)o * 16, (size_t)n * 16, reinterpret_cast<uint8_t*>(out));
+          });
         });
       }
     }
@@ -1528,6 +1649,14 @@ class Engine {
     return ple_packed_;
   }
 
+  // The stages have the same interface; one exists (CRUCIBLE_PLE_BF16 or the row width picks it).
+  template <class F>
+  void WithPleStage(F&& f) {
+    if (ple_stage16_) f(*ple_stage16_);
+    else if (ple_stage8_) f(*ple_stage8_);
+    else f(*ple_stage_);
+  }
+
   template <int K>
   void LaunchPleGather(int R) {
     if (m_.ple.host)
@@ -1538,7 +1667,9 @@ class Engine {
 
   void Ple(int R, int pos0, float* H = nullptr, int ldh = kWide) {
     H = H ? H : H_;
-    if (m_.ple.K == 5) LaunchPleGather<5>(R);
+    if (m_.ple.bf16) PleBf16GatherKernel<<<dim3(kPleHeads, R), kPleRowDim>>>(GatherPle(R), eple_);
+    else if (m_.ple.K == 5) LaunchPleGather<5>(R);
+    else if (m_.ple.K == 8) LaunchPleGather<8>(R);
     else LaunchPleGather<6>(R);
     LaunchDense(m_.ple.kv, 12800, kHidden, eple_, kHidden, kv_, 12800, R);
     if (VerificationSpansActive()) VerificationPle(H,ldh);
@@ -1695,6 +1826,8 @@ class Engine {
   unsigned long long *ecount_ = nullptr, *ecbuf_ = nullptr;
   int *mapj_ = nullptr, *rowl_ = nullptr;
   unsigned* moe_done_ = nullptr;
+  unsigned* moe_sync_ = nullptr;  // MoeStageKernel's counters (zero between its launches)
+  unsigned* qsa_sync_ = nullptr;  // QsaAttnTailKernel's counters (zero between its launches)
   std::unique_ptr<AsyncHead> overlap_;
   std::unique_ptr<BlockDraftHead> block_head_;
   bool draft_last_only_ = true;
@@ -1707,6 +1840,7 @@ class Engine {
   float draft_margin_ = INFINITY;
   std::string profile_scope_;
   std::string PrefillWidthIssue() const;
+  static std::vector<int> MoeLayerWidths(const Layer& L);
   int ChoosePrefillRows(int requested);
   void InitPrefill();
   const PrefillPlans& PrefillPlansFor(int R);
@@ -1716,6 +1850,9 @@ class Engine {
   bool PrefillPrunes(int R, bool predict, int keep, const std::string& dump) const;
   int PrefillFirstRow(int R, bool predict, int keep, const std::string& dump) const;
   void CheckChunk(int pos0, int R, bool predict);
+  void BeginPrefillJoin(int R, int pos0);
+  void PrefillCutAfter(int end, std::initializer_list<const void*> sources);
+  void PrefillCutPle(int pos0);
   const MtpPrefillPlan* MtpPrefillPlanFor(int R);
   // Bulk MTP plans by row count (a full chunk and the last partial chunk); null: the 8-row path for that count.
   std::map<int, std::unique_ptr<MtpPrefillPlan>> mtp_prefill_plans_;
@@ -1737,6 +1874,11 @@ class Engine {
   bool compact_state_ = false;
   std::vector<int> batch_streams_;
   int ctx_, mtp_rows_, prefill_rows_, pf_launch_rows_ = 0;
+  int pf_join_rows_ = 0, pf_room_rows_ = 0;  // x4-tail: join rows, and launch rows plus join rows
+  // x4-tail: the spec of the next Prefill call, and the cut of the running call with its copies done.
+  crucible::PrefillJoinSpec pf_join_{}, pf_cut_{};
+  bool pf_join_set_ = false;
+  std::vector<char> pf_cut_done_;
   size_t xh_capacity_, partial_capacity_;
   // Budget: 1 GiB and 16 entries, or one oversized custom plan. Scratch is separate.
   std::map<int,std::pair<uint64_t,std::unique_ptr<PrefillPlans>>> prefill_plans_;
@@ -1808,9 +1950,16 @@ class Engine {
   int *tok_, *ids_, *sel_, *nsel_, *sel_moe_, *map_;
   int64_t* rows_;
   uint16_t* ple_packed_ = nullptr;
-  std::unique_ptr<PinnedInputBuffer<uint16_t, kMaxPrefillRows * 16 * 61>> ple_stage_;
+  // prefill-x: the K-bit and 8-bit stages hold the largest launch (CRUCIBLE_PF_LAUNCH_ROWS with its join), so the
+  // gather starts at the upload and overlaps layer 0 (about 20 ms of device idle less per 8192-row launch). 64 MiB
+  // (61-word rows) or 81 MiB (81-word rows) pinned; only one of them exists.
+  static constexpr int kPleStageRows = kMaxPrefillLaunchRows;
+  int PleStageRows() const { return ple_stage16_ ? kMaxPrefillRows : kPleStageRows; }
+  std::unique_ptr<PinnedInputBuffer<uint16_t, kPleStageRows * 16 * 61>> ple_stage_;
+  std::unique_ptr<PinnedInputBuffer<uint16_t, kMaxPrefillRows * 16 * kPleRowDim>> ple_stage16_;
+  std::unique_ptr<PinnedInputBuffer<uint16_t, kPleStageRows * 16 * 81>> ple_stage8_;
   std::vector<int64_t> ple_host_rows_;
-  // Destroyed before the rows and ple_stage_: a forward that threw between
+  // Destroyed before the rows and the stages: a forward that threw between
   // PleRowsUploaded and Ple() leaves a gather that still writes there.
   PleDrainGuard ple_drain_{&m_.ple.host};
   int ple_host_count_ = 0;

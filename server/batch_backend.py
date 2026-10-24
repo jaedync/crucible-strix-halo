@@ -1,7 +1,8 @@
 """One command worker controls prefill, packed decode, cancellation, and output backpressure."""
-from collections import deque
+from collections import deque, namedtuple
 from dataclasses import dataclass, replace
 import json
+import re
 import os
 import queue
 import threading
@@ -45,7 +46,16 @@ STAGE_AHEAD_POLL_SECONDS = 0.5
 # The engine drops a ready read that no stage command touched for 60 s (engine/runtime/state_disk.h stage_seconds), so a
 # turn that waits for a slot polls its ready read again after this long.
 STAGE_REFRESH_SECONDS = 20.0
+# A "none" reply is not final: a returning turn often arrives while the host cache still holds its state,
+# and other sessions evict that entry to disk while the turn waits for a slot. A waiting turn asks again this often,
+# and a turn asks once more when its slot frees.
+STAGE_NONE_POLL_SECONDS = 5.0
 STAGE_STATES = ("none", "reading", "ready", "failed")
+# One stage reply (_stage). `tokens`: the disk state's length; `tag`: a read for a turn ahead took this turn's host
+# state (the engine's host_evict tag), 0 when none. An older engine sends neither reason nor tag.
+StageReply = namedtuple("StageReply", "state reason tokens tag", defaults=("-", 0, 0))
+# The engine's stage reasons are fixed words (engine/serve/batched_serve.h Stage); anything else is logged as "other".
+STAGE_REASON = re.compile(r"[a-z0-9_]{1,24}")
 # A stopping engine writes its states to disk for up to 75 s (engine/serve/batched_serve.h kStateFlushSeconds). The server
 # waits 85 s, then kills it: the whole stop fits in a systemd TimeoutStopSec=120 with a margin.
 STATE_FLUSH_SECONDS = 85
@@ -73,17 +83,21 @@ class LiveRequest:
 
 class BatchedEngineBackend(EngineBackend):
     counts_stall = True
+    bounds_think_cap = False  # the worker stops stepping a job at its think cap and keeps the slot for the continuation
     packed_rows = ""  # CRUCIBLE_PACKED_ROWS as the engine reads it; set in __init__
     prefill_interleave = 0
     encoder_slice_seconds = ENCODER_SLICE_SECONDS  # an average of the slice commands run; see encoder_rows
     interleave_min_rows = INTERLEAVE_MIN_ROWS
     kept = None  # set in __init__; None in tests that build the worker without it
     state_disk = False  # the disk tier; set from the engine's ready event
+    stage_job = False  # the engine takes a stage "job" tag (fix 2); set from the ready event
+    stage_jobs = 0  # the last stage job tag (_job_tag)
     def __init__(self, executable, checkpoint, context=32768, *, streams=8, output_timeout=30, prefill=None,
                  conversation_cache_mib=0, short_streams=0, short_ctx=0, packed_op="verify_step",
                  session_replay=False, slot_resume=None, slot_checkpoints=None, prefill_interleave=0,
                  interleave_min_rows=INTERLEAVE_MIN_ROWS, state_dir=None, state_disk_gib=None, cache_probation=None,
                  state_write_gib_per_day=None, cache_idle_minutes=None, engine_options=(), lookup=LOOKUP_DEPTH,
+                 state_write_delay_ms=None,
                  mtp_window=MTP_WINDOW):
         if (type(streams) is not int or not 1 <= streams <= 8 or
                 type(output_timeout) not in (int, float) or not 0 < output_timeout <= 300):
@@ -107,6 +121,9 @@ class BatchedEngineBackend(EngineBackend):
         if state_write_gib_per_day is not None and (type(state_write_gib_per_day) is not int or
                                                     not 0 <= state_write_gib_per_day <= 65536 or state_dir is None):
             raise ValueError('The daily state write budget is 0..65536 GiB and needs a state directory.')
+        if state_write_delay_ms is not None and (type(state_write_delay_ms) is not int or
+                                                 not 0 <= state_write_delay_ms <= 60000 or state_dir is None):
+            raise ValueError('The state write delay is 0..60000 ms and needs a state directory.')
         if packed_op not in ("verify_step", "step"):
             raise ValueError('Use the packed op verify_step or step.')
         if type(prefill_interleave) is not int or not 0 <= prefill_interleave < MODEL_LAYERS:
@@ -130,6 +147,7 @@ class BatchedEngineBackend(EngineBackend):
         self.state_disk = False
         self.requested_state_dir = state_dir
         self.staging = {}
+        self.queued_polls = {}  # id(job) -> the last read=0 stage of a turn behind the first (_stage_ahead)
         self.waiting = deque()
         self.requested_prefill = prefill
         self.streams = streams
@@ -188,6 +206,8 @@ class BatchedEngineBackend(EngineBackend):
         if state_disk_gib is not None: options += ('--state-disk-gib', str(state_disk_gib))
         if state_write_gib_per_day is not None:
             options += ('--state-disk-write-gib-per-day', str(state_write_gib_per_day))
+        # The same-second proof only; 0 (the engine default) never goes out, so older engines see the same options.
+        if state_write_delay_ms: options += ('--state-disk-write-delay-ms', str(state_write_delay_ms))
         super().__init__(executable, checkpoint, context, engine_options=options + tuple(engine_options),
                          lookup=lookup)
 
@@ -207,6 +227,7 @@ class BatchedEngineBackend(EngineBackend):
         # An engine can refuse the tier (another engine holds the directory); then it gets no stage command.
         self.state_disk = bool(getattr(self, "requested_state_dir", None)) and ready.get("state_disk") is True
         if self.state_disk: self.flush_seconds = STATE_FLUSH_SECONDS
+        self.stage_job = self.state_disk and ready.get("stage_job") is True
 
     def submit(self, ids, request, cache_prefix_tokens=0, shared_prefix_tokens=0, log_turn=True, image_offsets=(),
                after=None, think_cap=None):
@@ -305,8 +326,9 @@ class BatchedEngineBackend(EngineBackend):
                     raise ProtocolError("The engine returned an unexpected decode pass boundary.")
                 live = set(decoders)
                 self._check_complete("verify_step", live, part_tokens, part_finished)
-                self._count_rounds(part_tokens, "verify_step")
+                stepped = self._count_rounds(part_tokens, "verify_step")
                 self._publish(part, part_finished)
+                self._decode_lines(stepped, part_finished)
                 end = metrics.now()
                 self.trace.add(part_start, end, "verify_step", sorted(live), None, None)
                 self.last_step = time.monotonic()
@@ -358,7 +380,7 @@ class BatchedEngineBackend(EngineBackend):
             return start, end
         if op == "open" and not opened: raise ProtocolError("The engine omitted a sequence lease.")
         self._check_complete(op, selected, tokens, finished)
-        if op in ("step", "spec_step", "verify_step"): self._count_rounds(tokens, op)
+        stepped = self._count_rounds(tokens, op) if op in ("step", "spec_step", "verify_step") else {}
         if op == "close" and events: raise ProtocolError("The engine returned output after cancellation.")
         if op == "prefill" and "cursor" in boundary:
             rows = self._reported_rows(self.active[payload["request_id"]], boundary["cursor"])
@@ -370,6 +392,7 @@ class BatchedEngineBackend(EngineBackend):
             metrics.add_chunk(turn, start, end, rows)
             if tokens: turn["t_prefill_end"] = end
         self._publish(events, finished)
+        self._decode_lines(stepped, finished)
         return start, end
 
     def _count_rounds(self, tokens, op):
@@ -386,11 +409,26 @@ class BatchedEngineBackend(EngineBackend):
         except (KeyError, TypeError):  # A counter must never fail a step; a payload without spec has one row.
             asked = [1] * len(tokens)
         rows = min(pass_row_cap(self.packed_rows, len(tokens), getattr(self, "streams", PASS_ROWS)), sum(asked))
+        stepped = {}
         for id, seen in tokens.items():
-            turn = self.active[id].job.turn
+            stepped[id] = self.active[id].job
+            turn = stepped[id].turn
             turn["spec_rounds"] = turn.get("spec_rounds", 0) + 1
             turn["round_tokens"] = turn.get("round_tokens", 0) + len(seen)
             metrics.count_pass(turn, len(tokens), rows)
+        return stepped
+
+    @staticmethod
+    def _decode_lines(stepped, finished):
+        """The live crucible_decode lines after a step or pass has published (metrics.decode_line). A finished turn
+        writes its final line with its crucible_turn line instead; a cancelled job writes none."""
+        t = None  # read the clock only for a turn that can write a line
+        for id, job in stepped.items():
+            if id in finished or job.cancelled.is_set(): continue
+            if not (getattr(getattr(job, "after", None) or job, "turn", None) or {}).get("speculative"): continue
+            if t is None: t = metrics.now()
+            line = metrics.decode_line(job, t)
+            if line is not None: metrics.emit(line)
 
     def _check_complete(self, op, selected, tokens, finished):
         """Every selected decoder published, and exactly the turns that reached a stop or their limit finished."""
@@ -406,9 +444,10 @@ class BatchedEngineBackend(EngineBackend):
             entry = self.active[event["request_id"]]
             if event["event"] == "opened":
                 entry.generation = event["slot_generation"]
-                # The restore at open; a closed think turn cancels this job before its done event (http.py).
+                # The restore at open; a closed think turn cancels this job before its done event (http.py). The
+                # whole prompt is an End resume (re-send fix A): the prefill command then runs no row.
                 cached = event.get("cached_tokens")
-                if type(cached) is int and 0 <= cached < len(entry.job.payload["ids"]):
+                if type(cached) is int and 0 <= cached <= len(entry.job.payload["ids"]):
                     entry.job.turn["opened_cached"] = cached
                     # SRPT and aging rank the rows that remain after the restore, not the whole prompt.
                     entry.prefilled, entry.restored = cached, cached > 0
@@ -455,8 +494,10 @@ class BatchedEngineBackend(EngineBackend):
             if job.cancelled.is_set(): slot_context = None
             elif (slot_context := self._slot_for(job.payload)) is None: continue
             # The disk read runs before the open, so the open restores from memory (FIFO: later turns wait too).
-            elif self.state_disk and not self._staged(job): return False
-            if self.state_disk: self.staging.pop(id(job), None)
+            elif self.state_disk and not self._staged(job, opening=True, position=self._position(job)): return False
+            if self.state_disk:
+                self.staging.pop(id(job), None)
+                self.queued_polls.pop(id(job), None)
             self.waiting.remove(job)
             with self.admission_lock: self.pending_tokens -= len(job.payload["ids"])
             if slot_context is None:
@@ -466,7 +507,9 @@ class BatchedEngineBackend(EngineBackend):
         return False
 
     def _forget_job(self, job):
-        if self.state_disk: self.staging.pop(id(job), None)
+        if self.state_disk:
+            self.staging.pop(id(job), None)
+            self.queued_polls.pop(id(job), None)
         super()._forget_job(job)
 
     def _stageable(self, job):
@@ -475,20 +518,48 @@ class BatchedEngineBackend(EngineBackend):
                 len(payload["ids"]) >= STAGE_MIN_TOKENS)
 
     def _stage_ahead(self):
-        """Start the disk reads of the first waiting turns, so a read overlaps the wait for a slot. A turn with no
-        free slot never reaches _staged in _admit, so this also polls its read and keeps a ready read alive."""
+        """Start the disk read of the turn next in line, so the read overlaps its wait for a slot. A turn with no
+        free slot never reaches _staged in _admit, so this also polls its read and keeps a ready read alive.
+        An earlier change: only the first long turn (FIFO: the next free slot takes it) starts a read. A read holds host
+        memory inside the cache budget until its turn opens, so a read for a turn further back would hold that budget
+        for minutes (x6 waits: 80-170 s) and evict host states for nothing if it expired. The later turns of the first
+        STAGE_AHEAD poll only a read that they hold already, and each turn stages again when its slot frees. Each of
+        them also says that it waits (read=0, every STAGE_REFRESH_SECONDS): a read for a turn ahead may take the host
+        state of a session that waits behind it (the engine's read-ahead rule), never of a session that waits for
+        nothing."""
+        position, now = 0, time.monotonic()
         for job in list(self.waiting)[:STAGE_AHEAD]:
-            if self._stageable(job): self._staged(job, STAGE_AHEAD_POLL_SECONDS)
+            if not self._stageable(job): continue
+            record = self.staging.get(id(job))
+            if position == 0 or (record is not None and record["state"] in ("reading", "ready")):
+                self._staged(job, STAGE_AHEAD_POLL_SECONDS, position=position, read=position == 0)
+            elif now - self.queued_polls.get(id(job), -STAGE_REFRESH_SECONDS) >= STAGE_REFRESH_SECONDS:
+                if tag := self._stage(job.payload, position, False, self._job_tag(job)).tag:
+                    job.turn["state_disk_tag"] = tag
+                self.queued_polls[id(job)] = now
+            position += 1
 
-    def _staged(self, job, poll_seconds=STAGE_POLL_SECONDS):
+    def _position(self, job):
+        """The turn's place among the waiting long turns (the order of _stage_ahead)."""
+        position = 0
+        for other in self.waiting:
+            if other is job: return position
+            if self._stageable(other): position += 1
+        return position
+
+    def _staged(self, job, poll_seconds=STAGE_POLL_SECONDS, opening=False, position=0, read=True):
         """True when `job` may open: no disk read, a finished read, or a read that took too long. A reading turn is
-        polled every `poll_seconds` (a turn with a free slot: STAGE_POLL_SECONDS)."""
+        polled every `poll_seconds` (a turn with a free slot: STAGE_POLL_SECONDS). `opening`: the turn has a free
+        slot, so a "none" reply from an earlier poll is checked again. `position` and `read` go to the engine
+        (_stage)."""
         if not self._stageable(job): return True
         now = time.monotonic()
         record = self.staging.get(id(job))
+        none_poll = STAGE_POLL_SECONDS if opening else STAGE_NONE_POLL_SECONDS
         if (record is None or (record["state"] == "reading" and now - record["polled"] >= poll_seconds) or
-                (record["state"] == "ready" and now - record["polled"] >= STAGE_REFRESH_SECONDS)):
-            state = self._stage(job.payload)
+                (record["state"] == "ready" and now - record["polled"] >= STAGE_REFRESH_SECONDS) or
+                (record["state"] == "none" and now - record["polled"] >= none_poll)):
+            state, reason, tokens, tag = self._stage(job.payload, position, read, self._job_tag(job))
             if record is None: record = self.staging[id(job)] = dict(state=state, since=now, polled=now)
             else:
                 # The engine dropped the ready read and reads it again (a "reading" reply after "ready" or after a
@@ -499,12 +570,34 @@ class BatchedEngineBackend(EngineBackend):
                 record.update(state=state, polled=now)
             job.turn["state_disk"] = state
             job.turn["state_disk_wait_s"] = now - record["since"]
+            job.turn["state_disk_reason"] = reason
+            job.turn["state_disk_polls"] = job.turn.get("state_disk_polls", 0) + 1
+            job.turn["state_disk_tokens"] = tokens
+            if tag: job.turn["state_disk_tag"] = tag
         return record["state"] != "reading" or now - record["since"] > STAGE_WAIT_SECONDS
 
-    def _stage(self, payload):
-        """One stage command: the engine starts or reports the disk read for this request (no device work)."""
-        self.process.stdin.write(json.dumps(dict(op="stage", request=payload), separators=(",", ":"),
-                                            allow_nan=False) + "\n")
+    def _job_tag(self, job):
+        """Fix 2 (cause.md item 10): the turn's tag on the engine's stage and host_evict lines and on its turn line
+        (state_disk_job), so a log check links them. 0 for an engine without "stage_job" in its ready event: the train
+        23 engine refuses unknown fields (HIGH-2)."""
+        if not self.stage_job: return 0
+        tag = job.turn.get("state_disk_job")
+        if type(tag) is not int:
+            self.stage_jobs += 1
+            tag = job.turn["state_disk_job"] = self.stage_jobs
+        return tag
+
+    def _stage(self, payload, position=0, read=True, job=0):
+        """One stage command: the engine starts or reports the disk read for this request (no device work).
+        `position`: the turn's place among the waiting long turns; `read`: False for a turn that only says that it
+        waits; `job`: the turn's tag (_job_tag). Returns a StageReply. A Reading reply with reason "writing" is a state
+        that the engine's writer has not written yet: the turn waits for it as for a read (fix 2)."""
+        command = dict(op="stage", request=payload)
+        # Only a value that is not the engine default goes out: the train 23 engine refuses unknown fields (HIGH-2).
+        if position: command["position"] = position
+        if not read: command["read"] = 0
+        if job: command["job"] = job
+        self.process.stdin.write(json.dumps(command, separators=(",", ":"), allow_nan=False) + "\n")
         self.process.stdin.flush()
         staged = None
         while True:
@@ -517,7 +610,10 @@ class BatchedEngineBackend(EngineBackend):
             if (event.get("event") != "staged" or staged is not None or event.get("state") not in STAGE_STATES or
                     type(event.get("tokens")) is not int):
                 raise ProtocolError("The engine returned an invalid stage event.")
-            staged = event["state"]
+            reason, tag = event.get("reason", "-"), event.get("tag", 0)
+            if not (reason == "-" or isinstance(reason, str) and STAGE_REASON.fullmatch(reason)): reason = "other"
+            if type(tag) is not int or tag < 0: raise ProtocolError("The engine returned an invalid stage event.")
+            staged = StageReply(event["state"], reason, event["tokens"], tag)
 
     def _open(self, job, slot_context):
         if self.next_id >= (1 << 64): raise ProtocolError("The request ID limit was reached. Restart the worker.")
@@ -637,7 +733,9 @@ class BatchedEngineBackend(EngineBackend):
         head, entry.restored = entry.restored, False
         if id in self.active:
             # Without an engine cursor, rows are scheduled prompt rows: a restored tail's head chunk runs fewer.
-            metrics.emit(metrics.prefill_line(entry.job.turn, entry.prefilled, len(entry.job.payload["ids"]), end))
+            first = entry.job.after
+            metrics.emit(metrics.prefill_line(entry.job.turn, entry.prefilled, len(entry.job.payload["ids"]), end,
+                                              None if first is None else first.turn.get("request_id")))
         # The rate feeds aging deadlines for bulk chunks. A small head chunk, or a head chunk of unknown size,
         # would skew it (an 8-row head counted as 4096 rows reads as 40K tok/s).
         small = rows <= SMALL_ROW_CHUNK and self.prefill_rows
@@ -697,7 +795,7 @@ class BatchedEngineBackend(EngineBackend):
         model closes its own think block, so no continuation comes). continue_job queues the continuation before it
         cancels that job; the next _cancelled closes the job and opens the continuation on its slot, which then goes
         before every new turn (batch_scheduler._next_prefill). A cancel that lands during this loop's admissions
-        still holds: on the soak, 16 of 106 continuations lost a chunk to that race."""
+        still holds: in an agent test run, 16 of 106 continuations lost a chunk to that race."""
         return any(self._holding(entry) for entry in self.active.values())
 
     @staticmethod

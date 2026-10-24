@@ -103,6 +103,14 @@ struct ConversationStateIO {
     }
     return layout;
   }
+  // The snapshot bytes before the QSA layers (the fixed-size state) and after them (the request stacks), in Spans
+  // order. The NVMe tier's block plan needs them (state_blocks.h); another size there gives one state file.
+  static uint64_t HeadBytes(const SequenceState& state) {
+    uint64_t bytes = 0;
+    for (const auto& span : state.FixedSpans()) bytes += span.bytes;
+    return bytes;
+  }
+  static constexpr uint64_t kTailBytes = sizeof(float) * (kMaxRows + 1) * kWide + sizeof(float) * kWide;
   static std::vector<DeviceSpan> Spans(const SequenceState& state, size_t n, int mpos,
                                        float* stk, float* carry, bool include_mtp = true) {
     std::vector<DeviceSpan> spans;
@@ -111,10 +119,12 @@ struct ConversationStateIO {
     for (const auto& [l, c] : state.qc) {
       if (l == kLayers && !include_mtp) continue;
       const size_t length = l == kLayers ? size_t(mpos) : n;
-      add(c.k, length * 512 * sizeof(__half));
-      add(c.v, length * 512 * sizeof(__half));
-      add(c.ik_raw, QsaRawSnapshotBytes(c.raw_slots, length));
-      add(c.ik_pool, length ? QsaPoolFloats(int(length)) * sizeof(float) : 0);
+      // The sizes of the NVMe tier's block plan (state_blocks.h): one formula for both.
+      const auto sizes = QsaSnapshotSpans(0, c.raw_slots, length);
+      add(c.k, sizes[0].bytes);
+      add(c.v, sizes[1].bytes);
+      add(c.ik_raw, sizes[2].bytes);
+      add(c.ik_pool, sizes[3].bytes);
     }
     add(stk, sizeof(float) * (kMaxRows + 1) * kWide);
     add(carry, sizeof(float) * kWide);
@@ -155,6 +165,15 @@ struct ConversationStateIO {
   }
   // A span of the stream whose bytes a save reads from another device buffer of the same size.
   struct SpanSource { const void* live; const void* source; size_t bytes; };
+  // Points each span of `spans` that `sources` names at its other buffer (SaveAt; SlotCheckpointIO::CopyTo).
+  static void UseSources(std::vector<DeviceSpan>& spans, std::span<const SpanSource> sources) {
+    for (auto& span : spans)
+      for (const auto& source : sources)
+        if (span.pointer == source.live) {
+          if (span.bytes != source.bytes) throw std::logic_error("snapshot span source has another size");
+          span.pointer = source.source;
+        }
+  }
   // Save of the first `hist.size()` rows, with the host-side history and counters of that state, and some spans
   // read from `sources` (a Frontier point: SlotCheckpointIO::SaveFrom). The other spans are the stream's own.
   static std::shared_ptr<const ConversationSnapshot> SaveAt(Engine& e, const SequenceState& state,
@@ -167,12 +186,7 @@ struct ConversationStateIO {
     snapshot->resume = r;
     snapshot->qsa_layout = Layout(state);
     auto spans = Spans(state, r.length, r.mpos, stk, carry);
-    for (auto& span : spans)
-      for (const auto& source : sources)
-        if (span.pointer == source.live) {
-          if (span.bytes != source.bytes) throw std::logic_error("snapshot span source has another size");
-          span.pointer = source.source;
-        }
+    UseSources(spans, sources);
     const auto shared = SharedSpans(state, Settled(r), base);
     if (shared.empty()) {
       size_t total = 0;
@@ -230,5 +244,10 @@ struct ConversationStateIO {
     // RunGen rebuilds the request's proposal head before restore. Another request's
     // observed suffix must not change proposal probabilities or mapping ownership.
     return snapshot.resume;
+  }
+  // Restore's MTP step for a slot write with no snapshot (SlotCheckpointIO::CopyTo): Engine::EnsureMtpCache is
+  // private, and this struct is its friend.
+  static void EnsureMtpCache(Engine& e, SequenceState& state) {
+    if (!state.qc.contains(kLayers)) e.EnsureMtpCache(state, 0);
   }
 };

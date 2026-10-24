@@ -5,13 +5,16 @@ namespace crucible {
 // Each A fragment feeds both column tiles before reuse. The small register
 // window avoids keeping all RM fragments live beside both accumulator sets.
 // Paired LDS publication uses6144 bytes and only wave-local fences.
-template<int K,int RM,int WINDOW,bool HALF=false,bool SKIP=true>
+// KEEP (the M1 pair kernel): the accumulators go to keep[n * RM + r]
+// instead of the partial; the WMMA sequence does not change.
+// COPY > 0 only makes a separate instantiation (the same code): see PrefillMoeGemmBody.
+template<int K,int RM,int WINDOW,bool HALF=false,bool SKIP=true,bool KEEP=false,int COPY=0>
 __device__ __forceinline__ void MoeWindowBody(const Exl3GemmJob& j,
-    const Exl3GemmItem& it,uint32_t* ws) {
+    const Exl3GemmItem& it,uint32_t* ws,GemmF8* keep=nullptr) {
   static_assert(WINDOW>=1&&WINDOW<=3&&WINDOW<=RM);
 // The host pass must not instantiate AMD register constraints.
 #if defined(__HIP_DEVICE_COMPILE__)
-  constexpr int NB=2,T=8*K;
+  constexpr int NB=2,T=TileDwords(K);  // 8 K dwords; K3.5 (code 35): lane_window.h
   const int lane=threadIdx.x&31,wave=__builtin_amdgcn_readfirstlane(threadIdx.x>>5);
   const int b=it.b0+wave*NB,A=j.I/16;
   if(b*16<j.O) {
@@ -68,6 +71,13 @@ __device__ __forceinline__ void MoeWindowBody(const Exl3GemmJob& j,
       }
       GemmWaveSync();
     }
+    if constexpr(KEEP) {
+#pragma unroll
+      for(int n=0;n<NB;++n)
+#pragma unroll
+        for(int r=0;r<RM;++r)keep[n*RM+r]=acc[n][r];
+      return;
+    }
     constexpr uint32_t bytes=HALF?2:4;
     const auto ps=StreamRsrc(reinterpret_cast<const uint32_t*>(j.partial),(uint32_t)j.M*j.O*bytes);
 #pragma unroll
@@ -91,12 +101,12 @@ __device__ __forceinline__ void MoeWindowBody(const Exl3GemmJob& j,
 #endif
 }
 // The dispatch removes tail branches inside K without running padded row tiles.
-template<int K,int RM,bool HALF=false> __device__ __forceinline__ void MoeLiveWindowBody(
+template<int K,int RM,bool HALF=false,int COPY=0> __device__ __forceinline__ void MoeLiveWindowBody(
     const Exl3GemmJob& j,const Exl3GemmItem& it,uint32_t* ws) {
   static_assert(RM>=1&&RM<=6);
   const int live=min(RM,(j.M-it.m0+15)/16);
 #define LIVE_WINDOW(R) case R: if constexpr(R<=RM) \
-    MoeWindowBody<K,R,(R<3?R:3),HALF,false>(j,it,ws); break
+    MoeWindowBody<K,R,(R<3?R:3),HALF,false,false,COPY>(j,it,ws); break
   switch(live) {
     LIVE_WINDOW(1);LIVE_WINDOW(2);LIVE_WINDOW(3);
     LIVE_WINDOW(4);LIVE_WINDOW(5);LIVE_WINDOW(6);

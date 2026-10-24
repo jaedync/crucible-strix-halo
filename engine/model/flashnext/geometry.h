@@ -33,6 +33,10 @@ constexpr int kPleLayer = 1;
 constexpr bool PleBefore(int layer) { return layer == kPleLayer; }
 constexpr char kPleTensor[] = "layers.1.ple.";  // the PLE weights, under the PLE layer
 static_assert(kPleTensor[7] == '0' + kPleLayer && kPleTensor[8] == '.');
+// Each position gathers one n-gram table row per head; the rows fill the hidden width.
+constexpr int kPleHeads = 16;
+constexpr int kPleRowDim = kHidden / kPleHeads;  // 160
+static_assert(kPleHeads * kPleRowDim == kHidden);
 
 // ---- MoE (every layer) -------------------------------------------------------------------
 constexpr int kExperts = 512;

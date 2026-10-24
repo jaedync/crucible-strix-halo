@@ -1,4 +1,4 @@
-#include "../engine/serve/batch_session.h"
+#include "batch_mock_engine.h"
 #include "../engine/serve/batch_conversation_cache.h"
 #include "../engine/serve/batch_mtp_history.h"
 #include <cassert>
@@ -7,97 +7,6 @@
 #include <tuple>
 #include <numeric>
 
-struct MockEngine {
-  int selected = 0, calls = 0, prefill_rows = 0, launch_rows = 0;
-  std::map<int, std::vector<int>> histories;
-  std::vector<int> last;
-  int nan_row = -1;
-  bool short_output = false;
-  std::optional<int> forced_greedy;
-  int Context() const { return 64; }
-  std::vector<int> capacities;
-  int PrefillRows() const { return prefill_rows; }
-  int PrefillLaunchRows() const { return launch_rows ? launch_rows : prefill_rows; }
-  void ConfigureServeStreams(int count, uint64_t = 0, int short_count = 0, int short_ctx = 0) {
-    capacities.assign(size_t(count), Context());
-    for (int slot = count - short_count; slot < count; ++slot) capacities[size_t(slot)] = short_ctx;
-  }
-  int StreamCapacity(int slot) const { return capacities.at(size_t(slot)); }
-  void SelectStream(int slot) { selected = slot; }
-  void Reset() { histories[selected].clear(); }
-  std::vector<int> replays;
-  std::vector<int> chunks;  // rows per Forward or Prefill call; negative for Prefill (the bulk path)
-  bool in_prefill = false;
-  std::vector<int> Forward(const int* ids, int rows, int replay, int) {
-    ++calls; last.clear(); replays.push_back(replay); chunks.push_back(in_prefill ? -rows : rows);
-    for (int row = 0; row < rows; ++row) {
-      histories[selected].push_back(ids[row]); last.push_back(forced_greedy.value_or((ids[row] + 1) % 16));
-    }
-    return last;
-  }
-  int between_runs = 0;
-  // As Engine::Prefill: decode passes between the 48 layers, then the chunk continues on its own stream.
-  std::vector<int> keeps;  // per Prefill call: the first row whose final trunk stacks a caller reads
-  std::vector<int> Prefill(const int* ids, int rows, const std::string&, bool predict,
-                           const crucible::PrefillBetween* between = nullptr, int keep = 0) {
-    keeps.push_back(keep);
-    const int prefilling = selected;
-    if (between && crucible::InterleaveAllowed(rows, crucible::kMaxRows, true))
-      for (int layer = 0; layer < 48; ++layer)
-        if (crucible::InterleaveAfterLayer(layer, between->every, 48)) {
-          between->run(); ++between_runs; selected = prefilling;
-        }
-    in_prefill = true;
-    const auto output = Forward(ids, rows, 0, rows);
-    in_prefill = false;
-    last = {output.back()};
-    return predict ? last : std::vector<int>{};
-  }
-  std::vector<int> ForwardBatch(const std::vector<int>& ids, const std::vector<int>& slots) {
-    ++calls; last.clear();
-    for (size_t row = 0; row < ids.size(); ++row) {
-      histories[slots[row]].push_back(ids[row]); last.push_back(forced_greedy.value_or((ids[row] + 1) % 16));
-    }
-    return short_output ? std::vector<int>{} : last;
-  }
-  int max_pass_rows = crucible::kPackedRows;  // as Engine::MaxPassRows
-  mutable int max_pass_rows_calls = 0;          // the real call may build the 16-row plans
-  int MaxPassRows() const { ++max_pass_rows_calls; return max_pass_rows; }
-  std::vector<int> pass_widths;  // rows of each ForwardVerifySpans call
-  std::vector<int> ForwardVerifySpans(const std::vector<crucible::VerifySpan>& spans) {
-    ++calls; last.clear();
-    int width = 0;
-    for (const auto& span : spans) width += int(span.tokens.size());
-    pass_widths.push_back(width);
-    for (const auto& span : spans)
-      for (const int token : span.tokens) { histories[span.stream].push_back(token); last.push_back((token + 1) % 16); }
-    return last;
-  }
-  std::vector<float> CopyLogits(int, int row = 0) const {
-    std::vector<float> scores(16);
-    for (int id = 0; id < 16; ++id) scores[id] = -float(std::abs(last[row] - id));
-    if (row == nan_row) scores[0] = std::numeric_limits<float>::quiet_NaN();
-    return scores;
-  }
-};
-crucible::ServeRequest Request(int token, int n = 5, double temperature = 0, uint64_t seed = 0) {
-  crucible::ServeRequest r; r.ids = {token}; r.max_tokens = n; r.spec = 0; r.stop_ids.clear();
-  r.sampling.temperature = temperature; r.sampling.seed = seed; return r;
-}
-std::vector<int> Complete(crucible::BatchSession<MockEngine>& session, uint64_t id,
-                          const crucible::ServeRequest& request) {
-  std::vector<int> ids;
-  auto events = session.Open(id, request);
-  while (true) {
-    bool done = false;
-    for (const auto& event : events) {
-      if (event.token) ids.push_back(*event.token);
-      if (event.done) { done = true; assert(event.completion_tokens == ids.size()); }
-    }
-    if (done) return ids;
-    events = session.Step({id});
-  }
-}
 // Train 13: an engine that accepts images. BindImages records what each
 // open binds; the mock's rows do not depend on images, so only the cache key can tell two images apart.
 struct VisionMock : MockEngine {
@@ -151,10 +60,145 @@ std::vector<int> Finish(crucible::BatchSession<Engine>& session, uint64_t id, co
   }
 }
 
+// x4-tail: grid 16, launch 32, join 12, a 74-row speculative prompt with window 6 (warm-up
+// from 68) and its own frontier at 64. Without joins: 32, 32, 10 and a capture at 64 after the second launch. With
+// joins: 32, 42; the second launch passes 64 (its cut), and the frontier at 64 is saved from the cut buffer.
+void JoinTests() {
+  for (int mode = 0; mode < 4; ++mode) {
+    // 0: no join rows (today); 1: joins with a cut buffer, host frontier; 2: joins, no cut buffer; 3: joins with a
+    // cut buffer and slot frontiers.
+    MockEngine engine; engine.prefill_rows = 16; engine.launch_rows = 32; engine.context = 128;
+    engine.join_rows = mode ? 12 : 0;
+    crucible::BatchSession<MockEngine> session(engine, 1);
+    std::vector<size_t> captured, cut_captured;
+    std::vector<std::pair<size_t, size_t>> prepared;
+    std::vector<std::pair<int, int>> saved, cut_saved;
+    crucible::BatchCacheHooks hooks;
+    hooks.restore = [](const crucible::ServeRequest&) { return crucible::BatchRestore{}; };
+    hooks.bytes = [] { return size_t(0); };
+    hooks.capture = [&](const crucible::ServeRequest&, size_t cursor) { captured.push_back(cursor); };
+    hooks.next_capture = [](const crucible::ServeRequest& r, size_t cursor) {
+      const size_t own = r.ids.size() / 16 * 16;
+      return cursor < own ? own : SIZE_MAX;
+    };
+    static float state[4], target[4];
+    if (mode == 1 || mode == 3) {
+      hooks.cut_ready = [](const crucible::ServeRequest&) { return true; };
+      hooks.cut_prepare = [&](size_t position, size_t window) {
+        prepared.emplace_back(position, window);
+        return std::vector<crucible::PrefillCutCopy>{{state, target, sizeof state}};
+      };
+      hooks.cut_capture = [&](const crucible::ServeRequest&, size_t position) { cut_captured.push_back(position); };
+    }
+    if (mode == 3) {
+      hooks.checkpoint_save = [&](int slot, int index) { saved.emplace_back(slot, index); };
+      hooks.checkpoint_load = [](int, int, const crucible::SlotCheckpoint&) {};
+      hooks.frontier = [](const crucible::ServeRequest&, size_t,
+                          const std::function<bool(const crucible::SlotFrontier&)>& keep) { return keep({}); };
+      hooks.frontier_fits = [](const crucible::ServeRequest&, const crucible::SlotCheckpoint&) { return false; };
+      hooks.handover = [](int, int, const crucible::SlotCheckpoint&) {};
+      hooks.cut_save = [&](int slot, int index) { cut_saved.emplace_back(slot, index); };
+    }
+    session.SetCacheHooks(hooks);
+    std::vector<std::string> chunks;
+    crucible::BatchSpecHooks spec;
+    spec.check = [](const crucible::ServeRequest&) { return std::string(); };
+    spec.open = [](uint64_t, int, const crucible::ServeRequest&, size_t) {};
+    spec.chunk = [&](uint64_t, size_t start, int rows, bool) { chunks.push_back(std::to_string(start) + "+" + std::to_string(rows)); };
+    spec.first = [](uint64_t, int) {};
+    spec.step = [](uint64_t, int last, size_t, uint64_t) { return std::vector<int>{last + 1}; };
+    spec.close = [](uint64_t) {};
+    session.SetSpecHooks(spec);
+    auto request = Request(1, 4); request.spec = 7; request.mtp_prefix = 6;
+    request.ids.resize(74); std::iota(request.ids.begin(), request.ids.end(), 1);
+    session.Open(100, request, true);
+    while (session.Prefill(100).empty()) {}
+    session.Close(100);
+    assert(std::equal(request.ids.begin(), request.ids.end(), engine.histories[0].begin()));
+    if (mode == 0) {
+      assert((engine.chunks == std::vector<int>{-32, -32, -10}) && engine.joins.empty());
+      assert((captured == std::vector<size_t>{32, 64}) && cut_captured.empty());
+      continue;
+    }
+    if (mode == 2) {
+      // No cut buffer: the launch stops at the frontier, as without joins; the 10-row tail cannot join a launch that
+      // starts at 64 (it is the launch's first chunk). The engine still gets each launch's ledger.
+      assert((engine.chunks == std::vector<int>{-32, -32, -10}));
+      assert(engine.joins.size() == 3);
+      for (const auto& join : engine.joins) assert(join.ledger == 0 && join.cut == 0 && join.copies.empty());
+      assert((captured == std::vector<size_t>{32, 64}));
+      continue;
+    }
+    assert((engine.chunks == std::vector<int>{-32, -42}));
+    assert(engine.joins.size() == 2);
+    assert(engine.joins[0].ledger == 0 && engine.joins[0].cut == 0 && engine.joins[0].copies.empty());
+    // The plan without joins runs [32, 64) and [64, 74) in the second launch: ledger 32, the cut at row 32 of it.
+    assert(engine.joins[1].ledger == 32 && engine.joins[1].cut == 32 && engine.joins[1].copies.size() == 1);
+    assert(engine.joins[1].copies[0].source == state && engine.joins[1].copies[0].target == target);
+    assert((prepared == std::vector<std::pair<size_t, size_t>>{{64, 32}}));
+    // The MTP warms the joined launch in one call; the serve hook (BatchSpecDecoder::Chunk) splits it per grid chunk.
+    assert((chunks == std::vector<std::string>{"0+32", "32+42"}));
+    // Mode 3 keeps the frontier at 32 in the slot (no host capture).
+    assert((captured == (mode == 1 ? std::vector<size_t>{32} : std::vector<size_t>{})));
+    if (mode == 1) assert((cut_captured == std::vector<size_t>{64}));
+    if (mode == 3) {
+      // The slot frontier at 64 comes from the cut buffer, not from the slot (which holds 74 rows by then).
+      assert(cut_captured.empty() && (cut_saved.size() == 1));
+      assert(!saved.empty());  // the frontier at 32 after the first launch (and the End checkpoint), from the slot
+    }
+  }
+  // A bad spec never reaches a launch: an engine without join rows takes none (MockEngine asserts it).
+}
+
 int main() {
+  JoinTests();
+  // Boards 364 and 426: the done event carries the cache diagnosis and the per-tier counters as fixed words and
+  // numbers only (the server copies them into its turn line).
+  {
+    crucible::BatchEvent event;
+    event.done = true;
+    event.cache_reported = true;
+    event.cache_miss = "evicted";
+    event.closest_outcome = "reply_differs";
+    event.closest_tokens = 32768;
+    event.closest_age_s = 612.5;
+    event.counters_reported = true;
+    event.counters.host.lookups = 5;
+    event.counters.host.hits = 4;
+    event.counters.host.tokens = 49152;
+    const auto fields = crucible::BatchCacheFields(event);
+    assert(fields.find(",\"miss_reason\":\"evicted\"") != std::string::npos);
+    assert(fields.find(",\"closest_shared_tokens\":32768") != std::string::npos);
+    assert(fields.find(",\"closest_age_s\":612.500,\"closest_outcome\":\"reply_differs\"") != std::string::npos);
+    assert(fields.find(",\"cache_host_lookups\":5,\"cache_host_hits\":4,\"cache_host_tokens\":49152") !=
+           std::string::npos);
+    assert(fields.find(",\"cache_slot_lookups\":0,\"cache_slot_hits\":0,\"cache_slot_tokens\":0") !=
+           std::string::npos);
+    // A word outside the fixed set never reaches the line (it could carry request text).
+    event.cache_miss = "the prompt was too long";
+    assert(crucible::BatchCacheFields(event).find("miss_reason") == std::string::npos);
+    event.cache_miss = nullptr;
+    event.closest_outcome = nullptr;
+    assert(crucible::BatchCacheFields(event).find("closest_shared_tokens") == std::string::npos);
+  }
   MockEngine e;
   crucible::BatchSession<MockEngine> s(e, 8);
   assert(Complete(s, 1, Request(2)) == std::vector<int>({3,4,5,6,7}));
+  {  // The scoring position: same token with and without the option; the values are a log-softmax.
+    auto scored = Request(2, 1); scored.top_logprobs = 3;
+    const auto events = s.Open(60, scored);
+    assert(events.size() == 2 && events[0].token == 3 && events[0].logprobs.size() == 3);
+    double sum = 0;
+    for (int id = 0; id < 16; ++id) sum += std::exp(-std::abs(3 - id));
+    const int want[3] = {3, 2, 4};
+    for (int i = 0; i < 3; ++i) {
+      assert(events[0].logprobs[i].id == want[i]);
+      assert(std::fabs(events[0].logprobs[i].logprob - (-std::abs(3 - want[i]) - std::log(sum))) < 1e-5);
+    }
+    assert(events[1].done && events[1].logprobs.empty());
+    const auto plain = s.Open(61, Request(2, 1));
+    assert(plain[0].token == 3 && plain[0].logprobs.empty());
+  }
   const auto sampled = Complete(s, 2, Request(3, 8, .8, 77));
   auto left = s.Open(3, Request(3, 8, .8, 77));
   auto right = s.Open(4, Request(3, 8, .8, 77));
@@ -347,17 +391,19 @@ int main() {
     hooks.bytes = [] { return size_t(0); };
     session.SetCacheHooks(hooks);
     auto request = Request(1, 1); request.ids.resize(21); std::iota(request.ids.begin(), request.ids.end(), 1);
-    const auto run = [&](uint64_t id) {
-      auto events = session.Open(id, request, true);
+    const auto run = [&](uint64_t id, const crucible::ServeRequest& sent) {
+      auto events = session.Open(id, sent, true);
       while (events.empty() || !events.back().done) events = session.Prefill(id);
-      assert(engine.histories[0] == request.ids);
+      assert(engine.histories[0] == sent.ids);
       return events.back();
     };
-    const auto tail = run(96);
+    const auto tail = run(96, request);
     assert(tail.cached_tokens == 3 && !tail.checkpoint_resume);
     assert((engine.chunks == std::vector<int>{4, -4, -4, -4, -2}));
     engine.chunks.clear();
-    const auto resumed = run(97);
+    // An identical re-send resumes at its End point (fix A); a prompt that differs in its last token takes the Grid point.
+    auto changed = request; changed.ids.back() += 1000;
+    const auto resumed = run(97, changed);
     assert(resumed.cached_tokens == 19 && resumed.checkpoint_resume);
     assert((engine.chunks == std::vector<int>{-2}));
   }
@@ -629,7 +675,7 @@ int main() {
     assert(host_log[6] == "restore" && host_log[8] == "done slot_resume=0 cached=8");
   }
 
-  // In-slot checkpoints (soak405): a next prompt that leaves the previous output (a token split) resumes at the
+  // In-slot checkpoints: a next prompt that leaves the previous output (a token split) resumes at the
   // previous prompt end on the slot and prefills only the rest. A reset or a host restore drops the slot's points.
   {
     MockEngine engine; engine.prefill_rows = 4;
@@ -1008,6 +1054,7 @@ int main() {
       ++status.attempts;
       status.last = {11, true, ""};
       ++status.entries; ++status.evictions; status.bytes = 77; status.host_available = uint64_t(3) << 30;
+      status.pinned_bytes = uint64_t(5) << 20;  // frontier-copy: the pool's pinned chunks (soak memory rule)
       return std::nullopt;
     };
     seen_hooks.status = [&] { return status; };
@@ -1019,11 +1066,44 @@ int main() {
     assert(done.cache_saved_tokens == 4 && done.cache_save_refused == "host" && done.cache_tail_tokens == 11);
     assert(done.cache_entries == 2 && done.cache_evictions == 1 && done.cache_bytes == 77);
     assert(done.host_available == uint64_t(3) << 30 && done.slot_context == 64 && done.cache_reported);
+    assert(done.cache_pinned_bytes == uint64_t(5) << 20 && !done.frontier_copy);
     assert(crucible::BatchCacheFields(done) == ",\"cache_saved_tokens\":4,\"cache_tail_tokens\":11,\"cache_entries\":2,"
-           "\"cache_evictions\":1,\"cache_save_refused\":\"host\",\"host_free_mib\":3072");
+           "\"cache_evictions\":1,\"cache_save_refused\":\"host\",\"host_free_mib\":3072,\"cache_pinned_bytes\":5242880");
+    auto copied = done;
+    copied.frontier_copy = true;
+    assert(crucible::BatchCacheFields(copied).ends_with(",\"cache_pinned_bytes\":5242880,\"frontier_copy\":true"));
     assert(crucible::BatchCacheFields(events.front()).empty());
     // A request without speculation prints no draft counts: its done line stays byte-identical.
     assert(!done.draft && crucible::BatchDraftFields(done).empty());
+  }
+
+  // An earlier change: the open asks the slot tier first, and the restore hook counts the host and disk tiers. The done event
+  // carries the counters of the three tiers, and a miss without a diagnosis says "unknown" rather than "none".
+  {
+    MockEngine tier_engine; tier_engine.prefill_rows = 4;
+    crucible::BatchSession<MockEngine> tiered(tier_engine, 1);
+    std::vector<size_t> slots;
+    crucible::BatchCacheCounters counters;
+    crucible::BatchCacheHooks tier_hooks;
+    tier_hooks.restore = [&](const crucible::ServeRequest&) -> crucible::BatchRestore {
+      counters.Count(crucible::BatchCacheTier::Host, 0);  // a host lookup that served nothing
+      return {};
+    };
+    tier_hooks.slot_served = [&](size_t tokens) { counters.Count(crucible::BatchCacheTier::Slot, tokens); };
+    tier_hooks.status = [&] {
+      crucible::BatchCacheStatus status;
+      status.counters = counters;
+      return status;
+    };
+    tiered.SetCacheHooks(tier_hooks);
+    auto events = tiered.Open(1, Request(1, 2));
+    while (!events.back().done) events = tiered.Step({1});
+    const auto& done = events.back();
+    assert(done.counters_reported);
+    assert(done.counters.slot.lookups == 1 && done.counters.slot.hits == 0 && done.counters.slot.tokens == 0);
+    assert(done.counters.host.lookups == 1 && done.counters.host.hits == 0);
+    assert(done.counters.disk.lookups == 0);
+    assert(done.cache_miss && std::string_view(done.cache_miss) == "unknown");
   }
 
   // Session replay (G15): a tail without pending GDN rows still starts with one small-row decode-path Forward, as
@@ -1080,10 +1160,16 @@ int main() {
   assert((spec_engine.keeps == std::vector<int>{0, 0}));
   spec_engine.keeps.clear(); hook_calls.clear();
   spec_hooks.stacks = [](uint64_t, size_t start, int rows) { return start == 0 ? rows : 1; };
-  // The decoder's per-request draft counters, read before its close erases them (soak405).
+  // The decoder's per-request draft counters, read before its close erases them.
   spec_hooks.stats = [&](uint64_t id) {
     hook_calls.push_back("stats " + std::to_string(id));
     return crucible::BatchDraftStats{9, 4, 2};
+  };
+  // The live counters after each step (crucible_decode): a fake request that proposes 3 and accepts 2 per step.
+  long counted_steps = 0;
+  spec_hooks.counts = [&](uint64_t) {
+    ++counted_steps;
+    return crucible::BatchDraftCounts{3 * counted_steps, 2 * counted_steps, counted_steps};
   };
   speculative.SetSpecHooks(spec_hooks);
   auto sampled_spec = spec_request; sampled_spec.sampling.temperature = .5;
@@ -1101,10 +1187,19 @@ int main() {
   speculative.SettlePrompt();
   assert(hook_calls.back() == "first 7");
   try { speculative.Step({72}); assert(false); } catch (const std::invalid_argument&) {}
+  // The first token never carries step counters: it comes from the prompt, not from a step.
+  assert(!first[0].step_draft && crucible::BatchStepDraftFields(first[0]).empty());
   auto window = speculative.SpecStep(72);
   assert(window.size() == 3 && *window[2].token == 10 && !window[2].done);
+  // Only the step's first token event carries the counts after the step; the others keep their bytes.
+  assert(window[0].step_draft && window[0].step_draft->proposed == 3 && window[0].step_draft->steps == 1);
+  assert(crucible::BatchStepDraftFields(window[0]) == ",\"draft_proposed\":3,\"draft_accepted\":2,\"spec_steps\":1");
+  assert(!window[1].step_draft && !window[2].step_draft && crucible::BatchStepDraftFields(window[1]).empty());
   window = speculative.SpecStep(72);  // six tokens requested: the window is cut after two
   assert(window.size() == 3 && *window[1].token == 12 && window[2].done && window[2].completion_tokens == 6);
+  // A step that ends the request still reports its counts: they are read before the close erases them.
+  assert(window[0].step_draft && window[0].step_draft->steps == 2 && !window[2].step_draft);
+  assert(crucible::BatchStepDraftFields(window[2]).empty());  // a done event has no step counters
   assert(window[2].draft && window[2].draft->proposed == 9 && window[2].draft->accepted == 4 && window[2].draft->steps == 2);
   assert(crucible::BatchDraftFields(window[2]) == ",\"draft_proposed\":9,\"draft_accepted\":4,\"spec_steps\":2");
   assert(crucible::BatchDraftFields(window[1]).empty());
@@ -1278,6 +1373,7 @@ int main() {
       return std::vector<int>(greedy.begin(), greedy.end());
     };
     hooks.settle = [&] { calls.push_back("settle"); };
+    hooks.counts = [](uint64_t id) { return crucible::BatchDraftCounts{long(id), 1, 1}; };
     session.SetSpecHooks(hooks);
     auto a = Request(3, 6); a.spec = 7;
     auto b = Request(9, 6); b.spec = 7;
@@ -1295,6 +1391,12 @@ int main() {
       if (event.request_id == 102 && event.token) plain_tokens.push_back(*event.token);
     }
     assert((first_tokens == std::vector<int>{5, 6, 7, 8}) && (plain_tokens == std::vector<int>{14}));
+    // Step counters: on the first token event of each speculative request in the pass, none for the plain request.
+    std::map<uint64_t, std::vector<long>> counted;
+    for (const auto& event : events)
+      if (event.token) counted[event.request_id].push_back(event.step_draft ? event.step_draft->proposed : -1);
+    assert((counted[101] == std::vector<long>{101, -1, -1, -1}) && (counted[102] == std::vector<long>{-1}) &&
+           (counted[103] == std::vector<long>{103, -1, -1}));
     // The next pass trims publication at max_tokens: request 101 has one token left.
     calls.clear();
     const auto last = session.VerifyStep({101, 102, 103});
@@ -1742,8 +1844,13 @@ int main() {
       engine.histories[engine.selected] = hist;
       return crucible::BatchResident{hist.size(), 0, false};
     };
-    hooks.stage = [&](const crucible::ServeRequest& r, size_t floor) {
+    crucible::BatchStageQueue seen;
+    std::vector<bool> slot_prefix;  // an earlier change: in_slot of the held tail's first 5 tokens and of a foreign key
+    hooks.stage = [&](const crucible::ServeRequest& r, size_t floor, const crucible::BatchStageQueue& queue) {
       staged.emplace_back(r.ids.size(), floor);
+      seen = queue;
+      const std::vector<int> head = {1, 2, 3, 4, 5}, other = {9, 9};
+      slot_prefix = {queue.in_slot(head), queue.in_slot(other)};
       return crucible::BatchStage{"reading", 7};
     };
     session.SetCacheHooks(hooks);
@@ -1761,10 +1868,14 @@ int main() {
     next.ids.insert(next.ids.end(), out.begin(), out.end());
     next.ids.insert(next.ids.end(), {3, 4});
     const int calls = engine.calls;
-    const auto status = session.Stage(next);
+    const auto status = session.Stage(next, 2, false);
     assert(status.state == "reading" && status.tokens == 7 && session.Active() == 0 && engine.calls == calls);
+    // The queue place reaches the hook; the slot's held tail starts with the prompt's tokens.
+    assert(seen.position == 2 && !seen.read && slot_prefix == (std::vector<bool>{true, false}) && seen.job == 0);
+    session.Stage(next, 0, true, 77);
+    assert(seen.job == 77);  // fix 2 (item 10): the server's tag reaches the hook
     assert(staged.back() == std::make_pair(next.ids.size(), size_t(12)));  // slot 0 holds the 12-token tail
     auto bypass = next; bypass.cache_control = "bypass";
-    assert(session.Stage(bypass).state == "none" && staged.size() == 2);
+    assert(session.Stage(bypass).state == "none" && staged.size() == 3);
   }
 }

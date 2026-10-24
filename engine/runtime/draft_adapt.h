@@ -14,6 +14,7 @@ class BlockDraftHead {
     head_.front_s = 0;
     const int capacity = adaptive ? source.O : (int)blocks.size() * 128;
     HIP_OK(hipMalloc(&head_.tiles, (size_t)capacity * source.I * source.K / 8));
+    HIP_OK(hipMalloc(&front_.tiles, (size_t)capacity * source.I * source.K / 8));
     HIP_OK(hipMalloc(&head_.svh, (size_t)capacity * sizeof(__half)));
     HIP_OK(hipMalloc(&mapping_, (size_t)capacity / 128 * sizeof(int)));
     head_.O = 0;
@@ -23,6 +24,7 @@ class BlockDraftHead {
 
   ~BlockDraftHead() {
     HIP_OK(hipFree(head_.tiles));
+    HIP_OK(hipFree(front_.tiles));
     HIP_OK(hipFree(head_.svh));
     HIP_OK(hipFree(mapping_));
   }
@@ -41,6 +43,10 @@ class BlockDraftHead {
   }
 
   const Lin& Weights() const { return head_; }
+  // The same head in front tile order for split 1, so that the decode ring
+  // reads it (verify-rows: LinPolicyKernel read it at 198 GB/s). Every column
+  // keeps its tile order, so the logits stay bitwise equal.
+  const Lin& Front() const { return front_; }
   int* Mapping() const { return mapping_; }
 
  private:
@@ -63,9 +69,16 @@ class BlockDraftHead {
 
   void UploadMapping() {
     HIP_OK(hipMemcpy(mapping_, blocks_.data(), blocks_.size() * sizeof(int), hipMemcpyHostToDevice));
+    // A new block changes the chunk stride of every item, so the whole front copy is rebuilt.
+    uint32_t* const tiles = front_.tiles;
+    front_ = head_;
+    front_.tiles = tiles;
+    front_.front_s = 1;
+    EngineToFrontKernel<<<256, 256>>>(head_.tiles, front_.tiles, head_.I / 16, head_.O / 16, 8 * head_.K);
+    HIP_OK(hipGetLastError());
   }
 
-  Lin source_, head_;
+  Lin source_, head_, front_;
   bool adaptive_;
   std::vector<int> blocks_;
   std::vector<bool> seen_;

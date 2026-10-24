@@ -10,12 +10,18 @@ a tool call) and then the next user request. Sessions differ in the file their r
 
   build:  h2h_decode.py build --out prompts.json [--contexts 4096,32768,102400]
   run:    h2h_decode.py run --prompts prompts.json --url http://127.0.0.1:8796/v1 --engine NAME --out rows.jsonl
-          [--contexts ...] [--sessions 1,4]
+          [--contexts ...] [--sessions 1,4] [--prefix {none,distinct,shared}] [--prefix-salt STR]
   table:  h2h_decode.py table rows.jsonl [rows.jsonl ...]
 
 One session (session 0) runs alone. Then sessions 1..N run each turn at the same time (a barrier between turns).
 Before its first turn, each session sends its first prompt once with max_tokens 1 (one at a time), so the first
 measured turn starts from a warm prompt cache.
+
+Prompt start (--prefix, rows with several sessions only): "none" sends the same long history in every session (the
+prompt file as it is). "distinct" gives session k its own first system line, as agents have, so no session shares a
+prompt start. "shared" gives all sessions of a row one first line that is new to every cache: the sessions share one
+long prompt start, which an engine that keeps a prompt start only in the slot that owns it prefills again in each
+other slot. One session (n = 1) always runs as "none". Each row records the mode it ran with in "prefix".
 
 Decode rate of one request: (completion tokens - 1) / (last chunk time - first chunk time).
 With several sessions, "total" counts only the window in which every session decodes: each stream's tokens are
@@ -346,6 +352,22 @@ def arrival_body(base, model, salt):
             "max_tokens": 64, "enable_thinking": False, "temperature": 0.0}
 
 
+def with_first_line(base, salt):
+    """The same history behind a new first line in the system message: no prefix cache has seen it."""
+    msgs = [dict(m) for m in base["messages"]]
+    msgs[0]["content"] = f"Session {salt}.\n" + msgs[0]["content"]
+    return dict(base, messages=msgs)
+
+
+def session_bases(base, n, mode, salt):
+    """The prompt file entry of each of the n sessions of one row, for the --prefix mode (see the module docstring)."""
+    if n == 1 or mode == "none":
+        return [base] * n
+    if mode == "shared":
+        return [with_first_line(base, salt)] * n
+    return [with_first_line(base, f"{salt}-{k}") for k in range(n)]
+
+
 def run(args):
     prompts = json.loads(Path(args.prompts).read_text())
     url = args.url.rstrip("/")
@@ -354,11 +376,13 @@ def run(args):
     extras = json.loads(args.extra)
     extras = extras if isinstance(extras, list) else [extras]
     workloads = list(WORKLOADS)
-    for ctx, n, extra in [(c, int(n), e) for c in args.contexts.split(",") for n in args.sessions.split(",")
-                          for e in extras]:
+    salt0 = args.prefix_salt or str(time.time_ns())
+    rows = [(c, int(n), e) for c in args.contexts.split(",") for n in args.sessions.split(",") for e in extras]
+    for row_no, (ctx, n, extra) in enumerate(rows):
         base = prompts[ctx]
         first = 0 if n == 1 else 1  # session 0 runs alone; sessions 1..n run together
-        sessions = [Session(base, base["targets"][(first + k) % len(base["targets"])], args.model, extra)
+        bases = session_bases(base, n, args.prefix, f"{salt0}-{row_no}")  # a new salt per row: no row reuses another's cache
+        sessions = [Session(bases[k], base["targets"][(first + k) % len(base["targets"])], args.model, extra)
                     for k in range(n)]
         for k, x in enumerate(sessions):
             t = time.time()
@@ -391,7 +415,7 @@ def run(args):
             rates = [per_request(r) for r in results]
             total, win = window_total(results) if n > 1 else (rates[0], 0.0)
             row = {"engine": args.engine, "ctx": int(ctx), "workload": workload, "sessions": n, "extra": extra,
-                   "rates": rates, "total": total, "window_s": win, "e2e": [e2e(r) for r in results],
+                   "prefix": args.prefix if n > 1 else "none", "rates": rates, "total": total, "window_s": win, "e2e": [e2e(r) for r in results],
                    "max_gap_s": [max_gap(r) for r in results], **clocks.summary(),
                    "trace": None, "arrival": arrival_row if arrival is not None else None,
                    "prompt_tokens": [r["usage"].get("prompt_tokens") for r in results],
@@ -457,6 +481,10 @@ def main():
     r.add_argument("--arrival-delay", type=float, default=3.0)
     r.add_argument("--arrival-salt", default="", help="fixed first-line salt for the arrivals (turn name appended), "
                    "so two runs prefill the same arrival prompts; empty uses the clock")
+    r.add_argument("--prefix", choices=("none", "distinct", "shared"), default="none",
+                   help="prompt start of the rows with several sessions: none = the same history in every session, "
+                   "distinct = a unique first line per session, shared = one new first line for all sessions of a row")
+    r.add_argument("--prefix-salt", default="", help="fixed salt of the first lines, for tests and reruns; empty uses the clock")
     r.add_argument("--turns", type=int, default=len(WORKLOADS), help="run only the first N turns of each session")
     r.add_argument("--extra", default="{}", help="JSON merged into every measured request, or a list of them "
                    "(each runs its own sessions, in order)")

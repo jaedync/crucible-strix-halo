@@ -74,6 +74,13 @@ class PrefixCache {
     for (const auto& entry : entries_)
       if (entry.policy == policy) visit(std::span<const int>(entry.ids), *entry.snapshot);
   }
+  // As above, with the entry's own retention fields (its marks and clocks): the cache diagnostics read them
+  // only, and they never change the cache either.
+  template<class Visit>
+  void ForEachState(const Policy& policy, Visit visit) const {
+    for (const auto& entry : entries_)
+      if (entry.policy == policy) visit(entry);
+  }
   bool Insert(std::span<const int> ids, const Policy& policy, size_t bytes,
               std::shared_ptr<const Snapshot> snapshot) {
     if (ids.empty() || !snapshot || !bytes || bytes > budget_) return false;
@@ -124,7 +131,8 @@ class PrefixCache {
     if (!bytes || bytes > budget_) return false;
     const uint64_t needed = reserve + host_bytes;
     const uint64_t short_by = needed > available ? needed - available : 0;
-    const size_t over = bytes_ + bytes > budget_ ? bytes_ + bytes - budget_ : 0;
+    const size_t held = bytes_ + Outside();
+    const size_t over = held + bytes > budget_ ? held + bytes - budget_ : 0;
     if (!over && !short_by) return true;
     std::vector<std::pair<int, typename std::list<Entry>::iterator>> order;
     for (auto it = entries_.end(); it != entries_.begin();) {
@@ -144,11 +152,21 @@ class PrefixCache {
     for (size_t i = 0; i < victims; ++i) Evict(order[i].second, order[i].first);
     return true;
   }
+  // Puts back an entry that Evict removed (BatchConversationCache: a read-ahead point that the disk refused), with
+  // its fields, as the newest entry. Its bytes count again; Evictions() still counts its eviction.
+  void Reinsert(Entry entry) {
+    bytes_ += entry.bytes;
+    entries_.push_front(std::move(entry));
+  }
   // Call before allocating GPU snapshots to limit transient memory too.
   bool Reserve(size_t bytes) {
     if (!bytes || bytes > budget_) return false;
-    return bytes_ <= budget_ - bytes || ReserveHost(bytes, UINT64_MAX, 0);
+    return bytes_ + Outside() <= budget_ - bytes || ReserveHost(bytes, UINT64_MAX, 0);
   }
+  // Bytes outside the entries that the budget also holds (the disk reads that wait for their turn):
+  // a save makes room for them as for entries. Unset: none.
+  void SetOutside(std::function<size_t()> outside) { outside_ = std::move(outside); }
+  size_t Outside() const { return outside_ ? outside_() : 0; }
   size_t Budget() const { return budget_; }
   size_t Bytes() const { return bytes_; }
   size_t Entries() const { return entries_.size(); }
@@ -168,5 +186,6 @@ class PrefixCache {
   size_t budget_, bytes_ = 0, evictions_ = 0, superseded_evictions_ = 0;
   std::list<Entry> entries_;
   std::function<void(const Entry&, int)> evicted_;
+  std::function<size_t()> outside_;
 };
 }  // namespace crucible

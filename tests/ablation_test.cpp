@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -18,8 +19,9 @@ struct Tensor {
   std::vector<float> values;
 };
 
-std::vector<uint8_t> Safetensors(const std::vector<Tensor>& tensors, const std::string& extra = "") {
-  std::string header = "{\"__metadata__\":{\"tool\":\"test\"}";
+std::vector<uint8_t> Safetensors(const std::vector<Tensor>& tensors, const std::string& extra = "",
+                                const std::string& metadata = "\"tool\":\"test\"") {
+  std::string header = "{\"__metadata__\":{" + metadata + "}";
   std::vector<uint8_t> payload;
   for (const Tensor& t : tensors) {
     const size_t begin = payload.size();
@@ -137,6 +139,65 @@ void TestParse() {
   Rejects(std::vector<uint8_t>(4, 0), "short");
 }
 
+// The B1 pack layout: one direction for every
+// attention and MoE site of all 48 layers, b = lambda * a, pack in the
+// metadata. That is 96 sites from one vector.
+std::vector<Tensor> OneDirection(const std::vector<float>& a, float lambda) {
+  std::vector<Tensor> t;
+  for (int layer = 0; layer < 48; ++layer)
+    for (const char* site : {"attn", "mlp"}) {
+      t.push_back({Key(layer, site, 'a'), "F32", {kHidden}, a});
+      t.push_back({Key(layer, site, 'b'), "F32", {kHidden}, Scaled(a, lambda)});
+    }
+  return t;
+}
+
+void TestPackLayout() {
+  const std::vector<float> r = Unit(34);
+  const std::string metadata = "\"pack\":\"3.05bpw_h5_ng5\",\"expert_k\":\"3\",\"head_k\":\"5\"";
+  const crucible::AblationSet set =
+      crucible::ParseAblation(Safetensors(OneDirection(r, 1.25f), "", metadata));
+  assert(set.sites.size() == 96);
+  for (size_t i = 0; i < set.sites.size(); ++i) {
+    const crucible::AblationSite& s = set.sites[i];
+    assert(s.layer == int(i / 2));
+    assert(s.mlp == (i % 2 == 1));
+    assert(s.a == r);
+    assert(s.b == Scaled(r, 1.25f));
+  }
+}
+
+// Optional: check a generated sidecar file through the engine loader, so an
+// unpinned file (one changed byte) is refused as CRUCIBLE_ABLATE would refuse it.
+// Returns false on refusal.
+bool CheckPackFile(const char* path) {
+  crucible::AblationSet set;
+  try {
+    set = crucible::LoadAblationFile(path);
+  } catch (const std::invalid_argument& e) {
+    std::printf("pack file: refused %s\n", e.what());
+    return false;
+  }
+  // 96 sites for a direction pack, 36 for the repacked Heretic sidecar. Every
+  // site carries b = lambda * a, with lambda its own (Heretic: per-site directions and lambdas).
+  assert(!set.sites.empty() && set.sites.size() <= 96);
+  for (const crucible::AblationSite& s : set.sites) {
+    size_t big = 0;
+    for (size_t k = 1; k < s.a.size(); ++k)
+      if (std::fabs(s.a[k]) > std::fabs(s.a[big])) big = k;
+    assert(s.a[big] != 0.f);
+    const double lambda = double(s.b[big]) / double(s.a[big]);
+    assert(lambda > 0.1);  // an edit that removes something, not an identity
+    double worst = 0;
+    for (size_t k = 0; k < s.a.size(); ++k)
+      worst = std::max(worst, std::fabs(double(s.b[k]) - lambda * double(s.a[k])));
+    assert(worst <= 1e-5);
+  }
+  std::printf("pack file: ok sites=%zu K=%d,%d sha256=%s\n", set.sites.size(), set.pin->expert_k,
+              set.pin->head_k, set.sha256.c_str());
+  return true;
+}
+
 void TestPin() {
   assert(crucible::FindAblationPin(
              "05f77ae18082de58b31fb645f52ec5689dce22820add8bb81439e06f01998e5f") != nullptr);
@@ -146,6 +207,14 @@ void TestPin() {
   bool threw = false;
   try { crucible::CheckAblationCheckpoint(pin, 4, 6); } catch (const std::invalid_argument&) { threw = true; }
   assert(threw);
+  // The 4.05 metadata copy names the pack it was built for.
+  const struct { const char* sha; int expert_k, head_k; } b1[] = {
+      {"1bb0d4132a5798d2a7da7820b65af1e5d37e39a0cf5726f1986be924f2678baa", 4, 6},
+  };
+  for (const auto& want : b1) {
+    const crucible::AblationPin* p = crucible::FindAblationPin(want.sha);
+    assert(p && p->expert_k == want.expert_k && p->head_k == want.head_k);
+  }
 }
 
 void TestReference() {
@@ -177,10 +246,14 @@ void TestReference() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   TestSha256();
   TestParse();
+  TestPackLayout();
   TestPin();
   TestReference();
   std::puts("ablation_test: ok");
+  int refused = 0;
+  for (int i = 1; i < argc; ++i) refused += CheckPackFile(argv[i]) ? 0 : 1;
+  return refused == 0 ? 0 : 1;
 }

@@ -16,12 +16,17 @@ def policy_hashes():
             for path in (Path(__file__).resolve(), CENTRAL)}
 
 
+# Read by the server only (server/update_check.py). It cannot change a measurement, so it is no unknown switch.
+SERVER_ONLY_VARIABLES = frozenset({'CRUCIBLE_NO_UPDATE_CHECK'})
+
+
 def snapshot(env):
     hashes = policy_hashes()
     if hashes != _LOADED_POLICY:
         raise ValueError('environment policy changed after import')
     known = _shared.runtime_environment(env)
-    unknown = sorted(key for key in env if key.startswith('CRUCIBLE_') and key not in known)
+    unknown = sorted(key for key in env if key.startswith('CRUCIBLE_') and key not in known
+                     and key not in SERVER_ONLY_VARIABLES)
     return {'environment': {**known, **dict.fromkeys(unknown, '[REDACTED]')},
             'unknown_crucible_keys': unknown, 'environment_policy_hashes': hashes}
 

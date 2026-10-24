@@ -1,6 +1,7 @@
 // Resident requests accept a draft only when the serial target verifies it.
 #pragma once
 #include "bounds.h"
+#include "draft_stop.h"
 #include "../model/flashnext/geometry.h"
 #include "prompt.h"
 #include <algorithm>
@@ -68,24 +69,28 @@ GenerationResult GenerateExact(Engine& eng, std::span<const int> ids, int n, int
         ++result.forwards;
         continue;
       }
+      // No draft past the token limit or after a stop ID can commit a token (draft_stop.h).
+      const int room = DraftRoom(size_t(n) - result.ids.size());
       std::vector<int> drafts{eng.Mtp(stk, ctoks.data(), rc, mpos)[rc - 1]};
       mpos += rc;
-      for (int k = 1; k < depth; ++k) {
+      for (int k = 1; k < depth && ChainMayGrow(drafts, stops, room); ++k) {
         rows(stk, kMaxRows, k == 1 ? rc - 1 : 0, 1);
         drafts.push_back(eng.Mtp(stk + (size_t)kMaxRows * kWide, &drafts.back(), 1, mpos + k - 1)[0]);
       }
+      TrimDrafts(drafts, stops, room);
+      const int proposed = (int)drafts.size();
       std::vector<int> input{result.ids.back()};
       input.insert(input.end(), drafts.begin(), drafts.end());
-      const auto ys = eng.Forward(input.data(), depth + 1, replay, 1);
+      const auto ys = eng.Forward(input.data(), proposed + 1, replay, 1);
       int accepted = 0;
-      while (accepted < depth && drafts[accepted] == ys[accepted]) ++accepted;
+      while (accepted < proposed && drafts[accepted] == ys[accepted]) ++accepted;
       eng.Truncate(base + accepted + 1);
       rows(stk, 0, 0, accepted + 1);
       ctoks.assign(ys.begin(), ys.begin() + accepted + 1);
       for (int i = 0; i <= accepted; ++i) push(ys[i]);
       replay = accepted;
       result.accepted += accepted;
-      result.attempted += depth;
+      result.attempted += proposed;
       ++result.forwards;
     }
   }

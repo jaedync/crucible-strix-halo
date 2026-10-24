@@ -108,7 +108,7 @@ __device__ __forceinline__ void Exl3GemmBody(const Exl3GemmJob& j,
   const int A = j.I / 16;
   const int begin = A * it.s / j.S, end = A * (it.s + 1) / j.S;
   const LaneWindow<K> win(lane);
-  constexpr int T = 8 * K;
+  constexpr int T = TileDwords(K);
   const auto rs = StreamRsrc(j.tiles + ((size_t)b * A + begin) * T,
                              (end - begin) * T * 4);
   GemmF8 acc[RM] = {};

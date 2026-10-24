@@ -402,15 +402,10 @@ __device__ __forceinline__ int QsaPosition(QsaArgs a, int r, int t, int ns, int 
 
 // Twelve query waves share a tiled fp16 KV load. Staging 16 positions at a
 // time amortizes barriers without rounding Q or softmax probabilities.
-template <class Args = QsaArgs>
-__global__ void __launch_bounds__(384) QsaGqaSplitKernel(Args args, float* partial) {
-  const unsigned span = blockIdx.z/kQsaSplits;
-  const QsaArgs a = QsaSpanArgs(args, span);
-  if constexpr (kPackedQsa<Args>) if ((int)blockIdx.y >= a.R) return;
-  partial += (size_t)QsaSpanBase(args, span)*24*kQsaSplits*kQsaPart;
-  __shared__ uint4 keys[16][32], values[16][32];
-  const int lane = threadIdx.x&31, h = blockIdx.x*12+threadIdx.x/32;
-  const int r = blockIdx.y, split = blockIdx.z%kQsaSplits, g = blockIdx.x;
+// Split `split` of KV group g for row r; partial is the row span's base.
+__device__ __forceinline__ void QsaGqaSplitBody(const QsaArgs& a, float* partial, int g, int r, int split,
+                                                uint4 (&keys)[16][32], uint4 (&values)[16][32]) {
+  const int lane = threadIdx.x&31, h = g*12+threadIdx.x/32;
   const int ns = a.nsel[r], nb = (a.pos0+r+1)/4;
   const int n = ns < 0 ? a.pos0+r+1 : ns*4+(a.pos0+r+1)%4;
   const int begin = split*kQsaSplitTokens;
@@ -451,27 +446,36 @@ __global__ void __launch_bounds__(384) QsaGqaSplitKernel(Args args, float* parti
 }
 
 template <class Args = QsaArgs>
-__global__ void __launch_bounds__(256) QsaMergeKernel(Args args, const float* partial) {
-  const QsaArgs a = QsaSpanArgs(args, blockIdx.z);
+__global__ void __launch_bounds__(384) QsaGqaSplitKernel(Args args, float* partial) {
+  const unsigned span = blockIdx.z/kQsaSplits;
+  const QsaArgs a = QsaSpanArgs(args, span);
   if constexpr (kPackedQsa<Args>) if ((int)blockIdx.y >= a.R) return;
-  partial += (size_t)QsaSpanBase(args, blockIdx.z)*24*kQsaSplits*kQsaPart;
-  __shared__ float ob[256];
-  const int h = blockIdx.x, r = blockIdx.y, d = threadIdx.x;
-  const float* src = partial+((size_t)r*24+h)*kQsaSplits*kQsaPart;
-  float m = -INFINITY;
-  for (int s = 0; s < kQsaSplits; ++s) m = fmaxf(m,src[s*kQsaPart]);
-  float l = 0, o = 0;
-  for (int s = 0; s < kQsaSplits; ++s) {
-    const float* p = src+s*kQsaPart;
-    if (p[1] == 0) continue;
-    const float f = __expf(p[0]-m);
-    l += p[1]*f; o += p[2+d]*f;
+  partial += (size_t)QsaSpanBase(args, span)*24*kQsaSplits*kQsaPart;
+  __shared__ uint4 keys[16][32], values[16][32];
+  QsaGqaSplitBody(a, partial, blockIdx.x, blockIdx.y, blockIdx.z%kQsaSplits, keys, values);
+}
+
+// Head h of row r, output channel d = threadIdx.x (threads 0..255). Every
+// thread of the block calls it (one barrier); ob holds 256 floats.
+__device__ __forceinline__ void QsaMergeBody(const QsaArgs& a, const float* partial, int h, int r, float* ob) {
+  const int d = threadIdx.x;
+  if (d < 256) {
+    const float* src = partial+((size_t)r*24+h)*kQsaSplits*kQsaPart;
+    float m = -INFINITY;
+    for (int s = 0; s < kQsaSplits; ++s) m = fmaxf(m,src[s*kQsaPart]);
+    float l = 0, o = 0;
+    for (int s = 0; s < kQsaSplits; ++s) {
+      const float* p = src+s*kQsaPart;
+      if (p[1] == 0) continue;
+      const float f = __expf(p[0]-m);
+      l += p[1]*f; o += p[2+d]*f;
+    }
+    o /= l;
+    if (a.context) a.context[((size_t)r*24+h)*256+d] = o;
+    const float* q = a.q+((size_t)r*24+h)*512;
+    o *= Sigmoid(q[256+d]);
+    ob[d] = RoundH(RoundH(o)*__half2float(a.suh_o[h*256+d]));
   }
-  o /= l;
-  if (a.context) a.context[((size_t)r*24+h)*256+d] = o;
-  const float* q = a.q+((size_t)r*24+h)*512;
-  o *= Sigmoid(q[256+d]);
-  ob[d] = RoundH(RoundH(o)*__half2float(a.suh_o[h*256+d]));
   __syncthreads();
   if (d < 64) {
     const int half = d/32, lane = d&31;
@@ -484,6 +488,45 @@ __global__ void __launch_bounds__(256) QsaMergeKernel(Args args, const float* pa
     for (int i = 0; i < 4; ++i) dst[i] = __float2half(v[i]*kHadNorm);
   }
 }
+
+template <class Args = QsaArgs>
+__global__ void __launch_bounds__(256) QsaMergeKernel(Args args, const float* partial) {
+  const QsaArgs a = QsaSpanArgs(args, blockIdx.z);
+  if constexpr (kPackedQsa<Args>) if ((int)blockIdx.y >= a.R) return;
+  partial += (size_t)QsaSpanBase(args, blockIdx.z)*24*kQsaSplits*kQsaPart;
+  __shared__ float ob[256];
+  QsaMergeBody(a, partial, blockIdx.x, blockIdx.y, ob);
+}
+
+// QsaGqaSplitKernel and QsaMergeKernel in one launch for one row
+// (the R = 1 tail). Each block counts its split in its group's word of
+// sync; the blocks of the last 12 splits of a group then wait for all 32
+// splits and merge one head each. They are the last blocks to dispatch, so
+// every block they wait for is already resident. sync: [2] split counts and
+// [2] finished merges, zero between launches (the last merger of a group
+// clears its two words).
+__global__ void __launch_bounds__(384) QsaAttnTailKernel(QsaArgs a, float* partial, unsigned* sync) {
+  __shared__ uint4 keys[16][32], values[16][32];
+  const int g = blockIdx.x, split = blockIdx.z;
+  QsaGqaSplitBody(a, partial, g, 0, split, keys, values);
+  __syncthreads();  // every wave's partial stores before the release
+  if (threadIdx.x == 0) __hip_atomic_fetch_add(sync + g, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+  constexpr int kFirstMerger = kQsaSplits - 12;
+  if (split < kFirstMerger) return;
+  if (threadIdx.x == 0)
+    while (__hip_atomic_load(sync + g, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < (unsigned)kQsaSplits)
+      __builtin_amdgcn_s_sleep(1);
+  __syncthreads();
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+  QsaMergeBody(a, partial, g*12+split-kFirstMerger, 0, reinterpret_cast<float*>(&keys[0][0]));
+  // Every split of the group has counted itself (the wait above), so its words are free after 12 merges.
+  if (threadIdx.x == 0 &&
+      __hip_atomic_fetch_add(sync + 2 + g, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) == 11u) {
+    sync[g] = 0;
+    sync[2 + g] = 0;
+  }
+}
+static_assert(kQsaSplits >= 12, "twelve merging splits per group");
 
 inline void LaunchQsaAttn(QsaArgs a, float* scratch) {
   QsaGqaSplitKernel<<<dim3(2,a.R,kQsaSplits),384>>>(a,scratch);

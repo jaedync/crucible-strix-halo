@@ -1,6 +1,6 @@
 // With the R > 1 dense ring (ring_rows.h), 4 lookahead blocks and 24 MiB win
 // at every R on both packs, R=7 included (measured
-// 2026-10-06). CRUCIBLE_TUNE_ROWS=0 selects the untuned policy.
+// 2026-10-06). The head-K6 h6_ng8 packs use the same table. CRUCIBLE_TUNE_ROWS=0 selects the untuned policy.
 #pragma once
 #include <array>
 #include <cerrno>
@@ -33,7 +33,9 @@ inline RowPolicy ResolveRowPolicy(int rows, int headK, int expertK) {
   if (RowPolicyInt("CRUCIBLE_TUNE_ROWS",1,0,1) && rows>=1 && rows<=16) {
     const int row=rows<8 ? rows : 8;
     if (headK==5 && expertK==3) policy=regular[row-1];
-    else if (headK==6 && expertK==4) policy=quality[row-1];
+    // Every head-K6 pack takes the quality table: the h6_ng8 packs (routed K2..K5) keep the
+    // same token IDs with it, and their layer-0 routed width is not 4.
+    else if (headK==6) policy=quality[row-1];
   }
   policy.fuse=RowPolicyInt("CRUCIBLE_FUSE",policy.fuse,0,3);
   policy.cache=RowPolicyInt("CRUCIBLE_STATIC_CACHE",policy.cache,0,4);

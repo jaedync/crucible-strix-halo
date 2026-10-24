@@ -220,16 +220,19 @@ __global__ void __launch_bounds__(256) PrefillMoeInputPackedKernel(PrefillMoe a)
 // Items with more than 32 live rows skip their padded row tiles at run time.
 // Packed items use exl3-gemm's measured compact choice for every row count.
 // HALF (down projection, fp16 pd) needs the packed body.
-template<int K,int RM,bool P,bool HALF=false> __device__ __forceinline__ void PrefillMoeGemmBody(const Exl3GemmJob& j,
+// COPY > 0: the same code in separate instantiations of the bodies, for the K7 jobs of the
+// kPrefillMoeK7Half kernels. The bodies hold lambdas that the inliner treats by their number of
+// callers, so a K7 body shared with new kernels changed the KMAX 7 kernels' code (isa_same).
+template<int K,int RM,bool P,bool HALF=false,int COPY=0> __device__ __forceinline__ void PrefillMoeGemmBody(const Exl3GemmJob& j,
     const Exl3GemmItem& it, uint32_t* ws) {
   static_assert(P || !HALF);
 #if defined(CRUCIBLE_MOE_WINDOW_PROBE) && CRUCIBLE_MOE_WINDOW_PROBE
   // Keep short prompts and all dense consumers on their current bodies.
   if constexpr(P&&RM==6) {
-    static_assert(kMoeNb==2);MoeLiveWindowBody<K,RM,HALF>(j,it,ws);return;
+    static_assert(kMoeNb==2);MoeLiveWindowBody<K,RM,HALF,COPY>(j,it,ws);return;
   }
 #endif
-  if (P) PrefillWideBody<K,RM,kMoeNb,true,true,true,HALF>(j,it,ws);
+  if (P) PrefillWideBody<K,RM,kMoeNb,true,true,true,HALF,false,COPY>(j,it,ws);
   else if (j.M-it.m0<=16) Exl3GemmBody<K,1,true,false,1,P,P,false,P>(j,it,ws);
   else if (RM==2 || j.M-it.m0<=32) Exl3GemmBody<K,2,true,false,1,P,P,false,P>(j,it,ws);
   else Exl3GemmBody<K,RM,true,false,1,P,P,true,P>(j,it,ws);
@@ -252,7 +255,10 @@ __device__ __forceinline__ Exl3GemmJob PrefillUniform(Exl3GemmJob j) {
           PrefillUniform(j.I),PrefillUniform(j.O),PrefillUniform(j.M),PrefillUniform(j.S),
           PrefillUniform(j.K),PrefillUniform(j.Xrows)};
 }
-// KMAX 6 adds the K6 body (4.05); KMAX 5 keeps the K3..5 kernels' registers.
+// KMAX 6 adds the K6 body (4.05); KMAX 5 keeps the K3..5 kernels' registers. KMAX 7 or 8 (the
+// h6_ng8 packs' shared experts) adds the K7 or K8 body next to K3..5; kPrefillMoeK7Half (decode_support.h)
+// adds K7 and K3.5 (code 35: 3.18, 3.68); kPrefillMoeK6Low adds K2, K2.5 (code 25) and copies of the K3
+// and K6 bodies (2.18, 2.68); any other width traps.
 template<int RM,bool P,int KMAX=5,bool HALF=false> __global__ void __launch_bounds__(128) PrefillMoeGemmKernel(const Exl3GemmJob* jobs,
     const Exl3GemmItem* items, const int* count) {
 #if defined(CRUCIBLE_MOE_WINDOW_PROBE) && CRUCIBLE_MOE_WINDOW_PROBE
@@ -264,15 +270,45 @@ template<int RM,bool P,int KMAX=5,bool HALF=false> __global__ void __launch_boun
   const int n=PrefillUniform(*count);
   for (int i=blockIdx.x; i<n; i+=gridDim.x) {
     const auto it=PrefillUniform(items[i]); const auto j=PrefillUniform(jobs[it.job]);
-    if (j.K==3) PrefillMoeGemmBody<3,RM,P,HALF>(j,it,ws);
+    if constexpr (KMAX==kPrefillMoeK6Low) {
+      if (j.K==2) PrefillMoeGemmBody<2,RM,P,HALF>(j,it,ws);
+      else if (j.K==25) PrefillMoeGemmBody<25,RM,P,HALF>(j,it,ws);
+      else if (j.K==3) PrefillMoeGemmBody<3,RM,P,HALF,1>(j,it,ws);
+      else if (j.K==6) PrefillMoeGemmBody<6,RM,P,HALF,1>(j,it,ws);
+      else __builtin_trap();
+    }
+    else if (j.K==3) PrefillMoeGemmBody<3,RM,P,HALF>(j,it,ws);
     else if (j.K==4) PrefillMoeGemmBody<4,RM,P,HALF>(j,it,ws);
     else if (j.K==5) PrefillMoeGemmBody<5,RM,P,HALF>(j,it,ws);
     else if constexpr (KMAX==6) { if (j.K==6) PrefillMoeGemmBody<6,RM,P,HALF>(j,it,ws); }
+    else if constexpr (KMAX==kPrefillMoeK7Half) {
+      if (j.K==7) PrefillMoeGemmBody<7,RM,P,HALF,1>(j,it,ws);
+      else if (j.K==35) PrefillMoeGemmBody<35,RM,P,HALF>(j,it,ws);
+      else __builtin_trap();
+    }
+    else if constexpr (KMAX>=7) { if (j.K==KMAX) PrefillMoeGemmBody<KMAX,RM,P,HALF>(j,it,ws); else __builtin_trap(); }
     __syncthreads();
   }
 }
 // half: fp16 partial output (the down projection's pd); packed RM 2, 4 or 6.
 inline bool PrefillMoeHalfOut(PrefillGemmShape g) { return g.packed && (g.rm==6 || g.rm==4 || g.rm==2); }
+// KW 7, 8, kPrefillMoeK7Half or kPrefillMoeK6Low: packed RM 2, 4 and 6 only, as K6.
+template <int KW>
+inline void LaunchPrefillMoeGemmWide(PrefillGemmShape g, const Exl3GemmJob* jobs, const Exl3GemmItem* items,
+                                     const int* count, bool half) {
+  if (!g.packed || (g.rm != 6 && g.rm != 4 && g.rm != 2)) {
+    std::fprintf(stderr, "K%d MoE GEMM supports packed RM 2, 4 and 6\n", KW); std::abort();
+  }
+  if (half) {
+    if (g.rm==6) PrefillMoeGemmKernel<6,true,KW,true><<<2048,128>>>(jobs,items,count);
+    else if (g.rm==4) PrefillMoeGemmKernel<4,true,KW,true><<<2048,128>>>(jobs,items,count);
+    else PrefillMoeGemmKernel<2,true,KW,true><<<2048,128>>>(jobs,items,count);
+    return;
+  }
+  if (g.rm==6) PrefillMoeGemmKernel<6,true,KW><<<2048,128>>>(jobs,items,count);
+  else if (g.rm==4) PrefillMoeGemmKernel<4,true,KW><<<2048,128>>>(jobs,items,count);
+  else PrefillMoeGemmKernel<2,true,KW><<<2048,128>>>(jobs,items,count);
+}
 inline void LaunchPrefillMoeGemm(PrefillGemmShape g, const Exl3GemmJob* jobs, const Exl3GemmItem* items,
                                  const int* count, bool k6 = false, bool half = false) {
   if (half) {
@@ -439,14 +475,27 @@ template<int RM,int KMAX=5> __global__ void __launch_bounds__(128) PrefillMoeFxK
         __builtin_amdgcn_s_sleep(1);
     __syncthreads();
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE,"agent");
-    if (j.K==3) PrefillMoeGemmBody<3,RM,true>(j,it,ws);
+    if constexpr (KMAX==kPrefillMoeK6Low) {
+      if (j.K==2) PrefillMoeGemmBody<2,RM,true>(j,it,ws);
+      else if (j.K==25) PrefillMoeGemmBody<25,RM,true>(j,it,ws);
+      else if (j.K==3) PrefillMoeGemmBody<3,RM,true,false,1>(j,it,ws);
+      else if (j.K==6) PrefillMoeGemmBody<6,RM,true,false,1>(j,it,ws);
+      else __builtin_trap();
+    }
+    else if (j.K==3) PrefillMoeGemmBody<3,RM,true>(j,it,ws);
     else if (j.K==4) PrefillMoeGemmBody<4,RM,true>(j,it,ws);
     else if (j.K==5) PrefillMoeGemmBody<5,RM,true>(j,it,ws);
     else if constexpr (KMAX==6) { if (j.K==6) PrefillMoeGemmBody<6,RM,true>(j,it,ws); }
+    else if constexpr (KMAX==kPrefillMoeK7Half) {
+      if (j.K==7) PrefillMoeGemmBody<7,RM,true,false,1>(j,it,ws);
+      else if (j.K==35) PrefillMoeGemmBody<35,RM,true>(j,it,ws);
+      else __builtin_trap();
+    }
+    else if constexpr (KMAX>=7) { if (j.K==KMAX) PrefillMoeGemmBody<KMAX,RM,true>(j,it,ws); else __builtin_trap(); }
     __syncthreads();
   }
 }
-inline void LaunchPrefillMoeFx(int rm, const PrefillMoe& a, bool k6 = false) {
+inline int PrefillFxLead() {
   // A negative lead would stop every block from claiming X items while all
   // wait on fx_ready, so a bad value is rejected.
   static const int lead=[] {
@@ -460,6 +509,10 @@ inline void LaunchPrefillMoeFx(int rm, const PrefillMoe& a, bool k6 = false) {
     }
     return (int)x;
   }();
+  return lead;
+}
+inline void LaunchPrefillMoeFx(int rm, const PrefillMoe& a, bool k6 = false) {
+  const int lead=PrefillFxLead();
   if (k6) {
     if (rm!=6 && rm!=4 && rm!=2) { std::fprintf(stderr,"K6 MoE queue supports RM 2, 4 and 6\n"); std::abort(); }
     if (rm==6) PrefillMoeFxKernel<6,6><<<2048,128>>>(a,lead);
@@ -472,6 +525,39 @@ inline void LaunchPrefillMoeFx(int rm, const PrefillMoe& a, bool k6 = false) {
   else if (rm==6) PrefillMoeFxKernel<6><<<2048,128>>>(a,lead);
   else if (rm==4) PrefillMoeFxKernel<4><<<2048,128>>>(a,lead);
   else PrefillMoeFxKernel<2><<<2048,128>>>(a,lead);
+}
+
+// The engine's MoE launches by the layer's PrefillMoeKmax (decode_support.h): 6 selects the K6
+// kernels as before; 7, 8, kPrefillMoeK7Half and kPrefillMoeK6Low the wide kernels (packed RM 2, 4 and 6 only).
+inline void LaunchPrefillMoeGemmK(PrefillGemmShape g, const Exl3GemmJob* jobs, const Exl3GemmItem* items,
+                                  const int* count, int kmax, bool half = false) {
+  if (kmax == kPrefillMoeK7Half) LaunchPrefillMoeGemmWide<kPrefillMoeK7Half>(g, jobs, items, count, half);
+  else if (kmax == kPrefillMoeK6Low) LaunchPrefillMoeGemmWide<kPrefillMoeK6Low>(g, jobs, items, count, half);
+  else if (kmax == 7) LaunchPrefillMoeGemmWide<7>(g, jobs, items, count, half);
+  else if (kmax == 8) LaunchPrefillMoeGemmWide<8>(g, jobs, items, count, half);
+  else LaunchPrefillMoeGemm(g, jobs, items, count, kmax == 6, half);
+}
+inline void LaunchPrefillMoeFxK(int rm, const PrefillMoe& a, int kmax) {
+  if (kmax < 7) return LaunchPrefillMoeFx(rm, a, kmax == 6);
+  if (rm!=6 && rm!=4 && rm!=2) { std::fprintf(stderr,"K%d MoE queue supports RM 2, 4 and 6\n",kmax); std::abort(); }
+  const int lead=PrefillFxLead();
+  if (kmax == kPrefillMoeK7Half) {
+    if (rm==6) PrefillMoeFxKernel<6,kPrefillMoeK7Half><<<2048,128>>>(a,lead);
+    else if (rm==4) PrefillMoeFxKernel<4,kPrefillMoeK7Half><<<2048,128>>>(a,lead);
+    else PrefillMoeFxKernel<2,kPrefillMoeK7Half><<<2048,128>>>(a,lead);
+  } else if (kmax == kPrefillMoeK6Low) {
+    if (rm==6) PrefillMoeFxKernel<6,kPrefillMoeK6Low><<<2048,128>>>(a,lead);
+    else if (rm==4) PrefillMoeFxKernel<4,kPrefillMoeK6Low><<<2048,128>>>(a,lead);
+    else PrefillMoeFxKernel<2,kPrefillMoeK6Low><<<2048,128>>>(a,lead);
+  } else if (kmax == 7) {
+    if (rm==6) PrefillMoeFxKernel<6,7><<<2048,128>>>(a,lead);
+    else if (rm==4) PrefillMoeFxKernel<4,7><<<2048,128>>>(a,lead);
+    else PrefillMoeFxKernel<2,7><<<2048,128>>>(a,lead);
+  } else {
+    if (rm==6) PrefillMoeFxKernel<6,8><<<2048,128>>>(a,lead);
+    else if (rm==4) PrefillMoeFxKernel<4,8><<<2048,128>>>(a,lead);
+    else PrefillMoeFxKernel<2,8><<<2048,128>>>(a,lead);
+  }
 }
 
 // One wave per row: ten rounds of a wave argmax (ties to the lower expert),

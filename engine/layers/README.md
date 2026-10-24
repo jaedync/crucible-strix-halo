@@ -9,7 +9,8 @@ Rank 2 (layer operators).
 - Row variants: `gdn_rows.h`, `moe_rows.h`, `moe_chunk_map.h`,
   `dense_rows.h`, `hc_wmma.h`.
 - Prefill operators: `prefill_hc.h`, `prefill_ple.h`, `prefill_moe.h`,
-  `prefill_moe_pair.h` (M1: gate/up and the mid step in one kernel).
+  `prefill_moe_pair.h` (M1: gate/up and the mid step in one kernel)
+  with its K-set allowlist `prefill_moe_kset.h` (host only).
 - Long-context QSA: `qsa_long.h`; capture tool `qsa_capture.h` with its
   policy `qsa_capture_policy.h`.
 - MoE helpers: `moe_window_policy.h` (the MoE window compile switch),

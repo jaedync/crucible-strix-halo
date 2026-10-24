@@ -17,6 +17,8 @@ struct Group {
   XfItem* d_out = nullptr;
   int nitems = 0, nin = 0, nout = 0, R = 1;
   bool has_k6 = false;
+  // A K7 or K8 job (kWideDecodeK, the h6_ng8 packs): the MaxK 8 kernels, never the ring kernels.
+  bool wide = false;
   bool aligned = false;  // every job's split span is a multiple of kPrefetch
   bool aligned_chunk = false;  // ... and of the ring chunk (lin_ring::kChunk)
   int fuse = 0, cache = 0;

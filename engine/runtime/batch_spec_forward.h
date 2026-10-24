@@ -120,7 +120,7 @@
     auto& group=draft_groups_[size_t(n)];
     if (!group) {
       group=std::make_unique<Group>();
-      Build(*group,{Job(draft_head_,x_,kHidden,logits_,draft_head_.O,kEpiStore,nullptr,n)},n,true);
+      Build(*group,{Job(draft_head_,x_,kHidden,logits_,draft_head_.O,kEpiStore,nullptr,n)},n,true,0,{draft_head_.front_s});
     }
     return *group;
   }

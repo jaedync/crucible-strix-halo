@@ -10,7 +10,7 @@ its own 24K-token start, up to about 44K, on the h2h layout (4 x 131072 slots, 1
 the answer room close every think block after one token, so each turn runs a continuation job. The client sends
 back the answer without the reasoning, as h2h_decode.py and many clients do, so the next prompt never repeats a
 think turn's tail. `served3` runs three such sessions on the served layout. `agents6` runs six (the 6-slot candidate
-B of an earlier change; the chain gives its layout with --server-args).
+B; the chain gives its layout with --server-args).
 
 Rule: a later turn of a session re-prefills at most its appended tokens (this prompt minus the previous one) plus
 --margin (4096, one prefill chunk). With --expect-replay it also re-prefills at most the tokens after the previous
@@ -332,16 +332,24 @@ class MemorySampler(threading.Thread):
 CACHE_BUDGET = re.compile(r"^conversation cache: (\d+) bytes budget", re.M)
 CHECKPOINT_BYTES = re.compile(r"^slot checkpoints: .* (\d+) bytes from the cache budget$", re.M)
 TURN_CACHE_BYTES = re.compile(r'^crucible_turn \{.*"cache_bytes": (\d+)', re.M)
+TURN_PINNED_BYTES = re.compile(r'^crucible_turn \{.*"cache_pinned_bytes": (\d+)', re.M)
 
 
 def cache_record(log_text):
-    """The cache budget, the slot checkpoints in it and the entry high-water from a server log, or None."""
+    """The cache budget, the slot checkpoints in it and the cache high-water from a server log, or None.
+
+    With cache_pinned_bytes the high-water is the pool's pinned memory,
+    each chunk once: idle chunks already lower MemAvailable, and shared chunks count once. Older logs keep the entry
+    bytes.
+    """
     budget, used = CACHE_BUDGET.search(log_text), [int(value) for value in TURN_CACHE_BYTES.findall(log_text)]
     if budget is None or not used:
         return None
     checkpoints = CHECKPOINT_BYTES.search(log_text)
-    return dict(budget_bytes=int(budget[1]), checkpoint_bytes=int(checkpoints[1]) if checkpoints else 0,
-                high_water_bytes=max(used))
+    record = dict(budget_bytes=int(budget[1]), checkpoint_bytes=int(checkpoints[1]) if checkpoints else 0,
+                  high_water_bytes=max(used))
+    pinned = [int(value) for value in TURN_PINNED_BYTES.findall(log_text)]
+    return dict(record, high_water_bytes=max(pinned), pinned_counted=True) if pinned else record
 
 
 def apply_memory_floor(report, lowest_kb, samples, floor_mib, cache=None):

@@ -8,9 +8,9 @@
 #include <cstdint>
 #include <hip/hip_runtime.h>
 
-namespace crucible {
+#include "decode_split.h"  // kFrontCols, kFrontTiles, FrontFitsShape
 
-constexpr int kFrontCols = 8, kFrontTiles = 4;
+namespace crucible {
 
 // Tile index of column block b, row tile a, for A row tiles, B column blocks, split S.
 __host__ __device__ inline size_t FrontTile(int b, int a, int A, int B, int S) {
@@ -18,11 +18,6 @@ __host__ __device__ inline size_t FrontTile(int b, int a, int A, int B, int S) {
   return ((size_t)(a2 / kFrontTiles) * items + (size_t)s * (B / kFrontCols) + b / kFrontCols) *
              (kFrontCols * kFrontTiles) +
          (b % kFrontCols) * kFrontTiles + a2 % kFrontTiles;
-}
-
-// A front order applies when every split span and the column count divide.
-inline bool FrontFitsShape(int A, int B, int S) {
-  return S > 0 && A % S == 0 && (A / S) % kFrontTiles == 0 && B % kFrontCols == 0;
 }
 
 // Engine-order copy of the 128 columns of block g (column blocks 8g..8g+7).
@@ -34,6 +29,19 @@ __global__ void FrontColumnsKernel(const uint32_t* __restrict__ src, uint32_t* _
     const size_t tile = w / T;
     const int c = (int)(tile / A), a = (int)(tile % A);
     dst[w] = src[FrontTile(g * kFrontCols + c, a, A, B, S) * T + w % T];
+  }
+}
+
+// Front order (split 1) of a whole engine-order matrix: engine tile c * A + a
+// holds column block c, row tile a.
+__global__ void EngineToFrontKernel(const uint32_t* __restrict__ src, uint32_t* __restrict__ dst,
+                                    int A, int B, int T) {
+  const size_t words = (size_t)A * B * T;
+  for (size_t w = (size_t)blockIdx.x * blockDim.x + threadIdx.x; w < words;
+       w += (size_t)gridDim.x * blockDim.x) {
+    const size_t tile = w / T;
+    const int c = (int)(tile / A), a = (int)(tile % A);
+    dst[FrontTile(c, a, A, B, 1) * T + w % T] = src[w];
   }
 }
 

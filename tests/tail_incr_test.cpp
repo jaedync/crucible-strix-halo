@@ -82,12 +82,26 @@ struct SequenceState {
   }
   std::vector<float> ple = std::vector<float>(16 * kWide);
   float* ple_ring = ple.data();
+  // One GDN layer (state, history, pending rows): the fixed spans that a checkpoint buffer holds besides the PLE ring.
+  std::vector<float> gdn_state = std::vector<float>(kGdnStateBytes / sizeof(float));
+  std::vector<float> gdn_hist = std::vector<float>(kGdnHistBytes / sizeof(float));
+  std::vector<float> gdn_pend = std::vector<float>(size_t(48) * kMaxRows * kPend);
   std::map<int, Layer> layers;
   SequenceState(int cap, bool compact, bool mtp) : capacity(cap), compact_state(compact) {
     for (int l : {3, 7}) qc[l] = layers[l].Allocate(cap, compact);
     if (mtp) qc[kLayers] = layers[kLayers].Allocate(cap, compact);
+    gstate[0] = gdn_state.data();
+    ghist[0] = gdn_hist.data();
+    gpend[0] = gdn_pend.data();
   }
-  void Reset() { hist.clear(); retained.Reset(); std::fill(ple.begin(), ple.end(), 0); }
+  // As the engine's Reset: the GDN state and history and the PLE ring go to zero; the pending rows stay.
+  void Reset() {
+    hist.clear();
+    retained.Reset();
+    std::fill(ple.begin(), ple.end(), 0);
+    std::fill(gdn_state.begin(), gdn_state.end(), 0);
+    std::fill(gdn_hist.begin(), gdn_hist.end(), 0);
+  }
 };
 struct Engine {
   std::vector<std::unique_ptr<SequenceState>> sequences_;
@@ -120,6 +134,8 @@ void Forward(SequenceState& s, size_t from, size_t to, uint32_t salt) {
         for (size_t i = 0; i < 4096; ++i) layer.pool[block * 4096 + i] = float(block * 7 + i + salt + to);
   }
   std::fill(s.ple.begin(), s.ple.end(), float(salt + to));
+  for (auto* gdn : {&s.gdn_state, &s.gdn_hist, &s.gdn_pend})
+    for (size_t i = 0; i < gdn->size(); ++i) (*gdn)[i] = float(salt + to + i % 89);
   s.hist.resize(to, int(salt % 1000));
   assert(s.retained.Forward(int(to - from), 0, int(to - from)).empty());
 }
@@ -270,11 +286,11 @@ void SpillRoomWithSharedChunks() {
   std::vector<float> stk((kMaxRows + 1) * kWide, 5), carry(kWide, 6);
   Forward(s, 0, 20000, 1);
   const auto r1 = Resume(20000, false);
-  const size_t bytes1 = ConversationStateIO::Bytes(e, s, r1, stk.data(), carry.data()) + sizeof(ConversationPolicy);
+  const size_t bytes1 = ConversationStateIO::Bytes(e, s, r1, stk.data(), carry.data()) + kConversationPolicyBytes;
   const auto base = ConversationStateIO::Save(e, s, r1, stk.data(), carry.data());
   Forward(s, 20000, 24000, 2);
   const auto r2 = Resume(24000, false);
-  const size_t bytes2 = ConversationStateIO::Bytes(e, s, r2, stk.data(), carry.data()) + sizeof(ConversationPolicy);
+  const size_t bytes2 = ConversationStateIO::Bytes(e, s, r2, stk.data(), carry.data()) + kConversationPolicyBytes;
   const SaveBase from{base, 20000};
   const size_t shared = ConversationStateIO::SharedBytes(s, 24000, from);
   const SharedSave share{bytes2 - shared, ConversationStateIO::SharedOwners(s, 24000, from)};
@@ -384,7 +400,152 @@ void SaveFromCheckpoint(bool compact, bool mtp, bool with_base, bool truncated) 
   assert(threw);
 }
 
+// fc-d2d: SlotCheckpointIO::CopyTo writes to the target slot the bytes
+// that SaveFrom and then ConversationStateIO::Restore write, with no host stage (no pinned chunk, no host copy).
+struct SlotBytes {
+  std::map<int, Layer> layers;
+  std::vector<float> ple, gdn_state, gdn_hist, gdn_pend;
+  std::vector<int> hist;
+  RetainedPrefix retained;
+  bool mtp;
+  explicit SlotBytes(const SequenceState& s)
+      : layers(s.layers), ple(s.ple), gdn_state(s.gdn_state), gdn_hist(s.gdn_hist), gdn_pend(s.gdn_pend),
+        hist(s.hist), retained(s.retained), mtp(s.qc.contains(kLayers)) {}
+  // The fixed state only: GDN state, history and pending rows (review-fcd2d LOW-3).
+  bool SameGdn(const SlotBytes& o) const {
+    return gdn_state == o.gdn_state && gdn_hist == o.gdn_hist && gdn_pend == o.gdn_pend;
+  }
+  bool operator==(const SlotBytes& o) const {
+    if (!SameGdn(o) || layers.size() != o.layers.size() || ple != o.ple || hist != o.hist || mtp != o.mtp ||
+        std::memcmp(&retained, &o.retained, sizeof(RetainedPrefix)) != 0)
+      return false;
+    for (const auto& [l, layer] : layers) {
+      const auto other = o.layers.find(l);
+      if (other == o.layers.end() || layer.k != other->second.k || layer.v != other->second.v ||
+          layer.raw != other->second.raw || layer.pool != other->second.pool)
+        return false;
+    }
+    return true;
+  }
+};
+void CopyToEqualsHostCopy(bool compact, bool donor_mtp, bool target_mtp, bool truncated) {
+  constexpr int kRows = 24576;
+  Engine e;
+  e.sequences_.push_back(std::make_unique<SequenceState>(kRows, compact, donor_mtp));
+  e.sequences_.push_back(std::make_unique<SequenceState>(kRows, compact, target_mtp));
+  e.sequences_.push_back(std::make_unique<SequenceState>(kRows, compact, target_mtp));
+  SequenceState& s = *e.sequences_[0];
+  SequenceState& host = *e.sequences_[1];  // the host path: SaveFrom, then Restore
+  SequenceState& copy = *e.sequences_[2];  // CopyTo
+  std::vector<float> stk((kMaxRows + 1) * kWide, 0), carry(kWide, 0);  // the shared zero pair of target state
+  const size_t f = 20096, n = 24000;
+  Forward(s, 0, f, 1);
+  SlotCheckpointIO::Buffer buffer(SlotCheckpointIO::Bytes(s));
+  SlotCheckpointIO::Save(s, buffer);
+  const SlotCheckpoint point{s.hist, {}, 0, false, CheckpointKind::Frontier, 1, {f, false, false}};
+  // The donor decodes on: the fixed state, the compact ring, the PLE ring and the pool blocks from f change.
+  Forward(s, f, n, 3);
+  if (truncated) s.hist.resize(n - 300);
+  // Both targets hold another session's rows in every span, also above f (a restore leaves those rows).
+  Forward(host, 0, kRows, 7);
+  Forward(copy, 0, kRows, 7);
+  assert(SlotBytes(host) == SlotBytes(copy));
+  const auto r = FrontierResume(f);
+  const SlotBytes donor_before(s);
+  ConversationStateIO::Restore(e, host, *SlotCheckpointIO::SaveFrom(e, s, buffer, point, r, stk.data(), carry.data()),
+                               stk.data(), carry.data());
+  const auto pinned_before = pinned;
+  const int copies_before = copies;
+  const auto stk_before = stk, carry_before = carry;
+  SlotCheckpointIO::CopyTo(e, s, buffer, point, r, stk.data(), carry.data(), copy);
+  assert(pinned == pinned_before && copies == copies_before);  // no host stage
+  assert(SlotBytes(copy).SameGdn(SlotBytes(host)));  // the GDN spans come from the checkpoint buffer
+  assert(SlotBytes(copy) == SlotBytes(host));
+  assert(copy.hist == point.hist && copy.qc.contains(kLayers) == (donor_mtp || target_mtp));
+  // The copy only reads the donor and its checkpoint buffer; the shared pair stays.
+  assert(SlotBytes(s) == donor_before && stk == stk_before && carry == carry_before);
+}
+// Every refusal comes before the first write: the target keeps its bytes.
+void CopyToRefuses() {
+  constexpr int kRows = 24576;
+  Engine e;
+  e.sequences_.push_back(std::make_unique<SequenceState>(kRows, false, true));
+  e.sequences_.push_back(std::make_unique<SequenceState>(kRows, false, true));
+  e.sequences_.push_back(std::make_unique<SequenceState>(16384, false, true));
+  e.sequences_.push_back(std::make_unique<SequenceState>(kRows, true, true));
+  SequenceState& s = *e.sequences_[0];
+  SequenceState& target = *e.sequences_[1];
+  SequenceState& small = *e.sequences_[2];    // capacity below f
+  SequenceState& compact = *e.sequences_[3];  // another trunk layout
+  std::vector<float> stk((kMaxRows + 1) * kWide, 0), carry(kWide, 0);
+  const size_t f = 20096;
+  Forward(s, 0, f, 1);
+  SlotCheckpointIO::Buffer buffer(SlotCheckpointIO::Bytes(s));
+  SlotCheckpointIO::Save(s, buffer);
+  const SlotCheckpoint point{s.hist, {}, 0, false, CheckpointKind::Frontier, 1, {f, false, false}};
+  Forward(s, f, 24000, 3);
+  Forward(target, 0, kRows, 7);
+  Forward(small, 0, 16384, 7);
+  Forward(compact, 0, kRows, 7);
+  const auto refuses = [&](SequenceState& to, const SlotCheckpoint& at, const ConversationResume& r, auto error) {
+    const SlotBytes before(to);
+    bool threw = false;
+    try { SlotCheckpointIO::CopyTo(e, s, buffer, at, r, stk.data(), carry.data(), to); }
+    catch (const decltype(error)&) { threw = true; }
+    assert(threw && SlotBytes(to) == before);
+  };
+  // Rows gone from the donor: another token below f, or a stream truncated below f.
+  SlotCheckpoint other = point;
+  other.hist[5] += 1;
+  refuses(target, other, FrontierResume(f), std::logic_error(""));
+  const auto hist = s.hist;
+  s.hist.resize(f - 1);
+  refuses(target, point, FrontierResume(f), std::logic_error(""));
+  s.hist = hist;
+  // A copy with MTP rows, another length, or the donor as its own target.
+  auto with_mtp = FrontierResume(f);
+  with_mtp.mpos = int(f);
+  refuses(target, point, with_mtp, std::logic_error(""));
+  refuses(target, point, FrontierResume(f - 128), std::logic_error(""));
+  refuses(s, point, FrontierResume(f), std::logic_error(""));
+  // A target with too few rows or another trunk layout.
+  refuses(small, point, FrontierResume(f), std::runtime_error(""));
+  refuses(compact, point, FrontierResume(f), std::runtime_error(""));
+  // The good copy still runs after the refusals.
+  SlotCheckpointIO::CopyTo(e, s, buffer, point, FrontierResume(f), stk.data(), carry.data(), target);
+  assert(target.hist == point.hist);
+}
+
+// An earlier change: a checkpoint buffer with a tail (fix A keeps the MTP carry after the spans) takes spans only
+// up to the tail, and a save never writes the tail.
+void SaveKeepsTheTail() {
+  Engine e;
+  e.sequences_.push_back(std::make_unique<SequenceState>(24576, true, false));
+  SequenceState& s = *e.sequences_[0];
+  Forward(s, 0, 20000, 1);
+  const size_t spans = SlotCheckpointIO::Bytes(s), tail = kWide * sizeof(float);
+  SlotCheckpointIO::Buffer buffer(spans + tail, tail);
+  assert(buffer.bytes == spans + tail && buffer.tail == tail);
+  std::memset(buffer.device + spans, 0x5A, tail);
+  SlotCheckpointIO::Save(s, buffer);
+  for (size_t i = 0; i < tail; ++i) assert(buffer.device[spans + i] == 0x5A);
+  // Spans that reach into the tail are refused, also when the whole buffer would hold them.
+  SlotCheckpointIO::Buffer small(spans + tail - 1, tail);
+  bool threw = false;
+  try { SlotCheckpointIO::Save(s, small); } catch (const std::logic_error&) { threw = true; }
+  assert(threw);
+  threw = false;
+  try { SlotCheckpointIO::Buffer wrong(tail - 1, tail); } catch (const std::invalid_argument&) { threw = true; }
+  assert(threw);
+}
+
 int main() {
+  SaveKeepsTheTail();
+  for (bool compact : {false, true})
+    for (bool donor_mtp : {false, true})
+      for (bool target_mtp : {false, true})
+        for (bool truncated : {false, true}) CopyToEqualsHostCopy(compact, donor_mtp, target_mtp, truncated);
+  CopyToRefuses();
   for (bool compact : {false, true})
     for (bool mtp : {false, true})
       for (bool with_base : {false, true})

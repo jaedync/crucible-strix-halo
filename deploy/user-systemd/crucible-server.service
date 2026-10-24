@@ -1,0 +1,14 @@
+# Optional template: run the server as a user unit, so that an automatic update can restart it.
+# Replace @CHECKOUT@ with the folder of your clone and @MODEL@ with the model folder.
+# Skip this file if you already run the server your own way.
+# If you installed requirements-cpu.txt in a virtual environment, replace /usr/bin/python3 with its python.
+[Unit]
+Description=Crucible server
+
+[Service]
+WorkingDirectory=@CHECKOUT@
+ExecStart=/usr/bin/python3 -m server @MODEL@ --engine build/engine/crucible --ctx 32768
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

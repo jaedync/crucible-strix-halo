@@ -7,12 +7,14 @@
 // runs the mid kernel's operations in its order (LinOutLane, LinInLane).
 #pragma once
 #include "prefill_moe.h"
+#include "prefill_moe_kset.h"
 
 namespace crucible {
 constexpr int kPairPad=256+4;                 // stage row: gate 128 | up 128 | pad
 constexpr int kPairTileWords=2*(2*16*136/2);  // the double-buffered tiles of two X items
 static_assert(kPairTileWords>=16*kPairPad);
 static_assert(kPairTileWords>=8*kGemmWaveWords);
+static_assert(kPairTileWords>=8*kMoeNb*kGemmWaveWords);  // MoeWindowBody: kMoeNb exchanges per wave
 
 // Per 16-row tile: the 8 waves stage their accumulators, then each wave runs
 // the mid step on 2 rows (the pattern of PrefillGemmOutKernel's epilogue).
@@ -66,15 +68,25 @@ template<int RM,int MUT> __device__ __forceinline__ void PrefillMoePairEpilogue(
 // sits inside each branch: after a shared merge the accumulators spilled.
 // Gate and up of one expert have the same K and rows, so both sides take the
 // same branch and the same barriers.
-template<int K,int RM,int MUT> __device__ __forceinline__ void PrefillMoePairItem(const PrefillMoe& a,
+// TOP is the kernel's RM. TOP 6 uses MoeWindowBody, the body of
+// PrefillMoeFxKernel<6> (MoeLiveWindowBody): with PrefillWideBody the
+// compiler put part of the decode before the A loads of the 6-tile K4, K5
+// and K6 loops and waited for all loads at the loop top (vmcnt(0)); the
+// 4.05 engine then lost about 50 ms per 4,096 rows (findings section 11).
+template<int K,int RM,int MUT,int TOP=RM> __device__ __forceinline__ void PrefillMoePairItem(const PrefillMoe& a,
     const Exl3GemmJob& j, Exl3GemmItem it, int side, uint32_t* lds) {
   if constexpr (RM>1) {
-    if ((j.M-it.m0+15)/16<RM) { PrefillMoePairItem<K,RM-1,MUT>(a,j,it,side,lds); return; }
+    if ((j.M-it.m0+15)/16<RM) { PrefillMoePairItem<K,RM-1,MUT,TOP>(a,j,it,side,lds); return; }
   }
   const int b0=it.b0;
   it.b0-=side*4*kMoeNb;
   GemmF8 acc[kMoeNb*RM];
-  PrefillWideBody<K,RM,kMoeNb,true,false,true>(j,it,lds,acc);
+#if CRUCIBLE_MOE_WINDOW_PROBE
+  if constexpr (TOP==6)
+    MoeWindowBody<K,RM,(RM<3 ? RM : 3),false,false,true>(j,it,lds,acc);
+  else
+#endif
+    PrefillWideBody<K,RM,kMoeNb,true,false,true>(j,it,lds,acc);
   PrefillMoePairEpilogue<RM,MUT>(a,it.job>>1,j.M,it.m0,b0,acc,reinterpret_cast<float*>(lds));
 }
 

@@ -244,6 +244,32 @@ int PairMain(int R,bool quality,int rm,bool skew,int pairs) {
   std::printf("result pack=%d R=%d rm=%d routing=%s median-save-AB=%.1f B-faster=%d/%d\n",pack,R,rm,tag,bench::Median(ab),pos,pairs);
   cold.Free();return 0;
 }
+// Next 4.05 lever (findings section 11.4): main's FX kernel against its
+// two-kernel form, the X transform (PrefillMoeInputPackedKernel) and the RM6
+// gate/up GEMM, so the transform's share of FX is known. Timing only; the
+// partials of both forms are compared as information.
+int SplitMain(int R,bool quality,bool skew) {
+  Fixture f(R,quality,skew);f.a.tile_rows=96;
+  const int pack=quality?405:305;const char* tag=skew?"skew":"uniform";
+  f.Plan(true);LaunchPrefillMoeFx(6,f.a,quality);CheckLaunch();
+  const auto fg=f.pg.Get(),fu=f.pu.Get();
+  f.pg.Nan();f.pu.Nan();f.Plan();f.Input();f.Gemm();CheckLaunch();
+  const auto gg=f.pg.Get(),gu=f.pu.Get();
+  const bool same=std::memcmp(fg.data(),gg.data(),fg.size()*4)==0&&std::memcmp(fu.data(),gu.data(),fu.size()*4)==0;
+  const auto cold=gm::MakeColdCache();
+  const double scale=48.*4096/R;
+  std::vector<double> fx,pl,in,ge;
+  for(int p=0;p<3;++p) {
+    fx.push_back(ColdTime([&]{f.Plan(true);LaunchPrefillMoeFx(6,f.a,quality);},cold,"fx"));
+    pl.push_back(ColdTime([&]{f.Plan();},cold,"plan"));
+    in.push_back(ColdTime([&]{f.Plan();f.Input();},cold,"plan-input"));
+    ge.push_back(ColdTime([&]{f.Plan();f.Gemm();},cold,"plan-gemm"));
+  }
+  const double F=bench::Median(fx),P=bench::Median(pl),I=bench::Median(in)-P,G=bench::Median(ge)-P;
+  std::printf("split pack=%d R=%d routing=%s partials-bitwise=%d ms-per-call fx=%.4f plan=%.4f input=%.4f gemm=%.4f\n",pack,R,tag,(int)same,F,P,I,G);
+  std::printf("split pack=%d R=%d routing=%s ms-per-4096 fx=%.1f input=%.1f gemm=%.1f input+gemm=%.1f fx-minus-gemm=%.1f\n",pack,R,tag,F*scale,I*scale,G*scale,(I+G)*scale,(F-G)*scale);
+  std::fflush(stdout);cold.Free();return 0;
+}
 // Rows list: "1-16,97,2047" (each 1 to 8192).
 std::vector<int> RowList(const char* s) {
   std::vector<int> v;
@@ -270,6 +296,15 @@ int main(int argc,char** argv) {
       const int rm=rmarg?rmarg:R>=4096?6:R>=2048?4:2;
       rc|=PairMain(R,!std::strcmp(argv[2],"405"),rm,skew,std::strcmp(argv[3],"time")?0:5);
     }
+    return rc;
+  }
+  // Split mode: ROWS-LIST 305|405 split [uniform|skew], rows 4096 to 8192 (RM6).
+  if(argc>3&&!std::strcmp(argv[3],"split")) {
+    if(argc>5||(std::strcmp(argv[2],"305")&&std::strcmp(argv[2],"405")))return 2;
+    const auto rows=RowList(argv[1]);const bool skew=argc>4&&!std::strcmp(argv[4],"skew");
+    if(rows.empty()||(argc>4&&!skew&&std::strcmp(argv[4],"uniform")))return 2;
+    for(const int R:rows)if(R<4096)return 2;
+    int rc=0;for(const int R:rows)rc|=SplitMain(R,!std::strcmp(argv[2],"405"),skew);
     return rc;
   }
   if(argc>3)return 2;

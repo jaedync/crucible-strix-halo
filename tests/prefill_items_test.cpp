@@ -35,5 +35,16 @@ int main() {
   assert(is(PrefillFusedClassesOf(mixed2, 2, true), true, false, true));
   for (const int* k : {k5, k6, mixed}) assert(is(PrefillFusedClassesOf(k, 2, false), false, false, false));
   std::printf("fused classes ok\n");
+  // K7 and K8 groups (h6_ng8 packs) run their own fused kernel; every job must have that width.
+  const int k7[] = {7, 7, 7, 7}, k8[] = {8, 8}, wide_mixed[] = {7, 7, 6}, wide_two[] = {7, 8}, k3[] = {3};
+  assert(PrefillWideKOf(k7, 4) == 7);
+  assert(PrefillWideKOf(k8, 2) == 8);
+  assert(PrefillWideKOf(wide_mixed, 3) == -1);
+  assert(PrefillWideKOf(wide_two, 2) == -1);
+  for (const int* k : {k5, k6, mixed, mixed2, k3}) assert(PrefillWideKOf(k, 1) == 0);
+  assert(PrefillWideKOf(k5, 4) == 0 && PrefillWideKOf(mixed, 4) == 0);
+  // A wide group is one fused class: no K6 launch and no split.
+  assert(is(PrefillFusedClassesOf(k7, 4, true), true, false, false));
+  std::printf("wide classes ok\n");
   return 0;
 }

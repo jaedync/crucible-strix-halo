@@ -33,7 +33,7 @@ BASELINE = frozenset({
 })
 
 # Top-level directories with a charter. kernels/ leaves with the layout move.
-TOP_LEVEL = {'bench', 'docs', 'engine', 'ref', 'server',
+TOP_LEVEL = {'bench', 'deploy', 'docs', 'engine', 'ref', 'server',
              'tests', 'tools', 'training'} | ({'kernels'} if (layout.ROOT / 'kernels').is_dir() else set())
 
 HOW_TO_FIX = (

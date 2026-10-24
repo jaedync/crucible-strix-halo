@@ -1,4 +1,4 @@
-// In-slot checkpoint gate (soak405): a restore from a checkpoint at p, after the slot ran past p, must give the
+// In-slot checkpoint gate: a restore from a checkpoint at p, after the slot ran past p, must give the
 // same state bytes, IDs, logits and layer dumps as a restore from a full snapshot at p. Run it once with
 // CRUCIBLE_COMPACT_STATE=0 and once with 1. Usage: slot_checkpoint_gate CKPT IDS_FILE NEW_OUTPUT_DIR
 #define ENGINE_LIBRARY

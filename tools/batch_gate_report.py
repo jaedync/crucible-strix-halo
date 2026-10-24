@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -36,7 +37,7 @@ RUNTIME_KNOBS = (
     "CRUCIBLE_PF_OUT", "CRUCIBLE_PF_LAUNCH_ROWS", "CRUCIBLE_PF_STAGE_SHARE", "CRUCIBLE_ABLATE", "CRUCIBLE_ABLATE_ANY_CHECKPOINT",
     "CRUCIBLE_COMPACT_STATE",
     "CRUCIBLE_QSA_CAPTURE_INDEX_ONLY",
-    "CRUCIBLE_HC_WMMA", "CRUCIBLE_PLE_HOST",
+    "CRUCIBLE_HC_WMMA", "CRUCIBLE_PLE_BF16", "CRUCIBLE_PLE_HOST",
 
     "CRUCIBLE_PF_PRUNE", "CRUCIBLE_PLE_TRACE",
     "CRUCIBLE_MTP_SIDECAR",
@@ -46,11 +47,24 @@ RUNTIME_KNOBS = (
 )
 
 
+def ple_bf16_public(value):
+    """The BF16 n-gram table as a report shows it: file name and size. The path names the user's home, and
+    the 102 GB file is too large to hash for each gate."""
+    path = Path(value)
+    try:
+        info = path.stat()
+    except OSError:
+        return "set"
+    return f"{path.name} ({info.st_size} bytes)" if stat.S_ISREG(info.st_mode) else "set"
+
+
 def runtime_environment(env):
     # The sidecar path names the user's home; mtp_sidecar_record publishes its sha256 and size instead.
     out = {name: env.get(name) for name in RUNTIME_KNOBS}
     if out.get("CRUCIBLE_MTP_SIDECAR"):
         out["CRUCIBLE_MTP_SIDECAR"] = "set (see mtp_sidecar)"
+    if out.get("CRUCIBLE_PLE_BF16"):
+        out["CRUCIBLE_PLE_BF16"] = ple_bf16_public(out["CRUCIBLE_PLE_BF16"])
     return out
 
 

@@ -1,0 +1,21 @@
+# Template. Off until you install it (see "Updates" in the README). Nothing in the repository installs or enables it.
+# Replace @CHECKOUT@ with the folder of your clone; the install command in the README does it with sed.
+[Unit]
+Description=Update Crucible to the newest release (make update)
+
+[Service]
+Type=oneshot
+WorkingDirectory=@CHECKOUT@
+# After a good update, restart this user unit if it runs. Delete the line if you start the server another way.
+Environment=CRUCIBLE_RESTART_UNIT=crucible-server.service
+ExecStart=/usr/bin/make update
+# The build takes a long time. Give the rest of the system the first turn.
+Nice=19
+# The server and its model share this memory. A build (make, one job) peaked at 1.4 GB in a test, so the cap is about
+# three times that. If memory runs out anyway, the kernel stops the build first, and not the server.
+# OOMPolicy=continue: systemd does not stop the whole unit then. The update script sees that the build failed and
+# restores the previous release. Without this line, the script stops with the build and leaves the new source behind.
+MemoryMax=4G
+OOMScoreAdjust=1000
+OOMPolicy=continue
+TimeoutStartSec=6h

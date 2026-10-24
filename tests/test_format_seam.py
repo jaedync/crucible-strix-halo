@@ -63,7 +63,12 @@ ALLOWED = {
     'engine/layers/kernels/prefill_gdn.h': {'wht': 3, 'scale': 3},
     'engine/layers/kernels/prefill_qsa.h': {'wht': 1, 'scale': 1},
     'engine/layers/kernels/prefill_qsa_union.h': {'wht': 1, 'scale': 1},
-    'engine/layers/moe_rows.h': {'wht': 3, 'scale': 7},
+    # +1 wht, +1 scale (packs): MoeFusedKernelWide copies MoeFusedKernel's down prep, because a
+    # shared function changed the train 23 kernels' ISA (5842e3bb).
+    'engine/layers/moe_rows.h': {'wht': 4, 'scale': 8},
+    # New (decode-fuse 0d12f8cb): the R=1 MoE stage does the input transform inside the expert launch, so the
+    # launch count drops; moving its transform calls to engine/exl3/ is an earlier change and must keep the stage's ISA.
+    'engine/layers/moe_stage.h': {'wht': 4, 'scale': 6},
     'engine/layers/ops.h': {'wht': 1, 'scale': 3, 'type': 1},
     'engine/layers/persistent_ops.h': {'wht': 2, 'scale': 2},
     'engine/layers/prefill_moe.h': {'wht': 5, 'scale': 10},

@@ -177,7 +177,7 @@ def render(request):
 
 
 def test_a_streamed_duplicate_parameter_call_does_not_break_the_next_request():
-    # Train-13 soak S5: the server streamed a call, judged it invalid (duplicate_parameter), and then refused the
+    # An earlier soak run: the server streamed a call, judged it invalid (duplicate_parameter), and then refused the
     # client's next request, which carried that call back in its history (HTTP 400). The session stopped there.
     text = "Reading.\n" + DUPLICATE
     backend = ScriptBackend(token_events(list(text)))

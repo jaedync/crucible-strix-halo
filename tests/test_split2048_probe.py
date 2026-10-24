@@ -58,7 +58,7 @@ class SplitProbeTest(unittest.TestCase):
 
     def test_cpp_cut_validation(self):
         source = (ROOT / 'bench/split2048.hip').read_text()
-        body = source[source.index('std::vector<int> Schedule('):source.index('void Capture(')]
+        body = source[source.index('std::vector<int> Schedule('):source.index('// The batch-serve schedules')]
         program = ('#include <vector>\n#include <algorithm>\n#include <stdexcept>\n'
                    'constexpr int kPrefillCoreRows=2048, kMaxRows=8;\n' + body + '''
 int main() {
@@ -77,6 +77,38 @@ int main() {
             binary = Path(temp) / 'check'
             subprocess.run(['g++', '-std=c++20', str(path), '-o', str(binary)], check=True)
             subprocess.run([str(binary)], check=True)
+
+    def test_pre_mode_schedules(self):
+        # An earlier change: the Pre-cut mode takes its schedules from bench/split2048_schedule.h and refuses a
+        # prompt without a Pre point or a schedule pair that differs by more than the cut.
+        source = (ROOT / 'bench/split2048.hip').read_text()
+        body = source[source.index('struct PreCase {'):source.index('void Capture(')]
+        program = ('#include "%s"\n#include <stdexcept>\n'
+                   'constexpr int kPrefillCoreRows=2048, kMaxRows=8;\n'
+                   'namespace crucible { inline constexpr size_t kPreEndMinTokens = 32768; }\n'
+                   % (ROOT / 'bench/split2048_schedule.h') + body + '''
+int main() {
+  const PreCase c = PreSchedules(39964, 4096, 8192);
+  if (c.pre != 38912 || c.whole != std::vector<int>{8192,8192,8192,8192,7196}) return 1;
+  if (c.split != std::vector<int>{8192,8192,8192,8192,4096,2048,1052}) return 2;
+  if (PreSchedules(34825, 4096, 8192).split.back() != 9) return 3;
+  for (int length : {34824, 32000}) {
+    try { PreSchedules(length, 4096, 8192); return 4; } catch (const std::runtime_error&) {}
+  }
+}
+''')
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'check.cpp'
+            path.write_text(program)
+            binary = Path(temp) / 'check'
+            subprocess.run(['g++', '-std=c++20', str(path), '-o', str(binary)], check=True)
+            subprocess.run([str(binary)], check=True)
+
+    def test_merged_launch_rows_are_allowed(self):
+        # The Pre-cut mode runs the serve schedule, whose launches merge two grid chunks (8,192 rows).
+        adapted = probe.adapt_prompt((ROOT / 'engine/runtime/prompt.h').read_text())
+        self.assertIn('R > EngineLaunchRows(eng)', adapted)
+        self.assertNotIn('R > step', adapted)
 
     def test_fail_closed_source_transform(self):
         source = (ROOT / 'engine/runtime/prompt.h').read_text()

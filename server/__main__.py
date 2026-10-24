@@ -8,7 +8,7 @@ from http.server import ThreadingHTTPServer as StdlibServer
 from pathlib import Path
 import signal
 import sys
-from . import metrics
+from . import metrics, update_check
 from .api import MAX_COUNT, MAX_MTP_WINDOW, MTP_WINDOW, MAX_ALL, ApiError, ServerDefaults
 from .backend import EngineBackend, LOOKUP_DEPTH, MAX_CONVERSATION_CACHE_MIB
 from .batch_scheduler import INTERLEAVE_MIN_ROWS
@@ -16,6 +16,7 @@ from .hosts import ALLOWED_HOSTS_ENV, HostError, resolve_allowed_hosts
 from .http import Service, handler_for
 from .think_budget import MIN_THINKING_DEFAULT
 from .tokenization import ModelTokenizer
+from .version import server_commit, server_version
 
 # serve --draft-blocks: the engine's file limit (draft_policy.h kDraftBlocksFileMax).
 DRAFT_BLOCKS_FILE_MAX = 64 * 1024
@@ -65,6 +66,10 @@ def listen_url(host, port):
 def main():
     parser = argparse.ArgumentParser(description="Temporary local Crucible server (default 127.0.0.1:8790)")
     parser.add_argument("checkpoint", type=Path)
+    parser.add_argument("--version", action="version", version=f"crucible {server_version()}")
+    parser.add_argument("--no-update-check", action="store_true",
+                        help="Do not ask GitHub for a newer release at start. CRUCIBLE_NO_UPDATE_CHECK=1 does the same. "
+                             "The check is a notice only: it never updates anything.")
     parser.add_argument("--engine", type=Path, default=Path(__file__).resolve().parents[1] / "build/engine/crucible")
     parser.add_argument("--ctx", type=int, default=32768)
     parser.add_argument("--model-id", default="crucible")
@@ -76,8 +81,8 @@ def main():
     parser.add_argument("--streams", type=int, choices=range(1, 9), default=None,
                         help="Batch slots (default 1). The batched stack serves every request, including speculation.")
     parser.add_argument("--serial", action="store_true",
-                        help="Rollback for one train (removed in train 20): serve with the old serial stack, one request "
-                             "at a time. It accepts draft_head full, draft_adapt 1 and draft_q 0. Not with --streams.")
+                        help="Serve with the serial worker: one request at a time, in a FIFO queue. It accepts draft_head "
+                             "full, draft_adapt 1 and draft_q 0. Not with --streams.")
     parser.add_argument("--conversation-cache-mib", type=int, default=0)
     parser.add_argument("--prefill", type=int, default=None)
     parser.add_argument("--host-reserve-mib", type=int, default=None, metavar="1024..131072",
@@ -126,6 +131,9 @@ def main():
     parser.add_argument("--state-disk-write-gib-per-day", type=int, default=None, metavar="0..65536",
                         help="SSD wear guard: GiB that --state-dir may write in one local day, across restarts "
                              "(default 300). Above it, spills and stop flushes are refused; 0 only reads.")
+    parser.add_argument("--state-disk-write-delay-ms", type=int, default=None, metavar="0..60000",
+                        help="Tests only: each state write waits this long first (the same-second restore proof). "
+                             "Its states go to their own folder. Default 0.")
     parser.add_argument("--allowed-host", action="append", default=[], metavar="HOST[:PORT]",
                         help=f"Strict mode: refuse (HTTP 403) every request whose Host header is not listed. Repeat the "
                              f"flag or use commas; HOST without a port matches any port; the match ignores case. It "
@@ -136,7 +144,7 @@ def main():
                         help="Lower max_tokens to the context room instead of rejecting the request.")
     parser.add_argument("--temperature", type=float, default=None, metavar="0..2",
                         help="Server default temperature for requests that send none (default 0, greedy). A request "
-                             "field always wins.")
+                             "with logprobs and no temperature stays at 0. A request field always wins.")
     parser.add_argument("--top-k", type=int, default=None, metavar="0..248320",
                         help="Server default top_k for requests that send none (default 0, off).")
     parser.add_argument("--top-p", type=float, default=None, metavar="0..1",
@@ -287,6 +295,9 @@ def main():
     if args.state_disk_write_gib_per_day is not None and (args.state_dir is None or
                                                           not 0 <= args.state_disk_write_gib_per_day <= 65536):
         parser.error("--state-disk-write-gib-per-day needs --state-dir and a value in [0,65536]")
+    if args.state_disk_write_delay_ms is not None and (args.state_dir is None or
+                                                       not 0 <= args.state_disk_write_delay_ms <= 60000):
+        parser.error("--state-disk-write-delay-ms needs --state-dir and a value in [0,60000]")
     if args.state_disk_gib is not None and (args.state_dir is None or not 1 <= args.state_disk_gib <= 65536):
         parser.error("--state-disk-gib needs --state-dir and a value in [1,65536]")
     if args.vision_max_pixels is not None and (not args.vision or not 65536 <= args.vision_max_pixels <= 4194304):
@@ -361,6 +372,7 @@ def main():
                                            state_dir=None if args.state_dir is None else str(args.state_dir),
                                            state_disk_gib=args.state_disk_gib, cache_probation=args.cache_probation,
                                            state_write_gib_per_day=args.state_disk_write_gib_per_day,
+                                           state_write_delay_ms=args.state_disk_write_delay_ms,
                                            cache_idle_minutes=args.cache_idle_minutes,
                                            engine_options=engine_options,
                                            lookup=args.lookup, mtp_window=args.mtp_window)
@@ -375,6 +387,8 @@ def main():
                     default_mtp_prefix=args.mtp_window, capture=capture, allowed_hosts=allowed_hosts,
                     defaults=defaults)))
         server.daemon_threads = True
+        commit = server_commit()
+        print(f"Crucible v{server_version()}" + (f" ({commit})" if commit else ""), file=sys.stderr, flush=True)
         # The switch changes prompt IDs, so the startup line records it with the address.
         print(f"Crucible is ready at {listen_url(args.host, args.port)} (content special tokens: "
               f"{args.content_special_tokens})", file=sys.stderr, flush=True)
@@ -389,6 +403,7 @@ def main():
             print("Host check: off (any Host)", file=sys.stderr, flush=True)
         if defaults.describe():
             print("Request defaults: " + defaults.describe(), file=sys.stderr, flush=True)
+        update_check.start(server_version(), disabled=args.no_update_check)
         server.serve_forever()
     except KeyboardInterrupt:
         pass

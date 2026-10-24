@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <vector>
 #include "../model/flashnext/geometry.h"
+#include "tenant.h"
 
 namespace crucible {
 struct ConversationPolicy {
@@ -15,8 +16,14 @@ struct ConversationPolicy {
   std::vector<int> draft_selection;
   bool head_auto = false;
   int mtp_prefix = 0;
+  // W1: who the state belongs to. Every cache, slot and disk match compares the whole policy, so a state
+  // matches only inside its tenant. Last, so that the positional initializations keep their meaning.
+  StateTenant tenant = kLocalTenant;
   bool operator==(const ConversationPolicy&) const = default;
 };
+// The bytes that the cache counts for an entry's policy: train 23's count, without the tenant key. With the local
+// tenant every budget decision then stays the same as before W1 (the key is 32 bytes of an entry of 100 MB or more).
+inline constexpr size_t kConversationPolicyBytes = sizeof(ConversationPolicy) - sizeof(StateTenant);
 struct ConversationResume {
   size_t length = 0;
   int mpos = 0, replay = 0, next_id = -1;

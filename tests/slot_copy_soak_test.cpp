@@ -69,7 +69,7 @@ class SlotAgents {
     const bool trusted = job.from_tail && !guard;
     totals.refused += !Save(hist, trusted, guard, one_copy_);
     held_[size_t(job.slot)] = Held{hist, trusted, guard, ++tick_};
-    if (one_copy_) cache_.SetResident(job.slot, hist, 0);
+    if (one_copy_) cache_.SetResident(job.slot, hist, 0, policy_);
   }
   // Host bytes per session now: all entries, and the part that copies a slot's state.
   void Sample(int sessions) {

@@ -385,6 +385,20 @@ def test_think_continuation_resumes_from_its_first_job_slot(start_backend):
     collect(waiting)
 
 
+def test_identical_resend_reports_the_whole_prompt_restored(start_backend):
+    """Re-send fix A: an End resume opens with cached_tokens equal to the prompt length. The server keeps
+    that count (SRPT ranks no rows left), and the prefill command with no rows publishes the first token."""
+    backend = start_backend(True, streams=1, env={"FAKE_SLOT_CONTEXTS": "128", "FAKE_CHECKPOINTS": "1",
+                                                  "FAKE_END_RESUME": "1", "FAKE_DELAY": ".002"})
+    cold, _ = collect(backend.submit([1, 2, 3, 4], request(4)))
+    again = backend.submit([1, 2, 3, 4], request(4))
+    ids, _ = collect(again)
+    assert ids == cold and again.turn["opened_cached"] == 4
+    entry_rows = [entry["rows"] for entry in backend.trace.since(0) if entry["op"] == "prefill" and
+                  entry["request_ids"] == [again.turn["request_id"]]]
+    assert len(entry_rows) == 1
+
+
 def test_think_continuation_waits_for_its_first_job_to_close(start_backend):
     """continue_job queues the continuation before it cancels the first job. A free slot must not take the
     continuation in between: it would open without the first job's end state."""
@@ -426,7 +440,7 @@ def test_think_continuation_releases_its_slot_when_the_client_leaves(start_backe
 
 def test_think_cap_token_holds_peer_chunks_for_the_continuation(start_backend):
     """A first job that reached its think cap gets its continuation from the HTTP thread a moment later. A peer's
-    chunk must not start in between: on the 4-agent soak that chunk delayed 40 of 105 continuations by about 3 s
+    chunk must not start in between: in a 4-agent test run that chunk delayed 40 of 105 continuations by about 3 s
     (decode gaps)."""
     backend = start_backend(True, streams=2, env={"FAKE_SLOT_CONTEXTS": "128,128", "FAKE_CHECKPOINTS": "1",
                                                   "FAKE_DELAY": ".002", "FAKE_PREFILL_ROWS": "4"})

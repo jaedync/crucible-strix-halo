@@ -12,10 +12,11 @@ Synthetic token prompts (frozen code-like text, no user data), sent as completio
   E 33,100 tokens: control, frontier below len - 256
 Steps: each prompt cold (greedy, spec 7, cache auto: the reference, and it saves the frontier); A to D again at the
 same time; C again at spec 0; E again; D sampled cold (cache bypass) and sampled again (cache auto, same seed).
-Pass: every cold send restored 0 rows; every re-send restored 32,768 rows and gave the IDs of its cold send; the spec 0
+Pass: every cold send restored 0 rows; every re-send restored 32,768 rows (or, with its `slot_checkpoint end_resume`
+line, the whole prompt: re-send fix A) and gave the IDs of its cold send; the spec 0
 re-send gave the spec 7 IDs; single re-sends have TTFT under 2 s and the 4 concurrent ones under 5 s; the engine log
 (CRUCIBLE_SPEC_STATS=1) shows mtp_origin = max(restored, len - 256) for each spec 7 send (BatchSpecDecoder::Open):
-32,768 for the re-sends of A to D, 32,844 for the re-send of E, len - 256 for each cold send. The verdict also counts
+32,768 for the re-sends of A to D, 32,844 for the re-send of E, len - 256 for each cold send, len for an End resume. The verdict also counts
 the cache_capture lines (saves and evictions).
 """
 import argparse
@@ -39,6 +40,7 @@ SAMPLED = dict(temperature=0.6, top_p=0.95, seed=7)
 TTFT_ONE_S, TTFT_FOUR_S = 2.0, 5.0
 SETTINGS = dict(context=262144, streams=4, prefill=4096, cache_mib=26624, prefill_interleave=10)
 CAPTURE = re.compile(r"^cache_capture tokens=(\d+) class=\w+ saved=(\d) evicted=(\d+) superseded_evicted=(\d+) ")
+END_EVENT = re.compile(r"^slot_checkpoint end_resume tokens=(\d+) slot=(\d+) request=(\d+)$")
 SPEC_STATS = re.compile(r"^spec_stats id=(\d+) cached=(\d+) proposed=(\d+) accepted=(\d+) steps=(\d+) .*"
                         r"mtp_origin=(\d+) mtp_continued=(\d+) mtp_restarts=(\d+)$")
 
@@ -56,8 +58,8 @@ def prompt_ids(encode, label, length):
     return head + body[:need] + tail
 
 
-def request(ids, spec=7, cache="auto", sampled=False):
-    body = dict(prompt=list(ids), max_tokens=MAX_TOKENS, spec=spec, temperature=0.0, seed=1, cache_control=cache)
+def request(ids, spec=7, cache="auto", sampled=False, max_tokens=MAX_TOKENS):
+    body = dict(prompt=list(ids), max_tokens=max_tokens, spec=spec, temperature=0.0, seed=1, cache_control=cache)
     if sampled:
         body |= SAMPLED
     return validate_request(body, "completion", "crucible")
@@ -67,7 +69,8 @@ def row(step, label, ids, result, spec, cache, sampled):
     done = result["done"]
     return dict(step=step, prompt=label, prompt_tokens=len(ids), spec=spec, cache=cache, sampled=sampled,
                 output_ids=result["output_ids"], cached_tokens=done.get("cached_tokens"),
-                request_id=done.get("request_id"), ttft=result["ttft"], seconds=result["seconds"])
+                request_id=done.get("request_id"), ttft=result["ttft"], seconds=result["seconds"],
+                end_resume=done.get("end_resume") is True)
 
 
 def run_steps(backend, prompts, timeout):
@@ -153,6 +156,10 @@ def check(report, log_lines):
                                                                        "sampled-resend"]:
         return ["missing or reordered steps"], []
     stats = spec_stats(log_lines)
+    # Re-send fix A (always on with slot checkpoints): a re-send on the slot that holds
+    # its End point restores the whole prompt and logs `slot_checkpoint end_resume tokens=<len> request=<id>`. Such a
+    # request must restore its whole prompt; a request without the line keeps the older rule (the 32,768 frontier).
+    ends = {(int(m.group(1)), int(m.group(3))) for m in map(END_EVENT.match, map(str.strip, log_lines)) if m}
     cold = {r["prompt"]: r for r in rows if r["step"] == "cold"}
     sampled_cold = next(r for r in rows if r["step"] == "sampled-cold")
     for r in rows:
@@ -161,7 +168,10 @@ def check(report, log_lines):
         if r["prompt_tokens"] != length:
             problems.append(f"{where}: prompt has {r['prompt_tokens']} tokens, expected {length}")
         resend = r["step"] not in ("cold", "sampled-cold")
-        want = FRONTIER if resend else 0
+        resumed = (length, r["request_id"]) in ends
+        if resumed and not resend:
+            problems.append(f"{where}: end_resume line for a cold send")
+        want = (length if resumed else FRONTIER) if resend else 0
         if r["cached_tokens"] != want:
             problems.append(f"{where}: cached_tokens {r['cached_tokens']}, expected {want}")
         if resend:
@@ -181,7 +191,7 @@ def check(report, log_lines):
                                 f"expected {want} and {origin}")
         summary.append(dict(step=r["step"], prompt=r["prompt"], prompt_tokens=r["prompt_tokens"], spec=r["spec"],
                             sampled=r["sampled"], cached_tokens=r["cached_tokens"], ttft=r["ttft"],
-                            tokens=len(r["output_ids"]), **({k: stat[k] for k in ("proposed", "accepted", "mtp_origin")}
+                            end_resume=resumed, tokens=len(r["output_ids"]), **({k: stat[k] for k in ("proposed", "accepted", "mtp_origin")}
                                                           if stat else {})))
     return problems, summary
 

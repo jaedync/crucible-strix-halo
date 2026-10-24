@@ -26,7 +26,11 @@ and four sessions reach 109 tok/s in total. Its next-token accuracy is 0.0038 hi
 Speculative decoding (MTP) is on, as in daily use. A cold prompt has no part in the cache. The server
 ran with four sessions and image input on, as in daily use.
 
+The numbers in this section and in the later sections, except [v0.26.0 against v0.22.0](#v0260-against-v0220), are from the v0.22.0 engine, and each table names its dates.
+
 **3.05 bpw pack (the faster option)**
+
+*Engine v0.22.0, measured Oct 18 to 19, 2026.*
 
 | Context | First token, cold prompt | Prefill | Decode, code | Decode, prose |
 |---|---:|---:|---:|---:|
@@ -40,6 +44,8 @@ All values are the median of 9 runs (Oct 18 to 19, 2026), 8 for the 100K decode 
 
 **4.05 bpw pack (the higher-quality option)**
 
+*Engine v0.22.0, measured Oct 17 to 19, 2026.*
+
 | Context | First token, cold prompt | Prefill | Decode, code | Decode, prose |
 |---|---:|---:|---:|---:|
 | 4K | not measured | not measured | 65 tok/s | 53 tok/s |
@@ -47,7 +53,7 @@ All values are the median of 9 runs (Oct 18 to 19, 2026), 8 for the 100K decode 
 | 100K | not measured | not measured | 58 tok/s | 50 tok/s |
 | 130K | 83.9 s ¹ | 1,550 tok/s ¹ | not measured | not measured |
 
-All values are the median of 5 runs (Oct 17 to 19, 2026) with the build of this source. A run that did not measure a row does not count for that row. First token and prefill: the median of two cold requests in each run. Decode: one session, from the first to the last token of the code turn and of the prose turn. "not measured": those runs did not measure this cell.\
+All values are the median of 5 runs (Oct 17 to 19, 2026) with the v0.22.0 build. A run that did not measure a row does not count for that row. First token and prefill: the median of two cold requests in each run. Decode: one session, from the first to the last token of the code turn and of the prose turn. "not measured": those runs did not measure this cell.\
 ¹ A prompt of 130,080 tokens.
 
 **Four sessions at once:** 132 tok/s in total at 32K and 119 tok/s at 100K on
@@ -88,15 +94,67 @@ How each value was measured: [measurement details](#measurement-details).
 Oct 17 to 19, 2026 (4.05 pack). Each Crucible value is the median of its runs. Values from an earlier run or
 an older build name their date and their build.
 
+## v0.26.0 against v0.22.0
+
+Most rows are equal or faster in this release. Decode with 4 sessions on the 4.05 pack is 5% slower, and code decode with 1 session is 2% to 3% slower: see the notes under the tables. The tables below come
+from one run of the two engines on one machine, one after the other. The tables in the other sections keep their dates
+and are not measured again.
+
+The tables compare v0.22.0 (A) with v0.26.0 (B). The releases v0.22.1 to v0.22.4 use the same engine as v0.22.0. Each cell is the median of 5 pairs. The v0.22.0 cell for 4 sessions on the 4.05 pack is the median of 4 pairs, because one pair gave no value. The ratio is B divided by A. For the rows in tok/s, a ratio above 1
+means that v0.26.0 is faster. For the rows in seconds, a ratio below 1 means that it is faster.
+
+Setup: Strix Halo with 128 GB. Each pack ran 5 pairs of A and B, in the order AB, BA, AB, BA, AB. A pair that failed a
+rule (low GPU clock, high disk wait, or a missing value) was run again once. The 4.05 pack had 7 tries (14 runs) and the 3.05 pack had 5 tries (10 runs). The median GPU clock
+was about 2,330 MHz in both builds. The server ran 4 sessions of 262,144 tokens, with MTP on and image input on. Only
+the serial row has MTP off. The cold rows use prompts that no cache has seen.
+
+**4.05 bpw pack**
+
+| Row | A: v0.22.0 | B: v0.26.0 | B/A |
+|---|---:|---:|---:|
+| Serial decode, short context (tok/s) | 30.9 | 32.0 | 1.036 |
+| Decode at 32K, 1 session, code (tok/s) | 66.1 | 64.9 | 0.982 |
+| Decode at 32K, 1 session, prose (tok/s) | 49.0 | 49.3 | 1.005 |
+| Decode at 32K, 4 sessions, total (tok/s) | 110.8 | 105.2 | 0.949 |
+| Cold prefill 32K, time to first token (s) | 19.74 | 19.04 | 0.965 |
+| Cold prefill 130K, time to first token (s) | 84.15 | 81.94 | 0.974 |
+| Re-send of the same 32K prompt, time to first token (s) | 1.872 | 0.021 | 0.011 |
+
+**3.05 bpw pack**
+
+| Row | A: v0.22.0 | B: v0.26.0 | B/A |
+|---|---:|---:|---:|
+| Serial decode, short context (tok/s) | 35.4 | 36.5 | 1.029 |
+| Decode at 32K, 1 session, code (tok/s) | 75.3 | 73.4 | 0.974 |
+| Decode at 32K, 1 session, prose (tok/s) | 59.5 | 59.2 | 0.995 |
+| Decode at 32K, 4 sessions, total (tok/s) | 129.6 | 129.2 | 0.997 |
+| Cold prefill 32K, time to first token (s) | 18.75 | 18.78 | 1.001 |
+| Cold prefill 130K, time to first token (s) | 80.39 | 80.77 | 1.005 |
+| Re-send of the same 32K prompt, time to first token (s) | 1.728 | 0.021 | 0.012 |
+
+What the tables show:
+
+- A prompt that you send again gets its first token in about 0.02 s instead of 1.7 to 1.9 s.
+- Cold prefill is 2.6% to 3.5% faster on the 4.05 pack. On the 3.05 pack it is equal within 0.5%.
+- Serial decode is 3% to 4% faster.
+- Decode with 4 sessions on the 4.05 pack is 5% slower: 110.8 to 105.2 tok/s (0.949). One of the 5 runs of v0.26.0
+  was low (86.4 tok/s). In the 4.05 test, 3 of the 14 runs gave no value for this row: 2 of v0.22.0 and 1 of v0.26.0.
+  This is a known fault of the measurement and is not new in this release. The 3.05 test had no failed run.
+- The 3.05 pack shows no loss with 4 sessions (0.997).
+- Decode at 32K with 1 session varies more between runs in v0.26.0 on the code prompt. The medians are within 3%.
+
+How each value was measured: [measurement details](#measurement-details).
+
 ## Same-harness comparison with Halogen and Gufo
 
 Crucible values are the median of repeat runs: 5 runs for the 4.05 pack (Oct 17 to 19, 2026) and 9 runs for
 the 3.05 pack (Oct 18 to 19, 2026). Halogen 0.16.2 and Gufo 0.9.0 (MTP) ran once, on Oct 17, 2026. All
 columns ran on one machine with one request client, one engine at a time. The 3.05 column used the same
 engine binary and prompts as the 4.05 column. The Quality section shows the quality difference of each
-engine and weight format.
+engine and weight format. The Crucible columns are from the v0.22.0 engine, measured Oct 17 to 19, 2026 (4.05) and Oct 18 to 19, 2026 (3.05). They are not measured again
+for v0.26.0.
 
-Engines: Crucible 4.05 (4.05 bpw EXL3, median of 5 runs (Oct 17 to 19, 2026), build of this source, 4 sessions); Crucible 3.05 (3.05 bpw EXL3, median of 9 runs (Oct 18 to 19, 2026), same engine binary and prompts, 4 sessions, conversation cache 25,600 MiB against 9,700 MiB); Halogen (0.16.2, one run (Oct 17, 2026), 4 sessions); Gufo (0.9.0, one run (Oct 17, 2026), GGUF UD-Q4_K_XL, MTP).
+Engines: Crucible 4.05 (4.05 bpw EXL3, median of 5 runs (Oct 17 to 19, 2026), v0.22.0 build, 4 sessions); Crucible 3.05 (3.05 bpw EXL3, median of 9 runs (Oct 18 to 19, 2026), same engine binary and prompts, 4 sessions, conversation cache 25,600 MiB against 9,700 MiB); Halogen (0.16.2, one run (Oct 17, 2026), 4 sessions); Gufo (0.9.0, one run (Oct 17, 2026), GGUF UD-Q4_K_XL, MTP).
 
 **Prefill and first token.** Time to the first token of one request with 4 output tokens, the median of the runs. A re-send repeats the last cold prompt. An extension adds about 4K tokens of other source to it.
 
@@ -362,6 +420,96 @@ python tools/tok.py "$CKPT" encode "Write a Python function that adds two number
 build/engine/crucible gen "$CKPT" --ids-file prompt.ids --n 160 --spec 2 --ctx 4096
 ```
 
+## Updates
+
+Each release has a number `v0.<train>.<fix>`. The release notes are in [CHANGELOG.md](CHANGELOG.md) and on the
+Releases page of this repository on GitHub. The file `VERSION` has the number of your
+checkout. The server shows it at start, in `GET /v1/crucible/version`, and in `GET /v1/models`
+(`crucible_version`). `build/engine/crucible --version` shows the number of the engine build.
+
+**Watch for releases.** On GitHub, select Watch, then Custom, then Releases. GitHub sends you a message for each
+new release.
+
+**Start notice.** The server asks GitHub once in 24 hours if a newer release exists. It sends one plain request and
+nothing else. If a newer release exists, the server prints two lines at start:
+
+```text
+Crucible v0.26.1 is available (you run v0.26.0). Update: make update. Release notes: <link>
+Automatic updates are off unless you turned on the timer. See "Updates" in the README.
+```
+
+The notice never changes anything. A failed check prints nothing. To turn the check off, set
+`CRUCIBLE_NO_UPDATE_CHECK=1` or start the server with `--no-update-check`.
+
+**Update by hand.** Run this in your clone:
+
+```sh
+make update
+```
+
+The command gets the newest release tag, builds it, and runs a short self-test. It stops and changes nothing when
+you have local changes, or when your checkout is not on the release line. If the build or the self-test fails, the
+command restores the previous release by itself. It keeps the previous binary as `build/engine/crucible.prev`.
+
+A kill or a power loss can stop an update half way. The next `make update` or `make rollback` finds the file
+`build/update-running` and restores the previous release and its binary first, and it says so. It does not build again:
+a build can be stopped again by the same cause, and a restore cannot. The linker writes a temporary file and renames it,
+so the binary is never half written: a stopped build leaves the old binary or none. Until that next run, the checkout
+can be on the new release and the binary on the old one. After a stopped update, run `make update` before you start
+the server.
+
+`make update` does not restart your server. Stop the server and start it again to run the new release.
+
+`make update` leaves your clone on the release tag (a detached HEAD). A later `git pull` then fails. To get back on
+a branch, run `git checkout main && git pull`. To follow the releases again, run `make update`.
+
+To undo the last update, run:
+
+```sh
+make rollback
+```
+
+`make rollback` undoes one update, once, and needs a clean tree. It then holds the release that you left. `make update`
+and the timer skip that release until a newer one exists. To install the held release anyway, delete the file
+`build/update-hold` and run `make update`.
+
+The self-test checks the CPU part only. To add a short GPU test (a few greedy tokens against the stored token IDs),
+stop the server and run `make update CKPT="$CKPT"`. This release stores token IDs for the 3.05 and 4.05 packs. A pack
+with no stored token IDs is skipped, and the command says so.
+
+**Automatic updates (off by default).** Nothing in this repository turns them on. To turn them on, run these three
+commands in your clone. They install a systemd user timer that runs `make update` once a day at about 04:00:
+
+```sh
+mkdir -p ~/.config/systemd/user
+for f in crucible-update.service crucible-update.timer; do sed "s|@CHECKOUT@|$PWD|" deploy/user-systemd/$f > ~/.config/systemd/user/$f; done
+systemctl --user enable --now crucible-update.timer
+```
+
+A user timer runs only while you are logged in. To let it run when you are logged out, run
+`loginctl enable-linger "$USER"` once.
+
+The build runs next to your loaded model. A build with one job peaked at 1.4 GB of memory in a test. The service
+file limits the build to 4 GB (`MemoryMax`) and tells the kernel to stop the build first if memory runs out
+(`OOMScoreAdjust`). In the same test the build took 16 minutes.
+
+The 4 GB limit covers the split build, which is the default. If that build cannot run, the build falls back to the plain
+build, which can need more memory. If the plain build hits the limit, the kernel stops it, `make update` restores the
+previous release (`OOMPolicy=continue` in the service file lets it do so), and the timer tries again the next night.
+
+To turn them off:
+
+```sh
+systemctl --user disable --now crucible-update.timer
+```
+
+After a good update, the timer job restarts the user unit `crucible-server.service` if that unit runs. A restart
+stops the requests that are in progress. The folder `deploy/user-systemd/` has a template for that unit. In the
+template, replace `/usr/bin/python3` with the `python` of your virtual environment if you installed
+`requirements-cpu.txt` in one.
+Use no restart if you start the server in another way: delete the `CRUCIBLE_RESTART_UNIT` line in the installed
+service file. The timer job does not run the GPU self-test.
+
 ## Hardware and software
 
 - Ryzen AI Max+ 395, Radeon 8060S (gfx1151), 128 GB shared LPDDR5X-8000.
@@ -383,7 +531,7 @@ The test system has a Ryzen AI Max+ 395, Radeon 8060S (gfx1151), 128 GB shared L
 Its measured ceilings are **245.5 GB/s cold reads** and **48.2 TFLOPS f16 WMMA**.
 See [chip calibration](docs/CALIBRATION.md).
 
-These rows are engine benchmarks from early October. They compare the engine with the hardware.
+These rows are engine benchmarks measured on 2026-10-03 and 2026-10-04. They are not measured again for v0.26.0. They compare the engine with the hardware.
 **Serial decode** makes one token for each forward pass, without speculative decoding. Daily use has
 speculative decoding on: see [What it is like to use](#what-it-is-like-to-use).
 
@@ -410,12 +558,24 @@ HTTP transport.
 ## Measurement details
 
 - **The tables at the top:** the median of 9 runs (3.05, Oct 18 to 19, 2026) and of 5 runs (4.05, Oct 17 to
-  19, 2026) with the build of this source, and the daily server settings (four sessions, image input on).
+  19, 2026) with the v0.22.0 build, and the daily server settings (four sessions, image input on).
   First token and prefill are the median of two cold requests in each run. Prefill tok/s is the prompt tokens
   divided by the time to the first token, so it includes the server path. Decode is one session in a
   five-turn agent conversation (code, tool, sampled code, thinking, prose). The code and prose columns are
   the tokens per second of those turns, from the first to the last token. The runs measured cold prefill at
   32K and 130K, and decode at 4K, 32K and 100K.
+- **v0.26.0 against v0.22.0:** each run starts its own server with the server code of its own release, with 4 sessions
+  of 262,144 tokens, image input on and MTP on (off for the serial row). The conversation cache is 9,700 MiB for the
+  4.05 pack and 25,600 MiB for the 3.05 pack. The prompts are one synthetic coding conversation, with CPython library
+  files as tool results. Both engines get the same text. Every long prompt has its own first line, so no cache has seen
+  it. Serial decode: one code prompt, 257 tokens, the median of 2 runs. Cold prefill at 32K: the median of 5 cold
+  prompts. Cold prefill at 130K: one cold prompt. Prefill speed is the prompt tokens divided by the time to the first
+  token. Decode at 32K with 1 session: the code turn and the prose turn that follow the cold prompt, as the tokens
+  minus 1, divided by the time from the first to the last chunk. Decode with 4 sessions: 4 sessions with different
+  prompt starts, one code turn at the same time, in the window in which all 4 decode. Re-send: the same 32K request
+  sent again after the cold one, the median of 3. Each pack ran 5 pairs. A pair is one run of each engine, one after
+  the other. The pairs run in the order AB, BA, AB, BA, AB. A pair was run again when its GPU clock median was below
+  2,200 MHz or its disk wait was high. Each cell is the median of the pairs.
 - **Four sessions:** the total rate while all four sessions decode at the same time, and the median rate of each
   session.
 - **Follow-up turns:** the runs send a re-send and a 4K extension of each cold prompt. The older values
@@ -437,7 +597,7 @@ HTTP transport.
   the first token of a cold prompt came after 20.4 s at 32K and 82.8 s at
   130K.
 
-**Run-to-run spread (Crucible).** Each value is the median of the runs that measured the row. The range is
+**Run-to-run spread (Crucible).** Engine v0.22.0, measured Oct 17 to 19, 2026 (4.05) and Oct 18 to 19, 2026 (3.05). Each value is the median of the runs that measured the row. The range is
 the lowest to the highest run, with the number of runs.
 
 | Row | Crucible 4.05 | Crucible 3.05 |

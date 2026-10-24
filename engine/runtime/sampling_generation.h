@@ -205,8 +205,10 @@ class SampledGeneration {
   Proposals Drafts(int limit) {
     Proposals out;
     // Selecting lookup after comparing with a random MTP draw would change q.
-    const auto copied = history_.Draft(std::min(o_.lookup, limit));
+    auto copied = history_.Draft(std::min(o_.lookup, limit));
     out.lookup = copied.size() > 1;
+    // A copy that crosses a stop ID: the rows after it cannot commit a token (draft_stop.h).
+    TrimDrafts(copied, o_.stop_ids, limit);
     const int rows = int(ctoks_.size());
     metrics_.Begin();
     eng_.Mtp(stk_, ctoks_.data(), rows, mpos_, !out.lookup);
@@ -224,7 +226,7 @@ class SampledGeneration {
     out.probabilities.push_back(std::move(first_distribution));
     out.ids.push_back(Draw(out.probabilities.back(), Next()));
     float confidence = SampledDepthConfidence(margin);
-    for (int k = 1; k < std::min(o_.spec, limit); ++k) {
+    for (int k = 1; k < std::min(o_.spec, limit) && ChainMayGrow(out.ids, o_.stop_ids, limit); ++k) {
       if (o_.draft_q > 0 ? confidence * 0.75f < o_.draft_q : margin < o_.draft_margin) break;
       metrics_.Begin();
       Rows(stk_, kMaxRows, k == 1 ? rows - 1 : 0, 1);

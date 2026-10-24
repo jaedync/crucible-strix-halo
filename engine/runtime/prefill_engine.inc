@@ -1,11 +1,11 @@
 // Engine members stay separate from decode plan construction.
-// The prefill GEMMs decode EXL3 K3..kPrefillMaxK (K2 is a decode-path width).
+// The prefill GEMMs decode EXL3 K3..8 (PrefillWidthSupported; K2 is a decode-path width).
 // Returns the unsupported tensors, or an empty string. The constructor checks
 // right after the weights load, before any row-sized allocation.
 std::string Engine::PrefillWidthIssue() const {
   std::string bad;
   auto check=[&](const Lin& w, const std::string& name) {
-    if (w.tiles && (w.K<3 || w.K>kPrefillMaxK)) bad+=" "+name+"(K"+std::to_string(w.K)+")";
+    if (w.tiles && !PrefillWidthSupported(w.K)) bad+=" "+name+"(K"+std::to_string(w.K)+")";
   };
   for (int l=0; l<kLayers && bad.size()<200; ++l) {
     const auto& L=m_.L[l]; const std::string p="L"+std::to_string(l)+".";
@@ -16,11 +16,23 @@ std::string Engine::PrefillWidthIssue() const {
       check(L.gdn.qkv,p+"qkv"); check(L.gdn.z,p+"z"); check(L.gdn.out,p+"out");
     }
     check(L.moe.sg,p+"sg"); check(L.moe.su,p+"su"); check(L.moe.sd,p+"sd");
+    // Routed experts may also be K3.5 (code 35), which only the kPrefillMoeK7Half kernels hold, or K2
+    // and K2.5 (code 25), which only the kPrefillMoeK6Low kernels hold (PrefillMoeKmax below).
     for (const auto& e : L.moe.experts)
       for (int i=0; i<3; ++i)
-        if (e.K[i]<3 || e.K[i]>kPrefillMaxK) { bad+=" "+p+"experts(K"+std::to_string(e.K[i])+")"; break; }
+        if (!PrefillWidthSupported(e.K[i]) && !HalfDecodeK(e.K[i]) && e.K[i]!=2) {
+          bad+=" "+p+"experts(K"+KName(e.K[i])+")"; break;
+        }
+    if (bad.empty() && !PrefillMoeKmax(MoeLayerWidths(L))) bad+=" "+p+"moe(widths)";
   }
   return bad;
+}
+
+// The widths of a layer's MoE projections (shared expert, then every routed expert): PrefillMoeKmax's input.
+std::vector<int> Engine::MoeLayerWidths(const Layer& L) {
+  std::vector<int> widths{L.moe.sg.K,L.moe.su.K,L.moe.sd.K};
+  for (const auto& e : L.moe.experts) widths.insert(widths.end(),{e.K[0],e.K[1],e.K[2]});
+  return widths;
 }
 
 // kPrefillAuto picks the GEMM path when the weights allow it and falls back
@@ -45,8 +57,7 @@ int Engine::ChoosePrefillRows(int requested) {
     prefill_path_="GEMM path, "+std::to_string(rows)+"-row chunks";
     return rows;
   }
-  const std::string why="prefill GEMMs need EXL3 K3.."+std::to_string(kPrefillMaxK)+
-      " weights; this checkpoint has"+bad;
+  const std::string why="prefill GEMMs need EXL3 K3..8 weights; this checkpoint has"+bad;
   if (requested!=kPrefillAuto) {
     std::fprintf(stderr,"%s; run with --prefill 0\n",why.c_str());
     std::exit(2);
@@ -62,7 +73,7 @@ void Engine::InitPrefill() {
   // The vscan path keeps q and k of the whole launch ([part][16][rows][128]): the input GEMM's
   // GdnPrepEpi writes them before the first part. +16 MiB each per 2,048 rows over 6,144.
   static_assert(kPrefillCoreRows==2048,"GdnPrepEpi takes 2,048-row parts");
-  const size_t gdn_parts=(size_t)(std::max(pf_launch_rows_,1)+kPrefillCoreRows-1)/kPrefillCoreRows;
+  const size_t gdn_parts=(size_t)(std::max(pf_room_rows_,1)+kPrefillCoreRows-1)/kPrefillCoreRows;
   const size_t qk=std::max(48*core*128,gdn_parts*prefill::kGdnPrepPartFloats);
   pf_gdn_.q=Scratch<float>(qk); pf_gdn_.k=Scratch<float>(qk);
   pf_gdn_.v=Scratch<float>(48*core*128); pf_gdn_.w=Scratch<float>(vectors);
@@ -71,11 +82,11 @@ void Engine::InitPrefill() {
   pf_gdn_.g=Scratch<float>(48*core); pf_gdn_.beta=Scratch<float>(48*core);
   pf_gdn_micro_=NumericsOn("CRUCIBLE_PF_GDN_MICRO");
   pf_gdn_.lower=Scratch<float>(matrices); pf_gdn_.qk=Scratch<float>(matrices);
-  pf_ab_=Scratch<float>(pf_launch_rows_*96);
+  pf_ab_=Scratch<float>(pf_room_rows_*96);
   pf_prompt_stacks_=Scratch<float>((size_t)prefill_rows_*kWide);
   if (pf_pad_h_) {
     pf_hstride_=kWide+64;
-    pf_H_=Scratch<float>((size_t)pf_launch_rows_*pf_hstride_);
+    pf_H_=Scratch<float>((size_t)pf_room_rows_*pf_hstride_);
   }
   // Fragment-order copies of the trunk HC fn and up (1.29 GB, one buffer)
   // for the bulk dots and mix: 4K -44 ms, same bits.
@@ -93,8 +104,8 @@ void Engine::InitPrefill() {
     HIP_OK(hipGetLastError()); HIP_OK(hipDeviceSynchronize());
     std::fprintf(stderr,"prefill HC: fragment-order fn and up copies\n");
   }
-  pf_thi_=Scratch<__half>((size_t)pf_launch_rows_*kRank);
-  pf_tlo_=Scratch<__half>((size_t)pf_launch_rows_*kRank);
+  pf_thi_=Scratch<__half>((size_t)pf_room_rows_*kRank);
+  pf_tlo_=Scratch<__half>((size_t)pf_room_rows_*kRank);
   pf_context_=Scratch<float>((size_t)prefill_rows_*kQsaOutWidth);
   pf_qhi_=Scratch<__half>((size_t)prefill_rows_*kQsaOutWidth);
   // Two-pass top-k scratch, only for contexts past kQsaCandidates blocks.
@@ -107,21 +118,21 @@ void Engine::InitPrefill() {
   std::fprintf(stderr,"prefill numerics: %s\n",pf_split_ ? "exact split (CRUCIBLE_PF_EXACT_SPLIT)"
                : "fp16 HC dots and QSA operands, fp16 pd");
   auto& a=pf_moe_;
-  const size_t routes=(size_t)pf_launch_rows_*kTopK, rows=(size_t)pf_launch_rows_*kSlots;
+  const size_t routes=(size_t)pf_room_rows_*kTopK, rows=(size_t)pf_room_rows_*kSlots;
   a.dispatch.selected=sel_moe_;
   a.dispatch.tile_counts=Zeros<int>(kExperts*((routes+255)/256));
   a.dispatch.counts=Zeros<int>(kExperts); a.dispatch.offsets=Zeros<int>(kExperts+1);
   a.dispatch.pairs=Zeros<int>(routes); a.dispatch.row_ids=Zeros<int>(routes);
   a.inverse=Zeros<int>(routes); a.item_counts=Zeros<int>(2);
   pf_tiles_=PrefillTilesFromEnv(pf_tiles_);
-  pf_x_=Scratch<__half>((size_t)pf_launch_rows_*kHidden);
+  pf_x_=Scratch<__half>((size_t)pf_room_rows_*kHidden);
   // Without the union list the flash runs per row: another key order.
   if (!NumericsOn("CRUCIBLE_PF_QSA_ROWS")) {
     const int part=std::min(prefill_rows_,kPrefillCoreRows);
     pf_qsa_union_={Zeros<int>(prefill::QsaUnionListInts(part)),
                    Zeros<int>((part+prefill::kUnionRows-1)/prefill::kUnionRows)};
   }
-  pf_plegate_=Scratch<float>((size_t)pf_launch_rows_*kStreams);
+  pf_plegate_=Scratch<float>((size_t)pf_room_rows_*kStreams);
   a.gu=Zeros<LinJob>((kExperts+1)*2); a.down=Zeros<LinJob>(kExperts+1);
   a.g_gu=Zeros<Exl3GemmJob>((kExperts+1)*2); a.g_down=Zeros<Exl3GemmJob>(kExperts+1);
   const size_t items=((rows+31)/32+kExperts+1)*40;
@@ -238,6 +249,7 @@ void Engine::PrefillBlock(int li, const Layer& L, const PrefillLayer& P, int R, 
       auto a=QArgs(L.qsa,sequence_->qc.at(li),nullptr,std::min(kPrefillCoreRows,R-o),pos0+o,sequence_->Mrope());
       a.q+=(size_t)o*kQsaQWidth; a.k+=(size_t)o*kQsaKvWidth; a.v+=(size_t)o*kQsaKvWidth; a.idx+=(size_t)o*kQsaIdxWidth;
       prefill::LaunchQsaPrefillCache(a);
+      PrefillCutAfter(o+std::min(kPrefillCoreRows,R-o),{sequence_->qc.at(li).ik_raw});
     }
     Mark("qsa_prep");
     return;
@@ -256,6 +268,7 @@ void Engine::PrefillBlock(int li, const Layer& L, const PrefillLayer& P, int R, 
         auto c=QArgs(L.qsa,sequence_->qc.at(li),nullptr,n,pos0+o,sequence_->Mrope());
         c.q+=(size_t)o*kQsaQWidth; c.k+=(size_t)o*kQsaKvWidth; c.v+=(size_t)o*kQsaKvWidth; c.idx+=(size_t)o*kQsaIdxWidth;
         prefill::LaunchQsaPrefillCache(c);
+        PrefillCutAfter(o+n,{sequence_->qc.at(li).ik_raw});
         continue;
       }
       auto a=QArgs(L.qsa,sequence_->qc.at(li),direct ? out : out+(size_t)o*kQsaOutWidth,std::min(kPrefillCoreRows,R-o),pos0+o,
@@ -267,6 +280,7 @@ void Engine::PrefillBlock(int li, const Layer& L, const PrefillLayer& P, int R, 
       if (pf_qsa_union_.list) prefill::LaunchQsaPrefillUnion(qp,pf_qsa_union_,mark,nullptr,skip);
       else prefill::LaunchQsaPrefill(qp,mark,nullptr,skip);
       if (!warming_) CaptureQsa(a,li,false);
+      PrefillCutAfter(o+n,{sequence_->qc.at(li).ik_raw});
     }
     Mark("qsa_gate");
   } else {
@@ -288,6 +302,7 @@ void Engine::PrefillBlock(int li, const Layer& L, const PrefillLayer& P, int R, 
       }
       if (pf_gdn_micro_) prefill::LaunchGdnMicro(a,pf_y_);
       else prefill::LaunchGdnLanes(a,nullptr,true,gdn_epi ? P.input.shape.rm*16 : 0);
+      PrefillCutAfter(o+n,{sequence_->gstate.at(li),sequence_->ghist.at(li),sequence_->gpend.at(li)});
     }
     Mark("gdn_core");
   }
@@ -304,9 +319,11 @@ void Engine::PrefillBlock(int li, const Layer& L, const PrefillLayer& P, int R, 
   HcRead(L.hcm,R,true,xh_,half_x && moe.packed,H,ldh,shape_rows); Mark("hc_mix");
   LaunchDense(L.moe.router,kExperts+1,kHidden,x_,kHidden,rlog_,kExperts+1,R,true);
   PrefillMoeRouteWaveKernel<<<(R+7)/8,256>>>(rlog_,sel_moe_,wts_,R); Mark("moe_router");
-  // K6 projections (4.05 shared expert) select the K6 kernel instantiations.
-  bool k6=L.moe.sg.K==6 || L.moe.su.K==6 || L.moe.sd.K==6;
-  for (const auto& e : L.moe.experts) k6=k6 || e.K[0]==6 || e.K[1]==6 || e.K[2]==6;
+  // K6 projections (4.05 shared expert) select the K6 kernel instantiations, K7 and K8 (h6_ng8
+  // shared experts) the wide ones, K3.5 experts with K7 the kPrefillMoeK7Half ones, K2 and K2.5 experts
+  // with K6 the kPrefillMoeK6Low ones (PrefillWidthIssue rejects any other set before the GEMM path runs).
+  const int kmax=PrefillMoeKmax(MoeLayerWidths(L));
+  const bool k6=kmax==6;
   // Above 8 rows HcRead(hcm) leaves the fp16 copy of x_ in xh_ for the router
   // and the packed input transform.
   auto a=pf_moe_; a.dispatch.rows=R; a.tile_rows=16*moe.rm; a.packed=moe.packed; a.xh=xh_;
@@ -318,23 +335,25 @@ void Engine::PrefillBlock(int li, const Layer& L, const PrefillLayer& P, int R, 
   if (fused) PrefillMoeFxPlanKernel<<<1,512>>>(a,L.moe.d_experts,L.moe.sg,L.moe.su,L.moe.sd);
   else PrefillMoePlanKernel<<<1,512>>>(a,L.moe.d_experts,L.moe.sg,L.moe.su,L.moe.sd);
   Mark("moe_route");
-  // M1: packed 3.05 RM 2, 4 and 6 run gate/up and the mid step in one
+  // M1: packed RM 2, 4 and 6 run gate/up and the mid step in one
   // kernel (bitwise equal to FX + Mid); other shapes keep FX + Mid. 4.05
-  // (k6) keeps FX + Mid: on Oct 14 its pair saved only 11.5 ms per 4,096
-  // rows at 32K and 6.0 at 128K, under the 10 ms kill line at 128K.
-  const bool pair=fused && !k6 && PrefillMoePairShape(moe);
+  // (k6) is back on the pair path with the RM6 window body (findings
+  // section 11); merge only after its night pair passes the kill line.
+  // Only the byte-tested K sets take the pair path (prefill_moe_kset.h).
+  const bool tested=PrefillMoePairKSet(k6,L.moe.sg.K,L.moe.su.K,L.moe.sd.K,L.moe.experts);
+  const bool pair=fused && tested && PrefillMoePairShape(moe);
   if (pair) {
     LaunchPrefillMoePair(moe.rm,a,k6); Mark("moe_gateup");
   } else if (fused) {
-    LaunchPrefillMoeFx(moe.rm,a,k6); Mark("moe_gateup");
+    LaunchPrefillMoeFxK(moe.rm,a,kmax); Mark("moe_gateup");
   } else {
     if (a.packed) PrefillMoeInputPackedKernel<<<dim3(40,(R*kSlots+15)/16),256>>>(a);
     else PrefillMoeInputKernel<<<(R*kSlots*40+7)/8,256>>>(a);
     Mark("moe_xform");
-    LaunchPrefillMoeGemm(moe,a.g_gu,a.i_gu,a.item_counts,k6); Mark("moe_gateup");
+    LaunchPrefillMoeGemmK(moe,a.g_gu,a.i_gu,a.item_counts,kmax); Mark("moe_gateup");
   }
   if (!pair) { PrefillMoeMidKernel<<<(R*kSlots*5+7)/8,256>>>(a); Mark("moe_mid"); }
-  LaunchPrefillMoeGemm(moe,a.g_down,a.i_down,a.item_counts+1,k6,half_pd); Mark("moe_down");
+  LaunchPrefillMoeGemmK(moe,a.g_down,a.i_down,a.item_counts+1,kmax,half_pd); Mark("moe_down");
   if (const float* ab=AblMlp(li)) {
     if (half_pd) PrefillMoeCombineKernel<true,true><<<(R*20+7)/8,256>>>(a,wts_,nullptr,abl_y_,kHidden);
     else PrefillMoeCombineKernel<false,true><<<(R*20+7)/8,256>>>(a,wts_,nullptr,abl_y_,kHidden);
@@ -344,9 +363,67 @@ void Engine::PrefillBlock(int li, const Layer& L, const PrefillLayer& P, int R, 
   Mark("moe_combine");
 }
 
+// x4-tail: the spec of SetPrefillJoin for this call. The retained ledger gets the
+// window start of the plan without joins (the snapshot holds it), and the cut copies arm for PrefillBlock. Runs
+// after retained.Forward, before any kernel. Host code only.
+void Engine::BeginPrefillJoin(int R, int pos0) {
+  pf_cut_={}; pf_cut_done_.clear();
+  if (!std::exchange(pf_join_set_,false)) return;
+  crucible::PrefillJoinSpec join=std::exchange(pf_join_,{});
+  std::vector<std::pair<const void*,size_t>> spans;
+  for (const auto& span : sequence_->FixedSpans()) spans.emplace_back(span.pointer,span.bytes);
+  for (const auto& [layer,cache] : sequence_->qc)
+    if (layer!=kLayers && cache.raw_slots)
+      spans.emplace_back(cache.ik_raw,size_t(cache.raw_slots)*kQsaRawDim*sizeof(float));
+  if (!crucible::PrefillJoinValid(join,R,prefill_rows_,spans)) {
+    std::fprintf(stderr,"prefill join plan fault (x4-tail): rows %d, ledger %d, cut %d, %zu copies\n",R,join.ledger,
+                 join.cut,join.copies.size());
+    std::abort();
+  }
+  if (join.ledger) {
+    const size_t end=size_t(pos0)+size_t(R);
+    if (!crucible::RetainedPrefix::FromFields({end,end,size_t(pos0+join.ledger),0},sequence_->retained)) std::abort();
+  }
+  if (!join.cut) return;
+  pf_cut_done_.assign(join.copies.size(),0);
+  pf_cut_=std::move(join);
+}
+
+// x4-tail: after the core part that ends at row `end` of the launch, the copies of `sources` (when the cut is there).
+// The null stream keeps them in order with the kernels: each copy reads its span as the part left it.
+void Engine::PrefillCutAfter(int end, std::initializer_list<const void*> sources) {
+  if (!pf_cut_.cut || end!=pf_cut_.cut) return;
+  for (const void* source : sources)
+    for (size_t i=0; i<pf_cut_.copies.size(); ++i) {
+      const auto& copy=pf_cut_.copies[i];
+      if (copy.source!=source) continue;
+      if (pf_cut_done_[i]) std::abort();
+      HIP_OK(hipMemcpyAsync(copy.target,copy.source,copy.bytes,hipMemcpyDeviceToDevice,0));
+      pf_cut_done_[i]=1;
+    }
+}
+
+// x4-tail: the PLE ring at the cut holds rows cut-16..cut-1 of this launch (the cut is at least one core part in).
+// The ring kernel of LaunchPrefillPle runs again with the cut buffer as its ring and the cut as its rows, while
+// pf_plenv_ still holds the launch's fp16 values.
+void Engine::PrefillCutPle(int pos0) {
+  if (!pf_cut_.cut) return;
+  if (!batch_streams_.empty() || VerificationSpansActive()) std::abort();
+  for (size_t i=0; i<pf_cut_.copies.size(); ++i) {
+    const auto& copy=pf_cut_.copies[i];
+    if (copy.source!=sequence_->ple_ring) continue;
+    if (pf_cut_done_[i]) std::abort();
+    PleArgs a{kv_,m_.ple.nk1,m_.ple.nq1,m_.ple.nc1,m_.ple.conv,static_cast<float*>(copy.target),nullptr,pos0,
+              pf_cut_.cut,0};
+    PrefillPleRingKernel<<<dim3(kWide/256,16),256>>>(a,pf_plenv_);
+    HIP_OK(hipGetLastError());
+    pf_cut_done_[i]=1;
+  }
+}
+
 std::vector<int> Engine::Prefill(const int* tokens, int R, const std::string& dump, bool predict,
                                  const PrefillBetween* between, int keep) {
-  if (!ContextRowsFit((int)Length(),R,sequence_->capacity,pf_launch_rows_)) std::abort();
+  if (!ContextRowsFit((int)Length(),R,sequence_->capacity,pf_room_rows_)) std::abort();
   if (!ValidTokenIds(std::span<const int>(tokens,R),kVocab)) std::abort();
   // Prefill commits every row, so the retained ledger advances like Forward(R,0,R).
   const std::string state_error=sequence_->retained.Forward(R,0,R);
@@ -355,6 +432,7 @@ std::vector<int> Engine::Prefill(const int* tokens, int R, const std::string& du
     std::exit(1);
   }
   const int pos0=sequence_->hist.size();
+  BeginPrefillJoin(R,pos0);
   sequence_->hist.insert(sequence_->hist.end(),tokens,tokens+R);
   const auto& plans=PrefillPlansFor(R);
   if (!pf_host_tokens_) pf_host_tokens_=std::make_unique<PinnedInputBuffer<int,kMaxPrefillLaunchRows>>();
@@ -370,7 +448,7 @@ std::vector<int> Engine::Prefill(const int* tokens, int R, const std::string& du
   Mark("embed"); Dump(dump,0,R,bulk_H,ldh);
   const bool prune=PrefillPrunes(R,predict,keep,dump);
   const int first=prune ? 0 : PrefillFirstRow(R,predict,keep,dump);
-  RunTrunk([&](int) { Ple(R,pos0,bulk_H,ldh); Mark("ple"); },
+  RunTrunk([&](int) { Ple(R,pos0,bulk_H,ldh); PrefillCutPle(pos0); Mark("ple"); },
            [&](int l) {
              const bool last=l==kLayers-1;
              PrefillBlock(l,m_.L[l],plans.layers[l],R,pos0,prune && last,last ? first : 0);
@@ -385,6 +463,9 @@ std::vector<int> Engine::Prefill(const int* tokens, int R, const std::string& du
                sequence_=prefilling; profile_scope_=scope;
              }
            });
+  // x4-tail: every cut copy ran once (a source that no part reached is a plan fault).
+  for (const char done : pf_cut_done_) if (!done) std::abort();
+  pf_cut_={}; pf_cut_done_.clear();
   // The stacks stay in bulk_H: the head reads its row there, and readers copy rows with CopyPrefillStacks (T2).
   last_prefill_rows_=R;
   if (!predict) { Collect(); HIP_OK(hipDeviceSynchronize()); CheckChunk(pos0,R,false); return {}; }
@@ -422,7 +503,7 @@ const Engine::MtpPrefillPlan* Engine::MtpPrefillPlanFor(int R) {
   const auto& mtp=m_.mtp;
   const auto& qsa=mtp.L.qsa;
   for (const Lin* lin : {&mtp.fe,&mtp.fh,&qsa.q,&qsa.k,&qsa.v,&qsa.idx})
-    if (lin->K<3 || lin->K>kPrefillMaxK) return nullptr;
+    if (!PrefillWidthSupported(lin->K)) return nullptr;
   // E (eple_), N (qkv_), fc_embedding (z_) and fc_hidden (kv_): attention scratch that the cache-only MTP block
   // never reads. Each holds R rows of its width (AllocateStageArena).
   std::vector<LinJob> jobs{Job(mtp.fe,eple_,kHidden,z_,kHidden,kEpiStore,nullptr,R)};

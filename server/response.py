@@ -1,5 +1,6 @@
 """Build text and tool responses without changing accepted engine tokens."""
 import json
+import math
 import time
 import uuid
 from . import metrics
@@ -7,6 +8,16 @@ from .api import ApiError
 from .tool_output import ToolOutput
 from .stop_sequences import StopSequences
 from .thinking import ThinkSplitter
+
+def scoring_field(request, token, scores):
+    """The `logprobs` field of a scoring completion. Check the engine's list before it reaches a client."""
+    if (type(scores) is not list or not 0 < len(scores) <= 20 or
+            any(type(pair) is not list or len(pair) != 2 or type(pair[0]) is not int or
+                type(pair[1]) not in (int, float) or not math.isfinite(pair[1]) for pair in scores)):
+        raise ApiError("The engine returned an invalid logprobs list.", status=500)
+    top = [dict(token_id=pair[0], logprob=pair[1]) for pair in scores]
+    chosen = next((entry["logprob"] for entry in top if entry["token_id"] == token), None)
+    return dict(content=[dict(token_id=token, logprob=chosen, top_logprobs=top[:max(request.top_logprobs, 1)])])
 
 class CompletionResponse:
     def __init__(self, handler, service, request, prompt_ids):
@@ -17,6 +28,7 @@ class CompletionResponse:
                          created=int(time.time()), model=service.model, seed=request.seed)
         self.stream = service.tokenizer.stream()
         self.ids, self.text, self.raw_text, self.displayed = [], "", "", 0
+        self.scores = None  # the engine's [[id, logprob], ...] for a scoring request
         self.stop_filter = StopSequences(request.stop)
         stream_calls = request.stream and getattr(service, "stream_tool_calls", True)
         self.tools = ToolOutput(request, stream_calls) if request.kind == "chat" and request.tools else None
@@ -137,6 +149,8 @@ class CompletionResponse:
             choice["message" if self.request.kind == "chat" else "text"] = message if self.request.kind == "chat" else full_text
             if self.request.return_token_ids:
                 choice["token_ids"] = self.ids
+            if getattr(self.request, "top_logprobs", 0):
+                choice["logprobs"] = scoring_field(self.request, self.ids[0], self.scores)
             self.handler.send_json(200, self.base | dict(
                 object="chat.completion" if self.request.kind == "chat" else "text_completion", choices=[choice], usage=usage))
 

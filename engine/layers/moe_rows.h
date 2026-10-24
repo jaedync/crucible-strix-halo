@@ -156,7 +156,7 @@ __device__ __forceinline__ void MoeGemvCols(const LinJob& job, int s, const int 
   const int lane = threadIdx.x & 31;
   const LaneWindow<K> win(lane);
   const int q = lane & 3;
-  constexpr int T = 8 * K;
+  constexpr int T = TileDwords(K);  // 8 K dwords; half K: lane_window.h
   const int A = __builtin_amdgcn_readfirstlane(job.I >> 4);
   const int span = __builtin_amdgcn_readfirstlane(A / job.S);
   const int a0 = s * span;
@@ -292,7 +292,7 @@ __device__ __forceinline__ void MoeGemvColsChunked(const LinJob& job, int s, con
   const int lane = threadIdx.x & 31;
   const LaneWindow<K> win(lane);
   const int q = lane & 3;
-  constexpr int T = 8 * K;
+  constexpr int T = TileDwords(K);
   constexpr int XW = R * XC * 8;           // dwords per chunk buffer
   constexpr int XL = (XW + 255) / 256;     // fill dwords per thread
   const int A = __builtin_amdgcn_readfirstlane(job.I >> 4);
@@ -449,15 +449,17 @@ __device__ __forceinline__ void MoeRowsBodyP(int rows, const LinJob& job, const 
 }
 
 // Routed experts (KR=3 at 3.05, 4 at 4.05) run their compact row count; the
-// shared expert (KR+2) always runs all R rows. KR is a template argument, not
+// shared expert (KS, KR+2 on those packs) always runs all R rows. KR is a template argument, not
 // a runtime branch: one kernel holding the bodies of both checkpoints needs
 // more registers and lost 6% of serial decode on 3.05.
-template <int R, int KR, int PF, int C, int CACHE, typename Prep>
+// The h6_ng8 packs (MoeFusedKernelWide) have a KS 6, 7 or 8 shared expert; each layer's routed experts
+// have one width.
+template <int R, int KR, int KS, int PF, int C, int CACHE, typename Prep>
 __device__ __forceinline__ void MoeAnyBody(int K, int rows, const LinJob& job, const GemvItem& item,
                                            uint32_t* xs, Prep prep) {
   if (K == KR) MoeRowsBodyP<KR, R, PF, C, CACHE>(rows, job, item, xs, prep);
   // A packed pass pads its last shared chunk to kMaxRows rows (BuildLayer).
-  else if (K == KR + 2 && rows == R) MoeGemvCore<KR + 2, R, PF, C, CACHE>(job, item, xs, prep);
+  else if (K == KS && rows == R) MoeGemvCore<KS, R, PF, C, CACHE>(job, item, xs, prep);
   else __builtin_trap();  // ValidateMoe admits no other widths
 }
 
@@ -470,11 +472,11 @@ __device__ __forceinline__ void MoeRowsBodyChunked(int rows, const LinJob& job, 
 }
 
 // MoeAnyBody for gate/up items with chunked x staging.
-template <int R, int KR, int PF, int C, int CACHE, int XC>
+template <int R, int KR, int KS, int PF, int C, int CACHE, int XC>
 __device__ __forceinline__ void MoeAnyBodyChunked(int K, int rows, const LinJob& job, const GemvItem& item,
                                                   uint32_t* xs) {
   if (K == KR) MoeRowsBodyChunked<KR, R, PF, C, CACHE, XC>(rows, job, item, xs);
-  else if (K == KR + 2 && rows == R) MoeGemvCoreChunked<KR + 2, R, PF, C, CACHE, XC>(job, item, xs);
+  else if (K == KS && rows == R) MoeGemvCoreChunked<KS, R, PF, C, CACHE, XC>(job, item, xs);
   else __builtin_trap();
 }
 
@@ -523,8 +525,8 @@ __global__ void __launch_bounds__(256) MoeFusedKernel(const LinJob* __restrict__
     const int K = __builtin_amdgcn_readfirstlane(job.K);
     if (K == 0) return;
     const int rows = __builtin_amdgcn_readfirstlane(job.R);
-    if constexpr (XC > 0) MoeAnyBodyChunked<R, KR, PF, C, CACHE, XC>(K, rows, job, item, xs);
-    else MoeAnyBody<R, KR, PF, C, CACHE>(K, rows, job, item, xs, [&] { MoeFillX(job, item, rows, xs); });
+    if constexpr (XC > 0) MoeAnyBodyChunked<R, KR, KR + 2, PF, C, CACHE, XC>(K, rows, job, item, xs);
+    else MoeAnyBody<R, KR, KR + 2, PF, C, CACHE>(K, rows, job, item, xs, [&] { MoeFillX(job, item, rows, xs); });
     // MoeGemvCore and MoeGemvCoreChunked end with a barrier, so every wave's partial stores precede
     // this release.
     if (threadIdx.x == 0)
@@ -562,7 +564,67 @@ __global__ void __launch_bounds__(256) MoeFusedKernel(const LinJob* __restrict__
     }
     __syncthreads();
   };
-  MoeAnyBody<R, KR, PF, C, CACHE>(K, rows, d, item, xs, prep);
+  MoeAnyBody<R, KR, KR + 2, PF, C, CACHE>(K, rows, d, item, xs, prep);
+}
+
+// MoeFusedKernel for the h6_ng8 packs: shared expert KS (6, 7 or 8), routed experts KR (KS 6: K2, K2.5
+// or K3, the 2.18 and 2.68 packs). A copy of
+// MoeFusedKernel's body, not a shared inline function: moving that body into a function changed the
+// code of the train 23 kernels (isa_same), so the old kernel stays verbatim.
+template <int R, int KR, int KS, int PF = kMoePf, int CACHE = 0, int C = kMoeCols, int XC = 0>
+__global__ void __launch_bounds__(256) MoeFusedKernelWide(const LinJob* __restrict__ gu,
+                                                          const GemvItem* __restrict__ gu_items, int n_gu,
+                                                          const LinJob* __restrict__ dn,
+                                                          const GemvItem* __restrict__ dn_items, int n_dn,
+                                                          unsigned* __restrict__ done) {
+  static_assert(KS == 6 || KS == 7 || KS == 8);
+  extern __shared__ uint32_t xs[];
+  if ((int)blockIdx.x < n_gu) {
+    const GemvItem item = gu_items[blockIdx.x];
+    const LinJob& job = gu[item.job];
+    const int K = __builtin_amdgcn_readfirstlane(job.K);
+    if (K == 0) return;
+    const int rows = __builtin_amdgcn_readfirstlane(job.R);
+    if constexpr (XC > 0) MoeAnyBodyChunked<R, KR, KS, PF, C, CACHE, XC>(K, rows, job, item, xs);
+    else MoeAnyBody<R, KR, KS, PF, C, CACHE>(K, rows, job, item, xs, [&] { MoeFillX(job, item, rows, xs); });
+    // MoeGemvCore and MoeGemvCoreChunked end with a barrier, so every wave's partial stores precede
+    // this release.
+    if (threadIdx.x == 0)
+      __hip_atomic_fetch_add(done + (item.job >> 1), 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    return;
+  }
+  const GemvItem item = dn_items[blockIdx.x - n_gu];
+  const int u = item.job;
+  const LinJob& d = dn[u];
+  const int K = __builtin_amdgcn_readfirstlane(d.K);
+  if (K == 0) return;
+  const int rows = __builtin_amdgcn_readfirstlane(d.R);
+  // The wait for the gate/up items and the mid, as the body's x staging.
+  auto prep = [&] {
+    if (threadIdx.x == 0)
+      while (__hip_atomic_load(done + u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < (unsigned)kMoeGuItems<C>)
+        __builtin_amdgcn_s_sleep(1);
+    __syncthreads();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    // Mid for this job's rows into LDS, in the xh layout the body reads.
+    __half* xh = reinterpret_cast<__half*>(xs);
+    const int lane = threadIdx.x & 31;
+    for (int t = threadIdx.x >> 5; t < rows * 5; t += 8) {
+      const int r = t / 5, blk = t % 5;
+      float gv[4], uv[4];
+      LinOutBlock(gu[u * 2], r, blk, gv);
+      LinOutBlock(gu[u * 2 + 1], r, blk, uv);
+      const int c0 = blk * 128 + lane * 4;
+      float v[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) v[i] = RoundH(RoundH(Silu(gv[i]) * uv[i]) * __half2float(d.suh[c0 + i]));
+      Wht128(v);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) xh[r * kMoeInter + c0 + i] = __float2half(v[i] * kHadNorm);
+    }
+    __syncthreads();
+  };
+  MoeAnyBody<R, KR, KS, PF, C, CACHE>(K, rows, d, item, xs, prep);
 }
 
 // MoeCombineKernel (bench/kernels/moe_rows.h) with compact expert rows. All slot loads issue before the

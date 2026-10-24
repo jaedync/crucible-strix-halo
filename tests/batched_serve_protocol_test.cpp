@@ -19,9 +19,20 @@ int main() {
   // The disk tier: stage names a request only, so the engine can start a disk read before the open.
   const auto stage = ParseBatchCommand(R"({"op":"stage","request":{"ids":[1,2],"max_tokens":3,"spec":0}})", 32);
   assert(stage.op == "stage" && stage.request && stage.request->ids.size() == 2 && stage.request_id == 0);
+  assert(stage.position == 0 && stage.read);
+  // An earlier change: the turn's place in the server's queue, and a turn that may not start a read.
+  const auto queued = ParseBatchCommand(R"({"op":"stage","request":{"ids":[1,2],"max_tokens":3,"spec":0},"position":3,"read":0})", 32);
+  assert(queued.position == 3 && !queued.read && queued.job == 0);
+  // Fix 2 (cause.md item 10): the server's tag of the turn, for the stage and host_evict lines.
+  const auto tagged = ParseBatchCommand(R"({"op":"stage","request":{"ids":[1,2],"max_tokens":3,"spec":0},"position":0,"read":1,"job":42})", 32);
+  assert(tagged.job == 42 && tagged.read);
   for (const auto& bad : {
     R"({"op":"stage","request_id":1,"request":{"ids":[1,2],"max_tokens":3,"spec":0}})",
     R"({"op":"stage"})",
+    R"({"op":"stage","request":{"ids":[1,2],"max_tokens":3,"spec":0},"read":2})",
+    R"({"op":"stage","request":{"ids":[1,2],"max_tokens":3,"spec":0},"position":4097})",
+    R"({"op":"close","request_id":1,"position":1})",
+    R"({"op":"open","request_id":1,"request":{"ids":[1,2],"max_tokens":3,"spec":0},"job":1})",
     R"({"op":"prefill","request_id":5,"request_ids":[2]})",
     R"({"op":"prefill","request_id":5,"every":8})",
     R"({"op":"prefill","request_id":5,"request_ids":[5,2],"every":8})",

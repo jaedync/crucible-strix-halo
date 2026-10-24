@@ -286,7 +286,7 @@ def test_engine_messages_cover_the_serve_path():
     root = Path(__file__).parents[2]
     engine = root / "engine"
     pattern = re.compile(r'(?:runtime_error|invalid_argument|logic_error|out_of_range|overflow_error|length_error|'
-                         r'RecoverableOpenError)\("([^"\\]*)"')
+                         r'RecoverableOpenError|ServeTenantError)\("([^"\\]*)"')
     serve = ("engine/serve/serve.h", "engine/serve/serve_protocol.h", "engine/serve/batched_serve.h", "engine/serve/batched_serve_protocol.h",
              "engine/serve/batch_session.h", "engine/runtime/conversation_admission.h", "engine/model/flashnext/multimodal.h", "engine/model/flashnext/vision.h",
              "engine/serve/serve_settings.h", "engine/serve/batched_serve_settings.h", "engine/engine.hip",

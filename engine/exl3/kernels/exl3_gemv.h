@@ -5,7 +5,7 @@
 // lane t owns positions 8t..8t+7, i.e. rows {r0, r0+1, r0+8, r0+9} of columns
 // {c0, c0+8} with r0 = 2(t%4), c0 = t/4. Its eight 16-bit trellis states are
 // one contiguous 7K+16 bit window, so three dword loads and two funnel shifts
-// cover every state. Products use v_dot2_f32_f16 into fp32, one accumulator
+// cover every state (K <= 8, lane_window.h). Products use v_dot2_f32_f16 into fp32, one accumulator
 // chain per (row, column) in a fixed tile order: a row's result never depends
 // on how many rows share the pass (exact batching / drafting).
 //
@@ -18,6 +18,8 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+
+#include "lane_window.h"
 
 namespace crucible {
 
@@ -63,42 +65,31 @@ __device__ __forceinline__ __half2 Mul1Pair(uint32_t p0, uint32_t p1) {
   return __hfma2(h, inv, bias);
 }
 
-// Lane-invariant geometry of the lane's 96-bit window inside a tile ring.
-template <int K>
-struct LaneWindow {
-  // Two aligned dwords hold the state span. K=6 needs 58 bits; K=7 needs 65.
-  static_assert(K > 0 && 7 * K + 16 <= 64);
-  int d0;     // first dword (ring index) of the 3-dword window
-  int shift;  // 1..32: the lane's first state bit is bit `shift` of w0:w1
-  __device__ explicit LaneWindow(int t) {
-    int s = (8 * t + 1) * K - 16;  // first bit of position 8t's state
-    // floor((s - 1) / 32) keeps shift in 1..32, so alignbit's 5-bit shift
-    // amount 32 - shift never wraps and no lane needs a select.
-    int dw = (s - 1 >= 0) ? (s - 1) / 32 : -((32 - s) / 32);
-    d0 = ((dw % (8 * K)) + 8 * K) % (8 * K);
-    shift = s - dw * 32;
-  }
-};
-
 // Decodes the lane's 8 weights of one tile into 4 half2:
 // P0 = rows (r0, r0+1) col c0, P1 = rows (r0+8, r0+9) col c0,
 // P2 = rows (r0, r0+1) col c0+8, P3 = rows (r0+8, r0+9) col c0+8.
 template <int K, int MODE>
 __device__ __forceinline__ void DecodeLane(uint32_t w0, uint32_t w1, uint32_t w2,
                                            int shift, __half2 P[4]) {
-  // Aligned big-endian stream: bit 0 of the lane's range is a0's MSB.
-  uint32_t a0 = __builtin_amdgcn_alignbit(w0, w1, 32 - shift);
-  uint32_t a1 = __builtin_amdgcn_alignbit(w1, w2, 32 - shift);
   uint32_t st[8];
+  if constexpr (7 * K + 16 <= 64) {
+    // K <= 6: the train 23 code, kept verbatim so that its kernels stay ISA-equal (the LaneStates
+    // form computes the same states, but the compiler schedules it differently).
+    // Aligned big-endian stream: bit 0 of the lane's range is a0's MSB.
+    uint32_t a0 = __builtin_amdgcn_alignbit(w0, w1, 32 - shift);
+    uint32_t a1 = __builtin_amdgcn_alignbit(w1, w2, 32 - shift);
 #pragma unroll
-  for (int j = 0; j < 8; ++j) {
-    constexpr int kW = 32;
-    int end = j * K + 16;  // state j = bits [jK, jK + 16)
-    if (end <= kW) {
-      st[j] = a0 >> (kW - end);
-    } else {
-      st[j] = __builtin_amdgcn_alignbit(a0, a1, 64 - end);
+    for (int j = 0; j < 8; ++j) {
+      constexpr int kW = 32;
+      int end = j * K + 16;  // state j = bits [jK, jK + 16)
+      if (end <= kW) {
+        st[j] = a0 >> (kW - end);
+      } else {
+        st[j] = __builtin_amdgcn_alignbit(a0, a1, 64 - end);
+      }
     }
+  } else {
+    LaneStates<K>(w0, w1, w2, shift, st);  // K7, K8 and half widths (code 35 = K3.5): lane_window.h
   }
   uint32_t p[8];
 #pragma unroll

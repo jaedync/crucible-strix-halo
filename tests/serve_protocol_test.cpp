@@ -16,6 +16,11 @@ int main() {
   assert(r.stop_ids.size() == 2);
   const auto cached = ParseServeRequest(R"({"ids":[1,2],"max_tokens":1,"cache_control":"refresh","cache_prefix_tokens":1})", 32);
   assert(cached.cache_control == "refresh" && cached.cache_prefix_tokens == 1);
+  assert(ParseServeRequest(R"({"ids":[1],"max_tokens":1,"top_logprobs":20})", 32).top_logprobs == 20);
+  assert(ParseServeRequest(R"({"ids":[1],"max_tokens":1})", 32).top_logprobs == 0);
+  Rejected(R"({"ids":[1],"max_tokens":1,"top_logprobs":21})", "top_logprobs");
+  Rejected(R"({"ids":[1],"max_tokens":2,"top_logprobs":3})", "top_logprobs");
+  Rejected(R"({"ids":[1],"max_tokens":1,"temperature":0.5,"top_logprobs":3})", "top_logprobs");
   Rejected(R"({"ids":[1],"cache_control":"purge"})", "cache_control");
   assert(ParseServeRequest(R"({"ids":[1,2],"max_tokens":1,"cache_tail":"guard"})", 32).cache_tail == "guard");
   assert(ParseServeRequest(R"({"ids":[1,2],"max_tokens":1})", 32).cache_tail == "auto");

@@ -140,14 +140,16 @@ class CheckpointTests(unittest.TestCase):
         self.rejected(self.linear(dtype="BF16"), "expected dtype F16")
 
     def test_unsupported_k(self):
-        for width in (16, 40, 112, 128):
+        # K1, K9 and half widths: the probe's matrix is not a routed expert, so K3.5 (56) is rejected too.
+        for width in (16, 24, 40, 56, 144):
             self.rejected(self.linear(width=width), "supported K")
 
     def test_scale_length(self):
         self.rejected(self.linear(scale=127), "shape")
 
     def test_valid_linear(self):
-        for width in (32, 48, 64, 80, 96):
+        # K2..K6, and K7/K8 (kWideDecodeK: the h6_ng8 packs' dense and shared matrices).
+        for width in (32, 48, 64, 80, 96, 112, 128):
             result = self.linear(width=width)
             self.assertEqual(result.returncode, 0, result.stderr)
 

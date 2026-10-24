@@ -65,6 +65,10 @@ int main() {
   assert(parse({"--streams","4","--conversation-cache-mib","64","--session-replay","1","--state-dir","/x",
                 "--state-disk-write-gib-per-day","0"}).state_write_gib_per_day==0);
   assert(parse({"--streams","4","--conversation-cache-mib","64","--session-replay","1","--state-dir","/x"}).state_disk_gib==64);
+  // Fix 2 of an earlier change: the same-second GPU test delays each state write (default 0: no wait).
+  assert(parse({"--streams","4","--conversation-cache-mib","64","--session-replay","1","--state-dir","/x"}).state_write_delay_ms==0);
+  assert(parse({"--streams","4","--conversation-cache-mib","64","--session-replay","1","--state-dir","/x",
+                "--state-disk-write-delay-ms","3000"}).state_write_delay_ms==3000);
   for (const auto args:std::vector<std::vector<std::string_view>>{
       {"--streams","4","--state-dir","/x"},
       {"--streams","4","--conversation-cache-mib","64","--state-dir","/x"},
@@ -75,6 +79,11 @@ int main() {
       {"--streams","4","--conversation-cache-mib","64","--session-replay","1","--state-dir","/x","--state-disk-gib","65537"},
       {"--streams","4","--conversation-cache-mib","64","--session-replay","1","--state-disk-gib","10"},
       {"--streams","4","--conversation-cache-mib","64","--session-replay","1","--state-disk-write-gib-per-day","10"},
+      {"--streams","4","--conversation-cache-mib","64","--session-replay","1","--state-disk-write-delay-ms","10"},
+      {"--streams","4","--conversation-cache-mib","64","--session-replay","1","--state-dir","/x",
+       "--state-disk-write-delay-ms","60001"},
+      {"--streams","4","--conversation-cache-mib","64","--session-replay","1","--state-dir","/x",
+       "--state-disk-write-delay-ms","-1"},
       {"--streams","4","--conversation-cache-mib","64","--session-replay","1","--state-dir","/x",
        "--state-disk-write-gib-per-day","-1"},
       {"--streams","4","--conversation-cache-mib","64","--session-replay","1","--state-dir","/x",

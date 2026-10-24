@@ -36,6 +36,9 @@ cache_enabled = os.environ.get("FAKE_CACHE") == "1"
 # FAKE_CHECKPOINTS=1: each slot keeps its last prompt's end state (engine/runtime/slot_checkpoints.h). An open takes a free slot
 # whose end state its prompt repeats, and resumes there; any later open on that slot replaces the state.
 checkpoints = os.environ.get("FAKE_CHECKPOINTS") == "1"
+# FAKE_END_RESUME=1 (re-send fix A): a prompt equal to a slot's end state resumes the whole prompt;
+# its prefill command runs no row and publishes the first token.
+end_resume = os.environ.get("FAKE_END_RESUME") == "1"
 ends = {}
 command_log = os.environ.get("FAKE_COMMAND_LOG")
 rejection_mode = os.environ.get("FAKE_REJECTION_MODE", "safe")
@@ -58,6 +61,18 @@ def log_pixels(ok):
         with open(pixel_log, "a") as file: file.write(("ok" if ok else "bad") + "\n")
 
 
+# FAKE_LIVE_DRAFTS=1: as engine/serve/batch_session.h BatchStepDraftFields, the first token event of a speculative
+# step carries the request's cumulative counters. A spec_step proposes 3 and accepts 2; a verify_step proposes 2 and
+# accepts 1.
+live_drafts = os.environ.get("FAKE_LIVE_DRAFTS") == "1"
+
+
+def step_counts(state, proposed, accepted):
+    counts = state.setdefault("live", [0, 0, 0])
+    counts[0] += proposed; counts[1] += accepted; counts[2] += 1
+    return dict(zip(("draft_proposed", "draft_accepted", "spec_steps"), counts)) if live_drafts else {}
+
+
 def done_event(id, state):
     if state_disk: finished_prompts.append(list(state["request"]["ids"]))
     event = dict(event="done", request_id=id, slot_generation=state["generation"],
@@ -71,6 +86,9 @@ def done_event(id, state):
         if state["request"].get("draft_detail") == 1:  # per-token counters, equal to the position arrays above: 71 is missed for 99
             event.update(draft_tally=[[70, 1, 11, 9], [71, 2, 9, 6], [72, 3, 6, 4], [73, 4, 4, 2], [74, 5, 2, 1], [75, 6, 1, 0]], draft_miss=[[71, 2, 99, 2]], draft_detail_cut=0,
                          draft_lookup_rounds=0)
+    if live_drafts and "live" in state:
+        # The done event's three counters equal the last step's (one counter set in the engine).
+        event.update(zip(("draft_proposed", "draft_accepted", "spec_steps"), state["live"]))
     if cache_enabled:
         # This fixture checks metadata transport, not device snapshot exactness.
         event.update(cached_tokens=state["cached"], cache_class="shared")
@@ -131,6 +149,9 @@ for line in sys.stdin:
                               error="an image file does not match its digest", recoverable=True)), flush=True)
         print(json.dumps(dict(event="batch_end", op=op)), flush=True)
         continue
+    # An End resume (FAKE_END_RESUME): the prefill command runs no row and names no cursor, as the engine.
+    whole = op == "prefill" and command.get("request_id") in active and \
+        active[command["request_id"]]["cursor"] == len(active[command["request_id"]]["request"]["ids"])
     # The engine runs no decode pass in a command that runs an encoder slice.
     slicing = op == "prefill" and changed_id in active and active[changed_id].get("slices")
     if op == "prefill" and command.get("request_ids") and not slicing:
@@ -169,7 +190,8 @@ for line in sys.stdin:
             print(json.dumps(dict(event="error", error="no free sequence slot holds this request")), flush=True)
             print(json.dumps(dict(event="batch_end", op=op)), flush=True)
             continue
-        repeats = lambda index: index in ends and len(ends[index]) < len(request["ids"]) and \
+        repeats = lambda index: index in ends and (len(ends[index]) <= len(request["ids"]) if end_resume else
+                                                   len(ends[index]) < len(request["ids"])) and \
             request["ids"][:len(ends[index])] == ends[index]
         slot = min(free, key=lambda index: (contexts[index], not (checkpoints and repeats(index)), index))
         if checkpoints:
@@ -191,10 +213,13 @@ for line in sys.stdin:
         # A fixed window of three tokens, cut at max_tokens, stands in for draft and verify.
         id = command["request_id"]
         state = active[id]
+        counts = step_counts(state, 3, 2)
         for _ in range(3):
             state["token"] += 1
             state["count"] += 1
-            events.append(dict(event="token", request_id=id, slot_generation=state["generation"], id=state["token"]))
+            events.append(dict(event="token", request_id=id, slot_generation=state["generation"], id=state["token"]) |
+                          counts)
+            counts = {}
             if state["count"] == state["request"]["max_tokens"]:
                 events.append(done_event(id, state))
                 del active[id]
@@ -243,10 +268,13 @@ for line in sys.stdin:
             state = active[id]
             # A verify step stands in for one accepted draft: speculative requests publish two tokens.
             speculative = op == "verify_step" and state["request"]["spec"] > 0 and state["request"]["max_tokens"] > 1
+            counts = step_counts(state, 2, 1) if speculative else {}
             for _ in range(2 if speculative else 1):
                 state["token"] += 1
                 state["count"] += 1
-                events.append(dict(event="token", request_id=id, slot_generation=state["generation"], id=state["token"]))
+                events.append(dict(event="token", request_id=id, slot_generation=state["generation"], id=state["token"]) |
+                              counts)
+                counts = {}
                 if state["count"] == state["request"]["max_tokens"]:
                     events.append(done_event(id, state))
                     del active[id]
@@ -254,7 +282,7 @@ for line in sys.stdin:
     for event in events: print(json.dumps(event), flush=True)
     boundary = dict(event="batch_end", op=op)
     # The engine names its prompt cursor after each prefill chunk (the final chunk ends the prompt).
-    if op == "prefill" and os.environ.get("FAKE_NO_CURSOR") != "1" and not sliced:
+    if op == "prefill" and os.environ.get("FAKE_NO_CURSOR") != "1" and not sliced and not whole:
         boundary["cursor"] = cursor if cursor is not None else len(prompts[command["request_id"]])
     print(json.dumps(boundary), flush=True)
     # FAKE_SETTLE_ERROR=1: the prompt end after a first token fails (engine/serve/batched_serve.h): one error

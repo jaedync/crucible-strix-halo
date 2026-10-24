@@ -188,17 +188,25 @@
 #ifdef CRUCIBLE_QSA_TRACE
       QsaTrace(li, 0);
 #endif
-      QsaPrepKernel<<<dim3(33, R), 256>>>(a);
-      QsaPoolKernel<<<1, 256>>>(a);
+      // At R = 1 Prep runs the pool and, below 2048 positions, the selection's result; the split attention
+      // merges in its own launch (QsaAttnTailKernel).
+      const bool tail = R == 1;
+      if (tail) {
+        QsaPrepKernel<QsaArgs, 0, true><<<dim3(33, 1), 256>>>(a);
+      } else {
+        QsaPrepKernel<<<dim3(33, R), 256>>>(a);
+        QsaPoolKernel<<<1, 256>>>(a);
+      }
       LaunchQsaRetainRaw(a);
 #ifdef CRUCIBLE_QSA_TRACE
       QsaTrace(li, 1);
 #endif
-      LaunchQsaSelect(a, qsa_scratch_);
+      if (!tail || (pos0 + 1) / 4 > kSelBlocks) LaunchQsaSelect(a, qsa_scratch_);
 #ifdef CRUCIBLE_QSA_TRACE
       QsaTrace(li, 2);
 #endif
-      LaunchQsaAttn(a, qsa_scratch_);
+      if (tail) QsaAttnTailKernel<<<dim3(2, 1, kQsaSplits), 384>>>(a, qsa_scratch_, qsa_sync_);
+      else LaunchQsaAttn(a, qsa_scratch_);
 #ifdef CRUCIBLE_QSA_TRACE
       QsaTrace(li, 3);
 #endif

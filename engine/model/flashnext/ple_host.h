@@ -1,8 +1,10 @@
 // PLE n-gram rows gathered on the CPU from the mmapped checkpoint instead of a
-// device-resident copy (CRUCIBLE_PLE_HOST=1). The table is 32.6 GB (3.05) or
-// 39.0 GB (4.05), and each token reads only 16 rows, so the page cache holds
-// the rows in use and the rest stays on disk. The rows are plain copies of the
-// file bytes, which are the same bytes the resident path uploads.
+// device-resident copy (CRUCIBLE_PLE_HOST=1). The table is 32.6 GB (3.05),
+// 39.0 GB (4.05) or 102.4 GB (the BF16 rows of CRUCIBLE_PLE_BF16, 320 B each),
+// and each token reads only 16 rows, so the page cache holds the rows in use
+// and the rest stays on disk. The rows are plain copies of the file bytes,
+// which are the same bytes the resident path uploads. Nothing here depends on
+// the row size: a row can cross a page edge, and the hints cover both pages.
 // The file must stay unchanged while the engine runs: a truncated file makes a
 // later row read fail with SIGBUS, and a rewritten file changes the rows.
 #pragma once

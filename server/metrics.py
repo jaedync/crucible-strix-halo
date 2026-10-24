@@ -98,13 +98,33 @@ def _round(value):
 
 # Cache visibility from the engine's done event (batch serve). An older engine omits them; a wrong type is dropped.
 CACHE_INT_FIELDS = ("cache_saved_tokens", "cache_tail_tokens", "cache_entries", "cache_bytes", "cache_evictions",
-                    "host_free_mib", "slot_context")
+                    "host_free_mib", "slot_context", "cache_pinned_bytes",
+                    # An earlier change: the state nearest to a miss and how much of it the prompt repeats.
+                    "closest_shared_tokens",
+                    # An earlier change: per-tier lookups, hits and reused tokens (slot, host, disk), cumulative.
+                    "cache_slot_lookups", "cache_slot_hits", "cache_slot_tokens",
+                    "cache_host_lookups", "cache_host_hits", "cache_host_tokens",
+                    "cache_disk_lookups", "cache_disk_hits", "cache_disk_tokens")
+# The engine's fixed miss causes (engine/serve/cache_status.h) plus ssd_read_failed, which the server adds for
+# a failed disk read. A log reader can map a word it does not know to "other", so a new reason never costs the turn's metrics.
+MISS_REASONS = frozenset(("none", "bypass", "too_short", "new", "diverged", "evicted", "not_saved",
+                          "above_limit", "above_prompt", "off_grid", "schedule", "rows", "tail", "empty",
+                          "unknown", "ssd_read_failed"))
+CLOSEST_OUTCOMES = frozenset(("all", "prompt_differs", "reply_differs"))
 
 
 def _cache_fields(event):
     fields = {key: event[key] for key in CACHE_INT_FIELDS if type(event.get(key)) is int}
     if type(event.get("cache_save_refused")) is str:
         fields["cache_save_refused"] = event["cache_save_refused"]
+    # The miss diagnosis: a closed set of words, so no request text can reach the line.
+    if event.get("miss_reason") in MISS_REASONS:
+        fields["miss_reason"] = event["miss_reason"]
+    if event.get("closest_outcome") in CLOSEST_OUTCOMES:
+        fields["closest_outcome"] = event["closest_outcome"]
+    age = event.get("closest_age_s")
+    if type(age) in (int, float) and not isinstance(age, bool) and age >= 0:
+        fields["closest_age_s"] = float(age)
     # A count from the opened event comes with no cache class (request_line): replay_hit is then unknown, not false.
     if type(event.get("cached_tokens")) is int and not event.get("cache_class_unknown"):
         fields["replay_hit"] = bool(event["cached_tokens"]) and event.get("session_replay") is True
@@ -112,6 +132,10 @@ def _cache_fields(event):
         fields["slot_resume"] = True  # the replay state was still on the slot: no host restore
     if event.get("checkpoint_resume") is True:
         fields["checkpoint_resume"] = True  # an in-slot checkpoint: the prompt left the previous output
+    if event.get("frontier_copy") is True:
+        fields["frontier_copy"] = True  # a copy of another slot's Frontier point
+    if event.get("end_resume") is True:
+        fields["end_resume"] = True  # the whole prompt from an End point with outputs (re-send fix A)
     return fields
 
 
@@ -151,8 +175,9 @@ def draft_fields(*parts):
     The engine's done event names a speculative job's counters (spec_steps, draft_proposed, draft_accepted). Without
     them the batch worker's counts stand in: spec_rounds is the decode steps or passes that served the job, and
     draft_accepted their tokens less one correction per round (low by a cut round's rest, never high). The engine
-    values count only when every job that decoded reported them; a closed think turn's first job is cancelled
-    before its done event, so after any decode of it the turn uses the worker's counts for both jobs.
+    values count only when every job that decoded reported them. A closed think turn's first job is cancelled
+    before its done event: its last step counters (note_token, draft_live) stand in, and without them the turn
+    uses the worker's counts for both jobs.
     """
     engine = [all(type((event or {}).get(key)) is int for key in ENGINE_DRAFT_FIELDS) for _, event in parts]
     counted = [turn for turn, _ in parts if turn and type(turn.get("spec_rounds")) is int]
@@ -165,6 +190,89 @@ def draft_fields(*parts):
     if not counted: return None
     rounds = sum(turn["spec_rounds"] for turn in counted)
     return dict(spec_rounds=rounds, draft_accepted=sum(turn.get("round_tokens", 0) for turn in counted) - rounds)
+
+
+# crucible_decode (live drafts for a log reader): at most one line a second for each decoding
+# speculative turn, and one final line with its crucible_turn values. Counts only, never token IDs or text.
+DECODE_LINE_SECONDS = 1.0
+DECODE_DRAFT_KEYS = ("spec_rounds", "draft_proposed", "draft_accepted")
+
+
+def note_token(turn, event):
+    """Count one published token, and keep the cumulative draft counters that the first token event of a speculative
+    step carries (engine/serve/batch_session.h BatchStepDraftFields). Counters only: nothing reads them to decide."""
+    try:
+        turn["decode_tokens"] = turn.get("decode_tokens", 0) + 1
+        if all(type(event.get(key)) is int and event[key] >= 0 for key in ENGINE_DRAFT_FIELDS):
+            turn["draft_live"] = {key: event[key] for key in ENGINE_DRAFT_FIELDS}
+    except (AttributeError, TypeError):  # A counter must never fail a request.
+        return
+
+
+def _decode_text(fields):
+    try:
+        return "crucible_decode " + json.dumps({key: _round(value) for key, value in fields.items()}, allow_nan=False)
+    except (TypeError, ValueError):  # A log line must never stop the worker.
+        return None
+
+
+def decode_line(job, t):
+    """The live crucible_decode line of a speculative turn after one of its decode steps, or None (no speculation, no
+    round yet, or less than DECODE_LINE_SECONDS since the turn's last line or its first token).
+
+    A think-cap continuation (job.after) writes for its first job: the same request_id and rate limit, the client's
+    completion count (the first job's tokens up to the close and the close text, closed_count, then its own tokens),
+    and draft counts over both jobs, as request_line sums them.
+    """
+    try:
+        first = getattr(job, "after", None)
+        owner = (first or job).turn
+        start = owner.get("t_first_token")
+        if (not owner.get("speculative") or owner.get("decode_final") or start is None or
+                t - owner.get("decode_line_t", start) < DECODE_LINE_SECONDS):
+            return None  # decode_final: the final line is out (a stop string ends the client before its job)
+        turn = job.turn
+        if first is None:
+            draft, done = draft_fields((turn, turn.get("draft_live"))), turn.get("decode_tokens", 0)
+        else:
+            draft = draft_fields((owner, owner.get("draft_live")), (turn, turn.get("draft_live")))
+            done = owner.get("closed_count", owner.get("decode_tokens", 0)) + turn.get("decode_tokens", 0)
+        if getattr(job, "think_cap", None) is not None:
+            done = min(done, job.think_cap)  # tokens past an armed cap are discarded, so the count stays monotonic
+        # a log parser needs draft_proposed: without the engine's step counters (an older engine, or packed_op step
+        # before the first speculative step) the turn writes no line.
+        if not draft or not draft.get("spec_rounds") or "draft_proposed" not in draft or type(done) is not int:
+            return None
+        owner["decode_line_t"] = t
+        return _decode_text(dict(request_id=owner.get("request_id"), completion_tokens=done,
+                                 **{key: draft[key] for key in DECODE_DRAFT_KEYS if key in draft}, elapsed_s=t - start))
+    except (AttributeError, TypeError, ValueError):  # A counter must never fail a request.
+        return None
+
+
+def final_decode_line(turn_text, owner):
+    """The last crucible_decode line of a speculative turn: the values of its crucible_turn line (decode_s is the
+    elapsed time), or None for a turn without speculation, without a decode round or without draft_proposed."""
+    try:
+        if not owner.get("speculative") or not turn_text.startswith("crucible_turn "): return None
+        fields = json.loads(turn_text.split(" ", 1)[1])
+        if type(fields.get("spec_rounds")) is not int or not fields["spec_rounds"] or "draft_proposed" not in fields:
+            return None
+        return _decode_text(dict(request_id=fields.get("request_id"), completion_tokens=fields.get("completion_tokens"),
+                                 **{key: fields[key] for key in DECODE_DRAFT_KEYS if key in fields},
+                                 elapsed_s=fields.get("decode_s")))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def emit_turn(turn_text, owner):
+    """Write a turn's crucible_turn line, after its final crucible_decode line. owner: the turn's first job's turn."""
+    owner = owner or {}
+    decode = final_decode_line(turn_text, owner)
+    if decode is not None:
+        owner["decode_final"] = True  # no live line after the final one
+        emit(decode)
+    emit(turn_text)
 
 
 # Token IDs of the checkpoint's markers (server/tokenization.py checks <tool_call> and </tool_call>; </think> is the
@@ -215,6 +323,9 @@ def count_pass(turn, decoders, rows):
     turn.update(zip(TURN_COUNTS, counts))
 
 
+STAGE_STATES = ("none", "reading", "ready", "failed")  # server/batch_backend.py STAGE_STATES
+
+
 def load_fields(turns):
     """Numbers about the engine and the load that a turn ran under, from its jobs' counters (see
     server/tests/test_turn_fields.py). A field with no counter is left out. A bad counter leaves all of them out."""
@@ -235,6 +346,16 @@ def _load_fields(turns):
                       rows_per_pass=total["pass_rows"] / total["passes"])
     if any(type(turn.get("stall_s")) is float for turn in turns):
         fields["stall_s"] = sum(turn.get("stall_s", 0.0) for turn in turns)
+    # The last stage reply of the turn's first job (server/batch_backend.py _staged): links a turn to its disk read
+    # (an earlier change). Fixed words and numbers only.
+    staged = next((turn for turn in turns if turn.get("state_disk") in STAGE_STATES), None)
+    if staged is not None:
+        fields["state_disk"] = staged["state_disk"]
+        if type(staged.get("state_disk_wait_s")) is float: fields["state_disk_wait_s"] = staged["state_disk_wait_s"]
+        reason = staged.get("state_disk_reason")
+        if isinstance(reason, str) and re.fullmatch(r"[a-z0-9_]{1,24}|-", reason): fields["state_disk_reason"] = reason
+        for key in ("state_disk_polls", "state_disk_tokens", "state_disk_tag", "state_disk_job"):
+            if type(staged.get(key)) is int: fields[key] = staged[key]
     keys = ("think_tokens", "tool_tokens", "answer_tokens")
     if any(key in turn for turn in turns for key in keys):
         fields.update({key: sum(turn.get(key, 0) for turn in turns) for key in keys})
@@ -242,6 +363,17 @@ def _load_fields(turns):
 
 
 CLASS_KEYS = ("think_tokens", "tool_tokens", "answer_tokens")
+
+
+def _miss_reason(fields):
+    """The turn's cache miss cause: the engine's fixed word, or ssd_read_failed for a failed read.
+
+    The engine names why its cache served nothing. A failed disk read is the server's own evidence (the stage reply of
+    this turn), so it wins for a turn that cached nothing: the state existed, and its read failed. A turn that restored
+    state keeps the engine's word: the failed read was for another state, or for a turn ahead of this one.
+    """
+    if "miss_reason" in fields and fields.get("cached_tokens") == 0 and fields.get("state_disk") == "failed":
+        fields["miss_reason"] = "ssd_read_failed"
 
 
 def _drop_unequal_classes(fields):
@@ -267,6 +399,7 @@ def turn_line(summary, event, draft=None, load=None):
                   **_cache_fields(event))
     if draft is not None: fields.update(draft)
     if load: fields.update(load)
+    _miss_reason(fields)
     _drop_unequal_classes(fields)
     try:
         return "crucible_turn " + json.dumps({key: _round(value) for key, value in fields.items()}, allow_nan=False)
@@ -367,12 +500,16 @@ def request_line(first_turn, event, closed=None, cont_turn=None, cont_event=None
             # string). Its opened event and its chunks still name the restore and the rows it prefilled.
             summary = dict(summary or {}, prefill_tokens=_chunk_rows(first_turn))
             event = dict(event, cached_tokens=_opened(first_turn), cache_class_unknown=True)
+            # Its last step counters (note_token) stand in for the done event's.
+            return turn_line(summary, event, draft_fields((first_turn, first_turn.get("draft_live"))),
+                             load_fields((first_turn,)))
         return turn_line(summary, event, draft_fields((first_turn, event)), load_fields((first_turn,)))
     fields = dict(summary or {}, prefill_tokens=_chunk_rows(first_turn), t_done=cont_turn.get("t_done"))
     # The first job is cancelled before its done event: the cache after the turn is the continuation's report.
     after = {key: cont_event[key] for key in CACHE_INT_FIELDS + ("cache_save_refused",) if key in (cont_event or {})}
     line = turn_line(fields, dict(event, **after, cached_tokens=_opened(first_turn), cache_class_unknown=True),
-                     draft_fields((first_turn, None), (cont_turn, cont_event)), load_fields((first_turn, cont_turn)))
+                     draft_fields((first_turn, first_turn.get("draft_live")), (cont_turn, cont_event)),
+                     load_fields((first_turn, cont_turn)))
     cont = finalize(cont_turn, cont_event) or {}
     extra = dict(think_closed_at=closed.tokens, think_closed_by=closed.by, cont_request_id=cont_turn.get("request_id"),
                  cont_prompt_tokens=cont_event.get("prompt_tokens"), cont_cached_tokens=cont_event.get("cached_tokens"),
@@ -419,11 +556,14 @@ def _closed_classes(first_turn, cont_turn, closed_at, forced, total):
     return dict(think_tokens=think, tool_tokens=tool, answer_tokens=total - think - tool)
 
 
-def prefill_line(turn, done, total, end):
+def prefill_line(turn, done, total, end, turn_request_id=None):
+    # A closed think turn's continuation job has its own request_id; turn_request_id (the first job's id) lets a log reader
+    # pair its prefill lines with the turn. Other lines keep their keys.
     try:
-        return "crucible_prefill " + json.dumps(dict(request_id=turn.get("request_id"), done=done, total=total,
-                                                     elapsed_s=_round(_span(end, turn.get("t_first_gpu")))),
-                                                allow_nan=False)
+        fields = dict(request_id=turn.get("request_id"), done=done, total=total,
+                      elapsed_s=_round(_span(end, turn.get("t_first_gpu"))))
+        if turn_request_id is not None: fields["turn_request_id"] = turn_request_id
+        return "crucible_prefill " + json.dumps(fields, allow_nan=False)
     except (TypeError, ValueError):
         return "crucible_prefill " + json.dumps(dict(request_id=turn.get("request_id"), error="unloggable metrics"))
 

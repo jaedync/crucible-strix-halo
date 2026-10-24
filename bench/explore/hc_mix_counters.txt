@@ -1,3 +1,0 @@
-pmc: SQ_BUSY_CYCLES SQ_INSTS_VALU SQ_INSTS_LDS SQ_INSTS_TEX_LOAD
-pmc: LDSBankConflict MeanOccupancyPerActiveCU
-pmc: GPUBusy MemUnitBusy L2CacheHit

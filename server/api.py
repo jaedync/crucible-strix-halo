@@ -102,6 +102,7 @@ class Request:
     preserve_thinking: bool | None = None
     thinking_budget: int | None = None
     images: tuple = ()
+    top_logprobs: int = 0  # 0 is off; N asks for the first token's top-N log-probabilities
     # True: the request sent no count and the server default is "max". max_tokens is then a placeholder until
     # http.Service.fit sets the context room after the prompt.
     max_tokens_all: bool = False
@@ -194,6 +195,21 @@ def chat_messages(value, vision=None, images=None):
     from .tool_requests import chat_messages as normalize_messages
     return normalize_messages(value, vision, images)
 
+def asks_scores(body):
+    """True when the request asks for log-probabilities (logprobs or top_logprobs)."""
+    return not (body.get("logprobs") in (None, False) and body.get("top_logprobs") is None)
+
+def scoring_count(body, kind, count, temperature, stream):
+    """The engine's top-N for a scoring request, or 0. Only one greedy token of a completion has a log-probability."""
+    top = body.get("top_logprobs")
+    if not asks_scores(body):
+        return 0
+    if kind != "completion" or count != 1 or temperature != 0 or stream:
+        raise ApiError("logprobs needs a completion with max_tokens 1, temperature 0, and no stream.", "logprobs")
+    if top is not None and type(top) is not int:
+        raise ApiError("top_logprobs must be an integer in [0,20].", "top_logprobs")
+    return max(integer(0 if top is None else top, "top_logprobs", 0, 20), 1)
+
 def validate_request(body, kind, model, default_thinking=False, vision=None, vocab=VOCAB,
                      default_mtp_prefix=MTP_WINDOW, defaults=DEFAULTS):
     """vocab: the engine's vocabulary size (the backend's ModelInfo); the default suits engines before an earlier change.
@@ -202,7 +218,7 @@ def validate_request(body, kind, model, default_thinking=False, vision=None, voc
         raise ApiError("The request must be a JSON object.")
     allowed = {"model", "messages", "prompt", "max_tokens", "max_completion_tokens", "temperature", "n",
                "stream", "stream_options", "spec", "enable_thinking", "reasoning_effort", "chat_template_kwargs", *BUDGET_FIELDS,
-               "return_token_ids",
+               "return_token_ids", "logprobs", "top_logprobs",
                "top_k", "top_p", "min_p", "seed", "draft_q", "draft_head", "mtp_prefix", "draft_adapt",
                "cache_control", "tools", "tool_choice", "parallel_tool_calls", "stop", "crucible_metrics", *PENALTY_FIELDS}
     unknown = set(body) - allowed
@@ -216,7 +232,8 @@ def validate_request(body, kind, model, default_thinking=False, vision=None, voc
     stop = validate_stop(body.get("stop"))
     if body.get("model", model) != model:
         raise ApiError(f"The loaded model is {model}.", "model", 404)
-    temperature = number(body.get("temperature", defaults.temperature), "temperature", 0, 2)
+    # A scoring request needs temperature 0 (scoring_count), so a server default never applies to it.
+    temperature = number(body.get("temperature", 0 if asks_scores(body) else defaults.temperature), "temperature", 0, 2)
     # A default above the vocabulary filters nothing, so it is capped instead of failing every request.
     top_k = integer(body.get("top_k", min(defaults.top_k, vocab)), "top_k", 0, vocab)
     top_p = number(body.get("top_p", defaults.top_p), "top_p", 0, 1)
@@ -269,9 +286,10 @@ def validate_request(body, kind, model, default_thinking=False, vision=None, voc
             prompt = tuple(integer(token, "prompt", 0, vocab - 1) for token in prompt)
         elif not isinstance(prompt, str) or not prompt:
             raise ApiError("prompt must be nonempty text or one token-ID list. Batches are not supported.", "prompt")
+    top = scoring_count(body, kind, count, temperature, stream)
     return Request(kind, model, count, spec, stream, usage, thinking, effort, token_ids, prompt, messages,
                    temperature=temperature, top_k=top_k, top_p=top_p, min_p=min_p, seed=seed, cache_control=cache_control,
                    draft_q=draft_q, draft_head=draft_head, mtp_prefix=mtp_prefix, draft_adapt=draft_adapt,
                    tools=tools, tool_choice=choice, parallel_tool_calls=parallel, stop=stop,
                    crucible_metrics=metrics, preserve_thinking=preserve,
-                   thinking_budget=budget, images=tuple(images), max_tokens_all=fill)
+                   thinking_budget=budget, images=tuple(images), top_logprobs=top, max_tokens_all=fill)

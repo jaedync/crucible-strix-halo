@@ -47,6 +47,12 @@ class SnapshotChunkPool {
     std::lock_guard lock(mutex_);
     return idle_.size() * kChunkBytes;
   }
+  // Every pinned chunk once, in use and idle: entries that share chunks
+  // count them at full size each, so the soak memory rule reads this, not the entry bytes.
+  size_t PinnedBytes() const {
+    std::lock_guard lock(mutex_);
+    return pinned_ * kChunkBytes;
+  }
   // a save pins each new chunk on the calling thread (about 5.5 GB/s on the test machine), so a 3.5 GB tail save stopped
   // every decoder of the batch worker for 0.65 s. A helper thread pins idle chunks before the saves instead: it keeps
   // `bytes` idle, inside the pinned limit, and pins a chunk only when `may_pin` allows it (the host reserve). A pin

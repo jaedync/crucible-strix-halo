@@ -43,6 +43,9 @@ int main() {
     assert(ResolveRowPolicy(row,5,3)==regular[row-1]);
     assert(ResolveRowPolicy(row,6,4)==quality[row-1]);
   }
+  // The h6_ng8 packs (head K6; layer-0 routed K2, 2.5, 3, 3.5 or 4) take the quality table.
+  for (int expertK : {2, 25, 3, 35, 4, 5})
+    for (int row=1;row<=16;++row) assert(ResolveRowPolicy(row,6,expertK)==tuned);
   assert(ResolveRowPolicy(8,4,3)==base);
   assert(ResolveRowPolicy(0,5,3)==base);
   // Packed verify passes (9..16 rows) run the same policy; no table above.
