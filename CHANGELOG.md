@@ -3,6 +3,11 @@
 Releases are numbered `v0.<train>.<fix>`. This file lists the newest release first.
 The same text is in the notes of each release on GitHub.
 
+## v0.26.1 (2026-10-25)
+
+- README: new section "16-bit n-gram table (opt-in, experimental)" with one command, `python tools/ngram16/fetch.py`, that downloads only the 33 source files (104.3 GB), builds the BF16 table and checks its size and sha256. Opt-in with `CRUCIBLE_PLE_HOST=1 CRUCIBLE_PLE_BF16=<file>`.
+- `docs/OPENAI_CLIENTS.md`: request fields and refusals for OpenAI clients (pull request 1).
+
 ## v0.26.0 (2026-10-24)
 
 Release v0.26.0 is the engine of train 26. It follows v0.22.4.
