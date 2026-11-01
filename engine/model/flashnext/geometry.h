@@ -51,6 +51,10 @@ constexpr int kGdnDim = 128;
 constexpr int kGdnKeyWidth = kGdnKeyHeads * kGdnDim;           // 2048: q, and k
 constexpr int kGdnValueWidth = kGdnHeads * kGdnDim;            // 6144: v, z and the out_proj input
 constexpr int kGdnQkvWidth = 2 * kGdnKeyWidth + kGdnValueWidth;  // 10240
+// One layer's recurrent state, then the per-head lazy scale of the bulk prefill scan (prefill_gdn.h
+// GdnScanSgprKernel): 48 floats used, 64 kept so the buffer stays 256-byte aligned. A copy of the state carries it.
+constexpr int kGdnStateFloats = kGdnHeads * kGdnDim * kGdnDim;
+constexpr int kGdnScaleFloats = 64;
 
 // ---- QSA sparse attention ----------------------------------------------------------------
 constexpr int kQHeads = 24, kKvHeads = 2, kHeadDim = 256, kIdxHeads = 4, kIdxDim = 128;

@@ -32,7 +32,13 @@ The output is `build/engine/crucible`.
 The device code compiles in parallel parts, and an edit rebuilds only the parts it touches.
 The number of parallel compiles follows `make -j` (default 1). On the test machine, build with `make -j 1` only.
 The ISA is the same as with plain `hipcc`. Run `make SPLIT=0` for plain `hipcc`.
-After a kernel change, run `make isa-check`.
+After a kernel change:
+
+1. Build. If the build stops with `argument facts drift`, run `make -j 8 split-facts` (the test machine: `make -j 1 split-facts`) and commit `tools/devsplit_facts.tsv`.
+2. Run `make isa-check`.
+3. If it lists changed kernels, run `make split-groups CHANGED=<file>` and commit `tools/devsplit_groups.tsv`.
+4. On a merge conflict in either table, make the table again. Do not merge the lines by hand.
+
 Before you add a kernel, read the comment above the `isa-check` target in the Makefile.
 The same binary provides `gen`, `serve`, and `pfbench` commands.
 Experimental batching uses options on `gen`, not a separate `batch` command.

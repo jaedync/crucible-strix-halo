@@ -279,12 +279,13 @@ class Checkpoint {
   // Replaces the data of existing tensors named prefix* with the tensors of an
   // external safetensors file (the MTP draft sidecar). Every tensor in the file
   // must replace one of the same dtype and shape (SameOverrideShape). Returns the replaced count.
-  size_t Override(const std::string& path, const std::string& prefix) {
+  // A file with no tensors stops here, unless allow_empty: the caller then sees the count 0 and decides.
+  size_t Override(const std::string& path, const std::string& prefix, bool allow_empty = false) {
     // A key with a slash cannot collide with an index shard name (CheckFile).
     const std::string key = path.find('/') == std::string::npos ? "./" + path : path;
     if (maps_.count(key)) Fail(path, "", "override file is already loaded");
     const auto found = ParseHeader(key, path);
-    if (found.empty()) Fail(path, "", "override file has no tensors");
+    if (found.empty() && !allow_empty) Fail(path, "", "override file has no tensors");
     for (const auto& [name, ti] : found) {
       if (name.rfind(prefix, 0) != 0) Fail(path, name, "override tensor is outside " + prefix);
       if (!Has(name)) Fail(path, name, "override tensor is not in the checkpoint");

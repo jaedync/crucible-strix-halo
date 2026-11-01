@@ -9,6 +9,7 @@ struct LookaheadState {
   const uint8_t* base;
   unsigned long long total,window,progress,fetched;
   unsigned next,active;
+  unsigned hold;  // LookaheadHoldKernel blocks below this index wait (MoeSgKernel OPT bit 3 sets it for its launch)
 };
 __device__ LookaheadState* g_lookahead=nullptr;
 __device__ uint32_t g_lookahead_sink;
@@ -68,6 +69,53 @@ __global__ void __launch_bounds__(256) LookaheadKernel(LookaheadState* s) {
   if (acc==0x9e3779b9u) atomicExch(&g_lookahead_sink,acc);
 }
 
+// LookaheadKernel that also waits while s->hold is set (CRUCIBLE_MOE_B128=12, moe_b128_switch.h): the expert
+// stream then has the memory system alone, and the helper fetches its window during the other kernels.
+__global__ void __launch_bounds__(256) LookaheadHoldKernel(LookaheadState* s) {
+  __shared__ unsigned slab;
+  __shared__ bool stop,skip;
+  uint32_t acc=0;
+  unsigned long long fetched=0;
+  for (;;) {
+    if (threadIdx.x==0) {
+      auto p=__hip_atomic_load(&s->progress,__ATOMIC_RELAXED,__HIP_MEMORY_SCOPE_AGENT);
+      atomicMax(&s->next,unsigned(p/kLookaheadSlab));
+      slab=atomicAdd(&s->next,1u);
+      const auto off=static_cast<unsigned long long>(slab)*kLookaheadSlab;
+      do {
+        stop=!__hip_atomic_load(&s->active,__ATOMIC_RELAXED,__HIP_MEMORY_SCOPE_AGENT) || off>=s->total;
+        p=__hip_atomic_load(&s->progress,__ATOMIC_RELAXED,__HIP_MEMORY_SCOPE_AGENT);
+        const bool held=blockIdx.x<__hip_atomic_load(&s->hold,__ATOMIC_RELAXED,__HIP_MEMORY_SCOPE_AGENT);
+        if (stop || (off<p+s->window && !held)) break;
+        __builtin_amdgcn_s_sleep(2);
+      } while (true);
+      skip=off+kLookaheadSlab<=p;
+    }
+    __syncthreads();
+    if (stop) break;
+    if (!skip) {
+      const auto off=static_cast<unsigned long long>(slab)*kLookaheadSlab;
+      const auto left=s->total-off;
+      const size_t count=(left<kLookaheadSlab ? left : kLookaheadSlab)/16;
+      const uint4* p=reinterpret_cast<const uint4*>(s->base+off);
+#pragma unroll 16
+      for (size_t i=threadIdx.x;i<count;i+=256) {
+        const uint4 v=p[i]; acc^=v.x^v.y^v.z^v.w;
+      }
+      fetched+=count*16;
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x==0) atomicAdd(&s->fetched,fetched);
+  if (acc==0x9e3779b9u) atomicExch(&g_lookahead_sink,acc);
+}
+
+// MoeSgKernel OPT bit 3: the hold of v helper blocks for one launch (set at the start or after the ramp, cleared at
+// the first empty claim or by the last wave).
+__device__ __forceinline__ void LookaheadHold(unsigned v) {
+  if (LookaheadState* s=g_lookahead) __hip_atomic_store(&s->hold,v,__ATOMIC_RELAXED,__HIP_MEMORY_SCOPE_AGENT);
+}
+
 class LookaheadRunner {
  public:
   LookaheadRunner() = default;
@@ -82,8 +130,10 @@ class LookaheadRunner {
     HIP_OK(hipEventDestroy(ready_));
     HIP_OK(hipFree(state_));
   }
-  void Init(uint8_t* base,size_t bytes,bool enabled) {
+  // hold: run LookaheadHoldKernel (CRUCIBLE_MOE_B128=12).
+  void Init(uint8_t* base,size_t bytes,bool enabled,bool hold=false) {
     if (!enabled) return;
+    hold_=hold;
     LookaheadState state{}; state.base=base; state.total=bytes;
     HIP_OK(hipMalloc(&state_,sizeof(state)));
     HIP_OK(hipMemcpy(state_,&state,sizeof(state),hipMemcpyHostToDevice));
@@ -97,7 +147,8 @@ class LookaheadRunner {
     LookaheadResetKernel<<<1,1>>>(state_,size_t(policy.mib)<<20);
     HIP_OK(hipEventRecord(ready_,0));
     HIP_OK(hipStreamWaitEvent(stream_,ready_,0));
-    LookaheadKernel<<<policy.blocks,256,0,stream_>>>(state_);
+    if (hold_) LookaheadHoldKernel<<<policy.blocks,256,0,stream_>>>(state_);
+    else LookaheadKernel<<<policy.blocks,256,0,stream_>>>(state_);
   }
   void Stop() {
     if (!running_) return;
@@ -109,5 +160,6 @@ class LookaheadRunner {
   hipStream_t stream_=nullptr;
   hipEvent_t ready_=nullptr;
   bool running_=false;
+  bool hold_=false;
 };
 }  // namespace crucible

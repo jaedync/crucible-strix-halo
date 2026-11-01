@@ -8,7 +8,7 @@
 #include <string>
 
 #ifndef ENGINE_BUILD_VERSION
-#define ENGINE_BUILD_VERSION "0.26.1"
+#define ENGINE_BUILD_VERSION "0.30.0"
 #endif
 
 namespace crucible {

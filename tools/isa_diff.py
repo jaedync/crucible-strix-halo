@@ -42,7 +42,9 @@ import tempfile
 
 LLVM_DIRS = ("/opt/rocm/llvm/bin",)
 LOCAL = re.compile(r"\.(LBB|Lfunc_end|Lfunc_begin|Ltmp|LJTI|Lfunc_gep)(\d+)(_\d+)?")
-HEADER = re.compile(r"^[0-9a-f]+ <(.+)>:$")
+HEADER = re.compile(r"^([0-9a-f]+) <(.+)>:$")
+# The split build (tools/devsplit.py) adds stub kernels that only carry argument facts; they are not compared.
+STUB = "__devsplit_facts_"
 GETPC = re.compile(r"^s_getpc_b64 s\[(\d+):\d+\]$")
 ADD = re.compile(r"^s_add_u32 s(\d+), s\1, (0x[0-9a-f]+|-?\d+)$")
 ADDC = re.compile(r"^s_addc_u32 s(\d+), s\1, (0x[0-9a-f]+|-?\d+)$")
@@ -82,7 +84,7 @@ def symbol_table(text):
     syms = []
     for line in text.splitlines():
         f = line.split()
-        if len(f) >= 8 and f[0].endswith(":") and f[3] in ("OBJECT", "FUNC") and f[6] != "UND":
+        if len(f) >= 8 and f[0].endswith(":") and f[3] in ("OBJECT", "FUNC") and f[6] != "UND" and not f[7].startswith(STUB):
             syms.append((int(f[1], 16), int(f[2], 0), f[7]))
     return sorted(syms)
 
@@ -94,11 +96,19 @@ def where(syms, addr):
 
 def parse_disassembly(text, syms):
     """Function name -> normalized instruction text, from `llvm-objdump -d --no-show-raw-insn` output."""
-    units, name, pc, lo = {}, None, {}, {}
+    units, name, pc, lo, alias = {}, None, {}, {}, {}
     for line in text.splitlines():
         m = HEADER.match(line)
         if m:
-            name, pc, lo = m.group(1), {}, {}
+            name, pc, lo = m.group(2), {}, {}
+            if name.startswith(STUB):
+                # an empty stub shares its address with the next function: objdump may print the stub's name
+                at = int(m.group(1), 16)
+                stub = name
+                name = next((s[2] for s in syms if s[0] == at and s[1] and not s[2].endswith(".kd")), None)
+                if name is None:
+                    continue
+                alias[stub] = name
             units[name] = []
             continue
         if not name or not line.strip():
@@ -107,6 +117,9 @@ def parse_disassembly(text, syms):
         code = " ".join(code.split())
         addr = re.match(r"\s*([0-9A-Fa-f]+):", comment)
         target = re.search(r"<[^>]+>", comment)
+        if target and target.group()[1:].startswith(STUB):
+            stub, plus, off = target.group()[1:-1].partition("+")
+            target = re.match(r".*", f"<{alias.get(stub, stub)}{plus}{off}>")
         if (g := GETPC.match(code)) and addr:
             pc[int(g.group(1))] = int(addr.group(1), 16) + 4
         elif (a := ADD.match(code)) and int(a.group(1)) in pc:

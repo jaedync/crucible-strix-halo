@@ -25,8 +25,10 @@ template<class F> void Reject(F run) {
 }
 int main() {
   const Checkpoint ck;
-  assert(crucible::ExpectedStaticBytes(ck, 48) == 523264);
-  assert(crucible::ExpectedStaticBytes(ck, 1) == 29696);
+  // fp16 HC sites plan their fragment-order copies from the geometry (fn rows padded to 336 or 320), not
+  // from the 256-byte test payloads: 96 + 2 inject sites x 13,434,880 + 2 mixers x 13,107,200 bytes.
+  assert(crucible::ExpectedStaticBytes(ck, 48) == 1343279616);
+  assert(crucible::ExpectedStaticBytes(ck, 1) == 79979520);
   assert(crucible::StaticArenaCapacity(523264) == 2097152);
   assert(crucible::StaticArenaCapacity(1) == 2097152);
   assert(crucible::StaticArenaCapacity(2097152) == 2097152);
@@ -48,14 +50,17 @@ int main() {
   const Checkpoint padded{{{"lm_head.trellis", Tensor{"I16", {}, 0, 259}},
                            {"lm_head.suh", Tensor{"F16", {}, 0, 2}},
                            {"lm_head.svh", Tensor{"F16", {}, 0, 258}}}, Tensor{}};
-  assert(crucible::ExpectedStaticBytes(padded, 48) == 523776);
+  assert(crucible::ExpectedStaticBytes(padded, 48) == 1343279616 + 512);
   const std::string mlp = "model.language_model.layers.0.mlp.";
   const Checkpoint router{{{mlp + "gate.weight", Tensor{"F16", {}, 0, 2}},
                           {mlp + "shared_expert_gate.weight", Tensor{"F16", {}, 0, 2}}}, Tensor{}};
-  assert(crucible::ExpectedStaticBytes(router, 48) == 523008);
+  assert(crucible::ExpectedStaticBytes(router, 48) == 1343279616 - 256);
   const Checkpoint ignored{{{"model.language_model.embed_tokens.weight", Tensor{"BF16", {}, 0, SIZE_MAX}},
                            {"model.language_model.layers.1.ple.ple_embedding.ngram_embedding.trellis",
                             Tensor{"I16", {}, 0, SIZE_MAX}}}, Tensor{}};
-  assert(crucible::ExpectedStaticBytes(ignored, 48) == 523264);
-  std::cout << "static layout: 17 CPU checks PASS\n";
+  assert(crucible::ExpectedStaticBytes(ignored, 48) == 1343279616);
+  // CRUCIBLE_HC_WMMA=2: 98 inject sites and 2 mixers hold int8 blocks (hc_int8.h) in place of fp16 fn and up.
+  assert(crucible::ExpectedStaticBytes(ck, 48, true) == 703085056);
+  Reject([&] { crucible::ExpectedStaticBytes(absent, 1, true); });
+  std::cout << "static layout: 19 CPU checks PASS\n";
 }

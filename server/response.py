@@ -137,7 +137,8 @@ class CompletionResponse:
         if self.tools and self.tools.fallback:
             usage["tool_call_fallback"] = True
             usage["tool_call_invalid"] = self.tools.invalid
-            metrics.emit(metrics.fallback_line(request_id, len(self.ids), self.request.stream, self.tools.invalid))
+            metrics.emit(metrics.fallback_line(request_id, len(self.ids), self.request.stream, self.tools.invalid,
+                                                getattr(self.handler, "client_request_id", None)))
         elif self.tools and self.tools.unchecked and message.get("tool_calls"):
             metrics.emit(metrics.tool_pass_line(request_id, self.request.stream, len(message["tool_calls"]),
                                                 self.tools.unchecked))

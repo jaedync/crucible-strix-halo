@@ -263,6 +263,232 @@ bool AgentSoak(int sessions, size_t base_tokens, int rounds, bool print) {
 }
 }  // namespace
 
+
+// The Oct 28 memory incident: the daily engine needed --host-reserve-mib 11264 to keep MemAvailable above the
+// 10,240 MiB soak floor. The disk writer's queue holds evicted snapshots in pinned memory beside the cache, and neither
+// the cache budget nor the 8 GiB default reserve counted it. This is the CPU memory model of tools/agent_soak.py agents
+// (4 Pi sessions from 100K to 190K tokens) with the real 9,700 MiB layout: MemAvailable = baseline - cache - queue.
+namespace queue_model {
+constexpr uint64_t kMiB = uint64_t(1) << 20;
+constexpr uint64_t kBaseline = 22167 * kMiB;         // MemAvailable + pinned peak of the r11 soak (night log Oct 27)
+constexpr size_t kCacheBudget = size_t(7948) << 20;  // 9,700 MiB less the slot checkpoints and the cut buffer
+constexpr uint64_t kFloor = 10240 * kMiB, kMargin = 1000 * kMiB;  // the soak floor, and the gate's margin
+constexpr uint64_t kQueueLimit = uint64_t(4) << 30;  // min(8 GiB, host reserve 8 GiB / 2), batched_serve.h OpenDisk
+size_t StateBytes(size_t tokens) { return size_t(27460) * tokens; }  // 3,112,899,584 B at 113,380 tokens (soak r11)
+
+// counted: the fix (queue in Outside, one floor, spill ceiling). `reserve` and `queue_limit`: the server's
+// --host-reserve-mib and half of it. `restore`: a turn also restores the longest disk state of its session.
+struct Config {
+  bool counted;
+  uint64_t reserve = kDefaultHostReserve, queue_limit = uint64_t(4) << 30;
+  bool restore = false;
+  bool direct = false;  // cache-direct: a direct spill reads the device in chunks (a lazy snapshot), no full host copy
+  // cache-direct: only a resumed release saves lazily. A release to another session and a handover still copy the whole
+  // tail: this share (percent) of the direct spills is of that kind (Oct 28 soak: 4 of 86 releases were not resumed).
+  unsigned eager_percent = 0;
+};
+struct Outcome {
+  uint64_t lowest = UINT64_MAX;
+  size_t direct = 0, spilled = 0, dropped = 0, refused = 0, hits = 0, turns = 0, misses = 0, prefilled = 0;
+  uint64_t direct_peak = 0;  // cache-direct: the most host bytes that one direct spill held in the writer queue
+  uint64_t eager_peak = 0;   // the same for the spills that copy the whole tail (eager_percent)
+  size_t eager = 0;
+};
+
+constexpr uint64_t kRestBytes = 250 * 1000 * 1000, kStagingBytes = 8 * 8 * kMiB;
+
+class QueueCache {
+ public:
+  explicit QueueCache(Config config) : config_(config), cache_(kCacheBudget, {}, 4, config.reserve) {
+    policy_.prefill_rows = kRows;
+    if (config.counted) {
+      cache_.SetHostFloor(kFloor);
+      cache_.SetSpillSlack(uint64_t(2) << 30);
+      cache_.SetDirectMargin(uint64_t(1088) << 20);  // kDirectMargin, batch_state_disk.h
+      cache_.SetQueued([this] { return size_t(Queued()); });
+    }
+    cache_.SetSpill([this](std::span<const int> key, const ConversationPolicy&, const std::shared_ptr<const Cache::Entry>& entry,
+                           int, uint64_t room) { return Spill(key, entry->memory->bytes, !entry->snapshot->resume.prompt_only, room); });
+  }
+  void Turn(int session, size_t prompt) {
+    const auto ids = Stream(session, prompt);
+    size_t cached = 0;
+    bool from_tail = false;
+    if (const auto tail = cache_.FindTail(ids, policy_)) cached = tail->snapshot->hist.size(), from_tail = true;
+    if (!cached)
+      if (const auto entry = cache_.Find(ids, policy_, ids.size() - kTemplateTail, ids.size() - 1, kRows))
+        cached = entry->snapshot->hist.size();
+    // The disk tier: the longest state of this session that is below the prompt (written or queued).
+    if (config_.restore)
+      for (const auto& [key, tail] : disk_[session])
+        if (key < prompt && key > cached) cached = key, from_tail = tail;
+    ++out.turns, out.hits += cached > 0, out.misses += cached == 0, out.prefilled += prompt - cached;
+    const auto frontiers = BatchCacheFrontiers(ids.size(), ids.size() - kTemplateTail, kRows, kSharedPrefix);
+    for (size_t cursor = cached + kRows; !from_tail && cursor < ids.size(); cursor += kRows)
+      for (const auto& frontier : frontiers)
+        if (frontier.position == cursor) Save(ids, frontier.position, true, frontier);
+    Save(Stream(session, prompt + 79), prompt + 79, false, {});
+  }
+  Outcome out;
+
+ private:
+  using Cache = BatchConversationCache<Snapshot>;
+  static std::vector<int> Stream(int session, size_t length) {
+    std::vector<int> ids(length);
+    for (size_t i = 0; i < length; ++i) ids[i] = session * 1000000 + int(i);
+    return ids;
+  }
+  uint64_t Queued() const {
+    uint64_t sum = 0;
+    for (const auto bytes : queue_) sum += bytes;
+    return sum;
+  }
+  uint64_t Pinned() const { return cache_.Bytes() + Queued(); }
+  uint64_t Available() const { return kBaseline - Pinned(); }
+  // The disk writer ends one write per save: a state of 3 GB takes 0.4 to 2.4 s, about one prefill chunk (1 s).
+  void Write() {
+    if (!queue_.empty()) queue_.erase(queue_.begin());
+  }
+  // StateDisk::Spill: refused as "memory" when the payload is over the room, as "busy" when a state waits and the
+  // waiting bytes pass the queue limit (the first job of the queue is the one that the writer writes).
+  bool Spill(std::span<const int> key, size_t bytes, bool tail, uint64_t room) {
+    const bool taken = bytes <= room && !Busy(bytes);
+    if (taken) queue_.push_back(bytes), ++out.spilled, Written(key.size(), key.front(), tail);
+    else ++out.dropped;
+    return taken;
+  }
+  bool Busy(size_t bytes) const {
+    const uint64_t waiting = queue_.size() > 1 ? Queued() - queue_.front() : 0;
+    return waiting && waiting + bytes > config_.queue_limit;
+  }
+  // A state that the writer took is on disk for the next turn (it waits for the write, as a read waits).
+  void Written(size_t length, int first, bool tail) {
+    disk_[first / 1000000].emplace_back(length, tail);
+  }
+  // BatchPrefixCache::Direct: a slot tail that the cache refused goes to the writer when the host keeps the reserve
+  // (and, with the fix, the budget room); the writer holds the new snapshot, so it pins its bytes now.
+  void Direct(const std::vector<int>& ids, size_t bytes) {
+    // Chunked: the writer pins the rest of the state (fixed state, partial blocks; 250 MB in the Oct 28 soak
+    // log) and reads the full blocks from the device through 8 io_threads x 8 MiB of staging.
+    const bool eager = config_.direct && (calls_++ * 7919) % 100 < config_.eager_percent;  // 7919: spread the eager ones
+    const uint64_t host = config_.direct && !eager ? std::min<uint64_t>(bytes, kRestBytes + kStagingBytes) : bytes;
+    const uint64_t room = cache_.DirectRoom(Available());
+    if (host > room || Busy(host)) return void(++out.dropped);
+    queue_.push_back(host), ++out.direct;
+    (eager ? out.eager_peak : out.direct_peak) = std::max<uint64_t>(eager ? out.eager_peak : out.direct_peak, host);
+    out.eager += eager;
+    Written(ids.size(), ids.front(), true);
+  }
+  void Save(const std::vector<int>& ids, size_t position, bool frontier_save, const CacheFrontier& frontier) {
+    Write();
+    const auto make = [&] {
+      auto s = std::make_shared<Snapshot>();
+      s->hist.assign(ids.begin(), ids.begin() + position);
+      s->resume.length = position;
+      s->resume.prompt_only = frontier_save;
+      if (frontier_save) s->resume.prompt_boundary = ids.size() - kTemplateTail;
+      return std::shared_ptr<const Snapshot>(s);
+    };
+    const size_t bytes = StateBytes(position);
+    const bool saved = frontier_save ? cache_.Capture(ids, policy_, frontier, bytes, Available(), make)
+                                     : cache_.CaptureTail(ids, policy_, bytes, Available(), make, true);
+    out.refused += !saved;
+    if (!saved && !frontier_save) Direct(ids, bytes);
+    // The save allocates its chunks now, with the evicted states still queued: the dip of the incident.
+    out.lowest = std::min(out.lowest, Available());
+  }
+  Config config_;
+  ConversationPolicy policy_;
+  Cache cache_;
+  std::vector<uint64_t> queue_;
+  size_t calls_ = 0;
+  std::map<int, std::vector<std::pair<size_t, bool>>> disk_;  // session: (key length, tail)
+};
+
+// 4 sessions in turn, from 100K tokens by 700 to 190K: the cold prefills fill the cache, then each turn saves a tail.
+Outcome Run(Config config, int sessions = 4) {
+  QueueCache cache(config);
+  for (size_t prompt = 100000; prompt <= 190000; prompt += 700)
+    for (int session = 1; session <= sessions; ++session) cache.Turn(session, prompt + size_t(session) * 40);
+  return cache.out;
+}
+
+bool Soak(bool print) {
+  const Outcome before = Run({false}), after = Run({true});
+  const auto line = [&](const char* name, const Outcome& o) {
+    std::printf("queue_model %s lowest=%llu MiB spilled=%zu direct=%zu dropped=%zu refused=%zu hits=%zu/%zu\n",
+                name, static_cast<unsigned long long>(o.lowest / kMiB), o.spilled, o.direct, o.dropped, o.refused, o.hits, o.turns);
+  };
+  if (print) line("trunk", before), line("fixed", after);
+  // The model reproduces the incident: the trunk rules dip under the floor plus the margin; the fix does not, and the
+  // disk tier still takes states.
+  const bool reproduced = before.lowest < kFloor + kMargin;
+  const bool bounded = after.lowest >= kFloor + kMargin;
+  const bool disk = after.spilled > 0;
+  std::printf("queue_model reproduced=%d bounded=%d disk=%d %s\n", int(reproduced), int(bounded), int(disk),
+              reproduced && bounded && disk ? "PASS" : "FAIL");
+  return reproduced && bounded && disk;
+}
+
+// more sessions than slots (an agent and its subagents). The control is the production rule
+// before the fix (trunk with --host-reserve-mib 11264, queue limit half of it). The fix must keep the memory floor and
+// must not lose resumable state against it: every refused slot tail that the control writes to disk, the fix writes too.
+bool MoreSessionsThanSlots(bool print) {
+  bool pass = true;
+  for (const int sessions : {4, 6, 8}) {
+    const uint64_t reserve = 11264 * kMiB;
+    const Outcome control = Run({false, reserve, reserve / 2, true}, sessions), fixed = Run({true, kDefaultHostReserve, kQueueLimit, true}, sessions);
+    const auto line = [&](const char* name, const Outcome& o) {
+      std::printf("queue_model sessions=%d %s lowest=%llu MiB misses=%zu/%zu direct=%zu dropped=%zu spilled=%zu prefilled=%.2f Mtok\n",
+                  sessions, name, static_cast<unsigned long long>(o.lowest / kMiB), o.misses, o.turns, o.direct, o.dropped,
+                  o.spilled, double(o.prefilled) / 1e6);
+    };
+    if (print) line("control", control), line("fixed", fixed);
+    const bool floor = fixed.lowest >= 11240 * kMiB, misses = fixed.misses <= control.misses,
+               prefilled = double(fixed.prefilled) <= 1.10 * double(control.prefilled);
+    std::printf("queue_model sessions=%d lowest=%d misses=%d prefilled=%d %s\n", sessions, int(floor), int(misses), int(prefilled),
+                floor && misses && prefilled ? "PASS" : "FAIL");
+    pass = pass && floor && misses && prefilled;
+  }
+  return pass;
+}
+
+// cache-direct: a direct spill must not take a full host snapshot of the slot tail. The model is the
+// 6-session case of the Oct 29 review: the control is production's --host-reserve-mib 11264; "snapshot" is the direct
+// spill of the cache-mem2 branch (the whole tail pinned until its write ends); "chunked" holds the fixed state and the
+// partial blocks only (about 250 MB, state_disk direct log of the Oct 28 soak) beside a small staging buffer.
+bool DirectPeak(bool print) {
+  constexpr uint64_t kBound = 512 * kMiB;  // the rest of the state (250 MB) and the staging buffer (32 MiB) with room to spare
+  bool pass = true;
+  for (const int sessions : {4, 6, 8}) {
+    const uint64_t reserve = 11264 * kMiB;
+    const Outcome control = Run({false, reserve, reserve / 2, true}, sessions);
+    const Outcome chunked = Run({true, kDefaultHostReserve, kQueueLimit, true, true}, sessions);
+    if (print)
+      std::printf("direct_model sessions=%d control_peak=%llu MiB chunked_peak=%llu MiB chunked_lowest=%llu MiB direct=%zu dropped=%zu prefilled=%.2f/%.2f Mtok\n",
+                  sessions, static_cast<unsigned long long>(control.direct_peak / kMiB),
+                  static_cast<unsigned long long>(chunked.direct_peak / kMiB), static_cast<unsigned long long>(chunked.lowest / kMiB),
+                  chunked.direct, chunked.dropped, double(chunked.prefilled) / 1e6, double(control.prefilled) / 1e6);
+    const bool peak = chunked.direct_peak <= kBound, floor = chunked.lowest >= 11240 * kMiB,
+               misses = chunked.misses <= control.misses, prefilled = chunked.prefilled <= control.prefilled;
+    std::printf("direct_model sessions=%d peak=%d lowest=%d misses=%d prefilled=%d %s\n", sessions, int(peak), int(floor), int(misses),
+                int(prefilled), peak && floor && misses && prefilled ? "PASS" : "FAIL");
+    pass = pass && peak && floor && misses && prefilled;
+    // Only a resumed release is lazy: 5% of the direct spills (a release to another session, a handover) still copy the
+    // whole tail. The soak lowest, not this model, decides about --host-reserve-mib; the bar is 10,240 MiB.
+    const Outcome mixed = Run({true, kDefaultHostReserve, kQueueLimit, true, true, 5}, sessions);
+    const bool bar = mixed.lowest >= 10240 * kMiB, lazy_peak = mixed.direct_peak <= kBound;
+    if (print)
+      std::printf("direct_model sessions=%d mixed(5%% eager) lazy_peak=%llu MiB eager_peak=%llu MiB lowest=%llu MiB direct=%zu eager=%zu dropped=%zu\n",
+                  sessions, static_cast<unsigned long long>(mixed.direct_peak / kMiB), static_cast<unsigned long long>(mixed.eager_peak / kMiB),
+                  static_cast<unsigned long long>(mixed.lowest / kMiB), mixed.direct, mixed.eager, mixed.dropped);
+    std::printf("direct_model sessions=%d mixed bar=%d lazy_peak=%d %s\n", sessions, int(bar), int(lazy_peak), bar && lazy_peak ? "PASS" : "FAIL");
+    pass = pass && bar && lazy_peak;
+  }
+  return pass;
+}
+}  // namespace queue_model
+
 int main(int argc, char**) {
   const bool print = argc > 1;
   const bool frontiers = Soak(false, print), replay = Soak(true, print);
@@ -272,8 +498,10 @@ int main(int argc, char**) {
   // four resume points alone overflow 10 GiB: that needs the slot-resident resume (BatchSession), not this cache.
   const bool agents = AgentSoak(4, 31100, 2, print), served = AgentSoak(3, 31100, 2, print);
   const bool crowded = AgentSoak(4, 60000, 2, print);
+  const bool queue = queue_model::Soak(print), sessions = queue_model::MoreSessionsThanSlots(print),
+             direct = queue_model::DirectPeak(print);
   std::fflush(stdout);
-  const bool pass = frontiers && replay && multi && multi_replay && agents && served && crowded;
+  const bool pass = frontiers && replay && multi && multi_replay && agents && served && crowded && queue && sessions && direct;
   assert(pass);
   return pass ? 0 : 1;
 }

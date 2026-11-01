@@ -118,6 +118,14 @@ int main() {
   assert(rejects({{"mtp.a", "BF16", {4}, 9}}, shape));           // dtype differs
   assert(rejects({{"mtp.b", "BF16", {4}, 9}}, shape));           // plain shape differs
   assert(rejects({}, "override file has no tensors"));
+  {
+    // The engine start asks for the empty case to be counted, not stopped here: it stops with exit 2 (mtp_sidecar.h).
+    const std::string empty = (root / "empty.safetensors").string();
+    Write(empty, {});
+    st::Checkpoint ck(root.string());
+    assert(ck.Override(empty, "mtp.", /*allow_empty=*/true) == 0);
+    assert(ck.Data("mtp.a")[0] == 1);
+  }
   assert(rejects({{"mtp.q.trellis", "I16", {2, 4, 96}, 7}}, shape));   // second tile dimension differs
   assert(rejects({{"mtp.q.trellis", "I16", {4, 2, 96}, 7}}, shape));   // first tile dimension differs
   assert(rejects({{"mtp.q.trellis", "I16", {2, 2, 112}, 7}}, shape));  // K7: the engine takes K 2 to 6

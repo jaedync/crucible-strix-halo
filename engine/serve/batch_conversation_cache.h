@@ -157,7 +157,31 @@ class BatchConversationCache {
   }
   // Tests set the wall clock (seconds); the default is the steady clock.
   void SetClock(std::function<double()> clock) { clock_now_ = std::move(clock); }
-  uint64_t HostReserve() const { return host_reserve_; }
+  // the MemAvailable that every host allocation keeps free (a save, a spill, a read, a direct spill): the
+  // host reserve, or the floor when that is higher. The server sets the floor to the soak floor (kStageKeepFree).
+  uint64_t HostReserve() const { return std::max(host_reserve_, host_floor_); }
+  void SetHostFloor(uint64_t floor) { host_floor_ = floor; }
+  // the pinned bytes that a save may hold beyond the budget while the disk writer holds its victims. The
+  // queue counts in Outside() (SetOutside), so an eviction that goes to the writer does not free budget; a spill is
+  // taken only while cache + outside + the new bytes + the victim stay within the budget and `slack`. Default: no limit.
+  void SetSpillSlack(uint64_t slack) { spill_slack_ = slack; }
+  // The bytes that a new host allocation of `extra` may still pin beyond the cache and the outside bytes, within the
+  // budget and the spill slack (UINT64_MAX: no limit). For the direct spill of a refused save (batched_serve.h Direct).
+  uint64_t SpillBudgetRoom(size_t extra = 0) const {
+    if (spill_slack_ == UINT64_MAX) return UINT64_MAX;
+    const uint64_t held = uint64_t(cache_.Bytes()) + (staged_ ? staged_() : 0) + (queued_ ? queued_() : 0) + extra;
+    const uint64_t ceiling = uint64_t(cache_.Budget()) + spill_slack_;
+    return ceiling > held ? ceiling - held : 0;
+  }
+  // the host memory that a direct spill of a refused slot state may pin, from `available`
+  // (MemAvailable with the idle pool): what stays above the reserve and `direct_margin_`. The state is pinned only until its
+  // write ends, and it is a copy of a slot tail that is lost otherwise, so it has no budget cap: a full cache leaves at
+  // most the spill slack, and a tail of 113K to 190K tokens (3.1 to 5.2 GB) never fit. The queue counts in `available`.
+  uint64_t DirectRoom(uint64_t available) const {
+    const uint64_t keep = HostReserve() + direct_margin_;
+    return available > keep ? available - keep : 0;
+  }
+  void SetDirectMargin(uint64_t margin) { direct_margin_ = margin; }
   std::shared_ptr<const Entry> Find(std::span<const int> ids, const ConversationPolicy& policy,
                                    size_t boundary, size_t warmup_start, int rows) {
     const size_t stable = boundary ? boundary : ids.size();
@@ -251,7 +275,7 @@ class BatchConversationCache {
         throw std::runtime_error("session replay needs a generated tail with target state or full MTP rows");
       auto entry = std::make_shared<Entry>(Entry{std::move(lease), std::move(snapshot), CacheRetention::Session, guarded,
                                                  ++serials_, parent, prompt_tokens});
-      return Saved(cache_.Insert(hist, policy, bytes, std::move(entry)), trusted, trusted || proven);
+      return Saved(cache_.Insert(hist, policy, bytes, std::move(entry), false), trusted, trusted || proven);
     } catch (const std::bad_alloc&) {
       return Unmark(marked, "memory");
     }
@@ -294,7 +318,7 @@ class BatchConversationCache {
       auto entry = std::make_shared<Entry>(Entry{std::move(lease), std::move(snapshot), frontier.retention, false,
                                                  ++serials_, 0, frontier.position});
       // A prompt frontier holds client tokens, so it is a confirmed resume point; a speculative one is not yet.
-      return Saved(cache_.Insert(ids.first(frontier.position), policy, bytes, std::move(entry)), !frontier.speculative,
+      return Saved(cache_.Insert(ids.first(frontier.position), policy, bytes, std::move(entry), false), !frontier.speculative,
                    proven);
     } catch (const std::bad_alloc&) {
       return Unmark(marked, "memory");
@@ -382,7 +406,12 @@ class BatchConversationCache {
   // into the cache with its marks, and MakeRoom returns false with LastRefusal "spill" (x6h request 19 lost its point).
   using ReadAhead = std::function<bool(std::span<const int> key)>;
   using ReadAheadEvicted = std::function<bool(std::span<const int> key, size_t bytes, bool spilled)>;
-  void SetOutside(std::function<size_t()> outside) { cache_.SetOutside(std::move(outside)); }
+  void SetOutside(std::function<size_t()> outside) { staged_ = std::move(outside), InstallOutside(); }
+  // the writer's queue, apart from the staged reads. A save counts only the part of the queue
+  // above the spill slack in Outside(): the first `slack` bytes of the queue are the slack's own, and an eviction for
+  // them would only drop host entries for memory that the writer frees in a second or two. The total that a save pins
+  // beside the cache stays within budget + slack (SpillBudgetRoom counts the whole queue). Without a slack: all of it.
+  void SetQueued(std::function<size_t()> queued) { queued_ = std::move(queued), InstallOutside(); }
   // `keep_free`: the host memory that the eviction keeps free when it is more than the host reserve (the read's last
   // guard, kStageKeepFree), so the entries that leave are the ones that the guard needs.
   bool MakeRoom(size_t bytes, uint64_t available, ReadAhead read_ahead = {}, ReadAheadEvicted evicted = {},
@@ -784,16 +813,24 @@ class BatchConversationCache {
   void SpillVictims(uint64_t available, size_t bytes) {
     uint64_t have = available;
     for (const auto& victim : *victims_) have = victim.freed > UINT64_MAX - have ? UINT64_MAX : have + victim.freed;
-    const uint64_t need = host_reserve_ + bytes;
-    HandVictims(have > need ? have - need : 0);
+    const uint64_t need = HostReserve() + bytes;
+    // A read waits until the writer frees its victims before it allocates (ReadRoom), so only a save pins them
+    // beside its own new bytes: its victims also fit the budget room. `bytes` is the new host memory of the save
+    // (its shared chunks are in the cache's count already), so the room is in physical bytes, as the slack is.
+    HandVictims(have > need ? have - need : 0, reading_ ? UINT64_MAX : SpillBudgetRoom(bytes));
   }
-  void HandVictims(uint64_t room) {
+  // `room`: the host memory above the reserve for the victims; `budget_room`: the pinned bytes beyond the cache that
+  // the queue may take (SpillBudgetRoom). A victim leaves the hook's `room` the smaller of the two.
+  void HandVictims(uint64_t room, uint64_t budget_room = UINT64_MAX) {
     if (victims_->empty()) return;
     const auto victims = std::move(*victims_);
     victims_->clear();
     for (const auto& victim : victims) {
-      const bool spilled = spill_(victim.key, victim.policy, victim.entry, victim.tier, room);
-      if (spilled) room -= std::min<uint64_t>(room, victim.freed);
+      const bool spilled = spill_(victim.key, victim.policy, victim.entry, victim.tier, std::min(room, budget_room));
+      if (spilled) {
+        room -= std::min<uint64_t>(room, victim.freed);
+        if (budget_room != UINT64_MAX) budget_room -= std::min<uint64_t>(budget_room, victim.bytes);
+      }
       if (victim.tier == kReadAhead && read_ahead_evicted_ &&
           !read_ahead_evicted_(victim.key, victim.bytes, spilled) && victim.item) {
         cache_.Reinsert(*victim.item);
@@ -808,7 +845,7 @@ class BatchConversationCache {
   // next turn of a session that has no slot (tests/slot_copy_soak_test.cpp).
   bool Admit(size_t bytes, uint64_t available, bool resident = false, bool speculative = false,
              const SharedSave& share = {}) {
-    const uint64_t reserve = std::max<uint64_t>(host_reserve_, keep_free_);
+    const uint64_t reserve = std::max<uint64_t>(HostReserve(), keep_free_);
     const size_t host_bytes = share.host_bytes && share.host_bytes < bytes ? share.host_bytes : bytes;
     // The eviction hook records what each victim frees with the chunks that this save keeps. The plan's protected set
     // lives only inside this call: a re-entrant Plan from HandVictims must not find it (L1, review).
@@ -859,11 +896,20 @@ class BatchConversationCache {
       return item.bytes;
     }
   }
+  void InstallOutside() {
+    cache_.SetOutside([this]() -> size_t {
+      const uint64_t queued = queued_ ? queued_() : 0;
+      const uint64_t counted = spill_slack_ == UINT64_MAX ? queued : queued > spill_slack_ ? queued - spill_slack_ : 0;
+      return size_t((staged_ ? staged_() : 0) + counted);
+    });
+  }
   std::shared_ptr<SnapshotMemoryLedger> ledger_;
   PrefixCache<Entry, ConversationPolicy> cache_;
+  std::function<size_t()> staged_, queued_;  // the staged reads and the writer's queue (Outside)
   const size_t live_;
   bool slot_frontiers_ = false;
   const uint64_t host_reserve_;
+  uint64_t host_floor_ = 0, spill_slack_ = UINT64_MAX, direct_margin_ = 0;
   const bool probation_;
   const double idle_seconds_;
   std::function<double()> clock_now_;

@@ -96,6 +96,9 @@ StateDiskOptions Options(const std::string& identity, Logs& logs, const std::str
   options.min_tokens = 4;
   options.io_threads = 3;
   options.log = logs.Sink();
+  // The tier logic is under test, not the host disk: a fixed 1 TiB of free space, whatever the real filesystem holds.
+  // A test of the reserve or the full path sets its own free_space after this.
+  options.free_space = [] { return uint64_t(1) << 40; };
   return options;
 }
 

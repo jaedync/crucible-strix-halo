@@ -2,6 +2,7 @@
 // kPackedRows rows: jobs hold at most kMaxRows compact rows, and the shared
 // expert splits into kMaxRows-row chunks.
 #include "../engine/layers/moe_chunk_map.h"
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <iostream>
@@ -57,6 +58,11 @@ int main() {
         assert(j >= 0 && j < kMaxRows && (u - R * kTopK) * kMaxRows + j == r);
       }
     }
+  // The down group's xh (the stream-grid mid) never overlaps the gate/up inputs of any pass.
+  for (int R = 1; R <= kPackedRows; ++R) {
+    assert(MoeGateUpHalves(R) <= MoeDownXhOffset());
+    assert(MoeDownHalves(R) == std::size_t(MoeExpertJobs(R)) * std::min(R, kMaxRows) * kMoeInter);
+  }
   std::array<int, kExperts> seen{};
   seen.fill(-1);
   std::array<int, kPackedRows * kTopK> a{};

@@ -28,7 +28,7 @@ CPU_TESTS += build/bench/static_layout build/bench/test_migration_wait
 # headers as prerequisites: one header edit would rebuild every program (34 min to 3 h).
 DEPFILES := $(addsuffix .d,$(HIP_BINARIES) $(PINNED_HC_BINARIES) $(CPU_BINARIES))
 
-.PHONY: update rollback isa-check split-groups all engine binaries benchmarks cpu-tests gpu-tests test test-fast test-server test-cpu test-reference test-gpu help
+.PHONY: update rollback isa-check split-groups split-facts all engine binaries benchmarks cpu-tests gpu-tests test test-fast test-server test-cpu test-reference test-gpu help
 all: engine
 engine: build/engine/crucible
 binaries: $(HIP_BINARIES) $(CPU_BINARIES)
@@ -57,13 +57,19 @@ SPLIT_PARTS ?= 64
 # on any other machine.
 SPLIT_JOBS ?= $(or $(patsubst -j%,%,$(filter -j%,$(MAKEFLAGS))),1)
 SPLIT_GROUPS ?= tools/devsplit_groups.tsv
+# Argument facts of the one-module build: each part gets a stub kernel that passes
+# them, so IPSCCP finds the same facts in a part as in one module. SPLIT_CHECK=1 (default) also runs IPSCCP on the
+# whole module next to the part compiles and stops the build when a part sees other facts (`make split-facts`
+# fixes that). SPLIT_CHECK=0 skips the check (8 to 14 s on the test machine with -j 8) in an edit loop.
+SPLIT_FACTS ?= tools/devsplit_facts.tsv
+SPLIT_CHECK ?= 1
 SPLIT_WORK ?= build/engine/split
 ENGINE_FLAGS = $(CPPFLAGS) $(HIPFLAGS) -std=c++20 --offload-arch=$(GPU_ARCH) --rocm-path=$(ROCM_PATH) -I$(ROCM_PATH)/include -MMD -MP -MF $@.d $< $(LDFLAGS) $(LDLIBS)
 ENGINE_HIPCC = $(HIPCC) $(ENGINE_FLAGS)
-build/engine/crucible: engine/engine.hip Makefile tools/devsplit.py tools/devsplit_ir.py tools/devsplit_groups.tsv
+build/engine/crucible: engine/engine.hip Makefile tools/devsplit.py tools/devsplit_ir.py tools/devsplit_groups.tsv tools/devsplit_facts.tsv
 	@mkdir -p $(@D)
 ifeq ($(SPLIT),1)
-	@$(PYTHON) -I tools/devsplit.py --out $@ --work $(SPLIT_WORK) --parts $(SPLIT_PARTS) -j $(SPLIT_JOBS) --groups $(SPLIT_GROUPS) --hipcc $(HIPCC) -- $(ENGINE_FLAGS); \
+	@$(PYTHON) -I tools/devsplit.py --out $@ --work $(SPLIT_WORK) --parts $(SPLIT_PARTS) -j $(SPLIT_JOBS) --groups $(SPLIT_GROUPS) --facts $(SPLIT_FACTS) $(if $(filter 1,$(SPLIT_CHECK)),--check) --hipcc $(HIPCC) -- $(ENGINE_FLAGS); \
 	rc=$$?; if [ $$rc -eq 2 ]; then echo "devsplit could not plan the build, using hipcc"; $(ENGINE_HIPCC) -o $@; else exit $$rc; fi
 else
 	$(ENGINE_HIPCC) -o $@
@@ -72,6 +78,8 @@ endif
 # After a kernel change: `make isa-check` builds the engine with plain hipcc (about 20 min) and compares the ISA of
 # every kernel with the split build. If a kernel differs, run
 # `make split-groups CHANGED=<file>`, which writes the kernels that need one part to tools/devsplit_groups.tsv.
+# `make split-facts` writes tools/devsplit_facts.tsv (the test machine: about 40 s with -j 8, 110 s with -j 1): run it when the
+# build stops with "argument facts drift", and commit the file.
 build/engine/crucible.mono: engine/engine.hip Makefile
 	@mkdir -p $(@D)
 	$(ENGINE_HIPCC) -o $@
@@ -80,6 +88,8 @@ isa-check: build/engine/crucible build/engine/crucible.mono
 split-groups: engine/engine.hip
 	@test -n "$(CHANGED)" || { echo 'Set CHANGED=<file with the names of the changed kernels>.' >&2; exit 2; }
 	$(PYTHON) -I tools/devsplit.py --derive $(CHANGED) --groups $(SPLIT_GROUPS) --out build/engine/crucible --work build/engine/split-derive --hipcc $(HIPCC) -- $(ENGINE_FLAGS)
+split-facts: engine/engine.hip
+	$(PYTHON) -I tools/devsplit.py --derive-facts --facts $(SPLIT_FACTS) -j $(SPLIT_JOBS) --out build/engine/crucible --work build/engine/split-derive --hipcc $(HIPCC) -- $(ENGINE_FLAGS)
 
 build/%: %.hip Makefile
 	@mkdir -p $(@D)

@@ -106,9 +106,9 @@ int main() {
   assert(PrefillLaunchSetting("8192+128", 4096) == 8192);
   assert(PrefillJoinSetting("8192+128", 4096) == 128);
   assert(PrefillJoinSetting("16384+4095", 4096) == 4095);
-  assert(PrefillJoinSetting(nullptr, 4096) == 128 && kDefaultPrefillJoinRows == 128);  // the default is "8192+128"
+  assert(PrefillJoinSetting(nullptr, 4096) == 128 && kDefaultPrefillJoinRows == 128);  // the default is "16384+128"
   assert(PrefillJoinSetting(nullptr, 2048) == 0 && PrefillJoinSetting(nullptr, 0) == 0);  // other grids: no join
-  assert(PrefillLaunchSetting(nullptr, 4096) + PrefillJoinSetting(nullptr, 4096) == 8320);
+  assert(PrefillLaunchSetting(nullptr, 4096) + PrefillJoinSetting(nullptr, 4096) == 16512);
   assert(PrefillJoinSetting("8192", 4096) == 0);
   assert(PrefillJoinSetting("4096", 4096) == 0);
   for (const char* bad : {"8192+", "8192+0", "8192+-5", "8192++5", "8192+4096", "4096+128", "32768+1", "8192+12x",
@@ -147,6 +147,31 @@ int main() {
     bad = ok; bad.copies[1].source = target; assert(!PrefillJoinValid(bad, 8272, kGrid, spans));  // not a span
     bad = ok; bad.copies[1] = bad.copies[0]; assert(!PrefillJoinValid(bad, 8272, kGrid, spans));  // twice
     bad = ok; bad.copies[0].target = nullptr; assert(!PrefillJoinValid(bad, 8272, kGrid, spans));
+    // a Pre cut may be inside a core part (PrefillPreCutValid).
+    auto pre = ok; pre.cut = 3000; pre.pre = true; pre.start = 32768;
+    assert(PrefillJoinValid(pre, 8272, kGrid, spans));
+    bad = pre; bad.cut = 3002; assert(!PrefillJoinValid(bad, 8272, kGrid, spans));                // off the tile grid
+    bad = pre; bad.pre = false; assert(!PrefillJoinValid(bad, 8272, kGrid, spans));               // no Pre cut
+    bad = pre; bad.cut = 12; assert(!PrefillJoinValid(bad, 8272, kGrid, spans));                  // under 16 rows in
+  }
+  // Pre cuts inside a core part and the pieces of a launch.
+  {
+    assert(PrefillPreCutValid(32768, 2048, 2036) && PrefillPreCutValid(0, 3048, 3036));
+    assert(PrefillPreCutValid(0, 4096, 2048));                // a part end splits nothing
+    assert(!PrefillPreCutValid(0, 2048, 2044));               // 4 rows after the cut in the part
+    assert(!PrefillPreCutValid(0, 4096, 2052));               // 4 rows before the cut in its part
+    assert(!PrefillPreCutValid(0, 2048, 12) && !PrefillPreCutValid(0, 2048, 2048) && !PrefillPreCutValid(0, 2048, 1001));
+    assert(!PrefillPreCutValid(2, 2048, 1000));               // a launch start off the tile grid
+    // The QSA top-k kernels change above 8,192 blocks (position 32,772): no piece may end below it in a part above it.
+    assert(!PrefillPreCutValid(32768 - 1024, 2048, 1000) && PrefillPreCutValid(32768 - 1024, 2048, 1028));
+    assert(!PrefillPreCutValid(1024, 2048, 512) && PrefillPreCutValid(4096, 2048, 512));  // kSelBlocks: position 2,048
+    const auto pieces = PrefillPieces(5000, 3000);
+    assert(pieces.size() == 4);
+    assert(pieces[0].offset == 0 && pieces[0].rows == 2048 && pieces[0].part == 0 && pieces[0].part_rows == 2048);
+    assert(pieces[1].offset == 2048 && pieces[1].rows == 952 && pieces[1].part == 2048 && pieces[1].part_rows == 2048);
+    assert(pieces[2].offset == 3000 && pieces[2].rows == 1096 && pieces[2].part == 2048 && pieces[2].part_rows == 2048);
+    assert(pieces[3].offset == 4096 && pieces[3].rows == 904 && pieces[3].part == 4096 && pieces[3].part_rows == 904);
+    assert(PrefillPieces(5000, 0).size() == 3 && PrefillPieces(5000, 4096).size() == 3 && PrefillPieces(80, 0).size() == 1);
   }
 
   // The release prompts (4.05 a4v, window 256, own frontier only).

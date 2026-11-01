@@ -19,6 +19,7 @@
 #include "../../exl3/load_tasks.h"
 #include "../../exl3/decode_split.h"
 #include "../../exl3/front_order.h"
+#include "active_config.h"
 #include "mtp_sidecar.h"
 #include "../../layers/ops.h"
 #include "ple_host.h"
@@ -28,6 +29,9 @@
 #include "../../gfx1151/warmup.h"
 #include "../../exl3/static_layout.h"
 #include "../../switches.h"
+#include "../../layers/hc_frag.h"
+#include "../../layers/hc_int8.h"
+#include "../../layers/numerics.h"
 
 namespace crucible {
 
@@ -47,6 +51,8 @@ struct Hc {
   // Fragment-order copies for bulk prefill, or null.
   __half* fnf = nullptr;
   __half* upf = nullptr;
+  // CRUCIBLE_HC_WMMA=2: int8 fn and up for the WMMA decode read; fn and up then hold W' (hc_int8.h).
+  HcW8 q8;
 };
 
 struct Gdn {
@@ -184,9 +190,23 @@ class Loader {
     if (!ck_.Has("mtp.hyper_connection_mixer.hc_norm.weight"))
       ck_.AddFile("mtp_hyper_connection_mixer_patch.safetensors");
     // A tuned MTP head changes only drafts; verification keeps the trunk exact.
+    // What this engine runs with: the set switches and the sidecar by size and sha (never a path).
+    std::fprintf(stderr, "%s\n", ActiveConfig().c_str());
+    // The start stops (exit 2) when the sidecar cannot be read or replaces too few tensors: exact verify hides a
+    // broken drafter from every token gate, and only the speed shows it.
     if (const char* side = crucible::SwitchText("CRUCIBLE_MTP_SIDECAR"); side && *side) {
-      const size_t replaced = ck_.Override(side, "mtp.");
-      std::fprintf(stderr, "mtp sidecar: %zu tensors from %s\n", replaced, MtpSidecarLabel(side).c_str());
+      if (const std::string unreadable = MtpSidecarUnreadable(side); !unreadable.empty()) {
+        std::fprintf(stderr, "%s\n", unreadable.c_str());
+        std::exit(2);
+      }
+      const size_t replaced = ck_.Override(side, "mtp.", /*allow_empty=*/true);
+      const std::string label = MtpSidecarLabel(side);
+      const size_t expected = MtpSidecarExpected([&](const std::string& name) { return ck_.Has(name); });
+      if (const std::string fault = MtpSidecarFault(replaced, expected, label); !fault.empty()) {
+        std::fprintf(stderr, "%s\n", fault.c_str());
+        std::exit(2);
+      }
+      std::fprintf(stderr, "%s\n", MtpSidecarLine(replaced, label).c_str());
     }
     // Fixed-size kernels cannot safely consume arbitrary checkpoint geometry.
     // Validate every source before the first allocation or conversion task.
@@ -321,7 +341,7 @@ class Loader {
     streaming_ = streaming;
     const std::string P = "model.language_model.";
     auto t0 = std::chrono::steady_clock::now();
-    const size_t planned = streaming ? ExpectedStaticBytes(ck_, kLayers) : 0;
+    const size_t planned = streaming ? ExpectedStaticBytes(ck_, kLayers, hc8_) : 0;
     Arena static_arena(streaming ? StaticArenaCapacity(planned) : size_t(2) << 20, true);
     m.embed = (uint16_t*)Raw(P + "embed_tokens.weight");
     if (streaming) active_ = &static_arena;
@@ -363,6 +383,9 @@ class Loader {
     std::fprintf(stderr, "weight payload %zu bytes, arena reserved %zu bytes, staging peak %zu bytes\n",
                  m.bytes, arena_.reserved() + static_arena.reserved(), stage_peak_.load());
     std::fprintf(stderr, "front tile order: %d of %d dense matrices\n", front_count_, front_total_);
+    if (hc8_)
+      std::fprintf(stderr, "HC int8 (CRUCIBLE_HC_WMMA=2): %d sites, fn group %d, up group %d\n", hc8_sites_,
+                   kHc8FnGroup, kHc8UpGroup);
     PrintWidths(m);
   }
 
@@ -564,24 +587,98 @@ class Loader {
     Hc h;
     h.M = kRank + (inject ? kStreams : 0);
     h.w1 = F32(p + "hc_norm.weight", 1.f);
-    h.up = Concat16({p + "input_mix_weight_up.weight"});
+    if (hc8_) return HcW8Load(p, inject, h);
+    // Decode (HcW2Kernel) and bulk prefill read the fragment-order copies, so
+    // they go to active_ in decode order (the static arena, which the
+    // lookahead reads). The row-major fn and up go to arena_ for the other
+    // readers (VALU and persistent HC, small prefill). Same values.
+    const std::string un = p + "input_mix_weight_up.weight";
+    size_t ub = 0;
+    if (Info(un).dtype != "F16") ck_.Error(un, "expected dtype F16");
+    const uint8_t* usrc = Src(un, &ub);
+    if (ub != (size_t)kWide * kRank * 2) ck_.Error(un, "unexpected HC up size");
+    const int M = h.M;
+    const size_t fb = (size_t)M * kWide * 2, ffb = (size_t)(M + 15) / 16 * 16 * kWide * 2;
+    const auto fn = HcFn(p, inject);
+    uint8_t* uf = active_->Alloc(ub);
+    uint8_t* ff = active_->Alloc(ffb);
+    uint8_t* uw = arena_.Alloc(ub);
+    uint8_t* fw = arena_.Alloc(fb);
+    tasks_.push_back({ub, uw, usrc, nullptr});
+    tasks_.push_back({ub, uf, nullptr, [=](uint8_t* buf) {
+                        HcUpFragOrder(reinterpret_cast<const _Float16*>(usrc), reinterpret_cast<_Float16*>(buf));
+                      }});
+    tasks_.push_back({fb, fw, nullptr, fn});
+    tasks_.push_back({ffb, ff, nullptr, [=](uint8_t* buf) {
+                        std::vector<_Float16> w((size_t)M * kWide);
+                        fn(reinterpret_cast<uint8_t*>(w.data()));
+                        HcFnFragOrder(w.data(), M, reinterpret_cast<_Float16*>(buf));
+                      }});
+    h.fn = reinterpret_cast<__half*>(fw);
+    h.up = reinterpret_cast<__half*>(uw);
+    h.fnf = reinterpret_cast<__half*>(ff);
+    h.upf = reinterpret_cast<__half*>(uf);
+    return h;
+  }
+
+  // fp16 fn = [down; inject] * (1 + w), row-major [M][kWide].
+  std::function<void(uint8_t*)> HcFn(const std::string& p, bool inject) {
     const uint8_t* down = Src(p + "input_mix_weight_down.weight");
     const uint8_t* inj = inject ? Src(p + "block_inject_weight.weight") : nullptr;
     const uint8_t* nw = Src(p + "hc_norm.weight");
     const bool nbf = Info(p + "hc_norm.weight").dtype == "BF16";
+    const int M = kRank + (inject ? kStreams : 0);
+    return [=](uint8_t* buf) {
+      _Float16* out = reinterpret_cast<_Float16*>(buf);
+      for (int m = 0; m < M; ++m) {
+        const uint8_t* row = m < kRank ? down + (size_t)m * kWide * 2 : inj + (size_t)(m - kRank) * kWide * 2;
+        for (int c = 0; c < kWide; ++c)
+          out[(size_t)m * kWide + c] = (_Float16)(ToF(Read16(row, c), false) * (1.f + ToF(Read16(nw, c), nbf)));
+      }
+    };
+  }
+
+  // CRUCIBLE_HC_WMMA=2: the int8 blocks go to active_ in decode order (the
+  // static arena, which the lookahead reads), and W' in fp16 to arena_ for
+  // the paths that read fp16. Each task quantizes its matrix again; the
+  // quantizer is deterministic, so the blocks and W' agree.
+  Hc HcW8Load(const std::string& p, bool inject, Hc h) {
+    const std::string un = p + "input_mix_weight_up.weight";
+    size_t ub = 0;
+    if (Info(un).dtype != "F16") ck_.Error(un, "expected dtype F16");
+    const uint8_t* usrc = Src(un, &ub);
+    if (ub != (size_t)kWide * kRank * 2) ck_.Error(un, "unexpected HC up size");
     const int M = h.M;
-    uint8_t* d = active_->Alloc((size_t)M * kWide * 2);
-    tasks_.push_back({(size_t)M * kWide * 2, d, nullptr, [=](uint8_t* buf) {
-                        _Float16* out = reinterpret_cast<_Float16*>(buf);
-                        for (int m = 0; m < M; ++m) {
-                          const uint8_t* row =
-                              m < kRank ? down + (size_t)m * kWide * 2 : inj + (size_t)(m - kRank) * kWide * 2;
-                          for (int c = 0; c < kWide; ++c)
-                            out[(size_t)m * kWide + c] =
-                                (_Float16)(ToF(Read16(row, c), false) * (1.f + ToF(Read16(nw, c), nbf)));
-                        }
+    const auto fn = HcFn(p, inject);
+    const size_t fb = Hc8Bytes(M, kWide, kHc8FnGroup), upb = Hc8Bytes(kWide, kRank, kHc8UpGroup);
+    uint8_t* fq = active_->Alloc(fb);
+    uint8_t* uq = active_->Alloc(upb);
+    uint8_t* fw = arena_.Alloc((size_t)M * kWide * 2);
+    uint8_t* uw = arena_.Alloc(ub);
+    tasks_.push_back({fb, fq, nullptr, [=](uint8_t* buf) {
+                        std::vector<_Float16> w((size_t)M * kWide);
+                        fn(reinterpret_cast<uint8_t*>(w.data()));
+                        std::memset(buf, 0, fb);
+                        Hc8Quantize(w.data(), M, kWide, kHc8FnGroup, buf, nullptr);
                       }});
-    h.fn = reinterpret_cast<__half*>(d);
+    tasks_.push_back({(size_t)M * kWide * 2, fw, nullptr, [=](uint8_t* buf) {
+                        fn(buf);
+                        auto* w = reinterpret_cast<_Float16*>(buf);
+                        Hc8Quantize(w, M, kWide, kHc8FnGroup, nullptr, w);
+                      }});
+    tasks_.push_back({upb, uq, nullptr, [=](uint8_t* buf) {
+                        std::memset(buf, 0, upb);
+                        Hc8Quantize(reinterpret_cast<const _Float16*>(usrc), kWide, kRank, kHc8UpGroup, buf, nullptr);
+                      }});
+    tasks_.push_back({ub, uw, nullptr, [=](uint8_t* buf) {
+                        std::memcpy(buf, usrc, ub);
+                        auto* w = reinterpret_cast<_Float16*>(buf);
+                        Hc8Quantize(w, kWide, kRank, kHc8UpGroup, nullptr, w);
+                      }});
+    h.fn = reinterpret_cast<__half*>(fw);
+    h.up = reinterpret_cast<__half*>(uw);
+    h.q8 = {fq, uq};
+    ++hc8_sites_;
     return h;
   }
 
@@ -630,6 +727,16 @@ class Loader {
       off += b;
     }
     e.table = reinterpret_cast<uint16_t*>(d);
+  }
+
+  // CRUCIBLE_HC_WMMA=2: int8 HC weights (hc_int8.h). Option A (CRUCIBLE_EXACT=1) keeps fp16.
+  static bool HcInt8() {
+    try {
+      return NumericsInt("CRUCIBLE_HC_WMMA", 1, 0, 2) == 2;
+    } catch (const std::invalid_argument& error) {
+      Die(error.what());
+    }
+    return false;
   }
 
   static bool PleHost() {
@@ -748,6 +855,8 @@ class Loader {
   Arena* active_ = &arena_;
   int front_count_ = 0, front_total_ = 0;
   bool streaming_ = false;
+  const bool hc8_ = HcInt8();
+  int hc8_sites_ = 0;
   std::vector<Task> tasks_;
   std::atomic<size_t> ndone_{0};
 };

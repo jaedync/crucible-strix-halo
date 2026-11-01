@@ -305,10 +305,18 @@ reasoning again (about 1 s for each 1,300 tokens). Only turns that reach the clo
 The continuation depends only on the request. It is not bit-identical to one job that decodes the forced tokens,
 because the second job computes the reasoning with prefill arithmetic.
 That turn writes one `crucible_turn` line with the counts that the client sees and the first job's times,
-so a log collector can join it to its own request record. `think_closed_at`, `think_closed_by`, and `cont_*` fields describe the
+so a gateway joins it to its own row for the request. `think_closed_at`, `think_closed_by`, and `cont_*` fields describe the
 second job. `crucible_metrics` in the reply describes the second job.
 Every `crucible_turn` line also carries numbers about the engine, the decode passes, the stall and the token
 classes.
+
+A request may send a gateway's id for it in the header `X-Client-Request-Id`. The flag `--client-request-id-header NAME`
+(or the variable `CRUCIBLE_CLIENT_REQUEST_ID_HEADER`; the flag wins) sets another header name: 1 to 64 letters, digits
+or hyphens, matched without regard to case. An invalid name stops the start. When the value matches
+`^[A-Za-z0-9_.:-]{1,64}$`, the server writes it as the field `client_request_id` in every `crucible_prefill`,
+`crucible_decode`, `crucible_turn`, `crucible_error` and `crucible_cancel` line of that request, on both workers and
+on both jobs of a closed think turn. So a gateway can pair a request with its lines when requests overlap. A missing or
+invalid header adds no field and changes nothing else. The value is never part of a reply.
 
 Two stderr lines show a turn while it runs. They hold counts only, never token IDs or text.
 

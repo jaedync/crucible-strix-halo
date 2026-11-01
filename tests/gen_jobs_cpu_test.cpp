@@ -58,6 +58,9 @@ void ParserTests(const Dir& dir) {
   // The same defaults and rules as one gen command: --chunk alone selects the small-row path.
   assert(jobs[0].options.prefill_rows == 0 && jobs[0].options.spec == kDefaultSpecDepth);
   assert(jobs[1].options.spec == 2 && jobs[1].stdout_path.empty() && jobs[1].stderr_path.empty());
+  // spec_sweep and gen take --stop-ids (training/mtp_tune/heads_ab.py passes it to every sweep case).
+  const auto stops = ParseGenJobs(Line({"--ids", "5", "--stop-ids", "248044,248046"}));
+  assert(stops[0].options.stop_ids == (std::vector<int>{248044, 248046}));
 
   assert(Has(Thrown([] { ParseGenJobs(""); }), "no jobs"));
   assert(Has(Thrown([] { ParseGenJobs("\n{\"args\": [\"--ids\", \"1\"], \"other\": 1}\n"); }), "line 2"));

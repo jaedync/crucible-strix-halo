@@ -1,6 +1,7 @@
 // The M1 pair path K-set allowlist (findings section 11.5 M4): only the
 // K sets that the bench envelope byte-tested take the pair path.
 #include "../engine/layers/prefill_moe_kset.h"
+#include <array>
 #include <cassert>
 #include <vector>
 
@@ -54,4 +55,13 @@ int main() {
   // The k6 flag picks the set: a K4/K6 layer without k6 is not 3.05.
   assert(!crucible::PrefillMoePairKSet(false,6,6,6,Make(4,6).experts));
   assert(!crucible::PrefillMoePairKSet(true,5,5,5,Make(3,5).experts));
+  // prefill-moe: every supported MoE width set has a tile kernel set; no KMAX code outside the RM6 sets does.
+  for (const auto w : crucible::kSupportedMoeWidths) {
+    assert(crucible::PrefillMoeTileKmax(crucible::PrefillMoeKmax(std::array<int,2>{w.kr,w.ks})));
+  }
+  for (const int k : {0,1,2,3,4,9,25,35,55,85}) assert(!crucible::PrefillMoeTileKmax(k));
+  // prefill-rows: the tile path starts at 8,192 launch rows (the 8192+128 default and larger launches).
+  static_assert(!crucible::PrefillMoeTileLaunch(4096) && !crucible::PrefillMoeTileLaunch(8191));
+  static_assert(crucible::PrefillMoeTileLaunch(8192) && crucible::PrefillMoeTileLaunch(8320) &&
+                crucible::PrefillMoeTileLaunch(32768));
 }

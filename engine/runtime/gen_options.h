@@ -32,6 +32,9 @@ struct GenOptions {
   std::function<void(int)> emit;
   std::function<void(std::span<const float>)> sampling_trace;
   crucible::ConversationHooks* conversation = nullptr;
+  // gen --debug-schedule diagnostics (cli/gen_debug_schedule.h); empty or 0 is off.
+  std::string debug_schedule, step_logits;
+  size_t debug_restore_at = 0, debug_state_at = 0;
 };
 
 inline GenOptions CliGenOptions() {

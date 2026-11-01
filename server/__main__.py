@@ -14,6 +14,7 @@ from .backend import EngineBackend, LOOKUP_DEPTH, MAX_CONVERSATION_CACHE_MIB
 from .batch_scheduler import INTERLEAVE_MIN_ROWS
 from .hosts import ALLOWED_HOSTS_ENV, HostError, resolve_allowed_hosts
 from .http import Service, handler_for
+from .request_id import CLIENT_REQUEST_ID_HEADER_ENV, HeaderNameError, resolve_client_request_id_header
 from .think_budget import MIN_THINKING_DEFAULT
 from .tokenization import ModelTokenizer
 from .version import server_commit, server_version
@@ -134,6 +135,11 @@ def main():
     parser.add_argument("--state-disk-write-delay-ms", type=int, default=None, metavar="0..60000",
                         help="Tests only: each state write waits this long first (the same-second restore proof). "
                              "Its states go to their own folder. Default 0.")
+    parser.add_argument("--client-request-id-header", default=None, metavar="NAME",
+                        help=f"Name of the request header in which a gateway sends its id for the request. A valid value "
+                             f"(1 to 64 characters of letters, digits and _ . : -) goes to the log lines as client_request_id; "
+                             f"it is never part of a reply. It replaces {CLIENT_REQUEST_ID_HEADER_ENV}. "
+                             "Default: X-Client-Request-Id.")
     parser.add_argument("--allowed-host", action="append", default=[], metavar="HOST[:PORT]",
                         help=f"Strict mode: refuse (HTTP 403) every request whose Host header is not listed. Repeat the "
                              f"flag or use commas; HOST without a port matches any port; the match ignores case. It "
@@ -331,6 +337,10 @@ def main():
         allowed_hosts = resolve_allowed_hosts(args.allowed_host, os.environ)
     except HostError as error:
         parser.error(str(error))
+    try:
+        request_id_header = resolve_client_request_id_header(args.client_request_id_header, os.environ)
+    except HeaderNameError as error:
+        parser.error(str(error))
     if not 1024 <= args.port <= 65535:
         parser.error("--port must be in [1024,65535]")
     if not args.model_id or len(args.model_id) > 200:
@@ -385,7 +395,7 @@ def main():
                     stream_tool_calls=args.stream_tool_calls == "on",
                     max_requests_per_client=args.max_requests_per_client, vision=vision,
                     default_mtp_prefix=args.mtp_window, capture=capture, allowed_hosts=allowed_hosts,
-                    defaults=defaults)))
+                    defaults=defaults, client_request_id_header=request_id_header)))
         server.daemon_threads = True
         commit = server_commit()
         print(f"Crucible v{server_version()}" + (f" ({commit})" if commit else ""), file=sys.stderr, flush=True)

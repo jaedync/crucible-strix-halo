@@ -64,6 +64,15 @@ inline std::string StageLine(const StageStatus& status, size_t prompt, size_t fl
 // (the saves' rule, 8 GiB by default) and not a cache budget; a read that it refuses says "room".
 inline constexpr uint64_t kStageKeepFree = uint64_t(10) << 30;  // 10 GiB
 inline constexpr uint64_t kStageCap = uint64_t(16) << 30;  // all staged reads together
+// the pinned bytes beyond the cache budget that a save may hold while the disk writer holds the states that
+// it evicted (BatchConversationCache::SetSpillSlack). The queue and the new bytes together stay within budget + slack,
+// so MemAvailable stays above the floor by design: the soak lowest is baseline - (budget + slack).
+inline constexpr uint64_t kSpillSlack = uint64_t(2) << 30;
+// MemAvailable that a direct spill of a slot state keeps above the floor (BatchConversationCache::DirectRoom).
+// 1,088 MiB: the soak floor plus this is 11,328 MiB, the lowest of production's --host-reserve-mib 11264 and 64 MiB
+// more. The queue model (6 and 8 sessions on 4 slots) loses 7% more prefill than that setting at this margin, and 26%
+// at 1,280 MiB.
+inline constexpr uint64_t kDirectMargin = uint64_t(1088) << 20;
 // The bytes that staged reads may hold in all: `staged` (held now) plus what MemAvailable (`available`, with the idle
 // chunk pool) leaves above the larger of the host reserve and kStageKeepFree. `unallocated`: the bytes of reads that
 // still read and have not taken their memory (StateDisk::UnallocatedReadBytes): MemAvailable still shows them.
@@ -272,16 +281,17 @@ class BatchDiskTier {
   // the snapshot (the device copy) only when the writer can take it; the writer holds it until its write ends.
   // Returns "" for a refusal that the disk does not take, "queued", or why not (Skip, waiting: the same state waits
   // for the writer already, memory, busy, Spill).
+  // `host` (0: `bytes`) is what the queue pins for a lazy snapshot, the writer reads the rest from the device.
   template<class Save>
   std::string SpillDirect(std::span<const int> key, const ConversationPolicy& policy, bool guarded,
-                          std::string_view refused, size_t bytes, size_t need, uint64_t room, Save save) {
+                          std::string_view refused, size_t bytes, size_t need, uint64_t room, Save save, size_t host = 0) {
     if (!Enabled() || !DirectRefusal(refused)) return {};
     if (key.size() < disk_.MinTokens()) return "short";
     if (auto skip = Skip(key, policy, bytes); !skip.empty()) return skip;
     if (disk_.Waiting(key, policy, compact_)) return "waiting";
     const uint64_t reading = disk_.UnallocatedReadBytes();
     if (need > (room > reading ? room - reading : 0)) return "memory";
-    if (disk_.QueueFull(bytes, key, policy, compact_)) return "busy";
+    if (disk_.QueueFull(host ? host : bytes, key, policy, compact_)) return "busy";
     std::shared_ptr<const Snapshot> snapshot;
     try {
       snapshot = save();

@@ -488,159 +488,130 @@ __global__ void __launch_bounds__(256) PrefillDenseTileKernel(const __half* W,in
       }
     }
 }
-// LDS-staged fp16 GEMM y[R][O] = x[R][2560] W[O][2560]^T. A block owns a
-// 64x64 tile; global loads are 16-byte pieces of 64-byte row segments, so every
-// fetched line is used, and the next 32-k stage loads while WMMAs run.
-// fp16 GEMM y[R][c0 + n] = x[R][2560] W[c0 + n][2560]^T for n < 128 per
-// block column, R x 128 tiles per block. 8 waves own 32 rows x 64 columns
-// (2 x 4 WMMA tiles). x and W stages of 32 k go through LDS, loaded into
-// registers one stage ahead. Every output keeps the k order of the other
-// dense kernels, so results are bitwise equal.
+// Dense GEMM stages: 32 k per LDS stage, rows padded by 8 halfs.
 constexpr int kBigStep=32, kBigPad=kBigStep+8;
-__global__ void __launch_bounds__(256) PrefillDenseBigKernel(const __half* W,int O,
-    const __half* x,float* y,int ldy,int R) {
-  __shared__ __attribute__((aligned(16))) _Float16 as[128][kBigPad], bs[128][kBigPad];
+
+// PrefillDenseFastKernel<DEPTH> (now in bench/kernels/prefill_hc.h) with three changes:
+// - a 1-D grid in supertiles: G consecutive row blocks take column block 0,
+//   then column block 1, and so on, so a row block of x is read from DRAM
+//   once and the next column blocks of it hit L2 (the 2-D grid walks all row
+//   blocks per column block: x is read once per column block);
+// - waves whose 64 columns are all past O skip their WMMAs, and waves with
+//   fewer than 4 valid column tiles skip the rest (O = 513 has one valid
+//   column in its last column block);
+// - RB = 64: 4 waves own 64 rows by 128 columns (more blocks for small O).
+// Same per-output k order: bitwise equal (bench/dense_next.hip: R8192 router
+// 1,930 -> 826 us, a/b 1,150 -> 561 us, PLE kv 28.1 -> 17.1 ms, cold caches).
+template<int DEPTH=4,int RB=64>
+__global__ void __launch_bounds__(RB*2) PrefillDenseSwKernel(const __half* W,int O,
+    const __half* x,float* y,int ldy,int R,int G) {
+  constexpr int kSteps=kHidden/kBigStep, NT=RB*2, PA=RB*4/NT, PB=512/NT;
+  static_assert(kSteps%DEPTH==0 && PA==2);
+  __shared__ __attribute__((aligned(16))) _Float16 as[2][RB][kBigPad], bs[2][128][kBigPad];
   const int t=threadIdx.x,lane=t&31,wave=t>>5;
-  const int r0=blockIdx.x*128,n0=blockIdx.y*128;
-  // Stage loads: 128 rows x 32 k per operand = 512 pieces of 16 bytes.
-  const __half* ap[2]; const __half* bp[2];
+  const int rbs=(R+RB-1)/RB, cbs=(O+127)/128, L=blockIdx.x;
+  const int g=L/(G*cbs), gs=min(G,rbs-g*G), i=L-g*G*cbs;
+  const int r0=(g*G+i%gs)*RB, n0=i/gs*128;
+  const __half* ap[PA]; const __half* bp[PB];
 #pragma unroll
-  for (int i=0;i<2;++i) {
-    const int idx=t+i*256,row=idx>>2,part=(idx&3)*8;
-    ap[i]=x+(size_t)min(r0+row,R-1)*kHidden+part;
-    bp[i]=W+(size_t)min(n0+row,O-1)*kHidden+part;
+  for (int q=0;q<PA;++q) {
+    const int idx=t+q*NT,row=idx>>2,part=(idx&3)*8;
+    ap[q]=x+(size_t)min(r0+row,R-1)*kHidden+part;
   }
-  // Native vectors: with HIP's uint4 (a union type) the prefetch lived in
-  // scratch and every load waited at once.
+#pragma unroll
+  for (int q=0;q<PB;++q) {
+    const int idx=t+q*NT,row=idx>>2,part=(idx&3)*8;
+    bp[q]=W+(size_t)min(n0+row,O-1)*kHidden+part;
+  }
   typedef unsigned U4 __attribute__((ext_vector_type(4)));
-  U4 na[2],nb[2];
-  auto load=[&](int k) {
+  U4 ra[DEPTH][PA],rb[DEPTH][PB];
 #pragma unroll
-    for (int i=0;i<2;++i) { na[i]=*reinterpret_cast<const U4*>(ap[i]+k); nb[i]=*reinterpret_cast<const U4*>(bp[i]+k); }
-  };
-  load(0);
-  prefill::F8 acc[2][4]={};
-  const int wr=(wave>>1)*32,wc=(wave&1)*64;
-#pragma unroll 1
-  for (int k0=0;k0<kHidden;k0+=kBigStep) {
-    __syncthreads();
-#pragma unroll
-    for (int i=0;i<2;++i) {
-      const int idx=t+i*256,row=idx>>2,part=(idx&3)*8;
-      *reinterpret_cast<U4*>(&as[row][part])=na[i];
-      *reinterpret_cast<U4*>(&bs[row][part])=nb[i];
-    }
-    __syncthreads();
-    if (k0+kBigStep<kHidden) load(k0+kBigStep);
-#pragma unroll
-    for (int kb=0;kb<kBigStep;kb+=16) {
-      prefill::H16 af[2],bf[4];
-#pragma unroll
-      for (int i=0;i<2;++i) af[i]=*reinterpret_cast<const prefill::H16*>(&as[wr+i*16+(lane&15)][kb]);
-#pragma unroll
-      for (int j=0;j<4;++j) bf[j]=*reinterpret_cast<const prefill::H16*>(&bs[wc+j*16+(lane&15)][kb]);
-#pragma unroll
-      for (int i=0;i<2;++i)
-#pragma unroll
-        for (int j=0;j<4;++j) acc[i][j]=__builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af[i],bf[j],acc[i][j]);
-    }
+  for (int q=0;q<PA;++q) {
+    const int idx=t+q*NT,row=idx>>2,part=(idx&3)*8;
+    *reinterpret_cast<U4*>(&as[0][row][part])=*reinterpret_cast<const U4*>(ap[q]);
   }
 #pragma unroll
-  for (int i=0;i<2;++i)
-#pragma unroll
-    for (int j=0;j<4;++j) {
-      const int n=n0+wc+j*16+(lane&15);
-      if (n>=O) continue;
-#pragma unroll
-      for (int z=0;z<8;++z) {
-        const int r=r0+wr+i*16+prefill::FragmentRow(z);
-        if (r<R) y[(size_t)r*ldy+n]=acc[i][j][z];
-      }
-    }
-}
-// PrefillDenseBigKernel with a pipelined k loop: double-buffered LDS, one
-// LDS-only barrier per 32-k stage, and DEPTH stages of x and W loads in flight
-// in registers (the Big kernel waits for each stage's loads at a full
-// __syncthreads, two per stage). Same per-output k order: bitwise equal.
-template<int DEPTH=2>
-__global__ void __launch_bounds__(256) PrefillDenseFastKernel(const __half* W,int O,
-    const __half* x,float* y,int ldy,int R) {
-  constexpr int kSteps=kHidden/kBigStep;
-  static_assert(kSteps%DEPTH==0);
-  __shared__ __attribute__((aligned(16))) _Float16 as[2][128][kBigPad], bs[2][128][kBigPad];
-  const int t=threadIdx.x,lane=t&31,wave=t>>5;
-  const int r0=blockIdx.x*128,n0=blockIdx.y*128;
-  const __half* ap[2]; const __half* bp[2];
-#pragma unroll
-  for (int i=0;i<2;++i) {
-    const int idx=t+i*256,row=idx>>2,part=(idx&3)*8;
-    ap[i]=x+(size_t)min(r0+row,R-1)*kHidden+part;
-    bp[i]=W+(size_t)min(n0+row,O-1)*kHidden+part;
-  }
-  // Native vectors: HIP's uint4 (a union type) kept the ring in scratch.
-  typedef unsigned U4 __attribute__((ext_vector_type(4)));
-  U4 ra[DEPTH][2],rb[DEPTH][2];
-#pragma unroll
-  for (int i=0;i<2;++i) {
-    const int idx=t+i*256,row=idx>>2,part=(idx&3)*8;
-    *reinterpret_cast<U4*>(&as[0][row][part])=*reinterpret_cast<const U4*>(ap[i]);
-    *reinterpret_cast<U4*>(&bs[0][row][part])=*reinterpret_cast<const U4*>(bp[i]);
+  for (int q=0;q<PB;++q) {
+    const int idx=t+q*NT,row=idx>>2,part=(idx&3)*8;
+    *reinterpret_cast<U4*>(&bs[0][row][part])=*reinterpret_cast<const U4*>(bp[q]);
   }
 #pragma unroll
-  for (int d=0;d<DEPTH;++d)
+  for (int d=0;d<DEPTH;++d) {
 #pragma unroll
-    for (int i=0;i<2;++i) {
-      ra[d][i]=*reinterpret_cast<const U4*>(ap[i]+(d+1)*kBigStep);
-      rb[d][i]=*reinterpret_cast<const U4*>(bp[i]+(d+1)*kBigStep);
-    }
+    for (int q=0;q<PA;++q) ra[d][q]=*reinterpret_cast<const U4*>(ap[q]+(d+1)*kBigStep);
+#pragma unroll
+    for (int q=0;q<PB;++q) rb[d][q]=*reinterpret_cast<const U4*>(bp[q]+(d+1)*kBigStep);
+  }
   PrefillLdsSync();
   prefill::F8 acc[2][4]={};
   const int wr=(wave>>1)*32,wc=(wave&1)*64;
+  // Valid column tiles of this wave (wave-uniform).
+  const int nj=max(0,min(4,(O-n0-wc+15)/16));
 #pragma unroll 1
   for (int s0=0;s0<kSteps;s0+=DEPTH)
 #pragma unroll
     for (int d=0;d<DEPTH;++d) {
       const int step=s0+d,buf=step&1;
-      // Slot d holds stage step + 1; refill it with stage step + 1 + DEPTH.
       if (step+1<kSteps) {
 #pragma unroll
-        for (int i=0;i<2;++i) {
-          const int idx=t+i*256,row=idx>>2,part=(idx&3)*8;
-          *reinterpret_cast<U4*>(&as[buf^1][row][part])=ra[d][i];
-          *reinterpret_cast<U4*>(&bs[buf^1][row][part])=rb[d][i];
+        for (int q=0;q<PA;++q) {
+          const int idx=t+q*NT,row=idx>>2,part=(idx&3)*8;
+          *reinterpret_cast<U4*>(&as[buf^1][row][part])=ra[d][q];
+        }
+#pragma unroll
+        for (int q=0;q<PB;++q) {
+          const int idx=t+q*NT,row=idx>>2,part=(idx&3)*8;
+          *reinterpret_cast<U4*>(&bs[buf^1][row][part])=rb[d][q];
         }
         if (step+1+DEPTH<kSteps) {
 #pragma unroll
-          for (int i=0;i<2;++i) {
-            ra[d][i]=*reinterpret_cast<const U4*>(ap[i]+(step+1+DEPTH)*kBigStep);
-            rb[d][i]=*reinterpret_cast<const U4*>(bp[i]+(step+1+DEPTH)*kBigStep);
-          }
+          for (int q=0;q<PA;++q) ra[d][q]=*reinterpret_cast<const U4*>(ap[q]+(step+1+DEPTH)*kBigStep);
+#pragma unroll
+          for (int q=0;q<PB;++q) rb[d][q]=*reinterpret_cast<const U4*>(bp[q]+(step+1+DEPTH)*kBigStep);
         }
       }
+      if (nj==4) {
 #pragma unroll
-      for (int kb=0;kb<kBigStep;kb+=16) {
-        prefill::H16 af[2],bf[4];
+        for (int kq=0;kq<kBigStep;kq+=16) {
+          const int kb=kq;
+          prefill::H16 af[2],bf[4];
 #pragma unroll
-        for (int i=0;i<2;++i) af[i]=*reinterpret_cast<const prefill::H16*>(&as[buf][wr+i*16+(lane&15)][kb]);
+          for (int a=0;a<2;++a) af[a]=*reinterpret_cast<const prefill::H16*>(&as[buf][wr+a*16+(lane&15)][kb]);
 #pragma unroll
-        for (int j=0;j<4;++j) bf[j]=*reinterpret_cast<const prefill::H16*>(&bs[buf][wc+j*16+(lane&15)][kb]);
+          for (int j=0;j<4;++j) bf[j]=*reinterpret_cast<const prefill::H16*>(&bs[buf][wc+j*16+(lane&15)][kb]);
 #pragma unroll
-        for (int i=0;i<2;++i)
+          for (int a=0;a<2;++a)
 #pragma unroll
-          for (int j=0;j<4;++j) acc[i][j]=__builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af[i],bf[j],acc[i][j]);
+            for (int j=0;j<4;++j) acc[a][j]=__builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af[a],bf[j],acc[a][j]);
+        }
+      } else if (nj>0) {
+#pragma unroll
+        for (int kq=0;kq<kBigStep;kq+=16) {
+          const int kb=kq;
+          prefill::H16 af[2];
+#pragma unroll
+          for (int a=0;a<2;++a) af[a]=*reinterpret_cast<const prefill::H16*>(&as[buf][wr+a*16+(lane&15)][kb]);
+#pragma unroll
+          for (int j=0;j<4;++j) {
+            if (j>=nj) break;
+            const prefill::H16 bf=*reinterpret_cast<const prefill::H16*>(&bs[buf][wc+j*16+(lane&15)][kb]);
+#pragma unroll
+            for (int a=0;a<2;++a) acc[a][j]=__builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af[a],bf,acc[a][j]);
+          }
+        }
       }
       PrefillLdsSync();
     }
 #pragma unroll
-  for (int i=0;i<2;++i)
+  for (int a=0;a<2;++a)
 #pragma unroll
     for (int j=0;j<4;++j) {
       const int n=n0+wc+j*16+(lane&15);
       if (n>=O) continue;
 #pragma unroll
       for (int z=0;z<8;++z) {
-        const int r=r0+wr+i*16+prefill::FragmentRow(z);
-        if (r<R) y[(size_t)r*ldy+n]=acc[i][j][z];
+        const int r=r0+wr+a*16+prefill::FragmentRow(z);
+        if (r<R) y[(size_t)r*ldy+n]=acc[a][j][z];
       }
     }
 }

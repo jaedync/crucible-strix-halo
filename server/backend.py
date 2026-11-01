@@ -11,6 +11,7 @@ from . import metrics
 from .engine_messages import ENGINE_REJECTED, ProtocolError
 from .api import LEGACY_MODEL, ApiError, ModelInfo, STOP_IDS
 from .hosts import ALLOWED_HOSTS_ENV
+from .request_id import CLIENT_REQUEST_ID_HEADER_ENV
 from .pixel_files import PixelStore
 
 @dataclass
@@ -52,10 +53,10 @@ LOOKUP_DEPTH, LOOKUP_MIN = 7, 8
 # (tests/test_switch_lists.py checks this set).
 ENGINE_KEEP_SWITCHES = frozenset({
     "CRUCIBLE_ABLATE", "CRUCIBLE_COMPACT_STATE",
-    "CRUCIBLE_DECODE_RING", "CRUCIBLE_EXACT",
-    "CRUCIBLE_FUSE", "CRUCIBLE_HC_WMMA",
-    "CRUCIBLE_LOOKAHEAD", "CRUCIBLE_LOOKAHEAD_MIB",
-    "CRUCIBLE_MTP_SIDECAR", "CRUCIBLE_PACKED_ROWS",
+    "CRUCIBLE_DECODE_RING", "CRUCIBLE_EXACT", "CRUCIBLE_EXACT_RESUME",
+    "CRUCIBLE_FUSE", "CRUCIBLE_GDN_VERIFY", "CRUCIBLE_HC_WMMA",
+    "CRUCIBLE_LAZY_SHADOW", "CRUCIBLE_LOOKAHEAD", "CRUCIBLE_LOOKAHEAD_MIB",
+    "CRUCIBLE_MOE_B128", "CRUCIBLE_MTP_SIDECAR", "CRUCIBLE_PACKED_ROWS",
     "CRUCIBLE_PERSISTENT_GDN",
     "CRUCIBLE_PF_EXACT_SPLIT", "CRUCIBLE_PF_FX_LEAD", "CRUCIBLE_PF_GDN_EAGER",
     "CRUCIBLE_PF_GDN_MICRO", "CRUCIBLE_PF_HC_FUSED", "CRUCIBLE_PF_LAUNCH_ROWS",
@@ -70,7 +71,7 @@ ENGINE_KEEP_SWITCHES = frozenset({
 
 # Read by the server itself, never by the engine (server/update_check.py). Not a switch, so no removal note, and the
 # engine environment drops it (the state-disk identity hashes every CRUCIBLE_* name the engine sees).
-SERVER_ONLY_VARIABLES = frozenset({"CRUCIBLE_NO_UPDATE_CHECK"})
+SERVER_ONLY_VARIABLES = frozenset({"CRUCIBLE_NO_UPDATE_CHECK", CLIENT_REQUEST_ID_HEADER_ENV})
 
 
 def engine_environment(environ):
@@ -213,8 +214,9 @@ class EngineBackend:
         return follow
 
     def submit(self, ids, request, cache_prefix_tokens=0, shared_prefix_tokens=0, log_turn=True, image_offsets=(),
-               after=None, think_cap=None):
-        """log_turn=False leaves the crucible_turn line to the caller (one line for a request that uses two jobs)."""
+               after=None, think_cap=None, client_request_id=None):
+        """log_turn=False leaves the crucible_turn line to the caller (one line for a request that uses two jobs).
+        client_request_id: the gateway's id for the request (metrics.client_request_id), for the job's log lines."""
         counts = dict(prompt_tokens=len(ids), max_tokens=request.max_tokens, context=self.context)
         if not ids:
             raise ApiError("The prompt and requested output must fit the configured context.", "max_tokens",
@@ -260,6 +262,7 @@ class EngineBackend:
             job.turn["enabled"] = request.crucible_metrics
             job.turn["log"] = log_turn
             job.turn["engine_id"] = self.engine_id
+            if metrics.client_request_id(client_request_id): job.turn["client_request_id"] = client_request_id
             # crucible_decode lines: only a request that speculates writes them (metrics.decode_line).
             job.turn["speculative"] = bool(request.spec) and request.max_tokens > 1
             if self.counts_stall: job.turn["stall_s"] = 0.0

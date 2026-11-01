@@ -22,6 +22,7 @@
     verify_spans_.reserve(spans.size());
     for (const auto& span:spans) sequences_[span.stream]->hist.reserve(prefixes[span.stream].length+span.tokens.size());
     struct Clear { std::vector<ActiveVerifySpan>& spans; ~Clear() { spans.clear(); } } clear{verify_spans_};
+    for (const auto& span:spans) MaterializeGdn(*sequences_[span.stream]);
     PrepareVerifySpans(spans,ple_rows);
     const BatchHostInputs input(tokens,std::move(ple_rows));
     lookahead_.Start(P.policy);
@@ -93,7 +94,7 @@
       const auto& span=verify_spans_[size_t(scored[k])];
       const float* last=H_+size_t(span.row+span.rows-1)*kWide;
       float* x=x_+k*kHidden;
-      if (hc_wmma_) HcWLaunch(hc.fn,hc.M,hc.up,hc.w1,last,1,x,nullptr,hcw_,++hcw_epoch_);
+      if (hc_wmma_) HcW2Launch(hc.fn,hc.fnf,hc.M,hc.up,hc.upf,hc.w1,last,1,x,nullptr,hcw_,++hcw_epoch_,hc.q8);
       else {
         HcDotsKernel<1><<<((hc.M+1)*kStreams+7)/8,256>>>(hc.fn,hc.M,last,dots_,ss_);
         HcMixKernel<1><<<kHidden/16,256>>>(hc.up,hc.w1,dots_,hc.M,ss_,last,x,nullptr);
@@ -150,7 +151,9 @@
         args.rows[i]=GdnRow(li,L,G,span.rows,span.pos,span.replay,span.commit,*sequences_[span.stream],span.row);
       }
       const dim3 grid(48,unsigned(verify_spans_.size()));
-      if (G.state_cache==6) GdnKernel<4,true><<<grid,256>>>(args);
+      const auto& last=verify_spans_.back();
+      if (GdnVerifyOn(last.row+last.rows)) LaunchGdnVerify(args,grid.y,G.state_cache);
+      else if (G.state_cache==6) GdnKernel<4,true><<<grid,256>>>(args);
       else if (G.state_cache==4) GdnKernel<4><<<grid,256>>>(args);
       else GdnKernel<0><<<grid,256>>>(args);
       return;

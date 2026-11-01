@@ -5,6 +5,7 @@
 // tiles. A per-block bit mask keeps each row's own selection exact.
 #pragma once
 #include "prefill_qsa.h"
+#include "qsa_union_lds.h"
 #include <cstdlib>
 #include <string>
 
@@ -459,11 +460,6 @@ QsaUnionHalfQKernel(QsaPrefill a, QsaUnion u) {
   }
 }
 
-// QsaUnionBuildKernel: one mask byte per block plus cnt, total and base.
-constexpr int kUnionStaticLds = (16 * 256 + 2 * 16) * (int)sizeof(int), kUnionMaxLds = 65536;
-inline bool QsaUnionFits(int pos0, int R) {
-  return (pos0 + R - 1) / 4 + 1 + kUnionStaticLds <= kUnionMaxLds;
-}
 
 inline size_t QsaUnionListInts(int rows) {
   return (size_t)((rows + kUnionRows - 1) / kUnionRows) * kUnionCap;

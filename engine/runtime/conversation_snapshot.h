@@ -3,6 +3,7 @@
 #include "conversation_resume.h"
 #include "../layers/cache_storage.h"
 #include "../gfx1151/pinned_allocator.h"
+#include "lazy_snapshot.h"
 #include "snapshot_bytes.h"
 #include <memory>
 #include <span>
@@ -212,6 +213,54 @@ struct ConversationStateIO {
     CopySnapshotRanges(copies, snapshot->bytes, true);
     return snapshot;
   }
+  // the full blocks of a slot tail that a direct disk write may read from the device later.
+  struct LazyPlan {
+    std::vector<StreamRange> intervals;  // snapshot byte ranges (lane 0 blocks below the settled rows), merged
+    uint64_t bytes = 0;                   // their total
+    size_t rows = 0;                      // the rows that they cover: a slot write below it ends the plan
+  };
+  // The plan for a slot whose rows [0, Settled) stay as they are (a resumed Release). `head` and `tail` are the disk's
+  // block geometry (StateDiskOptions). Empty when the geometry gives no full block.
+  static LazyPlan PlanLazy(const SequenceState& state, const ConversationResume& r, size_t block_rows, uint64_t head,
+                           uint64_t tail) {
+    LazyPlan plan;
+    SnapshotGeometry geometry;
+    const auto layout = Layout(state);  // the geometry holds a view of it
+    geometry.layout = layout;
+    geometry.rows = r.length;
+    geometry.mpos = size_t(std::max(r.mpos, 0));
+    geometry.head = head;
+    geometry.tail = tail;
+    for (const auto& span : Spans(state, r.length, r.mpos, nullptr, nullptr)) geometry.total += span.bytes;
+    const size_t settled = Settled(r);
+    plan.intervals = LazyIntervals(geometry, block_rows, settled);
+    plan.bytes = LazyBytesOf(plan.intervals);
+    if (plan.bytes) plan.rows = settled / block_rows * block_rows;
+    return plan;
+  }
+  // A save whose `plan` ranges stay on the device: the snapshot reads them through `source` when a user walks it. The
+  // rest is copied now (the copy waits for the stream, so the rows that the lazy reads see are final). No base.
+  static std::shared_ptr<const ConversationSnapshot> SaveLazy(Engine& e, const SequenceState& state,
+      const ConversationResume& r, float* stk, float* carry, const LazyPlan& plan,
+      const std::shared_ptr<LazySource>& source, bool shadow = false) {
+    Validate(e, state, r, state.hist.size(), stk, carry);
+    auto snapshot = std::make_shared<ConversationSnapshot>();
+    snapshot->hist.assign(state.hist.begin(), state.hist.end());
+    snapshot->retained = state.retained;
+    snapshot->resume = r;
+    snapshot->qsa_layout = Layout(state);
+    const auto spans = Spans(state, r.length, r.mpos, stk, carry);
+    const auto parts = SplitLazyParts(spans, plan.intervals, source);
+    // Shadow mode (CRUCIBLE_LAZY_SHADOW, soaks): the eager copy of the lazy rows, as the old path took it. LazySource compares
+    // each piece that the writer reads with it.
+    if (shadow)
+      for (const auto& part : parts)
+        if (part.lazy) source->AddShadow(part.device, DeviceShadowCopy(part.device, part.bytes));
+    std::vector<SnapshotRange> copies;
+    snapshot->bytes = SnapshotBytes::Compose(parts, copies);
+    CopySnapshotRanges(copies, snapshot->bytes, true);
+    return snapshot;
+  }
   static ConversationResume Restore(Engine& e, SequenceState& state, const ConversationSnapshot& snapshot,
                                     float* stk, float* carry) {
     Validate(e, state, snapshot.resume, snapshot.hist.size(), stk, carry, false);
@@ -235,6 +284,7 @@ struct ConversationStateIO {
     const auto spans = Spans(state, snapshot.hist.size(), snapshot.resume.mpos, stk, carry, mtp);
     state.Reset();
     CopySnapshotSpans(spans, snapshot.bytes, false);
+    state.gdn_lazy = true;  // the saved GDN state may hold a lazy scale
     state.hist = snapshot.hist;
     state.retained = snapshot.retained;
     if (!snapshot.resume.logits.empty()) {

@@ -6,6 +6,8 @@
 #else
 #define PREFILL_ITEMS_HD
 #endif
+#include <algorithm>
+#include <vector>
 
 namespace crucible {
 // Item w of the list that PrefillLinear::Build wrote for jobs of R rows and I
@@ -44,5 +46,21 @@ PREFILL_ITEMS_HD inline int PrefillWideKOf(const int* K, int n) {
     }
   }
   return wide && other ? -1 : wide;
+}
+
+// Items of the half prefill GEMM (prefill_half.h), 128 rows x 128 columns each: groups of G row
+// blocks; inside a group every column block of every job, and for each the group's row blocks.
+// Blocks in flight then share B in L2 and the group's A rows stay in the MALL. The order does not
+// change any output. M[j], O[j]: rows and columns of job j (O % 128 == 0).
+struct PrefillHalfItem { int job, m0, b0; };  // b0 in 16-column tiles
+inline std::vector<PrefillHalfItem> PrefillHalfItemsOf(const int* M, const int* O, int n, int G) {
+  std::vector<PrefillHalfItem> v;
+  int rows = 0;
+  for (int j = 0; j < n; ++j) rows = std::max(rows, M[j]);
+  for (int g0 = 0; g0 < rows; g0 += 128 * G)
+    for (int j = 0; j < n; ++j)
+      for (int b = 0; b < O[j] / 16; b += 8)
+        for (int m = g0; m < std::min(g0 + 128 * G, M[j]); m += 128) v.push_back({j, m, b});
+  return v;
 }
 }  // namespace crucible

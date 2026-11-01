@@ -93,10 +93,14 @@
   std::vector<int> ForwardBatch(const std::vector<int>& tokens, const std::vector<int>& streams,
                                 const std::string& dump = "") {
     CheckBatch(tokens, streams);
+    for (const int stream : streams) MaterializeGdn(*sequences_[stream]);
     const int R = (int)tokens.size();
     const Plans& P = PlansFor(R);
     // Host inputs must live through Head's blocking copy, including a future pinned upload path.
     const BatchHostInputs inputs(tokens, PrepareBatch(tokens, streams));
+    // Serial and batched decode run here. Head stops the lookahead; it was never started on this path, so R = 1 HC
+    // reads were cold. The prefetch only reads: tokens do not change.
+    lookahead_.Start(P.policy);
     host_tokens_.CopyTo(tok_, inputs.tokens().data(), inputs.tokens().size());
     host_rows_.CopyTo(rows_, inputs.rows().data(), inputs.rows().size());
     PleRowsUploaded(host_rows_.data(), (int)inputs.rows().size());

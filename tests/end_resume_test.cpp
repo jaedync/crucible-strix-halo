@@ -7,7 +7,10 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <cstdlib>
+#include <memory>
 #include <numeric>
+#include <tuple>
 #include <unistd.h>
 
 namespace {
@@ -23,19 +26,22 @@ ServeRequest Prompt(size_t length, int first = 1, int tokens = 3) {
 }
 
 // One session with the cache hooks of batched_serve.h in miniature: no host states, slot tails, and checkpoint
-// buffers that hold the slot's rows.
-struct Fixture {
-  MockEngine engine;
-  crucible::BatchSession<MockEngine> session;
+// buffers that hold the slot's rows. The engine is a parameter so a vision engine can use the same hooks.
+template <class E = MockEngine>
+struct FixtureT {
+  E engine;
+  crucible::BatchSession<E> session;
   std::map<std::pair<int, int>, std::vector<int>> buffers;
   std::vector<std::string> log;
   std::vector<size_t> captures, floors;
+  std::vector<std::pair<size_t, size_t>> cuts;  // b-cut2: the cut buffer's position and window per prepared cut
   size_t host_tail = 0;  // > 0: the host restores a session tail of this length (a replayed turn)
-  explicit Fixture(int slots = 1, int prefill = 4, size_t pre_min = 0, int core = 16,
-                   int launch = 0)
-      : session((engine.prefill_rows = prefill, engine.launch_rows = launch, engine), slots) {
+  explicit FixtureT(int slots = 1, int prefill = 4, size_t pre_min = 0, int core = 16,
+                    int launch = 0, int context = 64)
+      : session((engine.prefill_rows = prefill, engine.launch_rows = launch, engine.context = context, engine), slots) {
+    session.SetCoreRows(core);
+    session.SetSavePoints(0, 0);  // the save points have their own tests (SavePoints)
     if (pre_min) session.SetPreEnd(pre_min, core);
-    crucible::BatchCacheHooks hooks;
     hooks.restore = [this](const ServeRequest& r) -> crucible::BatchRestore {
       log.push_back("restore");
       if (!host_tail) return 0;
@@ -77,7 +83,29 @@ struct Fixture {
     hooks.pre_saved = [this](int slot, size_t tokens) {
       log.push_back("pre slot=" + std::to_string(slot) + " tokens=" + std::to_string(tokens));
     };
+    hooks.header_saved = [this](int slot, size_t tokens) {
+      log.push_back("header slot=" + std::to_string(slot) + " tokens=" + std::to_string(tokens));
+    };
     hooks.bytes = [] { return size_t(0); };
+    session.SetCacheHooks(hooks);
+  }
+  // join rows and a cut buffer, as batched_serve.h with "L+T" launch rows. The buffer holds the
+  // slot's rows below the cut, and cut_save copies them to a checkpoint buffer.
+  crucible::BatchCacheHooks hooks;
+  void EnableCuts(int join = 4) {
+    engine.join_rows = join;
+    static float state[4], target[4];
+    hooks.cut_ready = [](const ServeRequest& r) { return r.cache_control != "bypass"; };
+    hooks.cut_prepare = [this](size_t position, size_t window) {
+      cuts.emplace_back(position, window);
+      return std::vector<crucible::PrefillCutCopy>{{state, target, sizeof state}};
+    };
+    hooks.cut_save = [this](int slot, int index) {
+      const auto& stream = engine.histories[slot];
+      assert(!cuts.empty() && stream.size() > cuts.back().first);
+      buffers[{slot, index}].assign(stream.begin(), stream.begin() + std::ptrdiff_t(cuts.back().first));
+    };
+    hooks.cut_capture = [](const ServeRequest&, size_t) { assert(false); };
     session.SetCacheHooks(hooks);
   }
   // The request's tokens and its done event; `opened`: the events of the open (the first token, if any).
@@ -95,6 +123,7 @@ struct Fixture {
   }
   bool Logged(const std::string& line) const { return std::find(log.begin(), log.end(), line) != log.end(); }
 };
+using Fixture = FixtureT<MockEngine>;
 
 // A: greedy, sampled, one token, a stop token, and the switch off.
 void Identical() {
@@ -257,8 +286,8 @@ void PreEnd() {
     f.engine.chunks.clear();
     const auto [extended, ext_done] = f.Run(3, ext);
     assert(ext_done.cached_tokens == 48 && ext_done.checkpoint_resume && !ext_done.end_resume && f.Logged("load 48"));
-    // As an End resume of a longer prompt: one small-row head first, then the rest.
-    assert(f.engine.chunks.front() > 0 && f.engine.chunks.front() <= crucible::kMaxRows);
+    // A Pre point is on the core grid: no small-row head (GridResume), one bulk chunk for the rest.
+    assert(f.engine.chunks.front() == -12);
   }
   {
     // Merged launches stop at the Pre point too: without the cut the whole prompt is one launch.
@@ -305,6 +334,333 @@ void PreEnd() {
     assert(threw);
   }
 }
+// an End or Pre resume at a multiple of the core rows runs no small-row head. The
+// bulk kernels then see the same rows and the same 2,048-row part cuts as a cold prefill, so the request is bitwise
+// equal to it (extend-dump: s = 4,096 and 8,192). Off the grid the head stays. A tail (session replay) keeps its head.
+void GridResume() {
+  using crucible::kMaxRows;
+  const auto extend = [](const ServeRequest& base, size_t extra) {
+    auto r = base;
+    for (size_t i = 0; i < extra; ++i) r.ids.push_back(int((i * 7 + 3) % 16));
+    return r;
+  };
+  {
+    // On the grid (32 rows, core 16): no head, one bulk chunk for the 20 new rows; every Forward has replay 0.
+    Fixture f(1, 32, 0, 16);
+    const auto a = Prompt(32, 1, 2);
+    f.Run(1, a);
+    f.engine.chunks.clear(); f.engine.replays.clear();
+    const auto b = extend(a, 20);
+    const auto [out, done] = f.Run(2, b);
+    assert(done.cached_tokens == 32 && done.checkpoint_resume && !done.end_resume && f.Logged("load 32"));
+    assert((f.engine.chunks.front() == -20));
+    assert(std::all_of(f.engine.replays.begin(), f.engine.replays.end(), [](int r) { return r == 0; }));
+    // The same tokens as a cold prefill of the long prompt.
+    MockEngine reference; reference.prefill_rows = 32;
+    crucible::BatchSession<MockEngine> plain(reference, 1);
+    assert(Complete(plain, 1, b) == out);
+  }
+  {
+    // Off the grid (30 rows): the head stays, as before.
+    Fixture f(1, 32, 0, 16);
+    const auto a = Prompt(30, 1, 2);
+    f.Run(1, a);
+    f.engine.chunks.clear();
+    const auto [out, done] = f.Run(2, extend(a, 20));
+    assert(done.cached_tokens == 30 && done.checkpoint_resume);
+    assert(f.engine.chunks.front() > 0 && f.engine.chunks.front() <= kMaxRows);
+  }
+  {
+    // A tail on the grid (30 prompt rows + 2 kept output rows = 32): the head stays, with replay 0 or not, so the
+    // pending GDN rows of a speculative run never choose the path.
+    Fixture f(1, 32, 0, 16);
+    const auto a = Prompt(30, 1, 3);
+    const auto [first, first_done] = f.Run(1, a);
+    auto next = a;
+    next.ids.insert(next.ids.end(), first.begin(), first.begin() + 2);
+    next = extend(next, 20);
+    f.engine.chunks.clear();
+    const auto [out, done] = f.Run(2, next);
+    assert(done.cached_tokens == 32 && done.cache_tail);
+    assert(f.engine.chunks.front() > 0 && f.engine.chunks.front() <= kMaxRows);
+  }
+  {
+    // MTP warm-up (a speculative request): the draft hooks see every row from the resume point on, once and in
+    // order, as bulk chunks, and no Forward carries pending GDN rows (an End point has none).
+    Fixture f(1, 32, 0, 16);
+    std::vector<std::tuple<size_t, int, bool>> chunks;
+    std::vector<size_t> opened;
+    crucible::BatchSpecHooks hooks;
+    hooks.check = [](const ServeRequest&) { return std::string(); };
+    hooks.open = [&](uint64_t, int, const ServeRequest&, size_t cached) { opened.push_back(cached); };
+    hooks.chunk = [&](uint64_t, size_t start, int rows, bool bulk) { chunks.emplace_back(start, rows, bulk); };
+    hooks.first = [](uint64_t, int) {};
+    hooks.step = [](uint64_t, int last, size_t, uint64_t) { return std::vector<int>{(last + 1) % 16}; };
+    hooks.close = [](uint64_t) {};
+    f.session.SetSpecHooks(hooks);
+    const auto run = [&](uint64_t id, const ServeRequest& r) {
+      auto events = f.session.Open(id, r);
+      for (;;) {
+        for (const auto& event : events) if (event.done) return;
+        events = f.session.SpecStep(id);
+      }
+    };
+    auto a = Prompt(32, 1, 3);
+    a.spec = 7; a.mtp_prefix = 40;
+    run(1, a);
+    chunks.clear(); f.engine.replays.clear();
+    auto b = extend(a, 20);
+    run(2, b);
+    assert(opened.back() == 32);
+    assert((chunks == std::vector<std::tuple<size_t, int, bool>>{{32, 20, true}}));
+    assert(std::all_of(f.engine.replays.begin(), f.engine.replays.end(), [](int r) { return r == 0; }));
+  }
+  {
+    // A Pre point is a grid point too: an extension of a long prompt that resumes there has no head.
+    Fixture f(1, 32, 40, 16);
+    const auto c = Prompt(58, 1, 2);
+    f.Run(1, c);
+    auto ext = c;
+    ext.ids.resize(50);
+    ext.ids.insert(ext.ids.end(), {9, 9, 9, 9, 9, 9, 9, 9, 9, 9});
+    f.engine.chunks.clear();
+    const auto [extended, ext_done] = f.Run(3, ext);
+    assert(ext_done.cached_tokens == 48 && ext_done.checkpoint_resume && f.Logged("load 48"));
+    assert(f.engine.chunks.front() == -12);
+  }
+}
+// with exact resume on, a strict extension of an End point that is off the core grid
+// resumes at the last multiple of 4 rows that leaves more than 8 rows (a Pre point, saved for any length), so its bulk
+// rows and QSA tiles are the cold prefill's. An identical prompt still resumes at the End point; with the switch off
+// nothing changes.
+void ExactResume() {
+  using crucible::kMaxRows;
+  const auto extend = [](const ServeRequest& base, size_t extra) {
+    auto r = base;
+    for (size_t i = 0; i < extra; ++i) r.ids.push_back(int((i * 7 + 3) % 16));
+    return r;
+  };
+  {
+    // 58 rows (step 32, core 16): the Pre point is 48 (58 - 9 = 49, down to a multiple of 4), the End point 58 is off
+    // the grid and not a multiple of 4.
+    Fixture f(1, 32, 0, 16, 0, 160);
+    f.session.SetExactResume(true);
+    const auto c = Prompt(58, 1, 2);
+    const auto [cold, cold_done] = f.Run(1, c);
+    assert((f.engine.chunks == std::vector<int>{-32, -16, -10}));
+    assert(f.Logged("pre slot=0 tokens=48") && (f.captures == std::vector<size_t>{32}));
+    // Identical: the End point.
+    const auto [again, again_done] = f.Run(2, c);
+    assert(again == cold && again_done.end_resume && again_done.cached_tokens == 58);
+    // An extension: the Pre point, no head, bulk rows up to 64 (its own Pre point there), then the 6-row small tail
+    // that the cold plan of 70 rows runs alone (64 = 2 x 32, and 6 rows are 8 or fewer).
+    const auto ext = extend(c, 12);
+    f.engine.chunks.clear(); f.engine.replays.clear();
+    const auto [out, done] = f.Run(3, ext);
+    assert(done.cached_tokens == 48 && done.checkpoint_resume && !done.end_resume && f.Logged("load 48"));
+    assert((f.engine.chunks == std::vector<int>{-16, -6}) && f.Logged("pre slot=0 tokens=64"));
+    assert(std::all_of(f.engine.replays.begin(), f.engine.replays.end(), [](int r) { return r == 0; }));
+    MockEngine reference; reference.prefill_rows = 32; reference.context = 160;
+    crucible::BatchSession<MockEngine> plain(reference, 1);
+    assert(Complete(plain, 1, ext) == out);
+  }
+  {
+    // The switch off: the same extension resumes at the End point (58) with a head, as before.
+    Fixture f(1, 32, 40, 16, 0, 160);
+    const auto c = Prompt(58, 1, 2);
+    f.Run(1, c);
+    f.engine.chunks.clear();
+    const auto [out, done] = f.Run(2, extend(c, 12));
+    assert(done.cached_tokens == 58 && f.engine.chunks.front() > 0 && f.engine.chunks.front() <= kMaxRows);
+  }
+  {
+    // A cut on a chunk boundary (45 rows: 45 - 9 = 36, point 32): the Pre point is saved and the host capture stays.
+    Fixture f(1, 32, 0, 16, 0, 160);
+    f.session.SetExactResume(true);
+    const auto c = Prompt(45, 1, 2);
+    f.Run(1, c);
+    assert((f.engine.chunks == std::vector<int>{-32, -13}));
+    assert(f.Logged("pre slot=0 tokens=32") && (f.captures == std::vector<size_t>{32}));
+    f.engine.chunks.clear();
+    const auto [out, done] = f.Run(2, extend(c, 15));
+    assert(done.cached_tokens == 32 && (f.engine.chunks == std::vector<int>{-28}));  // lever 1: 60 rows end in a 28-row piece, no Pre point
+  }
+  {
+    // 40 rows: the cold plan is 32 bulk rows and an 8-row small tail, so the Pre point is the tail start 32
+    // (before: 28, and the 12 rows after it ran as bulk rows). The End point 40 holds the small-row tail, which the
+    // cold 50-row prompt runs as bulk rows, so the extension resumes at 32.
+    Fixture f(1, 32, 0, 16, 0, 160);
+    f.session.SetExactResume(true);
+    const auto c = Prompt(40, 1, 2);
+    f.Run(1, c);
+    assert((f.engine.chunks == std::vector<int>{-32, -8}));
+    assert(f.Logged("pre slot=0 tokens=32"));
+    f.engine.chunks.clear();
+    const auto [out, done] = f.Run(2, extend(c, 10));
+    assert(done.cached_tokens == 32 && (f.engine.chunks == std::vector<int>{-18}));
+  }
+  {
+    // A prompt with no multiple of 4 that leaves 9 rows and more than 8 rows since its chunk start (20 rows: the point
+    // is 8): no Pre point, so the extension starts from row 0 (cold arithmetic) instead of the off-grid End point.
+    Fixture f(1, 32, 0, 16, 0, 160);
+    f.session.SetExactResume(true);
+    const auto c = Prompt(20, 1, 2);
+    f.Run(1, c);
+    assert(!f.Logged("pre slot=0"));
+    f.engine.chunks.clear();
+    // 8 new rows: too few for a bulk resume at the End point (gdn-split-inv), which 10 rows would allow.
+    const auto [out, done] = f.Run(2, extend(c, 8));
+    // The 28-row prompt is cold again (lever 1: a 28-row piece, so no Pre point).
+    assert(done.cached_tokens == 0 && (f.engine.chunks == std::vector<int>{-28}) && !f.Logged("pre slot=0"));  // lever 1: no Pre point
+  }
+  {
+    // An End point on the grid stays usable (fix1): no head.
+    Fixture f(1, 32, 0, 16, 0, 160);
+    f.session.SetExactResume(true);
+    const auto c = Prompt(48, 1, 2);
+    f.Run(1, c);
+    f.engine.chunks.clear();
+    const auto [out, done] = f.Run(2, extend(c, 12));
+    assert(done.cached_tokens == 48 && f.engine.chunks.front() == -12);
+  }
+  {
+    // A resume from a Pre point off the chunk grid (48, step 32) still saves its own Pre point (68) for the next turn.
+    Fixture f(1, 32, 0, 16, 0, 160);
+    f.session.SetExactResume(true);
+    const auto c = Prompt(58, 1, 2);
+    f.Run(1, c);
+    f.engine.chunks.clear(); f.log.clear();
+    const auto next = extend(c, 23);
+    const auto [out, done] = f.Run(2, next);
+    assert(done.cached_tokens == 48 && (f.engine.chunks == std::vector<int>{-24, -9}));
+    assert(f.Logged("pre slot=0 tokens=72"));
+    f.engine.chunks.clear();
+    const auto [out2, done2] = f.Run(3, extend(next, 12));
+    assert(done2.cached_tokens == 72 && (f.engine.chunks == std::vector<int>{-12, -9}));  // the End point 81 is no tile
+  }
+  {
+    // A bypass prompt and a replayed turn make no Pre point.
+    Fixture f(1, 32, 0, 16, 0, 160);
+    f.session.SetExactResume(true);
+    auto b = Prompt(58, 1, 2); b.cache_control = "bypass";
+    f.Run(1, b);
+    assert(!f.Logged("pre slot=0 tokens=48"));
+  }
+}
+// the Pre point is the last multiple of 4 rows that leaves more than
+// 8 rows, so a resume that cannot use the End point (not a multiple of 4, or 8 new rows or fewer) recomputes at most
+// 20 rows instead of up to core_rows - 1.
+void ExactResumeFallback() {
+  const auto extend = [](const ServeRequest& base, size_t extra) {
+    auto r = base;
+    for (size_t i = 0; i < extra; ++i) r.ids.push_back(int((i * 7 + 3) % 16));
+    return r;
+  };
+  {
+    // 53 rows (not a multiple of 4): the Pre point is 44 (53 - 9), inside the second chunk, 12 rows past its start.
+    Fixture f(1, 32, 0, 16, 0, 160);
+    f.session.SetExactResume(true);
+    const auto c = Prompt(53, 1, 2);
+    f.Run(1, c);
+    assert((f.engine.chunks == std::vector<int>{-32, -12, -9}) && f.Logged("pre slot=0 tokens=44"));
+    f.engine.chunks.clear();
+    // The End point 53 is no tile-aligned state: the extension resumes at 44 (9 rows recomputed), as bulk rows.
+    const auto ext = extend(c, 22);
+    const auto [out, done] = f.Run(2, ext);
+    assert(done.cached_tokens == 44 && done.checkpoint_resume && f.Logged("load 44"));
+    assert((f.engine.chunks == std::vector<int>{-20, -11}) && f.Logged("pre slot=0 tokens=64"));
+    assert(std::all_of(f.engine.replays.begin(), f.engine.replays.end(), [](int r) { return r == 0; }));
+    MockEngine reference; reference.prefill_rows = 32; reference.context = 160;
+    crucible::BatchSession<MockEngine> plain(reference, 1);
+    assert(Complete(plain, 1, ext) == out);
+  }
+  {
+    // Another prompt that repeats only the Pre point, with 6 own rows: too few for a bulk resume, so it starts cold.
+    // Its Pre point would be 40, 8 rows past its chunk start (32), so the cut moves to the chunk boundary.
+    Fixture f(1, 32, 0, 16, 0, 160);
+    f.session.SetExactResume(true);
+    const auto c = Prompt(53, 1, 2);
+    f.Run(1, c);
+    auto other = c;
+    other.ids.resize(44);
+    for (int i = 0; i < 6; ++i) other.ids.push_back(9);
+    f.engine.chunks.clear(); f.log.clear();
+    const auto [out, done] = f.Run(2, other);
+    assert(done.cached_tokens == 0 && !f.Logged("load"));
+    assert((f.engine.chunks == std::vector<int>{-32, -18}) && f.Logged("pre slot=0 tokens=32"));
+  }
+  {
+    // A short tail: 40 rows (a multiple of 4, its last piece has 8 rows) and 8 new rows. The End point is too short for
+    // bulk rows, so the extension resumes at the seed's Pre point 32, the start of its small-row tail, 16
+    // rows back.
+    Fixture f(1, 32, 0, 16, 0, 160);
+    f.session.SetExactResume(true);
+    const auto c = Prompt(40, 1, 2);
+    f.Run(1, c);
+    assert(f.Logged("pre slot=0 tokens=32"));
+    f.engine.chunks.clear();
+    const auto [out, done] = f.Run(2, extend(c, 8));
+    assert(done.cached_tokens == 32 && f.Logged("load 32") && (f.engine.chunks == std::vector<int>{-16}));
+  }
+  {
+    // b-cut lever 1: 56 rows (a multiple of 4, a last piece of 24 rows) save no Pre point, because the End point is
+    // exact for any extension of more than 8 rows. An extension of 8 rows or fewer then starts cold.
+    Fixture f(1, 32, 0, 16, 0, 160);
+    f.session.SetExactResume(true);
+    const auto c = Prompt(56, 1, 2);
+    f.Run(1, c);
+    assert(!f.Logged("pre slot=0") && (f.engine.chunks == std::vector<int>{-32, -24}));
+    f.engine.chunks.clear();
+    const auto [out, done] = f.Run(2, extend(c, 8));
+    assert(done.cached_tokens == 0 && !f.Logged("load") && (f.engine.chunks == std::vector<int>{-32, -32}));
+    // A whole chunk at the end (64 rows, two chunks of 32): the End point is exact as well, no Pre point.
+    assert(!f.Logged("pre slot=0"));
+  }
+  {
+    // A last piece of 8 rows or fewer keeps its Pre point: the multiple of 4 rule does not apply.
+    Fixture f(1, 32, 0, 16, 0, 160);
+    f.session.SetExactResume(true);
+    f.Run(1, Prompt(36, 1, 2));
+    assert(f.Logged("pre slot=0 tokens=24") || f.Logged("pre slot=0 tokens=32"));
+  }
+  {
+    // 9 new rows after an End point (52 rows, no Pre point by lever 1): it serves.
+    Fixture f(1, 32, 0, 16, 0, 160);
+    f.session.SetExactResume(true);
+    const auto c = Prompt(52, 1, 2);
+    f.Run(1, c);
+    f.engine.chunks.clear();
+    const auto [out, done] = f.Run(2, extend(c, 9));
+    assert(done.cached_tokens == 52 && (f.engine.chunks == std::vector<int>{-9}));
+  }
+  {
+    // 9 new rows after the End point 56 make 65 rows, whose cold plan runs row 64 alone as a small-row tail,
+    // so only 8 bulk rows would follow the point: the prompt starts cold.
+    Fixture f(1, 32, 0, 16, 0, 160);
+    f.session.SetExactResume(true);
+    const auto c = Prompt(56, 1, 2);
+    f.Run(1, c);
+    f.engine.chunks.clear();
+    const auto [out, done] = f.Run(2, extend(c, 9));
+    assert(done.cached_tokens == 0 && (f.engine.chunks == std::vector<int>{-32, -32, -1}));
+  }
+  {
+    // 54 rows: the point 44 is 12 rows past the chunk start (32). 50 rows: the point 40 is 8 rows past it, too few for
+    // the piece before the cut, so it moves to 32.
+    Fixture f(1, 32, 0, 16, 0, 160);
+    f.session.SetExactResume(true);
+    f.Run(1, Prompt(50, 1, 2));
+    assert((f.engine.chunks == std::vector<int>{-32, -18}) && f.Logged("pre slot=0 tokens=32"));
+  }
+  {
+    // 41 rows: the point 32 is a chunk boundary (the host capture there stays).
+    Fixture f(1, 32, 0, 16, 0, 160);
+    f.session.SetExactResume(true);
+    f.Run(1, Prompt(41, 1, 2));
+    assert((f.engine.chunks == std::vector<int>{-32, -9}) && f.Logged("pre slot=0 tokens=32") &&
+           (f.captures == std::vector<size_t>{32}));
+  }
+}
 // An earlier change: an End resume of an image prompt frees the bound image rows at once, as a final chunk does.
 struct VisionEngine : MockEngine {
   struct Sequence {};
@@ -316,6 +672,46 @@ struct VisionEngine : MockEngine {
   Sequence& ActiveSequence() { return state; }
   void ReleaseImageRows(Sequence&, size_t cursor) { released.push_back(cursor); }
 };
+// a cut launch that first needs an image encoder slice (review, Oct 27). The slice ends the command before
+// the launch runs, so the cut state must stay open for the retry. One 64x64 image: four pad rows at 34..37, ending
+// before the cut launch [32, 58).
+struct VisionCutEngine : MockEngine {
+  struct Sequence {};
+  Sequence state;
+  size_t encoded = 0;  // image slices encoded so far
+  int encodes = 0;
+  bool HasVision() const { return true; }
+  double BindImages(Sequence&, const std::vector<crucible::ImageInput>&, size_t, bool = false) { return 0; }
+  int VisionSlicesLeft(const Sequence&) const { return int(1 - encoded); }
+  Sequence& ActiveSequence() { return state; }
+  void ReleaseImageRows(Sequence&, size_t) {}
+  int VisionSlicesBefore(Sequence&, size_t row) const { return encoded == 0 && row >= 38 ? 1 : 0; }
+  int EncodeVisionSlice(Sequence&) { encoded = 1; ++encodes; return 4; }
+};
+void ImageCutRetry() {
+  FixtureT<VisionCutEngine> f(1, 32, 0, 16, 0, 160);
+  f.session.SetExactResume(true);
+  f.EnableCuts();
+  char pattern[] = "/tmp/crucible-cut-vision-XXXXXX";
+  const int fd = mkstemp(pattern);
+  assert(fd >= 0);
+  const std::vector<char> zeros(64 * 64 * 3, 0);
+  assert(write(fd, zeros.data(), zeros.size()) == ssize_t(zeros.size()));
+  close(fd);
+  ServeRequest r = Prompt(58, 1, 2);
+  for (size_t i = 34; i < 38; ++i) r.ids[i] = crucible::kImagePad;
+  crucible::ImageInput image;
+  image.offset = 34; image.height = image.width = 64;
+  image.digest = std::string(64, 'a'); image.path = pattern;
+  r.images = {image};
+  const auto [out, done] = f.Run(1, r);
+  unlink(pattern);
+  assert(f.engine.encodes == 1);  // the slice ran first, so the first command ran no launch
+  assert(f.cuts.size() == 1);     // the retry took the cut 16 rows into the [32, 58) launch
+  assert(f.engine.joins.size() == 1 && f.engine.joins[0].pre && f.engine.joins[0].cut == 16);
+  assert(f.Logged("pre slot=0 tokens=48"));
+  assert(!out.empty() && done.done);
+}
 void ImageEndResume() {
   VisionEngine engine;
   engine.prefill_rows = 4;
@@ -354,12 +750,369 @@ void ImageEndResume() {
 }
 }  // namespace
 
+// the GDN scan carries its lazy scale, so an End point off the core grid resumes as bulk rows
+// with no head when it is a multiple of 4 rows (the QSA union tiles) and more than 8 rows follow. A core-point resume
+// never runs a last piece of 8 rows or fewer.
+void SplitResume() {
+  const auto extend = [](const ServeRequest& base, size_t extra) {
+    auto r = base;
+    for (size_t i = 0; i < extra; ++i) r.ids.push_back(int((i * 7 + 3) % 16));
+    return r;
+  };
+  {
+    // 48 rows (off the grid of 16, a multiple of 4), switch off: the extension (68 rows) resumes at 48 with no head.
+    // 68 rows end in a cold small-row tail of 4 rows (step 32), so the resume runs the 16 bulk rows up to 64
+    // and the tail alone (it ran one 20-row bulk launch before, also with the switch off).
+    Fixture f(1, 32, 40, 16, 0, 160);
+    const auto c = Prompt(48, 1, 2);
+    f.Run(1, c);
+    const auto ext = extend(c, 20);
+    f.engine.chunks.clear(); f.engine.replays.clear();
+    const auto [out, done] = f.Run(2, ext);
+    assert(done.cached_tokens == 48 && done.checkpoint_resume && !done.end_resume);
+    assert((f.engine.chunks == std::vector<int>{-16, -4}));
+    assert(std::all_of(f.engine.replays.begin(), f.engine.replays.end(), [](int r) { return r == 0; }));
+    MockEngine reference; reference.prefill_rows = 32; reference.context = 160;
+    crucible::BatchSession<MockEngine> plain(reference, 1);
+    assert(Complete(plain, 1, ext) == out);
+  }
+  {
+    // End 56 and 12 new rows leave 8 bulk rows before the cold tail (BulkEnd 64). Those 8 rows
+    // would run the small-row kernels where cold runs bulk rows, so the point is refused (as with exact resume):
+    // the request does not resume at 56, and it gives the cold tokens.
+    Fixture f(1, 32, 40, 16, 0, 160);
+    const auto c = Prompt(56, 1, 2);
+    f.Run(1, c);
+    const auto ext = extend(c, 12);
+    f.engine.chunks.clear();
+    const auto [out, done] = f.Run(2, ext);
+    assert(done.cached_tokens != 56);
+    MockEngine reference; reference.prefill_rows = 32; reference.context = 160;
+    crucible::BatchSession<MockEngine> plain(reference, 1);
+    assert(Complete(plain, 1, ext) == out);
+  }
+  {
+    // 54 rows (not a multiple of 4): the head stays.
+    Fixture f(1, 32, 40, 16, 0, 160);
+    const auto c = Prompt(54, 1, 2);
+    f.Run(1, c);
+    f.engine.chunks.clear();
+    const auto [out, done] = f.Run(2, extend(c, 12));
+    assert(done.cached_tokens == 54 && f.engine.chunks.front() > 0 && f.engine.chunks.front() <= crucible::kMaxRows);
+  }
+  {
+    // 56 rows with 8 new rows: too few for bulk rows, so the head stays.
+    Fixture f(1, 32, 40, 16, 0, 160);
+    const auto c = Prompt(56, 1, 2);
+    f.Run(1, c);
+    f.engine.chunks.clear();
+    const auto [out, done] = f.Run(2, extend(c, 8));
+    assert(done.cached_tokens == 56 && f.engine.chunks.front() > 0);
+  }
+  {
+    // Exact resume on: the End point 56 is exact, so the extension (76 rows) resumes there and not at the Pre point 32.
+    Fixture f(1, 32, 0, 16, 0, 160);
+    f.session.SetExactResume(true);
+    const auto c = Prompt(56, 1, 2);
+    f.Run(1, c);
+    f.engine.chunks.clear();
+    const auto [out, done] = f.Run(2, extend(c, 20));
+    assert(done.cached_tokens == 56 && done.checkpoint_resume && f.engine.chunks.front() == -20);
+    // 12 new rows make 68 = 64 + 4 rows, whose cold plan runs the last 4 rows alone, so only 8 bulk rows
+    // would follow the End point: the prompt starts cold. (The switch-off case above refuses the point too.)
+    Fixture g(1, 32, 0, 16, 0, 160);
+    g.session.SetExactResume(true);
+    g.Run(1, c);
+    g.engine.chunks.clear();
+    const auto [out2, done2] = g.Run(2, extend(c, 12));
+    assert(done2.cached_tokens == 0 && (g.engine.chunks == std::vector<int>{-32, -32, -4}));
+  }
+  {
+    // An on-grid End point (32) and 36 new rows: the prompt is 68 = 4 * 16 + 4 rows, and the cold plan runs its last 4
+    // rows alone as small-row kernels (F3). The resume keeps that tail alone too, so it does not cut the chunk before it.
+    // (Before F3 the cold plan merged the tail, and the resume ended its chunk 8 rows earlier to leave 12 bulk rows.)
+    Fixture f(1, 32, 40, 16, 0, 160);
+    const auto c = Prompt(32, 1, 2);
+    f.Run(1, c);
+    f.engine.chunks.clear();
+    const auto [out, done] = f.Run(2, extend(c, 36));
+    assert(done.cached_tokens == 32 && (f.engine.chunks == std::vector<int>{-32, -4}));
+  }
+  {
+    // The same with launch rows 64: the cold plan has the same 4-row tail alone, so the resume keeps it alone (F3).
+    Fixture f(1, 32, 40, 16, 64, 160);
+    const auto c = Prompt(32, 1, 2);
+    f.Run(1, c);
+    f.engine.chunks.clear();
+    const auto [out, done] = f.Run(2, extend(c, 36));
+    assert(done.cached_tokens == 32 && (f.engine.chunks == std::vector<int>{-32, -4}));
+  }
+}
+// with a cut buffer, the Pre point is a cut inside the launch that holds it (no launch
+// ends there), and lever 1 no longer drops it for a length that is a multiple of 4. A cut that PrefillPreCutValid
+// refuses (fewer than 16 rows in) keeps the old launch end.
+void ExactResumeCut() {
+  const auto extend = [](const ServeRequest& base, size_t extra) {
+    auto r = base;
+    for (size_t i = 0; i < extra; ++i) r.ids.push_back(int((i * 7 + 3) % 16));
+    return r;
+  };
+  const auto reference = [](const ServeRequest& r) {
+    MockEngine engine; engine.prefill_rows = 32; engine.context = 160;
+    crucible::BatchSession<MockEngine> plain(engine, 1);
+    return Complete(plain, 1, r);
+  };
+  {
+    // 58 rows: the Pre point 48 is a cut 16 rows into the second launch [32, 58), which no longer ends at 48.
+    Fixture f(1, 32, 0, 16, 0, 160);
+    f.session.SetExactResume(true);
+    f.EnableCuts();
+    const auto c = Prompt(58, 1, 2);
+    f.Run(1, c);
+    assert((f.engine.chunks == std::vector<int>{-32, -26}) && f.Logged("pre slot=0 tokens=48"));
+    assert(f.engine.joins.size() == 1 && f.engine.joins[0].pre && f.engine.joins[0].cut == 16 &&
+           f.engine.joins[0].start == 32 && f.engine.joins[0].ledger == 0);
+    assert((f.cuts == std::vector<std::pair<size_t, size_t>>{{48, 32}}) && (f.captures == std::vector<size_t>{32}));
+    // The extension resumes at 48; its own Pre point 72 is a cut 24 rows into its 33-row launch (the last row joins).
+    f.engine.chunks.clear(); f.engine.joins.clear(); f.log.clear();
+    const auto ext = extend(c, 23);
+    const auto [out, done] = f.Run(2, ext);
+    assert(done.cached_tokens == 48 && f.Logged("load 48") && (f.engine.chunks == std::vector<int>{-33}));
+    assert(f.engine.joins.size() == 1 && f.engine.joins[0].cut == 24 && f.Logged("pre slot=0 tokens=72"));
+    assert(out == reference(ext));
+    // The next turn resumes at that Pre point (the cut buffer's rows).
+    f.engine.chunks.clear();
+    const auto next = extend(ext, 12);
+    const auto [out2, done2] = f.Run(3, next);
+    assert(done2.cached_tokens == 72 && f.Logged("load 72") && out2 == reference(next));
+  }
+  {
+    // 60 rows (a multiple of 4, a 28-row last piece): lever 1 dropped the Pre point; the cut keeps it at 48, so a
+    // short extension (6 rows, too few for the End point) resumes there and not from row 0. Its 66 rows end in a
+    // 2-row small tail in the cold plan, so the bulk rows stop at 64.
+    Fixture f(1, 32, 0, 16, 0, 160);
+    f.session.SetExactResume(true);
+    f.EnableCuts();
+    const auto c = Prompt(60, 1, 2);
+    f.Run(1, c);
+    assert((f.engine.chunks == std::vector<int>{-32, -28}) && f.Logged("pre slot=0 tokens=48"));
+    f.engine.chunks.clear();
+    const auto ext = extend(c, 6);
+    const auto [out, done] = f.Run(2, ext);
+    assert(done.cached_tokens == 48 && (f.engine.chunks == std::vector<int>{-16, -2}) && out == reference(ext));
+  }
+  {
+    // 53 rows: the Pre point 44 is 12 rows into the launch, fewer than 16 (PrefillPreCutValid): the launch ends there.
+    // (56 rows would have the same point, and lever 1 then drops it.)
+    Fixture f(1, 32, 0, 16, 0, 160);
+    f.session.SetExactResume(true);
+    f.EnableCuts();
+    f.Run(1, Prompt(53, 1, 2));
+    assert((f.engine.chunks == std::vector<int>{-32, -12, -9}) && f.Logged("pre slot=0 tokens=44") && f.cuts.empty());
+  }
+  {
+    // Merged launches (launch rows 64): one launch [0, 58) with the cut at 48; its window is 32, the start of the
+    // launch that ends at 48 when the Pre point stops the plan.
+    Fixture f(1, 32, 0, 16, 64, 160);
+    f.session.SetExactResume(true);
+    f.EnableCuts();
+    f.Run(1, Prompt(58, 1, 2));
+    assert((f.engine.chunks == std::vector<int>{-58}) && f.Logged("pre slot=0 tokens=48"));
+    assert((f.cuts == std::vector<std::pair<size_t, size_t>>{{48, 32}}));
+    assert(f.engine.joins.size() == 1 && f.engine.joins[0].pre && f.engine.joins[0].cut == 48);
+  }
+  {
+    // The switch off: no cut and no Pre point.
+    Fixture f(1, 32, 0, 16, 64, 160);
+    f.EnableCuts();
+    f.Run(1, Prompt(58, 1, 2));
+    assert(f.cuts.empty() && !f.Logged("pre slot=0 tokens=48"));
+  }
+}
+
+// Save points: the Pre point `margin` rows before the prompt end and the point at the
+// end of the shared header, both saved by the one cut of a launch. Core parts of 32 rows, chunks of 64, launches of 128.
+void SavePoints() {
+  const auto extend_from = [](const ServeRequest& base, size_t keep, size_t extra) {
+    auto r = base;
+    r.ids.resize(keep);
+    for (size_t i = 0; i < extra; ++i) r.ids.push_back(int((i * 5 + 1) % 16));
+    return r;
+  };
+  const auto reference = [](const ServeRequest& r) {
+    MockEngine engine; engine.prefill_rows = 64; engine.context = 256;
+    crucible::BatchSession<MockEngine> plain(engine, 1);
+    return Complete(plain, 1, r);
+  };
+  const auto make = [](int slots, size_t margin, size_t header_min, bool exact = true) {
+    auto f = std::make_unique<Fixture>(slots, 64, 0, 32, 128, 256);
+    f->session.SetExactResume(exact);
+    f->session.SetSavePoints(margin, header_min);
+    f->EnableCuts();
+    return f;
+  };
+  {
+    // The margin point: 120 rows, 40 before the end -> 80, a cut 80 rows into the one launch (the 9 to 12 row point
+    // 108 is not saved). A prompt that diverges after 100 rows resumes at 80.
+    auto f = make(1, 40, 0);
+    const auto c = Prompt(120, 1, 2);
+    f->Run(1, c);
+    assert((f->engine.chunks == std::vector<int>{-120}) && f->Logged("pre slot=0 tokens=80") && !f->Logged("pre slot=0 tokens=108"));
+    assert((f->cuts == std::vector<std::pair<size_t, size_t>>{{80, 64}}));
+    assert(f->engine.joins.size() == 1 && f->engine.joins[0].pre && f->engine.joins[0].cut == 80);
+    f->engine.chunks.clear(); f->log.clear();
+    const auto diverged = extend_from(c, 100, 30);
+    const auto [out, done] = f->Run(2, diverged);
+    assert(done.cached_tokens == 80 && f->Logged("load 80") && out == reference(diverged));
+  }
+  {
+    // A point that is no valid cut: 130 rows in launches of 64, margin 56 -> 72, 8 rows into the second launch (a cut
+    // needs 16), and no point before it is one either (the first launch would end 4 rows after it). The old Pre point
+    // of lever 2 is kept, as an extra launch. 130 = 2 * 64 + 2, so the cold plan ends in a 2-row small-row
+    // tail and the Pre point is the tail start (BulkEnd, 128), not 9-12 rows early: the tail never runs as bulk rows.
+    Fixture f(1, 64, 0, 32, 64, 256);
+    f.session.SetExactResume(true); f.session.SetSavePoints(56, 0); f.EnableCuts();
+    f.Run(1, Prompt(130, 1, 2));
+    assert((f.engine.chunks == std::vector<int>{-64, -64, -2}) && f.Logged("pre slot=0 tokens=128") && f.cuts.empty());
+  }
+  {
+    // Margin 0 keeps the old point (lever 2): 108. The switch off (no exact resume): no cut at all.
+    auto f = make(1, 0, 0);
+    f->Run(1, Prompt(120, 1, 2));
+    assert(f->Logged("pre slot=0 tokens=108") && f->cuts.size() == 1 && f->cuts[0].first == 108);
+    auto off = make(1, 40, 40, false);
+    auto h = Prompt(120, 1, 2); h.shared_prefix_tokens = 50;
+    off->Run(1, h);
+    assert(off->cuts.empty() && !off->Logged("pre slot=0 tokens=80") && !off->Logged("header slot=0 tokens=48"));
+  }
+  {
+    // The header point: shared rows 50 -> 48. It takes the cut of the launch that holds the end Pre point, and that
+    // point is not saved (two buffers: header and End). A prompt that shares only the header resumes at 48.
+    auto f = make(1, 40, 40);
+    auto a = Prompt(120, 1, 2); a.shared_prefix_tokens = 50;
+    const auto [cold, cold_done] = f->Run(1, a);
+    assert(f->Logged("header slot=0 tokens=48") && !f->Logged("pre slot=0 tokens=80") && !f->Logged("pre slot=0 tokens=108"));
+    assert((f->cuts == std::vector<std::pair<size_t, size_t>>{{48, 0}}) && f->engine.joins.size() == 1);
+    auto b = a;
+    for (size_t i = 50; i < b.ids.size(); ++i) b.ids[i] = (b.ids[i] + 3) % 16;
+    f->log.clear();
+    const auto [out, done] = f->Run(2, b);
+    assert(done.cached_tokens == 48 && f->Logged("load 48") && out == reference(b));
+    // Resumed at the header, the request is no cold open: it saves its own end Pre point, not a second header point.
+    assert(!f->Logged("header slot=0 tokens=48") && f->Logged("pre slot=0 tokens=80"));
+  }
+  {
+    // A header block under the minimum, or a prompt without one (shared_prefix_tokens 0): no header point.
+    auto f = make(1, 40, 64);
+    auto a = Prompt(120, 1, 2); a.shared_prefix_tokens = 50;
+    f->Run(1, a);
+    assert(!f->Logged("header slot=0 tokens=48") && f->Logged("pre slot=0 tokens=80"));
+    auto g = make(1, 40, 40);
+    g->Run(1, Prompt(120, 1, 2));
+    assert(g->Logged("pre slot=0 tokens=80"));
+  }
+  {
+    // The end Pre point lies in a later launch (launches of 64 rows): the header point is skipped, the Pre point is
+    // kept. A slot that holds the header already is not given a second one.
+    Fixture f(1, 64, 0, 32, 64, 256);
+    f.session.SetExactResume(true); f.session.SetSavePoints(40, 40); f.EnableCuts();
+    auto a = Prompt(200, 1, 2); a.shared_prefix_tokens = 50;
+    f.Run(1, a);
+    assert(!f.Logged("header slot=0 tokens=48") && f.Logged("pre slot=0 tokens=160"));
+    auto h = make(2, 40, 40);
+    auto x = Prompt(120, 1, 2); x.shared_prefix_tokens = 50;
+    h->Run(1, x);
+    auto y = x;
+    for (size_t i = 50; i < y.ids.size(); ++i) y.ids[i] = (y.ids[i] + 5) % 16;
+    h->log.clear();
+    h->Run(2, y);  // the header point is held (slot 0): the cold open on the empty slot 1 saves none
+    assert(!h->Logged("header slot=1 tokens=48") && h->Logged("pre slot=1 tokens=80"));
+  }
+  {
+    // The shipped constants (review H1, Oct 28): the header point is off, because with several slots no gate shows that
+    // it restores (Affinity sends the next chat to an empty slot). The margin point stays. A shared header of 90
+    // rows in a launch of 128 would take the cut of the first launch (header point 88) if kHeaderMinRows were 64.
+    Fixture f(1, 128, 0, 32, 256, 512);
+    f.session.SetExactResume(true); f.session.SetSavePoints(crucible::kPreEndMargin, crucible::kHeaderMinRows); f.EnableCuts();
+    auto a = Prompt(160, 1, 2); a.shared_prefix_tokens = 90;
+    f.Run(1, a);
+    assert(!f.Logged("header slot=0 tokens=88") && f.Logged("pre slot=0 tokens=96"));
+  }
+  {
+    // Lookup: two slots hold tails; the slot with the header point is chosen for a prompt that shares the header.
+    auto f = make(2, 40, 40);
+    auto c = Prompt(100, 7, 2); c.ids[0] = 9; c.shared_prefix_tokens = 30;
+    f->Run(1, c);
+    auto a = Prompt(120, 1, 2); a.shared_prefix_tokens = 50;
+    f->Run(2, a);
+    const int header_slot = f->engine.selected;
+    auto b = a;
+    for (size_t i = 50; i < b.ids.size(); ++i) b.ids[i] = (b.ids[i] + 3) % 16;
+    f->log.clear();
+    const auto [out, done] = f->Run(3, b);
+    assert(f->engine.selected == header_slot && done.cached_tokens == 48 && out == reference(b));
+  }
+}
+
+// The cut's exactness rests on the 4-row QSA union tiles; with CRUCIBLE_PF_QSA_ROWS=1 (review, Oct 27) every part runs
+// the per-row flash, whose 16-row blocks start at the part start, so a cut piece off the 16-row grid groups its rows
+// differently. The switch is a numerics switch: no cut with it on. Lever 2 (the launch that ends at the Pre point)
+// still saves that point.
+void NoCutWithoutUnionList() {
+  setenv("CRUCIBLE_PF_QSA_ROWS", "1", 1);
+  {
+    Fixture f(1, 32, 0, 16, 0, 160);
+    f.session.SetExactResume(true);
+    f.EnableCuts();
+    f.Run(1, Prompt(58, 1, 2));
+    assert(f.cuts.empty() && f.engine.joins.empty());
+    assert(f.Logged("pre slot=0 tokens=48"));
+  }
+  unsetenv("CRUCIBLE_PF_QSA_ROWS");
+  {
+    Fixture f(1, 32, 0, 16, 0, 160);
+    f.session.SetExactResume(true);
+    f.EnableCuts();
+    f.Run(1, Prompt(58, 1, 2));
+    assert(f.cuts.size() == 1 && f.Logged("pre slot=0 tokens=48"));
+  }
+}
+
+// A margin cut in a launch that also ends at the old lever-2 Pre point (review, Oct 27): a slot has two general
+// checkpoint buffers. The cut takes one; the End point of the same prompt needs the other. The launch had also saved
+// the old Pre point at its end, so the End save evicted the margin point (the oldest), and the next turn restored
+// nothing. The request's pre_done flag already says it takes no other Pre point, so the old point must not be saved.
+void MarginCutKeepsItsBuffer() {
+  Fixture f(1, 4096, 0, 2048, 4096, 16384);  // launches of 4,096: the margin cut is inside one launch, the old Pre
+  f.session.SetExactResume(true);            // point (1,036 - 9, rounded to 4: 4,096) is that launch's end
+  f.session.SetSavePoints(64, 0);
+  f.EnableCuts(128);
+  const auto seed = Prompt(4105, 3, 2);
+  f.Run(1, seed);
+  assert(f.Logged("pre slot=0 tokens=4040"));
+  assert(!f.Logged("pre slot=0 tokens=4096"));
+  auto diverged = seed;  // the next turn of a chat: it shares 4,082 rows and diverges there
+  for (size_t i = 4082; i < diverged.ids.size(); ++i) diverged.ids[i] = (diverged.ids[i] + 7) % 16;
+  f.log.clear();
+  const auto [out, done] = f.Run(2, diverged);
+  assert(done.cached_tokens == 4040 && f.Logged("load 4040") && !out.empty());
+}
+
 int main() {
+  SavePoints();
+  MarginCutKeepsItsBuffer();
   ImageEndResume();
   Identical();
   Deferred();
   Speculative();
   AffinityAndStage();
   PreEnd();
+  GridResume();
+  ExactResume();
+  ExactResumeFallback();
+  ExactResumeCut();
+  ImageCutRetry();
+  NoCutWithoutUnionList();
+  SplitResume();
   return 0;
 }

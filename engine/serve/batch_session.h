@@ -7,6 +7,7 @@
 #include "cache_status.h"
 #include "../runtime/prefill_interleave.h"
 #include "../model/flashnext/prefill_launch.h"
+#include "../layers/numerics.h"
 #include "../runtime/draft_warmup.h"
 #include "../runtime/packed_rows_option.h"
 #include <algorithm>
@@ -195,6 +196,22 @@ struct BatchTailSource { bool replayed = false, guarded = false; int slot = -1; 
 // extended prompt resumes there. Below it the extra launch is a larger share of the prefill.
 inline constexpr size_t kPreEndMinTokens = 32768;
 
+// Save points (CRUCIBLE_EXACT_RESUME=1 only). Each is saved by the one cut a launch
+// takes (the x4-tail cut buffer), so no launch is added.
+// - The Pre point sits `kPreEndMargin` rows before the prompt end, not 9 to 12: a chat template closes the user turn
+//   about 23 rows before the end, and the next prompt diverges there, so a point 12 rows back is already past it.
+//   If the nearest multiple of 4 cannot be a cut, up to `kPreMarginSlack` rows further back are tried.
+// - The header point sits at the end of the shared system block (`shared_prefix_tokens`, rounded down to a multiple
+//   of 4), if the block is at least `kHeaderMinRows` rows: a later prompt with the same block, and a different rest,
+//   resumes there and not from row 0. It is OFF by default (kHeaderMinRows = 0, review H1 of Oct 28): with several
+//   slots the next chat opens on an empty slot and no GPU run restored it. It returns as its own change, with a proof.
+// - A free slot with such a point, whose resident tail is at most `kHeaderSlotTail` rows, is preferred to the slot
+//   left longest ago (Affinity): the tail that the open overwrites costs at most that much to build again.
+inline constexpr size_t kPreEndMargin = 64;
+inline constexpr size_t kPreMarginSlack = 16;
+inline constexpr size_t kHeaderMinRows = 0;
+inline constexpr size_t kHeaderSlotTail = 2048;
+
 // The output rows that an expected tail counts at most: the reserve stays near the usual tail, and a longer
 // output pins its extra chunks at the save (about 300 rows per 8 MB chunk).
 inline constexpr size_t kTailExpectRows = 4096;
@@ -231,6 +248,9 @@ struct BatchCacheHooks {
   // continues from that tail). Runs on the selected slot before any write, so the host can save the state that
   // leaves the device ("One copy").
   std::function<void(int slot, bool resumed)> release;
+  // Optional, the open resets `slot` and writes it from row 0 (no resume, no checkpoint). Runs on the
+  // selected slot before the reset; a disk write that still reads the slot's old rows from the device ends there.
+  std::function<void(int slot)> overwrite;
   // Optional, all five with the checkpoint hooks: slot frontiers.
   // `frontier`: the session frontier at `cursor` of a normal turn may stay in the slot instead of a host copy. The
   // hook calls `keep` with the frontier's metadata; it returns true when the slot kept it (no host capture there).
@@ -264,6 +284,8 @@ struct BatchCacheHooks {
   // with outputs; a prompt saved a Pre point at `tokens`.
   std::function<void(int slot, size_t tokens)> end_resumed;
   std::function<void(int slot, size_t tokens)> pre_saved;
+  // Optional, log line only (save points): a prompt saved the shared-header point at `tokens`.
+  std::function<void(int slot, size_t tokens)> header_saved;
   // Optional: totals and the latest save try. A capture or tail hook that tried a save raises `attempts`.
   std::function<BatchCacheStatus()> status;
   // Optional: a slot resume or a slot checkpoint served `tokens` (0: the slot held nothing for the
@@ -395,6 +417,25 @@ class BatchSession {
     pre_end_min_ = min_tokens;
     core_rows_ = core_rows;
   }
+  // the core-part size that decides which resume points run no small-row head (below).
+  // The GDN and QSA prefill kernels cut each launch into parts of this many rows.
+  void SetCoreRows(int core_rows) {
+    if (core_rows <= kMaxRows) throw std::invalid_argument("core parts need more than 8 rows");
+    core_rows_ = core_rows;
+  }
+  // a prompt that extends an old one resumes only from a point
+  // that is a multiple of the QSA tile rows with more than 8 new rows, so its bulk rows and tiles are the cold
+  // prefill's. A prompt of any length keeps a Pre point at its last multiple of 4 rows at least 9 rows below its end
+  // (PreEndPoint), and BestPoint refuses an End or Pre point that does not fit, unless the new prompt repeats it
+  // whole. Costs at most 20 rows of prefill, one small launch per prompt and no device memory.
+  void SetExactResume(bool on) { exact_resume_ = on; }
+  // Save points (exact resume only): the Pre point's distance from the prompt end (at most 9: the nearest multiple of
+  // 4 that leaves more than 8 rows) and the shortest shared header that gets a point (0: no header point). The
+  // defaults are kPreEndMargin and kHeaderMinRows; tests use smaller values for their short prompts.
+  void SetSavePoints(size_t margin, size_t header_min) {
+    pre_margin_ = margin;
+    header_min_ = header_min;
+  }
   const std::vector<int>& SlotContexts() const { return contexts_; }
   void SetCacheHooks(BatchCacheHooks hooks) { cache_ = std::move(hooks); }
   size_t Active() const { return active_.size(); }
@@ -444,7 +485,10 @@ class BatchSession {
       // HIGH-2: a resume from the slot's own Frontier point leaves the slot's tail, which the prompt does not repeat.
       if (held && from_frontier && cache_.drop) cache_.drop(slot);
       else if (held && cache_.release) cache_.release(slot, resident.has_value());
-      if (!resident && !point) engine_.Reset();
+      if (!resident && !point) {
+        if (cache_.overwrite) cache_.overwrite(slot);
+        engine_.Reset();
+      }
       Request& owned = *state;
       active_.emplace(id, std::move(state));
       if (cache_.restore) {
@@ -460,6 +504,12 @@ class BatchSession {
             checkpoints_.Confirm(slot, *point);
           } else {
             owned.grid_point = saved.kind == CheckpointKind::Grid;
+            // a prompt-state point (End or Pre) with no pending GDN rows resumes as a cold prefill does:
+            // bulk rows, no small-row head. On a core-part cut that was exact already (fix1). Off the cut the GDN
+            // scan carries its lazy scale (gdn-split-inv), so a point is exact where the QSA union tiles keep their
+            // 4-row grid and more than 8 rows follow (fewer run the small-row kernels).
+            owned.core_point = (saved.kind == CheckpointKind::End || saved.kind == CheckpointKind::Pre) &&
+                               saved.replay == 0 && BulkResumes(saved.hist.size(), owned.options.ids.size());
             hit = BatchRestore{saved.hist.size(), false, saved.replay, true, false, saved.guarded};
             // Fix A: the End point of this prompt (Best gives a point of the prompt's length only then).
             if (saved.hist.size() == owned.options.ids.size() && ResumesWhole(saved)) owned.end_outputs = saved.outputs;
@@ -471,7 +521,10 @@ class BatchSession {
             hit = resident ? cache_.resume(owned.options, *resident) : cache_.restore(owned.options);
         }
         // A host restore resets the stream itself; a miss after all must not keep the old slot state.
-        if (resident && !hit.slot && !hit.tokens) engine_.Reset();
+        if (resident && !hit.slot && !hit.tokens) {
+          if (cache_.overwrite) cache_.overwrite(slot);
+          engine_.Reset();
+        }
         if (hit.slot && (!resident || hit.tokens != resident->length || !hit.tail))
           throw std::logic_error("slot resume must keep the resident tail");
         // Only a slot or checkpoint resume keeps the slot's rows (below the restored length).
@@ -627,35 +680,106 @@ class BatchSession {
     const int replay = state.replay;
     // A Grid checkpoint is a chunk end of a replayed turn, after its head: the resume continues that turn's chunk
     // schedule, so it gives the same rows. A second head would shift every later chunk end.
-    const bool head = replay || (state.from_tail && state.cursor == state.cached && !state.grid_point);
+    // an End or Pre point on a core-part cut holds a bulk prompt state. It starts no head: the first 8 rows
+    // would run the decode-path kernels, which no cold prefill does (extend-dump: bitwise equal to cold at s = 4,096
+    // and 8,192 without it). A tail (session replay) keeps its head: its pending GDN rows depend on the spec and
+    // packing schedule, so they must not choose the path.
+    const bool head = replay || (state.from_tail && state.cursor == state.cached && !state.grid_point && !state.core_point);
     const bool bulk = prefill > 0 && !head;
     int rows = int(std::min<size_t>(head ? std::min(step, kMaxRows) : step, ids.size() - state.cursor));
-    std::optional<JoinedLaunch> joined;
-    const size_t pre = bulk ? PreEndPoint(state, step) : 0;
-    // Whole grid chunks merge into one launch when no capture point falls between them and the launch ends before
-    // the MTP warm-up rows; a replayed turn keeps the grid (it saves a slot checkpoint at each chunk end). With
-    // decoders waiting the grid stays: a merged layer is longer, so the decode gap grows (3 x 32K, interleave 10:
-    // 0.75 s against 0.65 s) and the extra passes cancel the launch gain (TTFT 27.1 s against 27.0 s).
-    if (bulk && !state.from_tail && decoders.empty() && EngineLaunchRows(engine_) > step &&
-        (!cache_.capture || cache_.next_capture)) {
-      size_t stop = cache_.capture ? cache_.next_capture(state.options, state.cursor) : SIZE_MAX;
-      if (state.spec) stop = std::min(stop, DraftWarmupStart(ids.size(), state.options.mtp_prefix));
-      if (pre && pre > state.cursor) stop = std::min(stop, pre);
-      rows = PrefillLaunchRows(state.cursor, ids.size(), step, EngineLaunchRows(engine_), stop);
-      // x4-tail: with join rows the prompt's last partial chunk joins the launch before it, and a launch may pass one
-      // capture point (the cut). The engine gets the spec right before the launch (below).
-      // Fix B: a join that reaches over the Pre point is dropped (the plain launch above ends at the point), and no
-      // launch from the point on joins: the plan without joins has no ledger off the grid.
-      if (EngineJoinRows(engine_) > 0 && !(pre && state.cursor >= pre)) {
-        auto join = JoinLaunch(state, step);
-        if (!(pre > state.cursor && pre < state.cursor + size_t(join.rows))) {
-          rows = join.rows;
-          joined = std::move(join);
-        }
+    // a core-point resume runs grid chunks from its point (no merge: it is a tail), so its
+    // last piece can have 8 rows or fewer, which run the small-row kernels where cold runs bulk rows. That piece joins
+    // this chunk when the launch buffers hold it; else this chunk ends a multiple of the QSA tile rows earlier.
+    if (bulk && state.core_point) {
+      // the launches end where the cold plan's bulk rows end (BulkEnd), also from a point off the grid, so a
+      // small-row tail of the cold plan runs alone here too. This holds with exact resume off as well: a resume from
+      // an End or Pre point 2,048 rows off the grid (6,144, then 8,196 rows) ran the tail as bulk rows.
+      const size_t end = BulkEnd(ids.size());
+      if (state.cursor < end) rows = int(std::min(size_t(rows), end - state.cursor));
+      const size_t rest = state.cursor < end ? end - state.cursor - size_t(rows) : 0;
+      // F3: when the cold plan of this prompt ends in the same small-row tail (the prompt is 4,096 k + rest rows), the
+      // tail stays small-row here too: joining it would run it as bulk rows where cold runs the small-row kernels.
+      const bool cold_small_tail = end == ids.size() && ids.size() % size_t(step) == rest;
+      if (rest > 0 && rest <= size_t(kMaxRows) && !cold_small_tail) {
+        const int cut = kQsaUnionTileRows * int((size_t(kMaxRows) + 1 - rest + kQsaUnionTileRows - 1) / kQsaUnionTileRows);
+        if (size_t(rows) + rest <= size_t(std::max(step, EngineLaunchRows(engine_) + EngineJoinRows(engine_))))
+          rows += int(rest);
+        else if (rows - cut > kMaxRows)  // chunks of 16 rows or fewer (test engines) keep their plan
+          rows -= cut;
       }
     }
-    // Fix B: the chunk that holds the Pre point ends there (a launch never passes it, above).
-    if (pre > state.cursor && pre < state.cursor + size_t(rows)) rows = int(pre - state.cursor);
+    std::optional<JoinedLaunch> joined;
+    size_t pre = bulk && !state.pre_done ? PreEndPoint(state, step) : 0;
+    const size_t margin = bulk && !state.pre_done ? PreMarginPoint(state, step) : 0;
+    const size_t header = bulk && !state.pre_done ? HeaderPoint(state, step) : 0;
+    // The rows of this launch, and its joins, with `point` as a stop (0: none).
+    const auto plan = [&](size_t point) {
+      int planned = rows;
+      std::optional<JoinedLaunch> join_plan;
+      // Whole grid chunks merge into one launch when no capture point falls between them and the launch ends before
+      // the MTP warm-up rows; a replayed turn keeps the grid (it saves a slot checkpoint at each chunk end). With
+      // decoders waiting the grid stays: a merged layer is longer, so the decode gap grows (3 x 32K, interleave 10:
+      // 0.75 s against 0.65 s) and the extra passes cancel the launch gain (TTFT 27.1 s against 27.0 s).
+      if (bulk && !state.from_tail && decoders.empty() && EngineLaunchRows(engine_) > step &&
+          (!cache_.capture || cache_.next_capture)) {
+        size_t stop = cache_.capture ? cache_.next_capture(state.options, state.cursor) : SIZE_MAX;
+        if (state.spec) stop = std::min(stop, DraftWarmupStart(ids.size(), state.options.mtp_prefix));
+        if (point && point > state.cursor) stop = std::min(stop, point);
+        planned = PrefillLaunchRows(state.cursor, ids.size(), step, EngineLaunchRows(engine_), stop);
+        // x4-tail: with join rows the prompt's last partial chunk joins the launch before it, and a launch may pass
+        // one capture point (the cut). The engine gets the spec right before the launch (below).
+        // Fix B: a join that reaches over the Pre point is dropped (the plain launch above ends at the point), and no
+        // launch from the point on joins: the plan without joins has no ledger off the grid.
+        if (EngineJoinRows(engine_) > 0 && !(point && state.cursor >= point)) {
+          auto join = JoinLaunch(state, step);
+          if (!(point > state.cursor && point < state.cursor + size_t(join.rows))) {
+            planned = join.rows;
+            join_plan = std::move(join);
+          }
+        }
+      }
+      // Fix B: the chunk that holds the Pre point ends there (a launch never passes it, above).
+      if (point > state.cursor && point < state.cursor + size_t(planned)) planned = int(point - state.cursor);
+      return std::pair{planned, std::move(join_plan)};
+    };
+    // the cut buffer saves the Pre point inside the launch that holds it, so the launch
+    // does not end there (no extra launch of 9 to 12 rows). The launch is the one without a Pre point: the default
+    // path's rows, plus a cut (PrefillPreCutValid keeps their bits).
+    // Save points: a launch takes one cut. The header point wins a launch that holds it, unless a later launch holds
+    // the end Pre point (the End save would then evict the header point from its two buffers, so the cut is not made).
+    // The end Pre point is the margin point if it can be a cut, else the 9 to 12 row point of lever 2 (above).
+    bool pre_cut = false, header_cut = false;
+    if ((pre > state.cursor || margin > state.cursor || header > state.cursor) && PreCutReady(state, decoders.empty())) {
+      auto [planned, join_plan] = plan(0);
+      const size_t launch_end = state.cursor + size_t(planned);
+      const auto cuttable = [&](size_t at) {
+        return at > state.cursor && at < launch_end && at % size_t(step) && !(join_plan && join_plan->cut) &&
+               PrefillPreCutValid(state.cursor, planned, int(at - state.cursor));
+      };
+      size_t cut = 0;
+      if (cuttable(header) && std::max(margin, pre) < launch_end) {
+        cut = header;
+        header_cut = true;
+      } else {
+        for (size_t at = margin; at > state.cursor && margin - at <= kPreMarginSlack && !cut; at -= size_t(kQsaUnionTileRows))
+          if (cuttable(at)) cut = at;
+        if (!cut && cuttable(pre)) cut = pre;
+      }
+      if (cut) {
+        rows = planned;
+        joined = join_plan ? std::move(*join_plan) : JoinedLaunch{planned};
+        joined->cut = cut;
+        joined->cut_window = PreCutWindow(state, step, cut);
+        joined->spec.cut = int(cut - state.cursor);
+        joined->spec.pre = true;
+        joined->spec.start = state.cursor;
+        pre_cut = true;
+      }
+    }
+    if (!pre_cut) {
+      if (pre && PreEndExact(state, step)) pre = 0;
+      std::tie(rows, joined) = plan(pre);
+    }
     const bool final = state.cursor + rows == ids.size();
     // The images that this chunk reads get their encoder slices first, one slice per command, so peers decode
     // between them; the embeddings of images behind the cursor are freed after the chunk.
@@ -664,6 +788,17 @@ class BatchSession {
         state.vision += engine_.EncodeVisionSlice(engine_.ActiveSequence());
         return {};
       }
+    // The launch runs now: only here does the request take the cut. An encoder slice above ran no launch, and the
+    // retry must take the same cut again (review, Oct 27: the flag was set before that return, so the retry saw a
+    // request that had already taken its cut and saved no Pre point at all).
+    if (pre_cut) {
+      state.pre_done = true;
+      // The request takes no other Pre point, so the old one is not saved either. A launch can end at the old Pre
+      // point: saving it would take the second general buffer, and the End save then evicts the cut point (the older
+      // one). The cut point is the better one: the End point is exact for an identical prompt, so the Pre point is
+      // for a later turn, and the cut is nearer to where such a turn diverges.
+      pre = 0;
+    }
     const double start = Clock();
     const int keep = !state.spec ? rows : spec_.stacks ? spec_.stacks(id, state.cursor, rows) : 0;
     // The PLE rows of the next two chunks start their disk reads now (CRUCIBLE_PLE_HOST).
@@ -681,7 +816,11 @@ class BatchSession {
         : engine_.Forward(ids.data() + state.cursor, rows, replay, rows);
     state.replay = 0;
     // x4-tail: the frontier inside the launch is saved first, as the launch that ended there saved it.
-    if (joined && joined->cut) SaveCut(state, joined->cut);
+    if (joined && joined->cut) {
+      if (header_cut) SaveCutHeader(state, joined->cut);
+      else if (joined->spec.pre) SaveCutPre(state, joined->cut);
+      else SaveCut(state, joined->cut);
+    }
     // A final chunk samples before the speculative hook: MTP pairing reuses the logits buffer, and serial
     // RunPrompt also reads the prompt logits before it pairs the MTP rows.
     if (final && output.empty()) throw std::runtime_error("engine returned no prompt prediction");
@@ -711,12 +850,14 @@ class BatchSession {
       engine_.ReleaseImageRows(engine_.ActiveSequence(), state.cursor);
     if (!final) {
       // A replayed turn saves no prompt frontiers (below), so its slot keeps the latest chunk boundary instead.
-      if (state.from_tail) SaveCheckpoint(state, CheckpointKind::Grid, 0, false);
+      // An exact-resume run from a core-grid point is no replayed turn: it saves its Pre point, not Grid points.
+      if (state.from_tail && !(exact_resume_ && state.core_point)) SaveCheckpoint(state, CheckpointKind::Grid, 0, false);
       state.prefill += Clock() - start;
       // Fix B: the Pre point is not a grid point, so no host frontier or slot Frontier point is due there.
       if (state.cursor == pre) {
         if (SaveCheckpoint(state, CheckpointKind::Pre, 0, false) && cache_.pre_saved) cache_.pre_saved(state.slot, pre);
-        return {};
+        // A point on the chunk grid (exact resume) is a grid frontier as well: the host capture below stays.
+        if (pre % size_t(step)) return {};
       }
       // A replayed turn's rows follow a shifted chunk schedule, so its prompt frontiers are not default-path state.
       if (cache_.capture && !state.from_tail) {
@@ -1012,6 +1153,8 @@ class BatchSession {
     bool cache_shared = false, from_tail = false, slot_resume = false, tail_guarded = false, from_checkpoint = false;
     bool frontier_copy = false;  // the open restored a copy of another slot's Frontier point
     bool grid_point = false;  // resumed from a Grid checkpoint
+    bool core_point = false;  // resumed from an End or Pre checkpoint on a core-part cut, no pending rows
+    bool pre_done = false;    // a Pre or header cut was taken: the request takes no other Pre point (save points)
     std::shared_ptr<const PromptOutputs> end_outputs;  // fix A: the End point's outputs; set until the first token
     std::shared_ptr<const PromptOutputs> outputs;      // fix A: this prompt's outputs, for its End point
     bool end_resumed = false;  // fix A: the open restored the whole prompt (the event's end_resume)
@@ -1057,13 +1200,105 @@ class BatchSession {
   // chunk start on the zero-origin grid of `step` rows), so the cut does not change GDN or QSA arithmetic
   // Only on the default chunk schedule (no tail, a restore on the grid), and only when
   // both new pieces have more than 8 rows.
+  // Exact resume (SetExactResume): any length, and the point is the last multiple of the QSA tile rows that leaves more
+  // than 8 rows after it. The GDN scan carries its lazy scale across a cut
+  // (gdn-split-inv) and the QSA union tiles keep their 4-row grid, so a cut there keeps the cold bits.
+  // The engine anchor is on whenever `step` is a multiple of the core rows (checked below). A point that would leave 8
+  // rows or fewer since the start of its chunk moves to that start: the piece before the cut must run bulk rows too.
+  // It can be a chunk boundary (the host capture there stays) or a cut inside a chunk. A point within 8 rows of the
+  // restore point is not new. A length that is a multiple of 4 whose last chunk piece has more than 8 rows saves no Pre
+  // point (b-cut lever 1, PreEndExact): its End point is exact for an extension of more than 8 rows.
   size_t PreEndPoint(const Request& state, int step) const {
     const size_t length = state.options.ids.size();
-    if (!pre_end_min_ || length < pre_end_min_ || !cache_.checkpoint_save || state.options.cache_control == "bypass" ||
-        state.from_tail || step <= core_rows_ || step % core_rows_ || state.cached % size_t(step))
+    // A resume at a core-grid point (core_point) is a plain bulk prefill from there, so its run saves a Pre point too.
+    if ((!pre_end_min_ && !exact_resume_) || !cache_.checkpoint_save || state.options.cache_control == "bypass" ||
+        (state.from_tail && !(exact_resume_ && state.core_point)) || step <= core_rows_ || step % core_rows_ ||
+        (exact_resume_ ? state.cached % size_t(core_rows_) && !state.core_point : state.cached % size_t(step) != 0))
       return 0;
+    if (exact_resume_) {
+      if (length <= size_t(kMaxRows)) return 0;
+      // when the cold plan ends in a small-row tail, the Pre point is the tail start (a chunk end). A point
+      // below it would end a launch there, and the next launch would run the tail as bulk rows.
+      const size_t end = BulkEnd(length);
+      if (end < length) return end > state.cached + size_t(kMaxRows) ? end : 0;
+      constexpr size_t tile = size_t(kQsaUnionTileRows);
+      size_t point = (length - size_t(kMaxRows) - 1) / tile * tile;
+      if (point <= state.cached) return 0;
+      const size_t chunk = state.cached + (point - state.cached) / size_t(step) * size_t(step);
+      if (point - chunk <= size_t(kMaxRows)) point = chunk;
+      return point > state.cached + size_t(kMaxRows) ? point : 0;
+    }
+    if (length < pre_end_min_) return 0;
     const size_t point = (length - 1) / size_t(step) * size_t(step) + size_t(core_rows_);
     return point < length && length - point > size_t(kMaxRows) ? point : 0;
+  }
+  // Save points: whether this request may save a point of its own choice (exact resume, a bulk run from a start that
+  // the core grid, or a core point, allows; the same conditions as PreEndPoint).
+  bool SavePointReady(const Request& state, int step) const {
+    return exact_resume_ && cache_.checkpoint_save && state.options.cache_control != "bypass" &&
+           (!state.from_tail || state.core_point) && step > core_rows_ && step % core_rows_ == 0 &&
+           (state.cached % size_t(core_rows_) == 0 || state.core_point);
+  }
+  // Save points: the Pre point `pre_margin_` rows before the prompt end, rounded down to a multiple of the QSA tile
+  // rows (0: none). Prefill takes it as a cut, with up to kPreMarginSlack rows less if the nearest one is no valid cut.
+  size_t PreMarginPoint(const Request& state, int step) const {
+    constexpr size_t tile = size_t(kQsaUnionTileRows);
+    const size_t length = state.options.ids.size();
+    if (pre_margin_ <= size_t(kMaxRows) + 1 || length <= pre_margin_ || !SavePointReady(state, step)) return 0;
+    const size_t point = (length - pre_margin_) / tile * tile;
+    return point > state.cursor + size_t(kMaxRows) ? point : 0;
+  }
+  // Save points: the end of the shared header block, rounded down to a multiple of the QSA tile rows (0: none). Only a
+  // cold open (the header is then below the first grid chunk, and no saved state holds it): the block must be at
+  // least `header_min_` rows, leave more than 8 rows after it, and no slot may hold that state already.
+  size_t HeaderPoint(const Request& state, int step) const {
+    constexpr size_t tile = size_t(kQsaUnionTileRows);
+    const ServeRequest& request = state.options;
+    const size_t shared = size_t(request.shared_prefix_tokens);
+    if (!header_min_ || shared < header_min_ || state.cached != 0 || !request.images.empty() || !SavePointReady(state, step))
+      return 0;
+    const size_t point = shared / tile * tile;
+    if (point <= state.cursor || point >= size_t(step) || request.ids.size() <= point + size_t(kMaxRows)) return 0;
+    return checkpoints_.Holds(Key(request, std::span<const int>(request.ids.data(), point)), request.tenant) ? 0 : point;
+  }
+  // b-cut lever 1 (exact resume): an End point on the tile grid whose last chunk piece has more than 8 rows (or is a
+  // whole chunk) is exact for any extension of more than 8 rows (BestPoint), so the Pre launch of 9 to 12 rows is not
+  // needed. Only an extension of 8 rows or fewer then loses (it resumes from an older point). Lever 2 (PreCutReady)
+  // saves the Pre point inside the launch instead, where it can.
+  bool PreEndExact(const Request& state, int step) const {
+    constexpr size_t tile = size_t(kQsaUnionTileRows);
+    const size_t length = state.options.ids.size();
+    // an End point after a small-row tail is no bulk state (BestPoint), so the Pre point stays.
+    if (!exact_resume_ || length % tile || state.cached % tile || BulkEnd(length) < length) return false;
+    const size_t rest = (length - state.cached) % size_t(step);
+    return rest == 0 || rest > size_t(kMaxRows);
+  }
+  // the cut buffer can take the Pre point of this request inside a launch: exact resume
+  // only (the default path keeps its launches), an engine with joins, no decoders between the layers (the PLE ring
+  // copy at the cut needs the launch alone), and a request that may take a cut (no MTP history).
+  bool PreCutReady(const Request& state, bool alone) const {
+    if constexpr (!requires { engine_.SetPrefillJoin(PrefillJoinSpec{}); }) return false;
+    // The cut's exactness rests on the 4-row QSA union tiles (PrefillPreCutValid). CRUCIBLE_PF_QSA_ROWS=1 drops the
+    // union list, so every part runs the per-row flash, which groups rows in 16-row dense blocks when the part ends at
+    // or before row 2,048 and runs one row per block above that (prefill_qsa.h LaunchQsaFlashSplit). A cut piece can
+    // land on the other side of that boundary than the whole part, and the two forms are not proven bitwise equal
+    // (review, Oct 27). No cut with the switch on.
+    if (NumericsOn("CRUCIBLE_PF_QSA_ROWS")) return false;
+    return exact_resume_ && alone && EngineJoinRows(engine_) > 0 && cache_.cut_ready && cache_.cut_prepare &&
+           cache_.cut_save && cache_.checkpoint_save && cache_.cut_ready(state.options);
+  }
+  // The retained ledger of a Pre cut: the start of the launch that ends at `pre` in the plan with the Pre stop, as the
+  // Pre save after that launch records it.
+  size_t PreCutWindow(const Request& state, int step, size_t pre) const {
+    const ServeRequest& request = state.options;
+    // The same branch as the merge in Prefill (decoders are none here: PreCutReady).
+    if (state.from_tail || EngineLaunchRows(engine_) <= step || (cache_.capture && !cache_.next_capture))
+      return state.cursor;
+    const size_t warm = state.spec ? DraftWarmupStart(request.ids.size(), request.mtp_prefix) : SIZE_MAX;
+    const auto stop = [&](size_t at) {
+      return std::min({cache_.capture ? cache_.next_capture(request, at) : SIZE_MAX, warm, pre});
+    };
+    return PrefillPlainStart(state.cursor, pre, request.ids.size(), step, EngineLaunchRows(engine_), stop);
   }
   bool Stops(const Request& state, int token) const {
     const auto& stops = state.options.stop_ids;
@@ -1185,6 +1420,15 @@ class BatchSession {
   }
   // x4-tail: the frontier at `cut` (inside the launch that just ran) from the cut buffer: a slot frontier, or a host
   // frontier as the capture after a launch that ended there saves it.
+  // the Pre point at `pre` (inside the launch that just ran) from the cut buffer.
+  void SaveCutPre(Request& state, size_t pre) {
+    if (SaveCheckpoint(state, CheckpointKind::Pre, 0, false, nullptr, pre) && cache_.pre_saved) cache_.pre_saved(state.slot, pre);
+  }
+  // Save points: the shared-header point at `point` (inside the launch that just ran) from the cut buffer.
+  void SaveCutHeader(Request& state, size_t point) {
+    if (SaveCheckpoint(state, CheckpointKind::Pre, 0, false, nullptr, point) && cache_.header_saved)
+      cache_.header_saved(state.slot, point);
+  }
   void SaveCut(Request& state, size_t cut) {
     const double saved = Clock();
     const uint64_t tried = CacheAttempts();
@@ -1263,15 +1507,24 @@ class BatchSession {
                               ? size_t(std::mismatch(held->key.begin(), held->key.end(), key.begin(), key.end()).first -
                                        held->key.begin()) : 0;
     if (point > size_t(request.shared_prefix_tokens)) return {3, std::max(point, common), 0};
+    // Save points: a point at the shared header (it is at most the shared rows, so it passed the test above). A slot
+    // with no tail ranks as an empty one but first; a small tail ranks above the slot left longest ago. The tail test
+    // (kHeaderSlotTail) is reached only when the held tail shares at most the header with the prompt. A chat template
+    // goes on with the same role tokens after the system block, so the tail of the seed chat has common > shared and
+    // returns {1, common} above: for chat the tail limit does not apply. An empty slot (rank 2) beats this slot, so a
+    // second chat opens cold on an empty slot and the header point is not used (review H1, L2): the header point is
+    // off by default (kHeaderMinRows = 0).
+    const bool header_point = exact_resume_ && header_min_ && point >= header_min_;
     // a slot that holds only a Frontier point is not empty (HIGH-1). Among the slots that other sessions
     // left, the smallest loss goes first (the Frontier point that the handover must copy), then the oldest.
     const size_t loss = checkpoints_.FrontierLength(slot);
     const size_t keep = std::numeric_limits<size_t>::max() - loss;
     if (!held) return loss ? std::tuple<int, size_t, uint64_t>{0, keep, std::numeric_limits<uint64_t>::max() - slot_used_[size_t(slot)]}
-                           : std::tuple<int, size_t, uint64_t>{2, 0, 0};
+                           : std::tuple<int, size_t, uint64_t>{2, header_point ? point : 0, 0};
     if (common > size_t(request.shared_prefix_tokens) && common >= held->key.size() - held->key.size() / 16)
       return {3, common, 0};
     if (common > size_t(request.shared_prefix_tokens)) return {1, common, 0};
+    if (header_point && held->key.size() <= kHeaderSlotTail) return {1, point, 0};
     return {0, keep, std::numeric_limits<uint64_t>::max() - held->used};
   }
   // The slot checkpoint to resume from, when it is longer than what the host cache would restore.
@@ -1282,10 +1535,47 @@ class BatchSession {
     if (!best || (cache_.peek && cache_.peek(request) >= checkpoints_.At(slot, *best).hist.size())) return std::nullopt;
     return best;
   }
+  // the end of the bulk rows in the cold plan of a prompt of `length` rows. A prompt of 4,096 k + t rows
+  // (k >= 1, t in 1..8) ends in a small-row launch of t rows (PrefillLaunchRows), which no bulk launch may take.
+  size_t BulkEnd(size_t length) const {
+    const int step = engine_.PrefillRows();
+    if (step <= kPrefillJoinSmallRows || length <= size_t(step)) return length;
+    const size_t tail = length % size_t(step);
+    return tail >= 1 && tail <= size_t(kPrefillJoinSmallRows) ? length - tail : length;
+  }
+  // a prompt state at `point` resumes a prompt of `length` tokens as a cold prefill does (bulk rows, no
+  // small-row head): on a core-part cut (fix1), or off it where the QSA union tiles keep their 4-row grid and more than
+  // 8 rows follow (the GDN scan carries its lazy scale; fewer rows run the small-row
+  // kernels).
+  bool BulkResumes(size_t point, size_t length) const {
+    return point % size_t(core_rows_) == 0 || (point % size_t(kQsaUnionTileRows) == 0 && length > point + size_t(kMaxRows));
+  }
   // MEDIUM-2: a Frontier point resumes only where the host rule (Find) would restore a host frontier of its length,
   // so the slot and the host give the same restore for one prompt.
   std::optional<int> BestPoint(int slot, const ServeRequest& request, std::span<const int> key) const {
     return checkpoints_.Best(slot, key, request.tenant, [&](const SlotCheckpoint& point) {
+      // Exact resume: an End point off the core grid is not a prefill state of a longer prompt (resume-exact);
+      // a prompt that repeats it whole still resumes there (fix A).
+      // an End point that resumes as bulk rows (BulkResumes) is exact off the grid too.
+      // a Pre point is off the grid now (PreEndPoint), and 8 new rows or fewer run the small-row kernels
+      // where the cold prompt runs bulk rows (its own Pre cut leaves more than 8), so a point of either kind needs
+      // a multiple of the QSA tile rows and more than 8 new rows; the next older point (a Pre point) serves.
+      // the new rows before the cold plan's small-row tail (BulkEnd) must be more than 8, and an End point
+      // must hold bulk rows only: a prompt of 8 rows or fewer, or one that ended in a small-row tail, ran those rows
+      // with the small-row kernels, which a longer cold prompt runs as bulk rows.
+      const size_t at = point.hist.size();
+      // a core point (bulk rows, no head) that leaves 8 rows or fewer
+      // before the end of the cold plan's bulk rows would run them with the small-row kernels where cold runs bulk
+      // rows. The point is refused; the next older point or the host cache serves.
+      if (!exact_resume_ && (point.kind == CheckpointKind::End || point.kind == CheckpointKind::Pre) &&
+          point.replay == 0 && at < key.size() && BulkResumes(at, key.size()) && BulkEnd(key.size()) > at &&
+          BulkEnd(key.size()) - at <= size_t(kMaxRows))
+        return false;
+      if (exact_resume_ && (point.kind == CheckpointKind::End || point.kind == CheckpointKind::Pre) &&
+          at < key.size() &&
+          !(point.replay == 0 && at % size_t(kQsaUnionTileRows) == 0 && BulkEnd(key.size()) > at + size_t(kMaxRows) &&
+            (point.kind == CheckpointKind::Pre || (at > size_t(kMaxRows) && BulkEnd(at) == at))))
+        return false;
       return point.kind != CheckpointKind::Frontier || (cache_.frontier_fits && cache_.frontier_fits(request, point));
     });
   }
@@ -1366,14 +1656,16 @@ class BatchSession {
       if (checkpoints_.At(slot, index).hist.size() > keep) cache_.handover(slot, index, checkpoints_.At(slot, index));
   }
   // Returns whether it saved a point (false: no checkpoints, a bypass request, or the slot holds that state).
+  // `cut`: the point is the cut buffer's state at that position (cut_save), not the slot's state at the cursor.
   bool SaveCheckpoint(Request& state, CheckpointKind kind, int replay, bool guarded,
-                      std::shared_ptr<const PromptOutputs> outputs = nullptr) {
-    if (!cache_.checkpoint_save || state.options.cache_control == "bypass") return false;
-    const std::span<const int> below(state.options.ids.data(), state.cursor);
+                      std::shared_ptr<const PromptOutputs> outputs = nullptr, size_t cut = 0) {
+    if (!cache_.checkpoint_save || state.options.cache_control == "bypass" || (cut && !cache_.cut_save)) return false;
+    const std::span<const int> below(state.options.ids.data(), cut ? cut : state.cursor);
     auto key = Key(state.options, below);
     const auto victim = checkpoints_.Victim(state.slot, key, kind, state.id, state.options.tenant);
     if (!victim) return false;
-    cache_.checkpoint_save(state.slot, *victim);
+    if (cut) cache_.cut_save(state.slot, *victim);
+    else cache_.checkpoint_save(state.slot, *victim);
     checkpoints_.Store(state.slot, *victim, {std::vector<int>(below.begin(), below.end()), std::move(key),
                                              replay, guarded, kind, state.id, {}, state.options.tenant,
                                              std::move(outputs)});
@@ -1458,6 +1750,8 @@ class BatchSession {
   uint64_t verify_turn_ = 0;
   size_t pre_end_min_ = 0;    // SetPreEnd (0: off)
   int core_rows_ = kPrefillLaunchCoreRows;
+  bool exact_resume_ = false;  // SetExactResume
+  size_t pre_margin_ = kPreEndMargin, header_min_ = kHeaderMinRows;  // SetSavePoints
   int pass_rows_ = kMaxRows;  // SetPassRows
   int wide_from_ = 0;         // SetPassRows: decoders from which a pass uses pass_rows_ (0: always)
   std::map<uint64_t, std::unique_ptr<Request>> active_;

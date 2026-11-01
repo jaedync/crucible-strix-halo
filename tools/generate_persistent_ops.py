@@ -66,11 +66,6 @@ def scheduled_body(source, name):
                                 'S[i] += PersistentCoefficient(kq + i, y) * delta;')
         result = result.replace('y += S[i] * qq[i];',
                                 'y += S[i] * PersistentCoefficient(qq + i, y);')
-        fence = '\n#if CRUCIBLE_PERSISTENT_GDN_LIMIT_LOADS\n      asm volatile("" ::: "memory");\n#endif\n'
-        for line in ('      mem += S[ii] * PersistentCoefficient(kq + ii, mem);',
-                     '      mem += S[i] * PersistentCoefficient(kq + i, mem);',
-                     '      S[i] += PersistentCoefficient(kq + i, y) * delta;'):
-            result = result.replace(line, fence + line)
     return result
 
 

@@ -73,6 +73,7 @@ struct SequenceState {
   std::vector<int> hist;
   RetainedPrefix retained;
   std::map<int, float*> gstate, ghist, gpend;
+  bool gdn_lazy = false;  // as engine/runtime/sequence_state.h
   std::map<int, QsaCache> qc;
   std::vector<DeviceSpan> FixedSpans() const {
     std::vector<DeviceSpan> spans;

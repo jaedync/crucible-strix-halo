@@ -46,5 +46,25 @@ int main() {
   // A wide group is one fused class: no K6 launch and no split.
   assert(is(PrefillFusedClassesOf(k7, 4, true), true, false, false));
   std::printf("wide classes ok\n");
+  // Half path items: every 128 x 128 block of every job exactly once, group by group.
+  long half_items = 0;
+  for (int G : {1, 3, 16})
+    for (const std::vector<int>& Ms : std::vector<std::vector<int>>{{16}, {97, 97}, {4096, 4096}, {8192, 8192, 8192, 8192}, {300, 2048}})
+      for (const std::vector<int>& Os : std::vector<std::vector<int>>{{128}, {10240, 6144}, {12288, 512, 512, 640}}) {
+        const int n = (int)std::min(Ms.size(), Os.size());
+        const auto v = PrefillHalfItemsOf(Ms.data(), Os.data(), n, G);
+        std::vector<std::vector<int>> seen(n);
+        for (int j = 0; j < n; ++j) seen[j].assign((size_t)((Ms[j] + 127) / 128) * (Os[j] / 128), 0);
+        int last_group = 0;
+        for (const auto& it : v) {
+          assert(it.job >= 0 && it.job < n && it.m0 % 128 == 0 && it.m0 < Ms[it.job] && it.b0 % 8 == 0 && it.b0 < Os[it.job] / 16);
+          assert(it.m0 / (128 * G) >= last_group);
+          last_group = it.m0 / (128 * G);
+          ++seen[it.job][(size_t)(it.m0 / 128) * (Os[it.job] / 128) + it.b0 / 8];
+        }
+        for (const auto& s : seen) for (int c : s) assert(c == 1);
+        half_items += (long)v.size();
+      }
+  std::printf("half items ok (%ld)\n", half_items);
   return 0;
 }

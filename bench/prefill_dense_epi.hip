@@ -10,7 +10,7 @@
 // Usage: prefill_dense_epi K [ROUNDS=5]
 #include "prefill_common.h"
 #include "../engine/exl3/decode_split.h"
-#include "../engine/layers/prefill_hc.h"
+#include "kernels/prefill_hc.h"
 #include "../engine/exl3/prefill_linear.h"
 #include <functional>
 using namespace crucible;

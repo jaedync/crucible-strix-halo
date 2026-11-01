@@ -60,7 +60,9 @@ def scan(root=ROOT):
 # scale 37, type 2; bench wht 13, scale 40. Target in engine: 0 (S5 adds engine/exl3/transform.h).
 ALLOWED = {
     'engine/engine.hip': {'scale': 6},
-    'engine/layers/kernels/prefill_gdn.h': {'wht': 3, 'scale': 3},
+    # +1 wht (gdn-pipe): GdnGateRow, the gate inside the fused GDN scan, calls Wht128Dpp itself; through
+    # LinInLane the fused kernel is 85 us per 2,048-row part slower.
+    'engine/layers/kernels/prefill_gdn.h': {'wht': 4, 'scale': 3},
     'engine/layers/kernels/prefill_qsa.h': {'wht': 1, 'scale': 1},
     'engine/layers/kernels/prefill_qsa_union.h': {'wht': 1, 'scale': 1},
     # +1 wht, +1 scale (packs): MoeFusedKernelWide copies MoeFusedKernel's down prep, because a
@@ -69,6 +71,10 @@ ALLOWED = {
     # New (decode-fuse 0d12f8cb): the R=1 MoE stage does the input transform inside the expert launch, so the
     # launch count drops; moving its transform calls to engine/exl3/ is an earlier change and must keep the stage's ISA.
     'engine/layers/moe_stage.h': {'wht': 4, 'scale': 6},
+    # New (moe-r35b, CRUCIBLE_MOE_B128=12, the default): MoeSgMidRows sums the partials of all rows before the output
+    # transform (LinOutBlock's arithmetic); helpers in engine/exl3/ changed the kernels' ISA (mode 7, the shape of 12)
+    # after their byte check and token gate, so the move to engine/exl3/ is an earlier change and must keep that ISA.
+    'engine/layers/moe_sg.h': {'wht': 2, 'scale': 2},
     'engine/layers/ops.h': {'wht': 1, 'scale': 3, 'type': 1},
     'engine/layers/persistent_ops.h': {'wht': 2, 'scale': 2},
     'engine/layers/prefill_moe.h': {'wht': 5, 'scale': 10},
@@ -76,9 +82,16 @@ ALLOWED = {
     'engine/model/flashnext/model.h': {'scale': 2, 'type': 1},
     'engine/runtime/draft_dense.h': {'wht': 1, 'scale': 1},
     'bench/kernels/exl3_moe_mid_probe.h': {'wht': 3, 'scale': 3},
+    # New (moe-d1, bench only): MoeFusedOwnKernel copies MoeFusedKernel's down prep (the mid) so its probe
+    # bodies run in the engine dispatch.
+    'bench/kernels/moe_flow.h': {'wht': 1, 'scale': 1},
     'bench/kernels/moe_rows.h': {'wht': 3, 'scale': 7},
     'bench/kernels/qsa_decode.h': {'wht': 1, 'scale': 1},
     'bench/moe_rows.hip': {'scale': 12},
+    # New (verify-moe, bench only): host setup of the expert pointer arrays (suh[0], svh[2]), as moe_rows.hip
+    # (moved from verify_moe.hip by moe-sg-fix).
+    'bench/verify_moe_plan.h': {'scale': 12},
+    'bench/prefill_dense_gemm.hip': {'wht': 1, 'scale': 4},
     'bench/prefill_dense_half.hip': {'wht': 3, 'scale': 12},
     'bench/prefill_moe_gemm.hip': {'wht': 2, 'scale': 2},
     'bench/prefill_moe_mid.hip': {'scale': 2},

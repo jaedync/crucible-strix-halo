@@ -70,6 +70,7 @@ struct SlotCheckpointIO {
     }
     state.hist = point.hist;
     state.retained = buffer.retained;
+    state.gdn_lazy = true;  // the saved GDN state may hold a lazy scale
   }
   // the host snapshot of a Frontier point while the stream holds later rows.
   // The buffer holds Spans(state, length) as Save copied them; the rows below the point are the stream's own, written
@@ -127,6 +128,7 @@ struct SlotCheckpointIO {
                               hipMemcpyDeviceToDevice, 0));
     // As Restore: the target's state is complete when the open goes on.
     HIP_OK(hipStreamSynchronize(0));
+    target.gdn_lazy = true;
     target.hist = std::move(hist);
     target.retained = buffer.retained;
   }

@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "../model/flashnext/geometry.h"
+#include "hc8_layout.h"
 
 namespace crucible {
 inline size_t CheckedBytesAdd(size_t a, size_t b) {
@@ -25,7 +26,8 @@ inline size_t StaticArenaCapacity(size_t bytes) {
 
 template<class Checkpoint> class StaticLayout {
  public:
-  explicit StaticLayout(Checkpoint& ck) : ck_(ck) {}
+  // hc8: the HC sites hold int8 blocks (hc8_layout.h) in place of fp16 fn and up.
+  explicit StaticLayout(Checkpoint& ck, bool hc8 = false) : ck_(ck), hc8_(hc8) {}
   size_t bytes() const { return bytes_; }
   void Raw(const std::string& n) { Add(Payload(n)); }
   void F32(const std::string& n) {
@@ -45,9 +47,19 @@ template<class Checkpoint> class StaticLayout {
   }
   void Hc(const std::string& p, bool inject) {
     F32(p + "hc_norm.weight");
-    if (inject) Concat({p + "input_mix_weight_down.weight", p + "block_inject_weight.weight"});
-    else Raw(p + "input_mix_weight_down.weight");
-    Raw(p + "input_mix_weight_up.weight");
+    if (hc8_) {
+      for (const char* n : {"input_mix_weight_down.weight", "input_mix_weight_up.weight"}) Payload(p + n);
+      if (inject) Payload(p + "block_inject_weight.weight");
+      Add(Hc8Bytes(kRank + (inject ? kStreams : 0), kWide, kHc8FnGroup));
+      Add(Hc8Bytes(kWide, kRank, kHc8UpGroup));
+      return;
+    }
+    // Fragment-order up and fn (fn rows padded to whole 16-row tiles); the
+    // row-major copies live in the main arena (model.h HcW).
+    for (const char* n : {"input_mix_weight_down.weight", "input_mix_weight_up.weight"}) Payload(p + n);
+    if (inject) Payload(p + "block_inject_weight.weight");
+    Add(size_t(kWide) * kRank * 2);
+    Add(size_t(kRank + (inject ? kStreams : 0) + 15) / 16 * 16 * kWide * 2);
   }
   void Layer(const std::string& p, bool attn) {
     Hc(p + "attn_hyper_connection.", true);
@@ -84,14 +96,15 @@ template<class Checkpoint> class StaticLayout {
   }
   void Add(size_t b) { bytes_ = CheckedBytesAdd(bytes_, AlignWeightBytes(b)); }
   Checkpoint& ck_;
+  const bool hc8_;
   size_t bytes_ = 0;
 };
 
 template<class Checkpoint>
-size_t ExpectedStaticBytes(Checkpoint& ck, int layers) {
+size_t ExpectedStaticBytes(Checkpoint& ck, int layers, bool hc8 = false) {
   if (layers <= 0)
     throw std::invalid_argument("static layout geometry is invalid");
-  StaticLayout<Checkpoint> layout(ck);
+  StaticLayout<Checkpoint> layout(ck, hc8);
   const std::string p = "model.language_model.";
   for (int l = 0; l < layers; ++l)
     layout.Layer(p + "layers." + std::to_string(l) + ".", IsQsa(l));

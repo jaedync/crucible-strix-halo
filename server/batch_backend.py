@@ -230,7 +230,7 @@ class BatchedEngineBackend(EngineBackend):
         self.stage_job = self.state_disk and ready.get("stage_job") is True
 
     def submit(self, ids, request, cache_prefix_tokens=0, shared_prefix_tokens=0, log_turn=True, image_offsets=(),
-               after=None, think_cap=None):
+               after=None, think_cap=None, client_request_id=None):
         if request.spec and request.max_tokens > 1:
             # G6a: solo speculative steps (greedy and sampled) with one fixed head.
             # Serial serve with the same policy and seed is the reference.
@@ -249,7 +249,7 @@ class BatchedEngineBackend(EngineBackend):
             if self.jobs.full() or len(ids) > self.pending_token_limit - self.pending_tokens:
                 raise ApiError("The batch request queue is full. Try again later.", status=503)
             job = super().submit(ids, request, cache_prefix_tokens, shared_prefix_tokens, log_turn, image_offsets, after,
-                                 think_cap)
+                                 think_cap, client_request_id)
             self.pending_tokens += len(ids)
             return job
 

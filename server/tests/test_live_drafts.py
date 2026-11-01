@@ -1,4 +1,4 @@
-"""crucible_decode: the live draft counters of a decoding speculative turn (live drafts for a log reader).
+"""crucible_decode: the live draft counters of a decoding speculative turn (the gateway's live drafts).
 
 The engine puts a speculative request's cumulative counters (draft_proposed, draft_accepted, spec_steps) on the first
 token event of each speculative step. The server writes at most one crucible_decode line a second for each such turn,
@@ -77,7 +77,7 @@ def test_no_line_without_speculation_or_before_a_round():
 
 
 def test_no_line_without_draft_proposed():
-    """a log parser needs draft_proposed: an engine without step counters writes no line."""
+    """A log parser needs draft_proposed: an engine without step counters writes no line."""
     turn = live_turn(spec_rounds=3, round_tokens=9, decode_tokens=10)
     assert metrics.decode_line(job(turn), 101.0) is None
     assert metrics.final_decode_line('crucible_turn {"request_id": 1, "spec_rounds": 3, "draft_accepted": 6, '
@@ -201,7 +201,7 @@ def test_closed_think_turn_keeps_one_request_id_and_cumulative_counts(start_back
     decode, (turn,) = parsed(lines, "crucible_decode"), parsed(lines, "crucible_turn")
     assert turn["request_id"] == first.turn["request_id"] != turn["cont_request_id"] == cont.turn["request_id"]
     assert {line["request_id"] for line in decode} == {first.turn["request_id"]}
-    # The continuation's prefill lines carry its own id; turn_request_id names the turn for a log reader (train 23).
+    # The continuation's prefill lines carry its own id; turn_request_id names the turn for the gateway (train 23).
     prefill = parsed(lines, "crucible_prefill")
     own = [line for line in prefill if line["request_id"] == cont.turn["request_id"]]
     base = [line for line in prefill if line["request_id"] == first.turn["request_id"]]
@@ -244,7 +244,7 @@ def test_http_close_writes_the_final_line_for_the_whole_turn():
 
 
 def test_prefill_line_names_the_turn_only_for_a_continuation():
-    """A log reader pairs a closed think turn's continuation by turn_request_id; every other line keeps today's keys."""
+    """The gateway pairs a closed think turn's continuation by turn_request_id; every other line keeps today's keys."""
     turn = dict(request_id=9, t_first_gpu=metrics.now())
     plain = json.loads(metrics.prefill_line(turn, 4, 8, metrics.now()).split(" ", 1)[1])
     assert sorted(plain) == ["done", "elapsed_s", "request_id", "total"]

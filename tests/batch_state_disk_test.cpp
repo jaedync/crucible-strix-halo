@@ -65,6 +65,9 @@ StateDiskOptions Options() {
   options.directory = std::string(16, '7') + "-" + std::string(16, '7') + "-" + std::string(16, '7');
   options.min_tokens = 12;
   options.log = [](const std::string&) {};
+  // The tier logic is under test, not the host disk: a fixed 1 TiB of free space, whatever the real filesystem holds.
+  // A test of the reserve or the full path sets its own free_space after this.
+  options.free_space = [] { return uint64_t(1) << 40; };
   return options;
 }
 ConversationPolicy Policy() {
@@ -134,6 +137,60 @@ void SpillRoomLeavesUnallocatedReads() {
   release.set_value();
   assert(StageWait(tier, Query(x), 0).state == StageState::Ready && tier.Disk().UnallocatedReadBytes() == 0);
   assert(tier.Spill(std::span<const int>(y).first(16), Policy(), entry, need) && tier.Drain(30));
+}
+
+// the writer's queue is pinned memory beside the cache. It counts in the budget (Outside) for the next save,
+// and a save's victims go to the writer only while the cache, the queue and the new bytes stay within the budget and
+// the spill slack. A read's victims have no such limit: the read waits until the writer frees them.
+void QueueCountsInTheBudget() {
+  auto options = Options();
+  options.root = Home() / "states-queue-budget";
+  std::promise<void> release;
+  std::shared_future<void> gate = release.get_future().share();
+  options.before_write = [&] { gate.wait(); };
+  Tier tier(options, false);
+  const auto ids = [](int first) { return Tokens(first, 40); };
+  const size_t payload = Make(std::span<const int>(ids(1)).first(16), false, 39)->bytes.size();
+  Cache cache(payload * 3, {}, 1, 1000, false);
+  cache.SetOutside([&] {
+    return size_t(tier.Disk().StagedBytes() + (cache.Reading() ? 0 : tier.Disk().QueuedBytes()));
+  });
+  cache.SetSpillSlack(payload);
+  cache.SetSpill([&](std::span<const int> key, const ConversationPolicy& policy,
+                     const std::shared_ptr<const Cache::Entry>& entry, int, uint64_t room) {
+    return tier.Spill(key, policy, entry, room, cache.Reading());
+  });
+  const auto save = [&](int first) {
+    const auto key = ids(first);
+    return cache.Capture(key, Policy(), {16, CacheRetention::Session}, payload, uint64_t(64) << 30,
+                         [&] { return Make(std::span<const int>(key).first(16), false, key.size() - 1); });
+  };
+  assert(save(1) && save(101) && save(201) && cache.Bytes() == payload * 3);
+  // w evicts x: the cache keeps 3 entries, the queue holds x. That is the budget and one payload of slack.
+  assert(save(301) && tier.Disk().QueuedBytes() == payload && cache.Bytes() == payload * 3);
+  // v finds the queue in Outside(): it evicts y and z; the slack takes y's write only. z is lost (memory).
+  assert(save(401) && tier.Disk().QueuedBytes() == payload * 2 && cache.Bytes() == payload * 2);
+  assert(cache.Bytes() + tier.Disk().QueuedBytes() == payload * 4);  // the budget and the slack, never more
+  release.set_value();
+  assert(tier.Drain(30) && tier.Disk().QueuedBytes() == 0);
+  const auto held = [&](int first) { auto key = ids(first); key.resize(16); return tier.Holds(key, Policy()); };
+  assert(held(1) && held(101) && !held(201));
+}
+
+// the queue count falls after the writer releases the snapshot, not before. A save that reads
+// QueuedBytes() between the two steps must not count a state as free while its chunks are still pinned.
+void QueueFallsAfterMemoryLeaves() {
+  auto options = Options();
+  options.root = Home() / "states-queue-order";
+  Tier tier(options, false);
+  const auto x = Tokens(1, 40);
+  const auto xs = Make(std::span<const int>(x).first(16), false, x.size() - 1);
+  std::atomic<uint64_t> counted_at_release = 0;
+  std::shared_ptr<const void> keep(xs.get(), [&, xs](const void*) { counted_at_release = tier.Disk().QueuedBytes(); });
+  const uint64_t payload = xs->bytes.size();
+  assert(tier.Disk().Spill(xs->hist, Policy(), false, false, false, std::move(keep), *xs).empty());
+  assert(tier.Drain(30) && tier.Disk().QueuedBytes() == 0);
+  assert(counted_at_release == payload);
 }
 
 // MEDIUM-5: a slot state that the host cache refuses goes straight to
@@ -757,6 +814,8 @@ int main() {
     assert(limited.Skip(Tokens(501, 30), Policy(), 3030) == "daily");
   }
   SpillRoomLeavesUnallocatedReads();
+  QueueCountsInTheBudget();
+  QueueFallsAfterMemoryLeaves();
   DirectSpill();
   InRunFrontier();
   StageRoomRule();

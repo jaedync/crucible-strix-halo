@@ -21,6 +21,9 @@ struct SequenceState {
   RetainedPrefix retained;
   std::map<int, QsaCache> qc;
   std::map<int, float*> gstate, ghist, gpend;
+  // a bulk prefill or a restore may have left a GDN state in the lazy form (S and a per-head scale, see
+  // engine/layers/kernels/prefill_gdn.h). The first small-row forward makes it S_true (Engine::MaterializeGdn).
+  bool gdn_lazy = false;
   float* ple_ring = nullptr;
   // Image request context (engine/model/flashnext/multimodal.h). Reset() keeps it: the request owner binds it before
   // the prompt and clears it when the request ends, so text requests always see a null table.
@@ -139,7 +142,8 @@ struct SequenceState {
   }
 
   void Reset() {
-    for (const auto& [l, s] : gstate) HIP_OK(hipMemset(s, 0, sizeof(float) * 48 * 128 * 128));
+    for (const auto& [l, s] : gstate) HIP_OK(hipMemset(s, 0, kGdnStateBytes));  // with the scale (0 means 1)
+    gdn_lazy = false;
     for (const auto& [l, h] : ghist) HIP_OK(hipMemset(h, 0, sizeof(float) * 16 * kGdnQkvWidth));
     HIP_OK(hipMemset(ple_ring, 0, sizeof(float) * 16 * kWide));
     hist.clear();

@@ -151,10 +151,6 @@ __device__ __forceinline__ void PersistentGdn(ComputeContext& ct, int task, GdnA
 #pragma unroll
     for (int ii = 0; ii < 64; ++ii) {
       S[ii] *= decay;
-
-#if CRUCIBLE_PERSISTENT_GDN_LIMIT_LOADS
-      asm volatile("" ::: "memory");
-#endif
       mem += S[ii] * PersistentCoefficient(kq + ii, mem);
     }
     part[hf][j] = mem;
@@ -218,10 +214,6 @@ __device__ __forceinline__ void PersistentGdn(ComputeContext& ct, int task, GdnA
 #pragma unroll
     for (int i = 0; i < 64; ++i) {
       S[i] *= decay;
-
-#if CRUCIBLE_PERSISTENT_GDN_LIMIT_LOADS
-      asm volatile("" ::: "memory");
-#endif
       mem += S[i] * PersistentCoefficient(kq + i, mem);
     }
     part[hf][j] = mem;
@@ -231,10 +223,6 @@ __device__ __forceinline__ void PersistentGdn(ComputeContext& ct, int task, GdnA
     float y = 0.f;
 #pragma unroll
     for (int i = 0; i < 64; ++i) {
-
-#if CRUCIBLE_PERSISTENT_GDN_LIMIT_LOADS
-      asm volatile("" ::: "memory");
-#endif
       S[i] += PersistentCoefficient(kq + i, y) * delta;
       y += S[i] * PersistentCoefficient(qq + i, y);
     }

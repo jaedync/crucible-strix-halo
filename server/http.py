@@ -14,6 +14,7 @@ from traceback import extract_tb
 from . import anthropic, metrics
 from .api import DEFAULTS, LEGACY_MODEL, MTP_WINDOW, ApiError, validate_request
 from .hosts import REFUSED, host_allowed
+from .request_id import DEFAULT_CLIENT_REQUEST_ID_HEADER
 from .response import CompletionResponse
 from .think_budget import SKIPPED_BY, skips_thinking, think_cap
 from .version import server_commit, server_version
@@ -81,8 +82,9 @@ class Service:
     def __init__(self, backend, tokenizer, model="crucible", clamp_max_tokens=False, default_thinking=False,
                  max_body_mib=1, thinking_answer_room=None, max_thinking_tokens=None, stream_tool_calls=True,
                  max_requests_per_client=0, vision=None, default_mtp_prefix=MTP_WINDOW, capture=None, allowed_hosts=None,
-                 defaults=DEFAULTS, min_thinking_tokens=0):
+                 defaults=DEFAULTS, min_thinking_tokens=0, client_request_id_header=DEFAULT_CLIENT_REQUEST_ID_HEADER):
         self.backend, self.tokenizer, self.model = backend, tokenizer, model
+        self.client_request_id_header = client_request_id_header  # request_id.resolve_client_request_id_header()
         self.allowed_hosts = allowed_hosts  # hosts.parse_allowed_hosts(): None accepts any Host header
         self.capture = capture  # serve --draft-capture: None unless the operator turns it on
         self.default_mtp_prefix = default_mtp_prefix  # serve --mtp-window
@@ -334,7 +336,7 @@ def handler_for(service):
             """SH-3: a protocol error before a method handler runs. The default page is HTML, and its reason phrase
             and log line quote the request line; this reply is JSON with a fixed text and a crucible_error line."""
             error = ApiError(PROTOCOL_ERRORS.get(code, "The request could not be processed."), status=code)
-            metrics.emit(metrics.client_error_line(None, code, error))
+            metrics.emit(metrics.client_error_line(None, code, error, client_request_id=self.client_request_id))
             try:
                 self.send_json(code, error_body(error))
             except OSError:
@@ -344,10 +346,18 @@ def handler_for(service):
             self.response_started = True
             super().send_response(code, message)
 
+        @property
+        def client_request_id(self):
+            """The gateway's id for this request (the header that --client-request-id-header names), or None. It goes
+            to the log lines only, never into a response."""
+            headers = getattr(self, "headers", None)
+            return None if headers is None else metrics.client_request_id(headers.get(service.client_request_id_header))
+
         def handle_one_request(self):
             """Last resort: socketserver would drop the connection and print a traceback, whose text can hold content."""
             # A keep-alive connection reuses the handler: the SSE ending below must see this request's output only.
             self.response_started, self.output = False, None
+            self.headers = None  # a request line that fails to parse must not log the previous request's id
             try:
                 super().handle_one_request()
             except Exception as error:
@@ -362,7 +372,8 @@ def handler_for(service):
                 except Exception:
                     # A raise here would reach socketserver, which prints the chained exception text.
                     request_id, message = None, f"unexpected {type(error).__name__}"
-                metrics.emit(metrics.error_line(request_id, 500, message, self.response_started))
+                metrics.emit(metrics.error_line(request_id, 500, message, self.response_started,
+                                                self.client_request_id))
                 body = error_body(ApiError("The server could not process the request.", status=500))
                 output = getattr(self, "output", None)
                 try:
@@ -401,9 +412,10 @@ def handler_for(service):
             turn = getattr(self.jobs[0], "turn", None) if getattr(self, "jobs", None) else None
             request_id = turn.get("request_id") if isinstance(turn, dict) else None
             if error.status < 500:
-                metrics.emit(metrics.client_error_line(request_id, error.status, error, started))
+                metrics.emit(metrics.client_error_line(request_id, error.status, error, started,
+                                                       self.client_request_id))
             else:
-                metrics.emit(metrics.error_line(request_id, error.status, error, started))
+                metrics.emit(metrics.error_line(request_id, error.status, error, started, self.client_request_id))
             try:
                 if started:
                     self.sse(error_body(error))
@@ -715,6 +727,7 @@ def handler_for(service):
                 admitted = service.admit_client(address)
                 request, prompt_ids, offsets = service.plan(request)
                 options = {}
+                if self.client_request_id: options["client_request_id"] = self.client_request_id
                 cap = service.think_cap(request)
                 if cap:
                     options["log_turn"] = False  # log_turn() writes one line for the whole request
@@ -743,7 +756,8 @@ def handler_for(service):
                     turn = getattr(self.jobs[0], "turn", None)
                     output = self.output
                     metrics.emit(metrics.cancel_line(turn.get("request_id") if isinstance(turn, dict) else None,
-                                                     len(output.ids) if output else 0, started))
+                                                     len(output.ids) if output else 0, started,
+                                                     self.client_request_id))
             finally:
                 for job in self.jobs:
                     job.cancelled.set()

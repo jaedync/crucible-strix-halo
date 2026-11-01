@@ -79,6 +79,9 @@ struct BatchMtpSlots {
 // also hold the MTP rows of the whole prefix, so a full-window hit continues the MTP warm-up.
 class BatchPrefixCache {
  public:
+  // a direct spill leaves the tail's full blocks on the device when they cover at least this many bytes; the
+  // disk writer's staging (io_threads x one 8 MiB chunk) is the host memory beyond the rest of the state.
+  static constexpr size_t kLazyMinBytes = size_t(64) << 20, kLazyStagingBytes = size_t(64) << 20;
   using Entry = crucible::BatchConversationCache<ConversationSnapshot>::Entry;
   // `streams`: sessions that run at once, each with one protected resume point.
   // `checkpoints`: in-slot resume points (slot_checkpoints.h). Their device bytes come out of the cache budget, so
@@ -149,6 +152,7 @@ class BatchPrefixCache {
         return Resume(r, resident);
       };
       hooks.release = [this](int slot, bool resumed) { Release(slot, resumed); };
+      hooks.overwrite = [this](int slot) { LazyEnd(slot); };
     }
     hooks.key = [](const crucible::ServeRequest& r, std::span<const int> tokens) { return Key(r, tokens); };
     if (disk_)
@@ -174,6 +178,9 @@ class BatchPrefixCache {
         // A Frontier resume is a host frontier hit: a whole pool block and prefill chunk, no pending rows (LOW-2).
         if (point.kind == crucible::CheckpointKind::Frontier && !crucible::SlotFrontierGrid(point.hist.size(), rows_, point.replay))
           throw std::logic_error("slot frontier resume needs a grid point with no pending rows");
+        // the restore writes the pool block of the point on the null stream, and the lazy disk reads use their own
+        // stream: they end first, for the rows from the point's settled length up.
+        LazyLimit(slot, point.hist.size() > size_t(std::max(point.replay, 0)) ? point.hist.size() - size_t(std::max(point.replay, 0)) : 0);
         SlotCheckpointIO::Restore(engine_.ActiveSequence(), Buffer(slot, index), point);
         if (mtp_ && point.outputs && point.outputs->carry) CopyCarry(Buffer(slot, index), slot, false);
         bases_.Limit(slot, point.hist.size(), point.replay);  // an earlier change
@@ -190,6 +197,9 @@ class BatchPrefixCache {
       };
       hooks.pre_saved = [](int slot, size_t tokens) {
         std::fprintf(stderr, "slot_checkpoint pre_end tokens=%zu slot=%d\n", tokens, slot);
+      };
+      hooks.header_saved = [](int slot, size_t tokens) {
+        std::fprintf(stderr, "slot_checkpoint header tokens=%zu slot=%d\n", tokens, slot);
       };
       hooks.diverged = [](size_t prompt, size_t restored, size_t tail, size_t common) {
         std::fputs(crucible::SessionReplayDivergenceLine(prompt, restored, {tail, common, prompt <= tail}).c_str(), stderr);
@@ -308,10 +318,35 @@ class BatchPrefixCache {
   void WriteSnapshot(const ConversationSnapshot& snapshot) {
     const auto held = mtp_ ? crucible::MtpHeldOf(snapshot.resume) : std::nullopt;
     const int slot = Slot();
+    LazyEnd(slot);  // this write ends the lazy reads of the slot's rows
     if (held) ConversationStateIO::Restore(engine_, engine_.ActiveSequence(), snapshot, mtp_->Stacks(slot), mtp_->Carry(slot));
     else ConversationStateIO::Restore(engine_, engine_.ActiveSequence(), snapshot, stk_, carry_);
     if (mtp_) mtp_->Restored(slot, held);
   }
+  // the lazy snapshots of a slot read its device rows when the disk writer walks them. A
+  // snapshot reads rows [0, Rows()) of the slot, which a resumed request keeps while it runs. Every write that can change
+  // those rows (a restore, a reset, a checkpoint resume below them, a frontier copy) ends the sources first: a writer
+  // that walks an ended source refuses the write ("lost"). The end waits for the one 8 MiB read in progress, so the
+  // slot is never written while a read of it runs. Used on the device worker only.
+  void LazyTrack(int slot, const std::shared_ptr<crucible::LazySource>& source) {
+    auto& list = lazy_.at(size_t(slot));
+    std::erase_if(list, [](const auto& weak) { return weak.expired(); });
+    list.push_back(source);
+  }
+  // The rows from `kept` up can change: the sources that read past `kept` end.
+  void LazyLimit(int slot, size_t kept) {
+    auto& list = lazy_.at(size_t(slot));
+    bool ended = false;
+    for (const auto& weak : list)
+      if (const auto source = weak.lock(); source && source->Rows() > kept && source->Valid()) source->Invalidate(), ended = true;
+    std::erase_if(list, [](const auto& weak) {
+      const auto source = weak.lock();
+      return !source || !source->Valid();
+    });
+    // The jobs that wait for the writer leave the queue now (review finding 7); the one in progress ends as "lost".
+    if (ended && disk_) disk_->Disk().DropLost();
+  }
+  void LazyEnd(int slot) { LazyLimit(slot, 0); }
   SaveBase Base(int slot) const {
     auto base = bases_.Get(slot);
     return {std::move(base.snapshot), base.rows};
@@ -345,6 +380,7 @@ class BatchPrefixCache {
     // Every host restore writes the slot, so the slot's MTP history is gone unless the restore brings it back.
     if (mtp_) mtp_->Restored(Slot(), std::nullopt);
     bases_.Clear(Slot());  // the open reset the slot; a restore below sets the base again
+    LazyEnd(Slot());
     crucible::BatchRestore miss;
     miss.tier = crucible::BatchCacheTier::Host;
     if (r.ids.size() < 2) {
@@ -454,8 +490,9 @@ class BatchPrefixCache {
       copies.push_back({span.pointer, cut_->device + offset, span.bytes});
       offset += span.bytes;
     }
-    if (position % 128 || !crucible::RetainedPrefix::FromFields({position, position, window_start, 0}, cut_->retained))
-      throw std::logic_error("prefill cut needs a grid point after its window start");
+    // any position; Spans lists the pool block of a position off the 128-position grid.
+    if (!crucible::RetainedPrefix::FromFields({position, position, window_start, 0}, cut_->retained))
+      throw std::logic_error("prefill cut needs a position after its window start");
     cut_->position = position;
     return copies;
   }
@@ -520,8 +557,20 @@ class BatchPrefixCache {
                                                                                 engine_.ActiveSequence().compact_state);
     if (!disk->Enabled()) return;
     disk_ = std::move(disk);
-    // Staged reads count in the cache budget: every save makes room for them too.
+    // Staged reads count in the cache budget: every save makes room for them too. so does
+    // the writer's queue, which holds the evicted snapshots in pinned memory until their writes end (the part above the
+    // spill slack, BatchConversationCache::SetQueued). A read does not count it: the read waits until the writer frees
+    // its victims (ReadRoom Wait) before it allocates.
     cache_.SetOutside([this] { return size_t(disk_->Disk().StagedBytes()); });
+    cache_.SetQueued([this] { return size_t(cache_.Reading() ? 0 : disk_->Disk().QueuedBytes()); });
+    // one MemAvailable floor for the saves, the spills and the direct spills, as for the reads; and the
+    // queue may pin only so many bytes beyond the budget while a save allocates beside it.
+    cache_.SetHostFloor(crucible::kStageKeepFree);
+    cache_.SetSpillSlack(crucible::kSpillSlack);
+    cache_.SetDirectMargin(crucible::kDirectMargin);
+    std::fprintf(stderr, "conversation cache: host floor %llu MiB, spill slack %llu MiB\n",
+                 static_cast<unsigned long long>(cache_.HostReserve() >> 20),
+                 static_cast<unsigned long long>(crucible::kSpillSlack >> 20));
     cache_.SetSpill([this](std::span<const int> key, const crucible::ConversationPolicy& policy,
                            const std::shared_ptr<const Entry>& entry, int, uint64_t room) {
       return disk_->Spill(key, policy, entry, room, cache_.Reading());
@@ -650,25 +699,50 @@ class BatchPrefixCache {
                  held->state.replay, int(resumed), int(saved), saved ? "-" : status.last.refused.c_str(),
                  cache_.Evictions() - evictions, bytes, cache_.Bytes(), cache_.CopyBytes(), SharedOf(share, bytes),
                  crucible::GenerationNow() - start);
-    if (!saved)
-      Direct(slot, held->key, Policy(held->tenant), held->state.length, held->guarded, bytes, share,
-             [&] { return SaveSlot(sequence, held->state, stk, carry, base); });
+    if (saved) return;
+    // a resumed request keeps the rows below the settled ones, so the full blocks of the tail stay on the
+    // device and the disk writer reads them in chunks. The host holds the rest of the state only (about 250 MB at
+    // 128K tokens), not the 3 to 5 GB snapshot that the old direct spill pinned until its write ended.
+    if (resumed && disk_) {
+      const auto plan = ConversationStateIO::PlanLazy(sequence, held->state, disk_->Disk().BlockRows(),
+                                                      disk_->Disk().BlockHeadBytes(), disk_->Disk().BlockTailBytes());
+      if (plan.bytes >= kLazyMinBytes) {
+        Direct(slot, held->key, Policy(held->tenant), held->state.length, held->guarded, bytes, share,
+               [&] { return SaveLazy(slot, sequence, held->state, stk, carry, plan); }, plan.bytes);
+        return;
+      }
+    }
+    Direct(slot, held->key, Policy(held->tenant), held->state.length, held->guarded, bytes, share,
+           [&] { return SaveSlot(sequence, held->state, stk, carry, base); });
+  }
+  // A save that leaves the full blocks on the device (ConversationStateIO::SaveLazy). The slot's base does not hold it.
+  std::shared_ptr<const ConversationSnapshot> SaveLazy(int slot, SequenceState& sequence, const crucible::ConversationResume& state,
+                                                       float* stk, float* carry,
+                                                       const ConversationStateIO::LazyPlan& plan) {
+    const auto source = std::make_shared<crucible::LazySource>(crucible::DeviceLazyReader(), plan.rows);
+    auto snapshot = ConversationStateIO::SaveLazy(engine_, sequence, state, stk, carry, plan, source, lazy_shadow_);
+    LazyTrack(slot, source);
+    return snapshot;
   }
   // MEDIUM-5 (BatchDiskTier::SpillDirect): the host cache refused this slot state, so it goes straight to
   // disk when the disk tier is on and host memory above the reserve holds its new bytes. Else it is lost, as before.
+  // `lazy`: the bytes of the snapshot that `save` leaves on the device (0: all of it is copied to the host).
   template<class Save>
   void Direct(int slot, std::span<const int> key, const crucible::ConversationPolicy& policy, size_t tokens,
-              bool guarded, size_t bytes, const crucible::SharedSave& share, Save save) {
+              bool guarded, size_t bytes, const crucible::SharedSave& share, Save save, size_t lazy = 0) {
     if (!disk_) return;
-    const uint64_t available = HostAvailable(), reserve = cache_.HostReserve();
-    const size_t need = share.host_bytes ? share.host_bytes : bytes;
+    const size_t host = lazy ? bytes - lazy : share.host_bytes ? share.host_bytes : bytes;
+    // Shadow mode (CRUCIBLE_LAZY_SHADOW) keeps an eager host copy of the lazy rows too: the room check counts it.
+    const size_t need = lazy ? host + kLazyStagingBytes + (lazy_shadow_ ? lazy : 0) : host;
     const std::string refused = cache_.Status().last.refused;
-    const auto result = disk_->SpillDirect(key, policy, guarded, refused, bytes, need,
-                                           available > reserve ? available - reserve : 0, save);
+    // the room is MemAvailable above the floor and the direct margin (DirectRoom), no budget cap.
+    const auto result = disk_->SpillDirect(key, policy, guarded, refused, bytes, need, cache_.DirectRoom(HostAvailable()), save,
+                                       lazy ? host : 0);
     if (result.empty()) return;
     // Numbers and fixed words only (the key and the tenant never go to a log line).
-    std::fprintf(stderr, "state_disk direct slot=%d tokens=%zu bytes=%zu need=%zu result=%s reason=%s\n", slot,
-                 tokens, bytes, need, result == "queued" ? "queued" : "refused", result == "queued" ? "-" : result.c_str());
+    std::fprintf(stderr, "state_disk direct slot=%d tokens=%zu bytes=%zu need=%zu result=%s reason=%s lazy=%zu host=%zu\n",
+                 slot, tokens, bytes, need, result == "queued" ? "queued" : "refused", result == "queued" ? "-" : result.c_str(), lazy,
+                 host);
   }
   // the session frontier at `cursor` stays in the slot. Shared frontiers stay
   // host copies (other sessions restore them). A full-window request that warmed its MTP rows keeps its host copy
@@ -762,6 +836,7 @@ class BatchPrefixCache {
     // As Restore: every host restore writes the slot, so its MTP history and base are gone.
     if (mtp_) mtp_->Restored(target, std::nullopt);
     bases_.Clear(target);
+    LazyEnd(target);
     // The session selects the target again on every exit; this guard covers the hook alone.
     const struct Reselect { Engine& engine; int slot; ~Reselect() { engine.SelectStream(slot); } } reselect{engine_, target};
     engine_.SelectStream(from);
@@ -943,6 +1018,9 @@ class BatchPrefixCache {
   std::array<std::optional<Held>, kMaxRows> held_;
   std::array<size_t, kMaxRows> expected_{};  // per slot: the bytes of the tail that its request may save (Expect)
   crucible::SlotBases<ConversationSnapshot, kMaxRows> bases_;  // an earlier change
+  // CRUCIBLE_LAZY_SHADOW=1 (a soak check): a lazy spill keeps the eager copy and the writer compares its pieces with it.
+  const bool lazy_shadow_ = [] { const char* on = crucible::SwitchText("CRUCIBLE_LAZY_SHADOW"); return on && on[0] == '1'; }();
+  std::array<std::vector<std::weak_ptr<crucible::LazySource>>, kMaxRows> lazy_;  // (LazyTrack)
   crucible::BatchConversationCache<ConversationSnapshot> cache_;
   // Declared after cache_: it is destroyed first, so no writer job outlives the entries that it holds.
   std::unique_ptr<crucible::BatchDiskTier<ConversationSnapshot>> disk_;
@@ -1688,8 +1766,17 @@ inline int BatchedServe(const std::string& checkpoint, int context, int streams,
   // asks the checkpoint hooks. The line shows whether they run; there is no switch.
   const bool points = cache && cache->CheckpointsOn();
   if (points) session.SetPreEnd(crucible::kPreEndMinTokens);
-  std::fprintf(stderr, "slot_checkpoint end_resume=%d pre_end=%d pre_end_min=%zu\n", int(points), int(points),
-               points ? crucible::kPreEndMinTokens : size_t(0));
+  // CRUCIBLE_EXACT_RESUME=1 makes a longer prompt resume a slot checkpoint only at a
+  // core-grid point, so its prefill equals the cold one (BatchSession::SetExactResume). Default off.
+  const char* exact_text = crucible::SwitchText("CRUCIBLE_EXACT_RESUME");
+  if (exact_text && *exact_text && std::string(exact_text) != "0" && std::string(exact_text) != "1") {
+    std::fprintf(stderr, "serve: CRUCIBLE_EXACT_RESUME must be 0 or 1\n");
+    return 2;
+  }
+  const bool exact_resume = points && exact_text && std::string(exact_text) == "1";
+  session.SetExactResume(exact_resume);
+  std::fprintf(stderr, "slot_checkpoint end_resume=%d pre_end=%d pre_end_min=%zu exact_resume=%d\n", int(points), int(points),
+               points ? crucible::kPreEndMinTokens : size_t(0), int(exact_resume));
   BatchSpecDecoder spec(engine, draft_blocks);
   session.SetSpecHooks(spec.Hooks());
   // CRUCIBLE_PACKED_ROWS: rows of one packed verify pass (default: 16 rows from 4 decoders where the engine runs

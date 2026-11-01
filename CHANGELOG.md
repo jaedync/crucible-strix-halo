@@ -3,6 +3,81 @@
 Releases are numbered `v0.<train>.<fix>`. This file lists the newest release first.
 The same text is in the notes of each release on GitHub.
 
+## v0.30.0 (2026-10-31)
+
+Release v0.30.0 is the engine of train 30. It follows v0.26.1.
+The v0.26.1 engine is the v0.26.0 engine (v0.26.1 changed docs and one tool). So this list covers all engine changes since v0.26.0.
+It makes prefill and decode faster, adds a gateway request id to the server log, and stops at a bad draft head file.
+Every change below keeps the output exact, except where the text says that it is opt-in.
+
+### Speed
+
+Against v0.26.0 on the same machine with the same tool and prompts (v0.26.0 measured Oct 28 to 29, v0.30.0 on Oct 31; balanced power profile,
+prefill launches of 8,192 rows): cold prefill is 5% to 6% faster on the 4.05 pack and 8% to 11% faster on the 3.05 pack, from 32K to 250K
+(8% to 9% against v0.26.0 measured the same night). Decode is 6% to 8% faster on the 4.05 pack from 64K to 250K (same reply text, same tokens
+per verify pass). On the 3.05 pack, decode is about equal (-2% to +1% against v0.26.0 measured the same night). The 3.05
+decode values come from builds that used a tuned draft head file that is not part of the release. In the ladder, decode with 4 sessions on the
+4.05 pack reads 4% lower (102.4 against 106.9 tok/s); we have not found a cause. The tables are in docs/RESULTS.md in the repository.
+
+- Long prompts prefill in launches of 16,384 rows (was 8,192). The MoE layers have tile kernels for launches of 8,192
+  rows or more. Method: one lease on Oct 25, 4.05 pack, same prompts, engine build of that date with the tile kernels, three arms in
+  ABC order (not ABAB). Cold 32K prefill is 3.1% faster (1,746.7 tok/s) and cold 130K is 3.0% faster, with equal token IDs.
+  The launch needs more device memory: the stage arena is 4,656 MiB instead of 2,346 MiB (3.3 GB more in total).
+  To keep the old size, set `CRUCIBLE_PF_LAUNCH_ROWS=8192+128`.
+- The dense prefill GEMMs have a new half-precision kernel. The kernel is 4.4% to 4.8% faster per call, and its output
+  bytes are equal to the old kernel. Method: ABAB, 4 pairs, 4.05 pack. Cold 32K prefill is 1.3% faster
+  (1,709.95 to 1,732.60 tok/s) and cold 130K is 1.2% faster, in 4 of 4 pairs. Energy per prompt is 1.2% lower.
+- Decode with several sessions is faster. A new MoE kernel (`CRUCIBLE_MOE_B128`, default now 12) serves the verify
+  passes of 2 to 16 rows with a capped grid. Method: ABAB, 6 pairs, 4.05 pack, no draft head file, 4 sessions at 32K, measured on an earlier build
+  (train 28, switch value 3; the default is now 12, which we did not measure the same way). Decode total was 8.3% faster, in 6 of 6 pairs. Serial decode and cold prefill do not change (within 0.1%).
+  The start check stops the server with a clear message if the grid is under one block.
+  To go back to the old kernel, set `CRUCIBLE_MOE_B128=0`. A bad value stops the start with exit code 2.
+- The server now starts the weight lookahead for batched passes. Method: ABAB, 6 pairs, 4.05 pack. Serial decode
+  through the server is 2.9% faster, in 6 of 6 pairs.
+- Serial decode on the 4.05 pack is 1.7% faster with a new exact kernel for the hyper-connection weights
+  (ABAB, 5 pairs, equal token IDs).
+- Other exact prefill changes: a deeper load pipeline in the MoE gate and up kernel, row tiles for MoE prefill from
+  1,024 rows, a fused GDN scan, and a carried GDN scale. The tail rows of a prompt join the next launch.
+  Each one is bitwise equal to the old path. We do not claim a separate gain for them.
+
+### Conversation cache
+
+- A cache restore of a long state uses far less host memory. The host copy of a spill to the disk tier fell from
+  3.1 to 5.2 GB to about 250 MB, written in pieces of 8 MiB. The state is restored exactly: a restore of 18,285 tokens
+  gave the same token IDs as a cold prompt.
+- A fix makes the write ledger of the disk tier exact: the day count no longer adds a file twice when two block writers
+  charge at the same time.
+- `CRUCIBLE_EXACT_RESUME` (opt-in, default 0) makes the resume of a longer prompt equal to a cold prompt. It costs at
+  most 20 extra prefill rows, one small launch and one save per prompt. See `docs/SESSION_REPLAY.md`.
+  On the default path, a resume point 1 to 8 rows below the end of a bulk launch is now refused, so more resumes
+  equal a cold prompt.
+- `CRUCIBLE_LAZY_SHADOW` (default off) is a check for testing: it keeps the old eager copy and compares each piece.
+
+### Server
+
+- New option `--client-request-id-header NAME` (also `CRUCIBLE_CLIENT_REQUEST_ID_HEADER`). The default header is
+  `X-Client-Request-Id`. A valid value (1 to 64 letters, digits and `_ . : -`) goes into every `crucible_prefill`,
+  `crucible_decode`, `crucible_turn`, `crucible_error` and `crucible_cancel` line as `client_request_id`. A gateway can
+  pair a request with its lines when requests overlap. The value never goes into a reply.
+- If `CRUCIBLE_MTP_SIDECAR` names a file that is missing, or one that replaces fewer than 17 tensors, the engine now
+  stops with exit code 2 and the line `mtp sidecar error`. Before, the engine ran on, and the exact verify step hid the fault: only the draft acceptance fell.
+- The engine writes an `active config:` line at start. It lists the `CRUCIBLE_*` switches that the environment sets,
+  with their values. A value with a path shows as `(path)`, and the draft head file shows as its size and a hash prefix.
+
+### Build
+
+- `make split-facts` and `SPLIT_CHECK=1` (default) keep the parallel build exact: a part that sees other compile facts
+  than the whole module stops the build. Run `make -j 8 split-facts` when the build says `argument facts drift`.
+  `SPLIT_CHECK=0` skips the check. See `docs/BUILD.md`.
+- `CRUCIBLE_GDN_VERIFY` (default off) is a GDN verify kernel that is bitwise equal. `CRUCIBLE_HC_WMMA=2` (default off)
+  reads int8 hyper-connection weights. It is a quality change, so it stays off.
+
+### Measurements
+
+Every number above is a speed change on the 4.05 pack, measured with an A/B script on one machine (Strix Halo, 128 GB),
+alternating the old and new build in balanced order. The tables for both packs, with the run counts and the GPU clock,
+are in `docs/RESULTS.md`. The speed table of the README compares v0.30.0 with v0.26.0 and v0.22.0.
+
 ## v0.26.1 (2026-10-25)
 
 - README: new section "16-bit n-gram table (opt-in, experimental)" with one command, `python tools/ngram16/fetch.py`, that downloads only the 33 source files (104.3 GB), builds the BF16 table and checks its size and sha256. Opt-in with `CRUCIBLE_PLE_HOST=1 CRUCIBLE_PLE_BF16=<file>`.

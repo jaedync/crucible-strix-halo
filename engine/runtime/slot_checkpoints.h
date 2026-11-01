@@ -15,6 +15,11 @@
 // A Pre checkpoint (fix B) is a chunk end at the existing 2,048-row core cut of a long prompt's final
 // chunk: a prompt that extends the old one inside its last message resumes there. It resumes as an End point does.
 //
+// Exactness: an End or Pre point at a multiple of the core
+// rows (2,048) resumes with no head and equals a cold prefill bit for bit. An End point off that grid does not: the
+// head runs decode-path kernels and the bulk part cuts differ. With CRUCIBLE_EXACT_RESUME=1 the session resumes a
+// longer prompt only from a multiple of 4 rows with more than 8 new rows (BatchSession::SetExactResume).
+//
 // A Frontier checkpoint is a session prompt frontier of a normal turn: a
 // grid-aligned state on the default chunk schedule. It resumes as a host frontier hit does (no head forward), and
 // the host keeps no copy of it until the slot must give it up (the session's Open guard).
@@ -112,6 +117,14 @@ class SlotCheckpoints {
       if (held[i]->hist.size() < held[victim]->hist.size()) victim = i;
     }
     return victim;
+  }
+  // Whether any slot holds a checkpoint of `tenant` with exactly this cache key, which is the same state (save points:
+  // the shared-header point is saved once, not again by every prompt that repeats the header).
+  bool Holds(std::span<const int> key, const StateTenant& tenant) const {
+    for (const auto& held : held_)
+      for (const auto& item : held)
+        if (item && item->tenant == tenant && std::ranges::equal(item->key, key)) return true;
+    return false;
   }
   // The buffer for a new Frontier point of request `owner` (MEDIUM-4):
   // - the Frontier buffer when it is empty or holds an older request's point (by the invariant that point is a

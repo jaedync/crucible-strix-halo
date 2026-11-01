@@ -23,6 +23,12 @@ MOE_MAP_HD constexpr int MoeSharedRow(int row) { return row % kMaxRows; }
 MOE_MAP_HD constexpr std::size_t MoeGateUpHalves(int rows) {
   return std::size_t(MoeExpertJobs(rows)) * 2 * (rows < kMaxRows ? rows : kMaxRows) * kHidden;
 }
+// Down input halves (the stream-grid kernel's mid, moe_sg.h): every down job slot holds up to kMaxRows rows.
+MOE_MAP_HD constexpr std::size_t MoeDownHalves(int rows) {
+  return std::size_t(MoeExpertJobs(rows)) * (rows < kMaxRows ? rows : kMaxRows) * kMoeInter;
+}
+// The down group's xh (halves from the xh base): after the gate/up inputs of the largest pass.
+MOE_MAP_HD constexpr std::size_t MoeDownXhOffset() { return MoeGateUpHalves(kPackedRows); }
 
 // seen starts at -1; its entry names the latest job of each expert. Returns
 // the routed job count, or -1 for an invalid row count or expert.
