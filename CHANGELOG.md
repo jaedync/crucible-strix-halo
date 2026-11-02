@@ -3,6 +3,44 @@
 Releases are numbered `v0.<train>.<fix>`. This file lists the newest release first.
 The same text is in the notes of each release on GitHub.
 
+## v0.31.0 (2026-11-02)
+
+Release v0.31.0 is the engine of train 31. It follows v0.30.0.
+It has one engine change: the sparse attention step of prefill (the QSA union flash) uses a new kernel. The output is exact.
+The decode path does not change. The server, the cache and the options do not change.
+
+### Speed
+
+- Prefill is faster (measured at 32K and 130K on the 4.05 pack, see below). The new kernel `QsaUnionStageKernel` replaces
+  `QsaUnionHalfQKernel` in the QSA union flash (12 attention layers). It does the same arithmetic in the same order, so
+  the bytes are equal. It splits the work between two groups of waves: loader waves bring K and V into LDS with buffer
+  loads, one step ahead, and the other waves run the QK chain, the softmax and the P V step. It is a build-time constant
+  (`kQsaUnionStage` in `engine/layers/kernels/prefill_qsa_union.h`), not a `CRUCIBLE_*` switch. Set it to `false` and
+  rebuild to get the old kernel.
+  - First gate (an engine build of Oct 30 with the new kernel against the same engine without it; 4.05 pack; ABAB, 4 pairs,
+    order-corrected): cold 32K prefill +2.62% and cold 130K prefill +3.86%.
+  - Against the v0.30.0 engine (4.05 pack; ABAB, 4 pairs, order 2 AB and 2 BA, order-corrected): cold 32K prefill
+    +2.91% (medians of the arms: 1,729 and 1,766 tok/s), faster in 4 of 4 pairs; the tool rated this as within noise, because the old arm spread 3.4%.
+- Measured Nov 1 to 2, 2026 on the build of this release, balanced power profile, in the runs by context length (32K to 250K), same tool and prompts as v0.30.0:
+  cold prefill against v0.30.0 changes by +1.6% to +4.5% on the 4.05 pack (both measured Nov 1) and by +2.6% to +4.7% on the 3.05 pack (v0.30.0 on Nov 1,
+  v0.31.0 on Nov 2, a repeat; public files, no tuned draft head file); decode changes by -0.2% to +2.1% and -0.3% to +0.4%. The tables and the reason for the
+  repeat are in `docs/RESULTS.md` (section Decode by context length).
+
+### Exactness and checks
+
+- Token gates on both packs (4.05 and 3.05): the output tokens are equal to the old kernel on the fixed gate set.
+- The bench `bench/qsa_attn.hip` compares the new kernel with a verbatim copy of the old one (`bench/kernels/qsa_attn_trunk.h`)
+  on 9 shapes, and 3 deliberate errors in the new kernel must show a difference. All checks passed.
+- The exact-extend load (a restore of a long state against a cold prompt) gave the same token IDs on both packs: 6 of 6 cases.
+- Decode: D1 (6 pairs, 4.05 pack, against the v0.30.0 engine, both engines with the same tuned draft head file, which is not part of the release) is within noise (corrected ratio 0.9987), and the token IDs are equal in all
+  30 of 30 requests of every pair. A memory soak of 3 runs passed.
+
+### Measurements
+
+Every speed number above except the last bullet of Speed is on the 4.05 pack, measured with an A/B script on one machine (Strix Halo, 128 GB), alternating the old and
+new build in balanced order, with the balanced power profile. The tables for both packs, with the run counts and the GPU clock,
+are in `docs/RESULTS.md`.
+
 ## v0.30.0 (2026-10-31)
 
 Release v0.30.0 is the engine of train 30. It follows v0.26.1.

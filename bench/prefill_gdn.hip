@@ -160,6 +160,7 @@ void Run(int rows, const std::string& fixture) {
   }
   const double serial_us = Time([&] { state.Zero(); hist.Zero(); serial(); }, 3);
   const double chunk_us = Time([&] { state.Zero(); hist.Zero(); chunk(); }, 5);
+  EnergyHook("gdn", "chunk64_prefill", chunk);
   if (std::getenv("PREFILL_PERSISTENT_REF")) {
     const double prepared_us=Time([&] {
       state.Zero();hist.Zero();

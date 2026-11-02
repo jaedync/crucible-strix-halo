@@ -137,6 +137,7 @@ void Run(int rows, int past) {
     double mean = 0; for (int c : counts) mean += c; mean /= counts.size();
     const double union_us = Time([&] { LaunchQsaUnionFlash(f, un); });
     const double base_us = Time([&] { LaunchQsaFlash(f); });
+    EnergyHook("attention", "qsa_union_flash", [&] { LaunchQsaUnionFlash(f, un); });
     std::printf("union rows=%d past=%d union_us=%.3f flash_only_us=%.3f mean_union_blocks=%.1f ctx_relL2=%.3g oracle=%.3g\n",
       rows, past, union_us, base_us, mean, ue.rel_l2, uo);
     if (ue.rel_l2 > 1e-5 || uo > 5e-6) std::exit(8);

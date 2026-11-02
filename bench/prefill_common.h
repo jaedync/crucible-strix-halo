@@ -1,8 +1,14 @@
 #pragma once
 #include "common.h"
 #include "../engine/gfx1151/common.h"
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <random>
+#include <thread>
 
 namespace prefill_bench {
 template <class T> struct Buffer {
@@ -70,6 +76,50 @@ template <class F> double Time(F launch, int repeat = 5) {
     us.push_back(timer.EndMs() * 1000.);
   }
   return bench::Median(us);
+}
+// Energy loop of one kernel class (a private measurement script reads the line): run `call` back to back for ENERGY_S
+// seconds and average the socket power (gpu_metrics v3.0, u32 mW at byte 112) over the last
+// 70 percent of the loop. The SMU averages its own window, so the loop must be long (10 s or more). No-op without ENERGY_S.
+inline double SocketW() {
+  std::ifstream f("/sys/class/drm/card1/device/gpu_metrics", std::ios::binary);
+  unsigned char buf[264];
+  unsigned mw = 0;
+  if (!f.read(reinterpret_cast<char*>(buf), 264)) return -1;
+  std::memcpy(&mw, buf + 112, 4);
+  return mw / 1000.;
+}
+template <class F> void EnergyHook(const char* cls, const char* what, F call) {
+  const char* env = std::getenv("ENERGY_S");
+  const double seconds = env ? std::atof(env) : 0;
+  if (seconds <= 0) return;
+  call();
+  HIP_OK(hipDeviceSynchronize());
+  std::atomic<bool> run{true};
+  std::vector<double> w;
+  std::thread sampler([&] {
+    const auto t0 = std::chrono::steady_clock::now();
+    while (run) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      if (std::chrono::steady_clock::now() - t0 > std::chrono::duration<double>(seconds * 0.3)) w.push_back(SocketW());
+    }
+  });
+  bench::EventTimer timer;
+  int calls = 0;
+  timer.Begin();
+  const auto t0 = std::chrono::steady_clock::now();
+  while (std::chrono::steady_clock::now() - t0 < std::chrono::duration<double>(seconds)) {
+    for (int i = 0; i < 4; ++i) call();
+    calls += 4;
+    HIP_OK(hipDeviceSynchronize());
+  }
+  const double us = timer.EndMs() * 1000. / calls;
+  run = false;
+  sampler.join();
+  double m = 0;
+  for (double x : w) m += x;
+  m /= std::max<size_t>(1, w.size());
+  std::printf("energy class=%s what=%s calls=%d us_per_call=%.2f socket_w=%.2f mj_per_call=%.4f samples=%zu\n", cls, what, calls, us, m,
+              us * m / 1000., w.size());
 }
 inline void CheckLaunch() { HIP_OK(hipGetLastError()); HIP_OK(hipDeviceSynchronize()); }
 }  // namespace prefill_bench

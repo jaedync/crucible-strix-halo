@@ -12,7 +12,7 @@ new release.
 nothing else. If a newer release exists, the server prints two lines at start:
 
 ```text
-Crucible v0.30.0 is available (you run v0.26.1). Update: make update. Release notes: <link>
+Crucible v0.31.0 is available (you run v0.30.0). Update: make update. Release notes: <link>
 Automatic updates are off unless you turned on the timer. See "Updates" in the README.
 ```
 

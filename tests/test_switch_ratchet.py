@@ -39,6 +39,7 @@ BENCH_RAW_READS = {
     ('bench/forward_rows.hip', '"FORWARD_ROWS_PROFILE"'): 1,
     ('bench/gdn_scan_pf.hip', '"GDN_HEADS"'): 2,
     ('bench/packed_rows.hip', '"VERIFY_SPLITS"'): 1,
+    ('bench/prefill_common.h', '"ENERGY_S"'): 1,   # energy loop of a measurement script; not a CRUCIBLE switch
     ('bench/prefill_dense_half.hip', '"DH_22"'): 1,
     ('bench/prefill_dense_half.hip', '"DH_HALF"'): 1,
     ('bench/prefill_dense_half.hip', '"DH_X22"'): 1,

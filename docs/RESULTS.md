@@ -11,7 +11,7 @@ Contents: [release ladder](#release-ladder) · [prefill by context length](#pref
 
 ## Release ladder
 
-One harness measured 11 builds, from Oct 8 to Oct 26, 2026, in a run series of Oct 27 to 28, 2026, and the build of v0.30.0 (Oct 30) on Oct 31, 2026 with the same harness. Each build ran with the
+One harness measured 11 builds, from Oct 8 to Oct 26, 2026, in a run series of Oct 27 to 28, 2026, the build of v0.30.0 (Oct 30) on Oct 31, 2026, and the build of v0.31.0 (Oct 31) on Nov 1 to 2, 2026 with the same harness. Each build ran with the
 server settings of its own time. The harness, the prompts and the rows are the same for all builds. Each value is the median
 of 2 runs. The GPU clock is the median of the runs (balanced power profile). Most builds are internal builds without a
 public release. A build without a Crucible release number is listed by its commit date.
@@ -32,6 +32,7 @@ public release. A build without a Crucible release number is listed by its commi
 | Oct 23 | v0.26.0, v0.26.1 | 19.4 | 1,613 | 82.0 | 1,574 | 0.014 | 65.8 | 50.5 | 106.9 | 32.1 | 2,326 |
 | Oct 26 | none (after v0.26.1) | 18.0 | 1,737 | 77.4 | 1,667 | 0.017 | 60.5 | 53.8 | 112.1 | 34.1 | 2,339 |
 | Oct 30 | v0.30.0 | 17.9 | 1,741 | 77.3 | 1,669 | 0.023 | 64.5 | 53.3 | 102.4 | 34.3 | 2,326 |
+| Oct 31 | v0.31.0 | 17.7 | 1,763 | 75.6 | 1,707 | 0.021 | 67.1 | 55.2 | 117.6 | 34.1 | 2,318 |
 
 **3.05 bpw pack**
 
@@ -50,11 +51,16 @@ public release. A build without a Crucible release number is listed by its commi
 | Oct 26 | none (after v0.26.1) | 17.4 | 1,793 | 81.7 | 1,579 | 0.014 | 74.8 | 61.0 | 130.8 | 39.1 | 2,316 |
 | Oct 30 | v0.30.0 | 16.9 | 1,845 | 74.2 | 1,738 | 0.020 | 70.1 † | 61.5 † | 129.3 † | 39.4 | 2,300 |
 | Oct 23 | v0.26.0, v0.26.1 (measured the same night as v0.30.0) † | 18.9 | 1,650 | 81.5 | 1,582 | 0.017 | 74.2 † | 60.7 † | 126.0 † | 36.4 | 2,329 |
+| Oct 31 | v0.31.0 | 16.8 | 1,858 | 72.8 | 1,771 | 0.017 | 75.4 | 57.2 | 128.1 | 39.2 | 2,295 |
+| Oct 30 | v0.30.0 (measured the same night as v0.31.0) | 16.9 | 1,843 | 74.2 | 1,739 | 0.017 | 76.7 | 59.4 | 127.2 | 39.5 | 2,299 |
+| Oct 23 | v0.26.0, v0.26.1 (measured the same night as v0.31.0) | 19.2 | 1,628 | 81.5 | 1,583 | 0.025 | 70.8 | 58.4 | 125.8 | 36.5 | 2,323 |
+| Oct 17 | v0.22.0 to v0.22.4 (measured the same night as v0.31.0) | 18.9 | 1,656 | 81.0 | 1,594 | 1.736 | 71.5 | 56.3 | 128.3 | 35.4 | 2,320 |
 
-† In the 3.05 table, the builds from Oct 9 to Oct 26, the row of v0.30.0 and the row of v0.26.0 measured on Oct 31 all ran with a tuned draft head file that is not part of any release. Compare their decode columns with each other only. With the public files, decode values can differ.
+† In the 3.05 table, the builds from Oct 9 to Oct 26, the row of v0.30.0 and the row of v0.26.0 measured on Oct 31 all ran with a tuned draft head file that is not part of any release. Compare their decode columns with each other only. With the public files, decode values can differ. The rows of Nov 1 to 2 (v0.31.0 and the older builds measured the same night) ran with the public files only: the tool stops a run if the server log shows a draft head file (`mtp sidecar:`).
 
 Notes:
 
+- The ladder run gave a valid result for 5 of 5 pack and build pairs (a pair is valid when all of its runs are valid, with no error and no give-up). The GPU clock of the pairs is 2,295 to 2,323 MHz.
 - All 22 pack and build pairs of the run series of Oct 27 to 28 gave a valid result. The harness recorded no error and no give-up.
   The run of Oct 31 gave a valid result for all 3 pack and build pairs (v0.30.0 on both packs, v0.26.0 on the 3.05 pack). Each pair has 2 of 2 valid runs, no error, no give-up, and a GPU clock of 2,300 to 2,333 MHz.
 - The v0.26.0 row of Oct 31 (3.05 pack) is the build of the row of Oct 23, measured the same night as v0.30.0 with the same tool and the same draft head file †. Cold 32K prefill is 1,845 tok/s for v0.30.0 against 1,650 tok/s for v0.26.0. Decode at 32K, code, is 70.1 against 74.2 tok/s; a paired run of the same night (see [decode by context length](#decode-by-context-length)) gives 0.98 to 1.01 for v0.30.0 against v0.26.0, so decode on this pack is about equal.
@@ -74,33 +80,35 @@ Notes:
 ## Prefill by context length
 
 Cold prompts of 32K to 250K tokens, one request at a time, through the server in the daily layout (4 sessions of 262,144
-tokens, image input on). Each point is the median of 4 runs (v0.22.0 and v0.26.0, measured Oct 28 to 29, 2026) or of 2 runs (v0.30.0, measured Oct 31, 2026). Every run has its own first line, so no cache has seen the prompt.
-Lines: v0.22.0 purple, v0.26.0 teal, v0.30.0 yellow.
+tokens, image input on). Each point is the median of 4 runs (v0.22.0 and v0.26.0, measured Oct 28 to 29, 2026) or of 2 runs (v0.30.0, measured Oct 31, 2026, and v0.31.0, measured Nov 1 to 2, 2026). Every run has its own first line, so no cache has seen the prompt.
+Lines: v0.22.0 purple, v0.26.0 teal, v0.30.0 orange, v0.31.0 yellow. On the 3.05 pack the lines of v0.26.0 and v0.30.0 are from Nov 1 to 2 (v0.30.0 on Nov 1), the line of v0.31.0 is from the repeat of the morning of Nov 2 (see the notes under [Decode by context length](#decode-by-context-length)), and the line of v0.22.0 is from Oct 28 to 29 (prefill does not use the draft head file).
 
 **4.05 bpw pack**
 
 ```mermaid
-%%{init: {"theme": "base", "themeVariables": {"xyChart": {"backgroundColor": "#0b0f14", "titleColor": "#e6edf3", "xAxisLabelColor": "#c9d1d9", "yAxisLabelColor": "#c9d1d9", "xAxisTitleColor": "#c9d1d9", "yAxisTitleColor": "#c9d1d9", "xAxisLineColor": "#3b4552", "yAxisLineColor": "#3b4552", "xAxisTickColor": "#3b4552", "yAxisTickColor": "#3b4552", "plotColorPalette": "#6f42c1, #1abc9c, #ffe083"}}}}%%
+%%{init: {"theme": "base", "themeVariables": {"xyChart": {"backgroundColor": "#0b0f14", "titleColor": "#e6edf3", "xAxisLabelColor": "#c9d1d9", "yAxisLabelColor": "#c9d1d9", "xAxisTitleColor": "#c9d1d9", "yAxisTitleColor": "#c9d1d9", "xAxisLineColor": "#3b4552", "yAxisLineColor": "#3b4552", "xAxisTickColor": "#3b4552", "yAxisTickColor": "#3b4552", "plotColorPalette": "#6f42c1, #1abc9c, #f78166, #ffe083"}}}}%%
 xychart-beta
     title "Prefill (tokens/s)"
     x-axis ["32k", "64k", "128k", "192k", "250k"]
-    y-axis "tokens/s" 1300 --> 1800
+    y-axis "tokens/s" 1300 --> 1900
     line [1578, 1564, 1526, 1490, 1416]
     line [1626, 1604, 1567, 1526, 1448]
     line [1700, 1701, 1664, 1624, 1536]
+    line [1749, 1754, 1723, 1683, 1576]
 ```
 
 **3.05 bpw pack**
 
 ```mermaid
-%%{init: {"theme": "base", "themeVariables": {"xyChart": {"backgroundColor": "#0b0f14", "titleColor": "#e6edf3", "xAxisLabelColor": "#c9d1d9", "yAxisLabelColor": "#c9d1d9", "xAxisTitleColor": "#c9d1d9", "yAxisTitleColor": "#c9d1d9", "xAxisLineColor": "#3b4552", "yAxisLineColor": "#3b4552", "xAxisTickColor": "#3b4552", "yAxisTickColor": "#3b4552", "plotColorPalette": "#6f42c1, #1abc9c, #ffe083"}}}}%%
+%%{init: {"theme": "base", "themeVariables": {"xyChart": {"backgroundColor": "#0b0f14", "titleColor": "#e6edf3", "xAxisLabelColor": "#c9d1d9", "yAxisLabelColor": "#c9d1d9", "xAxisTitleColor": "#c9d1d9", "yAxisTitleColor": "#c9d1d9", "xAxisLineColor": "#3b4552", "yAxisLineColor": "#3b4552", "xAxisTickColor": "#3b4552", "yAxisTickColor": "#3b4552", "plotColorPalette": "#6f42c1, #1abc9c, #f78166, #ffe083"}}}}%%
 xychart-beta
     title "Prefill (tokens/s)"
     x-axis ["32k", "64k", "128k", "192k", "250k"]
-    y-axis "tokens/s" 1300 --> 1900
+    y-axis "tokens/s" 1300 --> 2000
     line [1661, 1640, 1607, 1580, 1494]
-    line [1622, 1600, 1571, 1539, 1458]
-    line [1804, 1771, 1729, 1673, 1577]
+    line [1598, 1601, 1567, 1530, 1448]
+    line [1799, 1767, 1722, 1677, 1589]
+    line [1846, 1824, 1795, 1755, 1644]
 ```
 
 | Pack | Build | 32k | 64k | 128k | 192k | 250k |
@@ -108,12 +116,16 @@ xychart-beta
 | 4.05 | v0.22.0 | 1,578 | 1,564 | 1,526 | 1,490 | 1,416 |
 | 4.05 | v0.26.0 | 1,626 | 1,604 | 1,567 | 1,526 | 1,448 |
 | 4.05 | v0.30.0 | 1,700 | 1,701 | 1,664 | 1,624 | 1,536 |
+| 4.05 | v0.31.0 | 1,749 | 1,754 | 1,723 | 1,683 | 1,576 |
 | 3.05 | v0.22.0 | 1,661 | 1,640 | 1,607 | 1,580 | 1,494 |
-| 3.05 | v0.26.0 | 1,622 | 1,600 | 1,571 | 1,539 | 1,458 |
-| 3.05 | v0.30.0 | 1,804 | 1,771 | 1,729 | 1,673 | 1,577 |
+| 3.05 | v0.26.0 | 1,598 | 1,601 | 1,567 | 1,530 | 1,448 |
+| 3.05 | v0.30.0 | 1,799 | 1,767 | 1,722 | 1,677 | 1,589 |
+| 3.05 | v0.31.0 | 1,846 | 1,824 | 1,795 | 1,755 | 1,644 |
 
-Prefill falls 10% to 13% from 32K to 250K on every build. The 4 runs of one point of v0.22.0 and v0.26.0 differ by 2% or less on the 4.05 pack; the 2 runs of v0.30.0 differ by 2.2% or less (4.05 at 32K: 1,681 and 1,718).
+Prefill falls 9% to 12% from 32K to 250K on v0.22.0, v0.26.0 and v0.30.0, and 10% on the 4.05 pack and 11% on the 3.05 pack for v0.31.0. The 4 runs of one point of v0.22.0 and v0.26.0 differ by 2% or less on the 4.05 pack; the 2 runs of v0.30.0 differ by 2.2% or less (4.05 at 32K: 1,681 and 1,718).
 On the 3.05 pack they differ by 5% or less, except one low run (1,379 tok/s, v0.26.0 at 64K). The median ignores it.
+
+The ranges against v0.30.0 in the README use v0.30.0 measured on Nov 1, the same night as v0.31.0, on the 4.05 pack: prefill 1,722, 1,699, 1,659, 1,610 and 1,531 tok/s (32K to 250K). The 4.05 table above shows v0.30.0 of Oct 31.
 
 ## Decode by context length
 
@@ -121,39 +133,40 @@ One request at a time, through the server in the daily layout (4 sessions of 262
 balanced power profile). Each unit is one context of 32K to 250K tokens in one run: a cold prompt (content 1), then a new question on the same context
 (content 2; the cache holds the context). Every build got the same prompts and the same questions (the first line holds the run and the
 depth, never the build). One sample is one reply of 512 tokens; decode tok/s = (completion tokens - 1) / (last chunk time - first chunk time).
-2 runs per build and depth. v0.22.0 and v0.26.0 were measured Oct 29, 2026 (4.05 from 17:04, 3.05 until 22:52); v0.30.0 was measured Oct 31, 2026.
-Lines: v0.22.0 purple, v0.26.0 teal, v0.30.0 yellow.
+2 runs per build and depth. v0.22.0 and v0.26.0 were measured Oct 29, 2026 (4.05 from 17:04, 3.05 until 22:52); v0.30.0 was measured Oct 31, 2026; v0.31.0 was measured Nov 1, 2026 on the 4.05 pack and on the morning of Nov 2 on the 3.05 pack (a repeat, see the notes below); the 3.05 lines of v0.26.0 and v0.30.0 were measured Nov 1 to 2 (v0.30.0 on Nov 1; public files, no tuned draft head file).
+Lines: v0.22.0 purple, v0.26.0 teal, v0.30.0 orange, v0.31.0 yellow.
 
 For v0.22.0 and v0.26.0 (run of Oct 29), a third question in each unit gave a 10-token reply, so it is invalid and gave no decode number. Every point of these two builds has at most 4 samples
 (2 runs x 2 questions). Replies that ended early (341 or 485 tokens on the 4.05 pack, 10 tokens twice on the 3.05 pack) and requests without a clock sample
 (13 of 30 second questions on the 3.05 pack, at 32K, 64K and some at 192K) are dropped, so those points have fewer samples.
 For v0.30.0 (run of Oct 31), the third question gave a valid reply in all units, so a point has at most 6 samples (2 runs x 3 questions). A short reply (10 tokens) was dropped:
-2 of 30 requests on the 4.05 pack and 6 of 30 on the 3.05 pack. No request lacked a clock sample. The ratios below use only the questions that both builds answered.
+2 of 30 requests on the 4.05 pack and 6 of 30 on the 3.05 pack. The runs of v0.31.0 and the v0.30.0 run of Nov 1 dropped the same number of requests (2 of 30 on the 4.05 pack, 6 of 30 on the 3.05 pack). No request lacked a clock sample. The ratios below use only the questions that both builds answered.
 
 **4.05 bpw pack**
 
 ```mermaid
-%%{init: {"theme": "base", "themeVariables": {"xyChart": {"backgroundColor": "#0b0f14", "titleColor": "#e6edf3", "xAxisLabelColor": "#c9d1d9", "yAxisLabelColor": "#c9d1d9", "xAxisTitleColor": "#c9d1d9", "yAxisTitleColor": "#c9d1d9", "xAxisLineColor": "#3b4552", "yAxisLineColor": "#3b4552", "xAxisTickColor": "#3b4552", "yAxisTickColor": "#3b4552", "plotColorPalette": "#6f42c1, #1abc9c, #ffe083"}}}}%%
+%%{init: {"theme": "base", "themeVariables": {"xyChart": {"backgroundColor": "#0b0f14", "titleColor": "#e6edf3", "xAxisLabelColor": "#c9d1d9", "yAxisLabelColor": "#c9d1d9", "xAxisTitleColor": "#c9d1d9", "yAxisTitleColor": "#c9d1d9", "xAxisLineColor": "#3b4552", "yAxisLineColor": "#3b4552", "xAxisTickColor": "#3b4552", "yAxisTickColor": "#3b4552", "plotColorPalette": "#6f42c1, #1abc9c, #f78166, #ffe083"}}}}%%
 xychart-beta
     title "Decode (tokens/s)"
     x-axis ["32k", "64k", "128k", "192k", "250k"]
-    y-axis "tokens/s" 50 --> 70
+    y-axis "tokens/s" 50 --> 75
     line [64.6, 56.1, 57.3, 54.0, 58.1]
     line [58.4, 55.4, 53.8, 53.9, 57.9]
     line [68.4, 66.1, 63.3, 61.9, 61.2]
+    line [69.0, 66.6, 63.9, 62.9, 61.9]
 ```
 
-**3.05 bpw pack †**
+**3.05 bpw pack** (public files, no tuned draft head file; there is no v0.22.0 line, because its 3.05 run of Oct 29 used the tuned file)
 
 ```mermaid
-%%{init: {"theme": "base", "themeVariables": {"xyChart": {"backgroundColor": "#0b0f14", "titleColor": "#e6edf3", "xAxisLabelColor": "#c9d1d9", "yAxisLabelColor": "#c9d1d9", "xAxisTitleColor": "#c9d1d9", "yAxisTitleColor": "#c9d1d9", "xAxisLineColor": "#3b4552", "yAxisLineColor": "#3b4552", "xAxisTickColor": "#3b4552", "yAxisTickColor": "#3b4552", "plotColorPalette": "#6f42c1, #1abc9c, #ffe083"}}}}%%
+%%{init: {"theme": "base", "themeVariables": {"xyChart": {"backgroundColor": "#0b0f14", "titleColor": "#e6edf3", "xAxisLabelColor": "#c9d1d9", "yAxisLabelColor": "#c9d1d9", "xAxisTitleColor": "#c9d1d9", "yAxisTitleColor": "#c9d1d9", "xAxisLineColor": "#3b4552", "yAxisLineColor": "#3b4552", "xAxisTickColor": "#3b4552", "yAxisTickColor": "#3b4552", "plotColorPalette": "#1abc9c, #f78166, #ffe083"}}}}%%
 xychart-beta
     title "Decode (tokens/s)"
     x-axis ["32k", "64k", "128k", "192k", "250k"]
-    y-axis "tokens/s" 60 --> 85
-    line [78.0, 71.8, 72.6, 66.7, 66.6]
-    line [78.3, 72.2, 72.7, 67.2, 66.9]
-    line [73.2, 72.9, 72.9, 70.4, 67.7]
+    y-axis "tokens/s" 64 --> 76
+    line [73.2, 70.3, 71.0, 67.4, 66.4]
+    line [74.0, 71.2, 71.0, 68.8, 66.5]
+    line [73.8, 71.0, 70.9, 68.8, 66.7]
 ```
 
 Median decode tok/s (n = samples in the median):
@@ -163,19 +176,23 @@ Median decode tok/s (n = samples in the median):
 | 4.05 | v0.22.0 | 64.6 (n=4) | 56.1 (n=3) | 57.3 (n=4) | 54.0 (n=3) | 58.1 (n=4) |
 | 4.05 | v0.26.0 | 58.4 (n=4) | 55.4 (n=3) | 53.8 (n=4) | 53.9 (n=3) | 57.9 (n=4) |
 | 4.05 | v0.30.0 | 68.4 (n=6) | 66.1 (n=5) | 63.3 (n=6) | 61.9 (n=5) | 61.2 (n=6) |
-| 3.05 † | v0.22.0 | 78.0 (n=2) | 71.8 (n=2) | 72.6 (n=4) | 66.7 (n=3) | 66.6 (n=4) |
-| 3.05 † | v0.26.0 | 78.3 (n=2) | 72.2 (n=2) | 72.7 (n=4) | 67.2 (n=3) | 66.9 (n=4) |
-| 3.05 † | v0.30.0 | 73.2 (n=4) | 72.9 (n=4) | 72.9 (n=6) | 70.4 (n=5) | 67.7 (n=5) |
+| 4.05 | v0.31.0 | 69.0 (n=6) | 66.6 (n=5) | 63.9 (n=6) | 62.9 (n=5) | 61.9 (n=6) |
+| 3.05 | v0.26.0 | 73.2 (n=4) | 70.3 (n=4) | 71.0 (n=6) | 67.4 (n=5) | 66.4 (n=5) |
+| 3.05 | v0.30.0 | 74.0 (n=4) | 71.2 (n=4) | 71.0 (n=6) | 68.8 (n=5) | 66.5 (n=5) |
+| 3.05 | v0.31.0 | 73.8 (n=4) | 71.0 (n=4) | 70.9 (n=6) | 68.8 (n=5) | 66.7 (n=5) |
 
-† All 3.05 lines (v0.22.0, v0.26.0 and v0.30.0) were measured with a tuned draft head file that is not part of any release. They compare with each other only. With the public files, decode values can differ.
+The decode ranges against v0.30.0 in the README use v0.30.0 measured on Nov 1, the same night as v0.31.0, on the 4.05 pack: decode 68.7, 65.2, 63.6, 62.6 and 62.1 tok/s (32K to 250K). The 4.05 table above shows v0.30.0 of Oct 31.
 
-- Clock: the decode clock median is 2,765 to 2,884 MHz (4.05) and 2,771 to 2,812 MHz (3.05) (v0.30.0 ran about 100 MHz lower than the older builds on 4.05); every valid request ran with the balanced profile and above 2,200 MHz.
+The 3.05 lines were measured on Nov 1 to 2 with the public files only. The tool stops a run if the server log shows a draft head file (`mtp sidecar:`). The 3.05 decode lines of the earlier releases (Oct 29 and Oct 31) used a tuned draft head file that is not part of any release, so they are not in this table and do not compare with it. The older 3.05 rows of the [release ladder](#release-ladder) marked † are the same.
+
+- Clock: the decode clock median is 2,765 to 2,884 MHz (4.05) and 2,762 to 2,808 MHz (3.05); every valid request ran with the balanced profile and above 2,200 MHz.
+- The 3.05 line of v0.31.0 is a repeat. The first run of that unit (Nov 1) stopped when a drive temperature guard fired, and its second run, after the restart, read 14% to 18% lower than v0.30.0 with a lower GPU power draw. We treated that as a measurement fault, kept its files, and ran the whole unit again on Nov 2 with the same tool, prompts and build. The repeat has two runs that agree: against v0.30.0 of Nov 1, run 1 gives -0.5% to +0.4% and run 2 gives -0.3% to +0.2%. The line in the chart and the table is the repeat.
 - Same text (run of Oct 29): in all paired requests the reply sha256 was equal across builds, and the tokens per verify pass ratio to v0.26.0 was 1.000 at every depth.
-  The decode ratio is therefore a speed ratio. Median ratio v0.30.0 / v0.26.0 (32K to 250K): 4.05: 1.196, 1.068, 1.075, 1.061, 1.062; 3.05: 1.012, 1.009, 1.015, 1.011, 1.013. For v0.30.0 (run of Oct 31) the same holds in all 18 paired requests on the 4.05 pack and all 15 on the 3.05 pack (against v0.26.0 of Oct 29); the ratios use the questions that both builds answered. On the 3.05 pack both builds used the draft head file †. The v0.30.0 median at 32K on that pack (73.2) is below the v0.26.0 median (78.3) because it holds two third-question samples (68.0 and 70.2) that v0.26.0 has not; on the same questions the ratio is 1.012 (v0.26.0 of Oct 29; against v0.26.0 measured the same night, the ratios are 0.990, 0.981, 1.004, 1.006, 1.006; same reply text in 22 of 24 pairs). Each paired request had the same prompt token count in both builds.
-  v0.22.0 / v0.26.0: 4.05 1.122, 1.005, 1.012, 1.005, 1.005; 3.05 0.996, 0.994, 0.999, 0.992, 0.996.
+  The decode ratio is therefore a speed ratio. Median ratio v0.30.0 / v0.26.0 on the 4.05 pack (32K to 250K): 1.196, 1.068, 1.075, 1.061, 1.062. For v0.30.0 (run of Oct 31) the same holds in all 18 paired requests on the 4.05 pack (against v0.26.0 of Oct 29); the ratios use the questions that both builds answered. Each paired request had the same prompt token count in both builds. The 3.05 ratios of the runs of Oct 29 and Oct 31 are not repeated here, because those runs used the tuned draft head file †.
+  v0.22.0 / v0.26.0 on the 4.05 pack: 1.122, 1.005, 1.012, 1.005, 1.005.
 - v0.26.0 on the 4.05 pack read low in run 1 at 32K (cold 47.2 and second question 51.6 tok/s; v0.22.0 and the build of Oct 26 62.9 to 64.7), and on the cold prompt at 64K (55.4; the others 63.4 and 64.0) and 128K (52.9; the others 60.2 and 60.3). Run 2 read 65.2 and 67.1 at 32K. The 1.133 ratio at 32K comes from run 1. From run 2 alone the ratio is 1.01.
   The cause is not found. The medians above include these samples.
-- Decode falls with context: about 65 tok/s at 32K to 58 tok/s at 250K on 4.05, and 79 to 67 tok/s on 3.05 (v0.22.0 and v0.26.0; v0.30.0: 68 to 61 tok/s on 4.05, 73 to 68 tok/s on 3.05). The draft head accepts more tokens on some contexts than on others
+- Decode falls with context: about 65 tok/s at 32K to 58 tok/s at 250K on 4.05 (v0.22.0 and v0.26.0; v0.30.0: 68 to 61 tok/s). The values of the 3.05 pack are in the table above. The draft head accepts more tokens on some contexts than on others
   (tokens per verify pass 2.5 to 3.5 on 4.05), so the curve is not smooth.
 
 ## Power profile

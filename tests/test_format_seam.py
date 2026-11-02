@@ -64,7 +64,9 @@ ALLOWED = {
     # LinInLane the fused kernel is 85 us per 2,048-row part slower.
     'engine/layers/kernels/prefill_gdn.h': {'wht': 4, 'scale': 3},
     'engine/layers/kernels/prefill_qsa.h': {'wht': 1, 'scale': 1},
-    'engine/layers/kernels/prefill_qsa_union.h': {'wht': 1, 'scale': 1},
+    # +1 wht, +1 scale (qsa-attn): QsaUnionStageKernel copies QsaUnionHalfQKernel's fused gate epilogue, element
+    # by element, so the two kernels keep the same bits.
+    'engine/layers/kernels/prefill_qsa_union.h': {'wht': 2, 'scale': 2},
     # +1 wht, +1 scale (packs): MoeFusedKernelWide copies MoeFusedKernel's down prep, because a
     # shared function changed the train 23 kernels' ISA (5842e3bb).
     'engine/layers/moe_rows.h': {'wht': 4, 'scale': 8},
@@ -87,6 +89,8 @@ ALLOWED = {
     'bench/kernels/moe_flow.h': {'wht': 1, 'scale': 1},
     'bench/kernels/moe_rows.h': {'wht': 3, 'scale': 7},
     'bench/kernels/qsa_decode.h': {'wht': 1, 'scale': 1},
+    # New (qsa-attn, bench only): the verbatim trunk 27e0f62b QsaUnionHalfQKernel, the byte reference of bench/qsa_attn.hip.
+    'bench/kernels/qsa_attn_trunk.h': {'wht': 1, 'scale': 1},
     'bench/moe_rows.hip': {'scale': 12},
     # New (verify-moe, bench only): host setup of the expert pointer arrays (suh[0], svh[2]), as moe_rows.hip
     # (moved from verify_moe.hip by moe-sg-fix).

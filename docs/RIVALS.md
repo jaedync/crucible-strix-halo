@@ -6,8 +6,8 @@ Where an engine leads, the table shows it.
 
 **Dates and versions.** All rival values on this page were measured Oct 23 to 26, 2026, on Halogen 0.18.14 and Gufo 0.22.0.
 Newer versions exist: Halogen 0.18.18 and Gufo v0.27.0 (both Oct 29, 2026). We did not measure them. We did not measure the
-rivals again for Crucible v0.30.0. The Crucible values in these tables are from the builds named in each section (v0.26.0 or an
-internal build of Oct 25), not from v0.30.0. Gufo v0.27.0 serves log-probabilities; Gufo 0.22.0 did not.
+rivals again for Crucible v0.31.0. The Crucible values in these tables are from the builds named in each section (v0.26.0 or an
+internal build of Oct 25), not from v0.31.0. Gufo v0.27.0 serves log-probabilities; Gufo 0.22.0 did not.
 
 Contents: [the run of Oct 23 to 24](#the-run-of-oct-23-to-24-2026) · [the power profile run of Oct 26](#the-power-profile-run-of-oct-26-2026) ·
 [the follow-up turn](#the-follow-up-turn-single-runs-oct-25-to-26-2026) · [the packs](#what-differs-between-the-engines) ·

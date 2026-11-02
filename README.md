@@ -12,84 +12,80 @@ research software for one GPU architecture. It is not a general model backend or
 
 ## Speed of this release
 
-Release v0.30.0. Measured Oct 31, 2026 on the build of this release, balanced power profile (GPU clock about 2.30 to 2.33 GHz).
+Release v0.31.0. Measured Nov 1 to 2, 2026 on the build of this release, balanced power profile (GPU clock about 2.29 to 2.32 GHz).
 Each value is the median of 2 runs. The server ran 4 sessions of 262,144 tokens with image input and speculative decoding (MTP)
-on, as in daily use, with prefill launches of 8,192 rows (`CRUCIBLE_PF_LAUNCH_ROWS=8192+128`). Every row uses prompts that no
-cache has seen, except the re-send row. The v0.26.0 and v0.22.0 columns are earlier releases, measured with the same tool (run
-series of Oct 27 to 28, 2026). What changed since v0.26.1 is in the [Changelog](CHANGELOG.md).
+on, as in daily use, with prefill launches of 8,192 rows on the 4.05 pack (`CRUCIBLE_PF_LAUNCH_ROWS=8192+128`); on the 3.05 pack each build used its default (16,384 rows for v0.31.0 and v0.30.0, 8,192 rows for v0.26.0 and v0.22.0). Every row uses prompts that no
+cache has seen, except the re-send row. The v0.30.0, v0.26.0 and v0.22.0 columns are earlier releases, measured with the same tool
+(4.05 pack: v0.30.0 on Oct 31, 2026, the other two in the run series of Oct 27 to 28, 2026; 3.05 pack: all three the same night as v0.31.0, Nov 1 to 2,
+2026, with the public files and no tuned draft head file). What changed since v0.30.0 is in the [Changelog](CHANGELOG.md).
 
 **4.05 bpw pack (the higher-quality option)**
 
-| Row | v0.30.0 | v0.26.0 | v0.22.0 |
-|---|---:|---:|---:|
-| Cold prompt, 32K: first token (s) | 17.9 | 19.4 | 19.7 |
-| Cold prompt, 32K: prefill (tok/s) | 1,741 | 1,613 | 1,585 |
-| Cold prompt, 130K: first token (s) | 77.3 | 82.0 | 84.5 |
-| Cold prompt, 130K: prefill (tok/s) | 1,669 | 1,574 | 1,527 |
-| Same 32K prompt sent again: first token (s) | 0.023 | 0.014 | 1.870 |
-| Decode at 32K, 1 session, code, paired run (tok/s) | 68.4 | 58.4 (2 low samples) | 64.6 |
-| Decode at 32K, 1 session, prose (tok/s) | 53.3 | 50.5 | 50.4 |
-| Decode, 4 sessions, total (tok/s) | 102.4 | 106.9 | 106.7 |
-| Serial decode, no speculation, short context (tok/s) | 34.3 | 32.1 | 31.0 |
+| Row | v0.31.0 | v0.30.0 | v0.26.0 | v0.22.0 |
+|---|---:|---:|---:|---:|
+| Cold prompt, 32K: first token (s) | 17.7 | 17.9 | 19.4 | 19.7 |
+| Cold prompt, 32K: prefill (tok/s) | 1,763 | 1,741 | 1,613 | 1,585 |
+| Cold prompt, 130K: first token (s) | 75.6 | 77.3 | 82.0 | 84.5 |
+| Cold prompt, 130K: prefill (tok/s) | 1,707 | 1,669 | 1,574 | 1,527 |
+| Same 32K prompt sent again: first token (s) | 0.021 | 0.023 | 0.014 | 1.870 |
+| Decode at 32K, 1 session, code, paired run (tok/s) | 69.0 | 68.4 | 58.4 (2 low samples) | 64.6 |
+| Decode at 32K, 1 session, prose (tok/s) | 55.2 | 53.3 | 50.5 | 50.4 |
+| Decode, 4 sessions, total (tok/s) | 117.6 | 102.4 | 106.9 | 106.7 |
+| Serial decode, no speculation, short context (tok/s) | 34.1 | 34.3 | 32.1 | 31.0 |
 
 **3.05 bpw pack (the faster option)**
 
-| Row | v0.30.0 | v0.26.0 | v0.22.0 |
-|---|---:|---:|---:|
-| Cold prompt, 32K: first token (s) | 16.9 | 18.9 | 18.9 |
-| Cold prompt, 32K: prefill (tok/s) | 1,845 | 1,652 | 1,652 |
-| Cold prompt, 130K: first token (s) | 74.2 | 81.3 | 81.0 |
-| Cold prompt, 130K: prefill (tok/s) | 1,738 | 1,587 | 1,593 |
-| Same 32K prompt sent again: first token (s) | 0.020 | 0.021 | 1.736 |
-| Decode at 32K, 1 session, code (tok/s) | 70.1 † | 75.4 † | 70.6 † |
-| Decode at 32K, 1 session, prose (tok/s) | 61.5 † | 59.2 † | 58.3 † |
-| Decode, 4 sessions, total (tok/s) | 129.3 † | 133.1 † | 131.1 † |
-| Serial decode, no speculation, short context (tok/s) | 39.4 | 36.2 | 35.4 |
+| Row | v0.31.0 | v0.30.0 | v0.26.0 | v0.22.0 |
+|---|---:|---:|---:|---:|
+| Cold prompt, 32K: first token (s) | 16.8 | 16.9 | 19.2 | 18.9 |
+| Cold prompt, 32K: prefill (tok/s) | 1,858 | 1,843 | 1,628 | 1,656 |
+| Cold prompt, 130K: first token (s) | 72.8 | 74.2 | 81.5 | 81.0 |
+| Cold prompt, 130K: prefill (tok/s) | 1,771 | 1,739 | 1,583 | 1,594 |
+| Same 32K prompt sent again: first token (s) | 0.017 | 0.017 | 0.025 | 1.736 |
+| Decode at 32K, 1 session, code (tok/s) | 75.4 | 76.7 | 70.8 | 71.5 |
+| Decode at 32K, 1 session, prose (tok/s) | 57.2 | 59.4 | 58.4 | 56.3 |
+| Decode, 4 sessions, total (tok/s) | 128.1 | 127.2 | 125.8 | 128.3 |
+| Serial decode, no speculation, short context (tok/s) | 39.2 | 39.5 | 36.5 | 35.4 |
 
-† These values used a tuned draft head file that is not part of the release, so you cannot repeat them with the public files. The v0.30.0 column used it too, so the decode rows of the 3.05 pack compare with each other only.
-
-Two runs per cell is a small sample. Decode with 1 session changes between runs and between prompts, because the draft head
-predicts some text better than other text. In the run series of Oct 27 to 28, 11 builds span 60.5 to 66.9 tok/s on the 4.05 code
-row, so a difference of that size in the decode rows is not a result. The cold prefill rows and the re-send row move less.
-The 4.05 code row comes from the decode chart (v0.22.0 and v0.26.0 Oct 29, v0.30.0 Oct 31); the ladder gives 64.5 against 65.8 tok/s for it.
-Against v0.26.0 (same tool and prompts; v0.26.0 measured Oct 28 to 29, v0.30.0 on Oct 31), v0.30.0 prefills 5% to 6% faster on the
-4.05 pack and 8% to 11% faster on the 3.05 pack (8% to 9% against v0.26.0 measured the same night), at every length from 32K to 250K.
-It decodes 6% to 8% faster on the 4.05 pack from 64K to 250K, and 7% faster at 32K (run 2; v0.26.0 read low in run 1, which makes it 20%).
-On the 3.05 pack, decode is about equal (-2% to +1% against v0.26.0 measured the same night; 70.1 against 74.2 tok/s on the code row of
-that night); both builds used the draft head file †. Decode with 4 sessions on the 4.05 pack reads 4% lower than v0.26.0 in the table
-above (102.4 against 106.9 tok/s; the two runs gave 98.3 and 106.6), and v0.26.0 moved 5% between nights on the 3.05 pack (133.1 † and 126.0 † tok/s). We have not found a cause. All values use the balanced power profile; the performance profile gives other prefill rates
-([Rivals](docs/RIVALS.md#the-power-profile-run-of-oct-26-2026)). More data, the method and the older tables are in
-[Results](docs/RESULTS.md).
+Two runs per cell is a small sample. Decode with 1 session changes between runs and between prompts, because the draft head predicts some text better than other text. In the run series of Oct 27 to
+28, 11 builds span 60.5 to 66.9 tok/s on the 4.05 code row, so a difference of that size in the decode rows is not a result. The cold prefill rows and the re-send row move less. The 4.05 code row
+comes from the decode chart (v0.22.0 and v0.26.0 Oct 29, v0.30.0 Oct 31, v0.31.0 Nov 1). Against v0.30.0 in the runs by context length (same tool and prompts; v0.30.0 on Nov 1; v0.31.0 on Nov 1 for the
+4.05 pack and on the morning of Nov 2 for the 3.05 pack, a repeat, see [Results](docs/RESULTS.md#decode-by-context-length)), the prefill rate of v0.31.0 changes by +1.6% to +4.5% on the 4.05 pack and by +2.6% to +4.7% on the 3.05 pack, per context length from 32K to 250K (ratio of the medians). The
+release changes the attention step of prefill only. The decode path is unchanged; in the same runs the decode rate changes by -0.2% to +2.1% on the 4.05 pack and by -0.3% to +0.4% on the 3.05 pack. The 1-session decode rows of the 3.05 table read 1.8% (code) and 3.7% (prose) lower than v0.30.0; the 2 runs of those cells differ by 3% to 7%, so that is not a result. Decode with 4
+sessions on the 4.05 pack reads 117.6 tok/s, against 102.4 for v0.30.0 (Oct 31; the two runs gave 98.3 and 106.6) and 106.9 for v0.26.0; we do not claim a change. All 3.05 columns ran with the public files and no tuned draft head file. All values use the balanced power profile; the performance profile gives
+other prefill rates ([Rivals](docs/RIVALS.md#the-power-profile-run-of-oct-26-2026)). More data, the method and the older tables are in [Results](docs/RESULTS.md).
 
 **Prefill by context length, 4.05 bpw pack** (tokens per second, median of 4 runs per point for v0.22.0 and v0.26.0, run of Oct 28 to 29;
-2 runs per point for v0.30.0, run of Oct 31, 2026). Lines: v0.22.0 purple, v0.26.0 teal, v0.30.0 yellow.
+2 runs per point for v0.30.0, run of Oct 31, and for v0.31.0, run of Nov 1, 2026). Lines: v0.22.0 purple, v0.26.0 teal, v0.30.0 orange, v0.31.0 yellow.
 
 ```mermaid
-%%{init: {"theme": "base", "themeVariables": {"xyChart": {"backgroundColor": "#0b0f14", "titleColor": "#e6edf3", "xAxisLabelColor": "#c9d1d9", "yAxisLabelColor": "#c9d1d9", "xAxisTitleColor": "#c9d1d9", "yAxisTitleColor": "#c9d1d9", "xAxisLineColor": "#3b4552", "yAxisLineColor": "#3b4552", "xAxisTickColor": "#3b4552", "yAxisTickColor": "#3b4552", "plotColorPalette": "#6f42c1, #1abc9c, #ffe083"}}}}%%
+%%{init: {"theme": "base", "themeVariables": {"xyChart": {"backgroundColor": "#0b0f14", "titleColor": "#e6edf3", "xAxisLabelColor": "#c9d1d9", "yAxisLabelColor": "#c9d1d9", "xAxisTitleColor": "#c9d1d9", "yAxisTitleColor": "#c9d1d9", "xAxisLineColor": "#3b4552", "yAxisLineColor": "#3b4552", "xAxisTickColor": "#3b4552", "yAxisTickColor": "#3b4552", "plotColorPalette": "#6f42c1, #1abc9c, #f78166, #ffe083"}}}}%%
 xychart-beta
     title "Prefill (tokens/s)"
     x-axis ["32k", "64k", "128k", "192k", "250k"]
-    y-axis "tokens/s" 1300 --> 1800
+    y-axis "tokens/s" 1300 --> 1900
     line [1578, 1564, 1526, 1490, 1416]
     line [1626, 1604, 1567, 1526, 1448]
     line [1700, 1701, 1664, 1624, 1536]
+    line [1749, 1754, 1723, 1683, 1576]
 ```
 
-**Decode by context length, 4.05 bpw pack** (tokens per second, median of up to 4 samples for v0.22.0 and v0.26.0, up to 6 for v0.30.0; v0.22.0 and v0.26.0 from the run of
-Oct 29, 2026, v0.30.0 from the run of Oct 31, 2026; v0.22.0 purple, v0.26.0 teal, v0.30.0 yellow).
+**Decode by context length, 4.05 bpw pack** (tokens per second, median of up to 4 samples for v0.22.0 and v0.26.0, up to 6 for v0.30.0 and v0.31.0; v0.22.0 and v0.26.0 from the run of
+Oct 29, 2026, v0.30.0 from the run of Oct 31, 2026, v0.31.0 from the run of Nov 1, 2026; v0.22.0 purple, v0.26.0 teal, v0.30.0 orange, v0.31.0 yellow).
 
 ```mermaid
-%%{init: {"theme": "base", "themeVariables": {"xyChart": {"backgroundColor": "#0b0f14", "titleColor": "#e6edf3", "xAxisLabelColor": "#c9d1d9", "yAxisLabelColor": "#c9d1d9", "xAxisTitleColor": "#c9d1d9", "yAxisTitleColor": "#c9d1d9", "xAxisLineColor": "#3b4552", "yAxisLineColor": "#3b4552", "xAxisTickColor": "#3b4552", "yAxisTickColor": "#3b4552", "plotColorPalette": "#6f42c1, #1abc9c, #ffe083"}}}}%%
+%%{init: {"theme": "base", "themeVariables": {"xyChart": {"backgroundColor": "#0b0f14", "titleColor": "#e6edf3", "xAxisLabelColor": "#c9d1d9", "yAxisLabelColor": "#c9d1d9", "xAxisTitleColor": "#c9d1d9", "yAxisTitleColor": "#c9d1d9", "xAxisLineColor": "#3b4552", "yAxisLineColor": "#3b4552", "xAxisTickColor": "#3b4552", "yAxisTickColor": "#3b4552", "plotColorPalette": "#6f42c1, #1abc9c, #f78166, #ffe083"}}}}%%
 xychart-beta
     title "Decode (tokens/s)"
     x-axis ["32k", "64k", "128k", "192k", "250k"]
-    y-axis "tokens/s" 50 --> 70
+    y-axis "tokens/s" 50 --> 75
     line [64.6, 56.1, 57.3, 54.0, 58.1]
     line [58.4, 55.4, 53.8, 53.9, 57.9]
     line [68.4, 66.1, 63.3, 61.9, 61.2]
+    line [69.0, 66.6, 63.9, 62.9, 61.9]
 ```
 
-All 3 builds got the same prompts. On the same prompts and the same reply text, v0.30.0 decodes 1.06 to 1.08 times as fast as v0.26.0 from 64K to 250K, and 1.07 times at 32K in run 2 (1.20 with run 1, in which v0.26.0 read low). The v0.30.0 line holds up to 6 samples per point; the other two hold up to 4. v0.26.0 read low in run 1 at 32K (47.2 and 51.6 tok/s, the others 62.9
+All 4 builds got the same prompts. On the same prompts and the same reply text, v0.30.0 decodes 1.06 to 1.08 times as fast as v0.26.0 from 64K to 250K, and 1.07 times at 32K in run 2 (1.20 with run 1, in which v0.26.0 read low). The v0.30.0 and v0.31.0 lines hold up to 6 samples per point; the other two hold up to 4. v0.26.0 read low in run 1 at 32K (47.2 and 51.6 tok/s, the others 62.9
 to 64.7); the cause is not found. The third question of each unit of the run of Oct 29 was invalid (a 10-token reply, no decode
 number). The 3.05 chart and the data are in [Results](docs/RESULTS.md#decode-by-context-length).
 
@@ -97,7 +93,7 @@ number). The 3.05 chart and the data are in [Results](docs/RESULTS.md#decode-by-
 
 Our own measurements of Halogen 0.18.14 and Gufo 0.22.0 on the same machine, with the same prompts and client, Oct 23 to 26,
 2026. The GPU clock was similar; in the prefill rows Halogen ran about 3% higher. Each value is the median of 2 rounds. Each
-Crucible value is the 4.05 pack and the Crucible build of that date (v0.26.0 or a build of Oct 25), older than v0.30.0. Bold marks the fastest.
+Crucible value is the 4.05 pack and the Crucible build of that date (v0.26.0 or a build of Oct 25), older than v0.31.0. Bold marks the fastest.
 
 | Row | Halogen 0.18.14 | Gufo 0.22.0 | Crucible, same run | Measured |
 |---|---:|---:|---:|---|
@@ -108,7 +104,7 @@ Crucible value is the 4.05 pack and the Crucible build of that date (v0.26.0 or 
 | Cold prefill, 32K, performance power profile (tok/s), Crucible build of Oct 25 | **2,121** | 1,843 | 1,870 | Oct 26 |
 
 Halogen leads one-session decode and cold prefill at equal bits. It stores the layers that mix the hidden streams in 6 bits, and
-its pack has 4.16 bits per weight. Crucible leads with 4 and 8 sessions. At equal bits (4.05), Halogen also leads decode with speculation on code (104.9 against 89.1 tok/s). The 3.05 pack has a lower KL divergence than the pack of Halogen (see below). All rows, dates, packs and the method are in [Rivals](docs/RIVALS.md). Newer versions exist (Halogen 0.18.18, Gufo v0.27.0, both Oct 29, 2026); we measured neither, and we did not measure the rival values again for v0.30.0. Thank you to the authors of Halogen and Gufo: their engines made this comparison possible.
+its pack has 4.16 bits per weight. Crucible leads with 4 and 8 sessions. At equal bits (4.05), Halogen also leads decode with speculation on code (104.9 against 89.1 tok/s). The 3.05 pack has a lower KL divergence than the pack of Halogen (see below). All rows, dates, packs and the method are in [Rivals](docs/RIVALS.md). Newer versions exist (Halogen 0.18.18, Gufo v0.27.0, both Oct 29, 2026); we measured neither, and we did not measure the rival values again for v0.31.0. Thank you to the authors of Halogen and Gufo: their engines made this comparison possible.
 
 ## Why Crucible
 
@@ -126,7 +122,7 @@ its pack has 4.16 bits per weight. Crucible leads with 4 and 8 sessions. At equa
 | Halogen 0.18.14 | 4.16 | 0.0648 | 90.3% |
 
 - **The conversation cache.** A later turn pays only for its new tokens. Sending the same 32K prompt again gives the first token
-  after 0.023 s instead of 1.87 s in v0.22.0 (v0.26.0: 0.014 s; 4.05 pack). An optional disk tier keeps conversations
+  after 0.021 s instead of 1.87 s in v0.22.0 (v0.26.0: 0.014 s; 4.05 pack). An optional disk tier keeps conversations
   across a restart.
 
 ## Quick start

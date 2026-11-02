@@ -327,6 +327,9 @@ void Time(Fixture& f, const char* tag, int pairs) {
               f.set.name, f.R, tag, GA, GB, gflop / GA, gflop / GB, gw, pairs, (GA - GB) * scale, DA, DB, dflop / DA,
               dflop / DB, dw, pairs, (DA - DB) * scale);
   std::fflush(stdout);
+  // Energy loop (ENERGY_S): the trunk gate/up + down of one layer, MALL warm. Plan(96) first: TrunkDown reads that plan.
+  f.Plan(96); CheckLaunch();
+  EnergyHook("moe", "trunk_gateup_down", [&] { f.TrunkGateUp(); f.TrunkDown(); });
   cold.Free();
 }
 

@@ -413,6 +413,7 @@ int Run(int M, int I, int O) {
   exl3(); decode(); CheckLaunch();
   const auto ref = d1.Get();
   const double te = Time(exl3), td = Time(decode);
+  EnergyHook("dense", "exl3_fused_rm8", exl3);
   std::printf("M=%d I=%d O=%d K=%d: exl3 fused RM8 %.1f us (%.1f TFLOPS); decode copy %.1f us (%.1f MB)\n",
               M, I, O, K, te, tflop / (te * 1e-6), td, ntiles * 512 / 1e6);
   bool all = true;
