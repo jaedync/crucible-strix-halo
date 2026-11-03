@@ -128,9 +128,6 @@ __device__ __forceinline__ uint32_t PrefetchPhase(PersistentLinear p, uint32_t s
 #ifndef CRUCIBLE_PERSISTENT_GDN_PREFETCH
 #define CRUCIBLE_PERSISTENT_GDN_PREFETCH 1
 #endif
-#ifndef CRUCIBLE_PERSISTENT_GDN_WAVES
-#define CRUCIBLE_PERSISTENT_GDN_WAVES 9
-#endif
 // Nine waves per SIMD (168 VGPRs) give three blocks per WGP: 60 blocks.
 // Four blocks per WGP need twelve (128 VGPRs).
 // HC read: 2 streams its weights through the loader ring, 1 pipelines the
@@ -146,7 +143,7 @@ inline size_t PersistentGdnLds(size_t ring_lds) {
 // Front: projection jobs hold front-order tiles and strided eight-column items.
 template <bool Front>
 __global__ void __launch_bounds__(320)
-__attribute__((amdgpu_waves_per_eu(CRUCIBLE_PERSISTENT_GDN_WAVES)))
+__attribute__((amdgpu_waves_per_eu(9)))  // the nine waves above
 PersistentGdnKernel(PersistentGdnArgs a) {
   __shared__ lin_ring::Control ring;
   __shared__ PersistentSync sync;

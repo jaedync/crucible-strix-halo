@@ -8,6 +8,7 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -32,6 +33,7 @@
 #include "../../layers/hc_frag.h"
 #include "../../layers/hc_int8.h"
 #include "../../layers/numerics.h"
+#include "draft_chain_switch.h"
 
 namespace crucible {
 
@@ -128,6 +130,12 @@ struct Model {
   std::vector<DeviceSpan> buffers;
   uint8_t* static_base = nullptr;
   size_t static_bytes = 0;
+  // True when ok(layer) holds for every trunk layer (the MTP block is not one). The model owns the layer walk.
+  template <class Pred> bool AllLayers(Pred ok) const {
+    for (int l = 0; l < kLayers; ++l)
+      if (!ok(L[l])) return false;
+    return true;
+  }
 };
 
 // Smaller arenas limit unused reservation and retry high-order allocation more
@@ -186,7 +194,7 @@ class Loader {
     ck_.AddFile("ngram_embedding.safetensors");
     // The 4.05 pack keeps its 6-bit tower outside the index; 3.05 keeps it in a shard.
     if (vision && std::filesystem::exists(std::filesystem::path(dir) / "vision_k6.safetensors"))
-      ck_.AddFile("vision_k6.safetensors");
+      ck_.AddFile("vision_k6.safetensors", /*wins=*/true);
     if (!ck_.Has("mtp.hyper_connection_mixer.hc_norm.weight"))
       ck_.AddFile("mtp_hyper_connection_mixer_patch.safetensors");
     // A tuned MTP head changes only drafts; verification keeps the trunk exact.
@@ -310,38 +318,15 @@ class Loader {
     v.bytes = arena.total();
   }
 
-  // Fixed-size vision kernels need this geometry and one EXL3 width for every tower linear.
-  void ValidateVision(const std::string& P) {
-    int k = 0;
-    auto lin = [&](const std::string& n, int I, int O) {
-      const int kn = ValidateLinear(ck_, n, I, O);
-      if (k && kn != k) ck_.Error(n + ".trellis", "every vision linear must use the same EXL3 width");
-      if (kn < 3 || kn > 6) ck_.Error(n + ".trellis", "vision GEMMs need EXL3 K3..6");
-      k = kn;
-      ck_.Require(n + ".bias", {"F16"}, {O});
-    };
-    ck_.Require(P + "patch_embed.proj.weight", {"F16"}, {1152, 3, 2, 16, 16});
-    ck_.Require(P + "patch_embed.proj.bias", {"F16"}, {1152});
-    ck_.Require(P + "pos_embed.weight", {"F16", "BF16"}, {2304, 1152});
-    for (int i = 0; i < 27; ++i) {
-      const std::string B = P + "blocks." + std::to_string(i) + ".";
-      for (const char* n : {"attn.q_proj", "attn.k_proj", "attn.v_proj", "attn.proj"}) lin(B + n, 1152, 1152);
-      lin(B + "mlp.linear_fc1", 1152, 4352);
-      lin(B + "mlp.linear_fc2", 4352, 1152);
-      for (const char* n : {"norm1.weight", "norm1.bias", "norm2.weight", "norm2.bias"})
-        ck_.Require(B + n, {"F16", "BF16"}, {1152});
-    }
-    lin(P + "merger.linear_fc1", 4608, 4608);
-    lin(P + "merger.linear_fc2", 4608, kHidden);
-    ck_.Require(P + "merger.norm.weight", {"F16", "BF16"}, {1152});
-    ck_.Require(P + "merger.norm.bias", {"F16", "BF16"}, {1152});
-  }
+  // Fixed-size vision kernels need this geometry and one EXL3 width for every tower linear
+  // (ValidateVision in weight_validation.h, which also accepts BF16 for the F16 vision tensors).
+  void ValidateVision(const std::string& P) { crucible::ValidateVision(ck_, P); }
 
   void Load(Model& m, bool streaming = false) {
     streaming_ = streaming;
     const std::string P = "model.language_model.";
     auto t0 = std::chrono::steady_clock::now();
-    const size_t planned = streaming ? ExpectedStaticBytes(ck_, kLayers, hc8_) : 0;
+    const size_t planned = streaming ? ExpectedStaticBytes(ck_, kLayers, hc8_, mtp_hc8_) : 0;
     Arena static_arena(streaming ? StaticArenaCapacity(planned) : size_t(2) << 20, true);
     m.embed = (uint16_t*)Raw(P + "embed_tokens.weight");
     if (streaming) active_ = &static_arena;
@@ -357,8 +342,11 @@ class Loader {
     m.mtp.fh = LinW("mtp.fc_hidden");
     m.mtp.ne1 = F32("mtp.pre_fc_norm_embedding.weight", 1.f);
     m.mtp.nh1 = F32("mtp.pre_fc_norm_hidden.weight", 1.f);
+    // CRUCIBLE_DRAFT_CHAIN hc8: int8 HC for the MTP layer and its mixer only (drafts only; the trunk keeps fp16).
+    hc8_site_ = hc8_ || mtp_hc8_;
     LayerW("mtp.layers.0.", m.mtp.L, IsQsa(kMtpLayer));
     m.mtp.mixer = HcW("mtp.hyper_connection_mixer.", false);
+    hc8_site_ = hc8_;
     if (!streaming) {
       m.final_hc = HcW(P + "hyper_connection_mixer.", false);
       m.head = LinW("lm_head", FrontSplits({"lm_head"})[0]);
@@ -386,6 +374,9 @@ class Loader {
     if (hc8_)
       std::fprintf(stderr, "HC int8 (CRUCIBLE_HC_WMMA=2): %d sites, fn group %d, up group %d\n", hc8_sites_,
                    kHc8FnGroup, kHc8UpGroup);
+    else if (mtp_hc8_)
+      std::fprintf(stderr, "draft chain: MTP HC int8 (CRUCIBLE_DRAFT_CHAIN hc8): %d sites, fn group %d, up group %d\n",
+                   hc8_sites_, kHc8FnGroup, kHc8UpGroup);
     PrintWidths(m);
   }
 
@@ -447,17 +438,37 @@ class Loader {
   __half* Concat16(const std::vector<std::string>& names) {
     size_t total = 0;
     std::vector<std::pair<const uint8_t*, size_t>> parts;
+    // A BF16 tensor (third-party vision checkpoints) is converted to F16 once, here (bf16_half.h).
+    // The F16 path is unchanged: a plain copy of the stored bytes.
+    std::vector<std::shared_ptr<std::vector<uint16_t>>> converted;
     for (const auto& n : names) {
-      if (Info(n).dtype != "F16") ck_.Error(n, "expected dtype F16");
+      const std::string& dtype = Info(n).dtype;
+      if (dtype != "F16" && dtype != "BF16") ck_.Error(n, "expected dtype F16");
+      if (dtype == "BF16") {
+        HalfTensor h = ReadHalfTensor(ck_, n);
+        if (h.inexact)
+          std::fprintf(stderr, "load: %s: %zu BF16 values rounded to F16\n", n.c_str(), h.inexact);
+        auto v = std::make_shared<std::vector<uint16_t>>(std::move(h.bits));
+        parts.push_back({nullptr, v->size() * 2});
+        total += v->size() * 2;
+        converted.push_back(std::move(v));
+        continue;
+      }
       size_t b;
       const uint8_t* s = Src(n, &b);
       parts.push_back({s, b});
+      converted.push_back(nullptr);
       total += b;
     }
     uint8_t* d = active_->Alloc(total);
     size_t off = 0;
-    for (auto& [s, b] : parts) {
-      tasks_.push_back({b, d + off, s, nullptr});
+    for (size_t i = 0; i < parts.size(); ++i) {
+      const auto [s, b] = parts[i];
+      if (s) tasks_.push_back({b, d + off, s, nullptr});
+      else {
+        auto v = converted[i];
+        tasks_.push_back({b, d + off, nullptr, [v](uint8_t* buf) { std::memcpy(buf, v->data(), v->size() * 2); }});
+      }
       off += b;
     }
     return reinterpret_cast<__half*>(d);
@@ -587,7 +598,7 @@ class Loader {
     Hc h;
     h.M = kRank + (inject ? kStreams : 0);
     h.w1 = F32(p + "hc_norm.weight", 1.f);
-    if (hc8_) return HcW8Load(p, inject, h);
+    if (hc8_site_) return HcW8Load(p, inject, h);
     // Decode (HcW2Kernel) and bulk prefill read the fragment-order copies, so
     // they go to active_ in decode order (the static arena, which the
     // lookahead reads). The row-major fn and up go to arena_ for the other
@@ -739,6 +750,14 @@ class Loader {
     return false;
   }
 
+  // CRUCIBLE_DRAFT_CHAIN (draft_chain_switch.h): hc8 gives the MTP sites int8 HC. Drafts only, so the output stays.
+  static bool MtpHc8() {
+    DraftChain d;
+    if (!ResolveDraftChain(crucible::SwitchText("CRUCIBLE_DRAFT_CHAIN"), d))
+      Die("CRUCIBLE_DRAFT_CHAIN must be a comma list of hc8, lead and stop=01..99");
+    return d.hc8;
+  }
+
   static bool PleHost() {
     try {
       return RowPolicyInt("CRUCIBLE_PLE_HOST", 0, 0, 1) != 0;
@@ -856,6 +875,8 @@ class Loader {
   int front_count_ = 0, front_total_ = 0;
   bool streaming_ = false;
   const bool hc8_ = HcInt8();
+  const bool mtp_hc8_ = !hc8_ && MtpHc8();
+  bool hc8_site_ = hc8_;
   int hc8_sites_ = 0;
   std::vector<Task> tasks_;
   std::atomic<size_t> ndone_{0};

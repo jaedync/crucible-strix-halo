@@ -43,6 +43,8 @@
   // Each scored span's last row gets its own HC read (as Mtp) and one draft-head pass scores all of them.
   // Leaves span i's rows in H() from row Offset(i). Returns one choice per span ({-1, 0} when not scored).
   struct MtpSpan { int stream; const float* stacks; std::vector<int> tokens; int mpos; bool score; };
+  // The greedy chain's prior for a draft not yet computed (CRUCIBLE_DRAFT_CHAIN stop=NN; default kDraftNextPrior).
+  float DraftPrior() const { return draft_chain_.Prior(kDraftNextPrior); }
   std::vector<DraftChoice> MtpSpans(const std::vector<MtpSpan>& spans) {
     if (!batch_streams_.empty() || VerificationSpansActive()) throw std::invalid_argument("nested MTP pass");
     int rows=0;
@@ -102,9 +104,17 @@
     }
     Mark("hc_mix");
     const int n=int(scored.size());
-    RunGroup(DraftGroup(n),true,true);
-    for (int k=0;k<n;++k)
-      DraftChoiceKernel<<<1,1024>>>(logits_+size_t(k)*draft_head_.O,draft_head_.O,draft_blocks_,choice_+k,false);
+    if (draft_q_ && n == 1) {
+      // CRUCIBLE_DRAFT_HEAD=q4|q2: the block head's input transform, then the low-bit head (draft_quant.h). One row
+      // only: for 2..8 rows the EXL3 group reads its tiles once for all rows, and the coarse pass spills (draft-cost.md).
+      const Group& head=DraftGroup(n);
+      LinInKernel<<<(head.nin+7)/8,256>>>(head.d_jobs,head.d_in,head.nin);
+      draft_q_->Score(head.jobs[0].xh,n,logits_,draft_blocks_,choice_);
+    } else {
+      RunGroup(DraftGroup(n),true,true);
+      for (int k=0;k<n;++k)
+        DraftChoiceKernel<<<1,1024>>>(logits_+size_t(k)*draft_head_.O,draft_head_.O,draft_blocks_,choice_+k,false);
+    }
     Mark("draft_head");
     lookahead_.Stop();
     Collect();

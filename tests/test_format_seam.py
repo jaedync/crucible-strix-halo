@@ -89,7 +89,7 @@ ALLOWED = {
     'bench/kernels/moe_flow.h': {'wht': 1, 'scale': 1},
     'bench/kernels/moe_rows.h': {'wht': 3, 'scale': 7},
     'bench/kernels/qsa_decode.h': {'wht': 1, 'scale': 1},
-    # New (qsa-attn, bench only): the verbatim trunk 27e0f62b QsaUnionHalfQKernel, the byte reference of bench/qsa_attn.hip.
+    # New (qsa-attn, bench only): the verbatim v0.30.0 QsaUnionHalfQKernel, the byte reference of bench/qsa_attn.hip.
     'bench/kernels/qsa_attn_trunk.h': {'wht': 1, 'scale': 1},
     'bench/moe_rows.hip': {'scale': 12},
     # New (verify-moe, bench only): host setup of the expert pointer arrays (suh[0], svh[2]), as moe_rows.hip

@@ -105,22 +105,39 @@ def message_content(content, role, vision, images):
         parts.append(dict(type="image"))
     return parts
 
+ROLES = ("system", "user", "assistant", "tool")
+
 def normalize_message(item, index, vision=None, images=None):
+    where = f"messages[{index}]"
     if not isinstance(item, dict):
-        raise ApiError("Each message must be an object.", "messages")
+        raise ApiError(f"{where} must be an object.", "messages")
     role = item.get("role")
-    allowed = {"role", "content", "reasoning_content"}
+    # `reasoning` is the same history field as `reasoning_content` under the name that other engines, LiteLLM and Hermes use.
+    allowed = {"role", "content", "reasoning_content", "reasoning"}
     if role == "assistant":
         allowed |= {"tool_calls"}
     if role == "tool":
         allowed |= {"tool_call_id", "name"}
-    if set(item) - allowed:
-        raise ApiError("The message contains unsupported fields for its role.", "messages")
-    if role not in ("system", "user", "assistant", "tool") or (role == "system" and index != 0):
-        raise ApiError("Use system first, then user, assistant, or tool messages.", "messages")
-    reasoning = item.get("reasoning_content", "")
-    if not isinstance(reasoning, str):
-        raise ApiError("reasoning_content must be a string.", "messages")
+    extra = sorted(set(item) - allowed)
+    if extra:
+        names = ", ".join(name[:64] for name in extra[:8]) + (", ..." if len(extra) > 8 else "")
+        label = f" ({role})" if role in ROLES else ""
+        raise ApiError(f"{where}{label} has unsupported fields: {names}. This role accepts: {', '.join(sorted(allowed))}.",
+                       "messages")
+    if role not in ROLES or (role == "system" and index != 0):
+        raise ApiError(f"{where}: use system first, then user, assistant, or tool messages.", "messages")
+    # An empty string or null counts as absent (proxies send null for unset fields); two different non-empty texts are refused.
+    texts = {}
+    for key in ("reasoning_content", "reasoning"):
+        value = item.get(key)
+        if value is not None and not isinstance(value, str):
+            raise ApiError(f"{where} {key} must be a string.", "messages")
+        if value:
+            texts[key] = value
+    if len(set(texts.values())) > 1:
+        raise ApiError(f"{where} has reasoning and reasoning_content with different text. Send one of them, or the same text in both.",
+                       "messages")
+    reasoning = next(iter(texts.values()), "")
     calls = history_calls(item["tool_calls"]) if "tool_calls" in item else None
     content = ("" if role == "assistant" and calls and item.get("content") is None
                else message_content(item.get("content"), role, vision, images if images is not None else []))
@@ -129,7 +146,7 @@ def normalize_message(item, index, vision=None, images=None):
         result["tool_calls"] = calls
     if role == "tool":
         if not isinstance(item.get("tool_call_id"), str) or not item["tool_call_id"]:
-            raise ApiError("A tool message needs a tool_call_id.", "messages")
+            raise ApiError(f"{where} (tool) needs a tool_call_id.", "messages")
         result["tool_call_id"] = json_value(item["tool_call_id"], "messages")
         if "name" in item:
             result["name"] = function_name(item["name"], "messages")

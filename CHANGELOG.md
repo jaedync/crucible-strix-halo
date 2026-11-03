@@ -3,6 +3,65 @@
 Releases are numbered `v0.<train>.<fix>`. This file lists the newest release first.
 The same text is in the notes of each release on GitHub.
 
+## v0.32.0 (2026-11-03)
+
+Release v0.32.0 is the engine of train 32. It follows v0.31.0.
+It has three speed changes and one loader fix. The speed changes are a low-bit draft head for the MTP drafts, a draft chain that overlaps the first draft pass with the server work, and a smaller prefill stage arena that lets a prefill launch of 16,384 rows fit on the 4.05 pack. The loader fix is for a checkpoint with a plain HF vision tower (see Fixes).
+The two draft changes are opt-in switches (default off). The arena change is on by default.
+
+### Speed
+
+- Decode is faster. `CRUCIBLE_DRAFT_HEAD=q2` makes the MTP draft head read a 2-bit copy of its rows for coarse logits. The 8 best blocks of 128 tokens are
+  then recomputed from the EXL3 tiles. The draft changes only; the verify pass checks every draft, so the output does not change.
+  `CRUCIBLE_DRAFT_CHAIN=hc8,lead` changes the draft calls: `hc8` reads the hyper-connection weights of the MTP layer as int8, and `lead` starts the first
+  MTP pass of the next round while the server handles the tokens of the step. `CRUCIBLE_DRAFT_HEAD` and `CRUCIBLE_DRAFT_CHAIN` are unset by default.
+- The prefill stage arena is smaller. Row buffers of the attention and MoE views share bytes where their lifetimes do not overlap. At the launch of
+  16,384 rows (`CRUCIBLE_PF_LAUNCH_ROWS`, the default, `16384+128`) the arena is 2,174 MiB instead of 4,656 MiB (2,482 MiB less). The arithmetic does not change.
+  The launch of 16,384 rows now fits on the 4.05 pack with the long-context layout.
+- Gate numbers (4.05 pack, ABAB, 4 pairs, order 2 AB and 2 BA, order-corrected; the v0.32.0 engine with `CRUCIBLE_DRAFT_HEAD=q2`, `CRUCIBLE_DRAFT_CHAIN=hc8,lead`
+  and `CRUCIBLE_PF_LAUNCH_ROWS=16384+128` against the v0.31.0 engine with its own launch rows of 8192+128; both engines with the same tuned draft head file, which is not part of the release; the cold prefill gain includes the launch-row change):
+  cold 32K prefill +4.21% (se 0.14%, faster in 4 of 4 pairs), decode of 4 sessions at 32K +4.45%, decode of 1 stream with code text +2.07%, serial decode +0.55% (se 0.07%, a small change),
+  energy per arm -3.2%. D1 (mixed text, 6 pairs): +4.09%, equal token IDs in 30 of 30 requests of every pair.
+- Measured Nov 3, 2026 on the build of this release, balanced power profile, in the runs by context length (32K to 250K), same tool and prompts as v0.31.0, public files, no tuned draft
+  head file: cold prefill against v0.31.0 changes by +1.0% to +3.4% on the 4.05 pack (v0.31.0 measured Nov 1, v0.32.0 on Nov 3) and by -1.9% to -1.0% on the 3.05 pack (v0.31.0 measured Nov 2, v0.32.0 on Nov 3);
+  decode changes by +2.8% to +4.7% on the 4.05 pack and by +0.9% to +2.6% on the 3.05 pack. The v0.32.0 runs set `CRUCIBLE_DRAFT_HEAD=q2`, `CRUCIBLE_DRAFT_CHAIN=hc8,lead` and launch rows 16,384, and also
+  `CRUCIBLE_PLE_HOST=1` and `CRUCIBLE_COMPACT_STATE=1`. The v0.31.0 runs set neither draft switch, and on the 4.05 pack they used 8,192 launch rows.
+  On the 3.05 pack both builds used 16,384 launch rows; prefill reads 1.0% to 1.9% lower at every length with a higher GPU clock. The runs are on different nights (Nov 2 and Nov 3) and there is no same-night
+  comparison, so we do not know yet if this is a loss. With the defaults (no `CRUCIBLE_DRAFT_HEAD` and no `CRUCIBLE_DRAFT_CHAIN`) we expect decode as in v0.31.0; we did not measure the defaults.
+  The vision loader fix of this release came after these runs; it changes only the vision load path, not prefill or decode.
+  The tables and the run counts are in `docs/RESULTS.md` (section Decode by context length).
+- The release ladder row of v0.32.0 is not in the tables: the ladder run of Nov 3 did not complete, and the row comes with v0.33.0.
+
+### Exactness and checks
+
+- The output tokens of a request do not change with speculation, the draft head, the draft chain or the arena: the verify pass checks every draft, and the arena change does not change the arithmetic.
+- Token gates on both packs (4.05 and 3.05) with the three switches on: the output tokens equal the v0.31.0 engine on the fixed gate set (CHAIN PASS).
+- The exact-extend load gave the same token IDs on both packs: 6 of 6 cases each.
+- A memory soak of 3 runs passed (lowest free memory 13.1 GiB, 124 turns and 123 cache hits per run).
+- `tests/stage_plan_test.cpp` reproduces the old arena sizes and checks that the live buffers of each pass stay disjoint. The draft head and the draft chain have GPU and host tests
+  (`tests/draft_quant_test.hip`, `tests/draft_chain_switch_test.cpp`).
+
+### Abliterated mode on both packs (opt-in)
+
+- `docs/ABLITERATED.md` now covers the 4.05 pack. `tools/ablation_pack.py repackage` makes the 4.05 copy of the public andrevp sidecar from the downloaded file
+  and refuses to write it unless the copy has the sha256 that the engine pins. Crucible hosts no sidecar file. The mode is off by default.
+- The sidecar was tuned on the 3.05 pack. On the 4.05 pack we measured (26 to 29 Oct 2026): 0 of 25 harmful prompts refused (stock 25 of 25); KL from the 16-bit model
+  0.0248 against 0.0206 (896 positions); decode 2.7% slower; cold prefill 1.3% slower at 32K. 2 of 2,337 turns had a tool call that came back as text
+  (0 of 10,721 on stock builds). The page lists the details and the responsibility note.
+
+### Fixes
+
+- History messages may carry `reasoning` next to or instead of `reasoning_content` (LiteLLM and Hermes send both). An empty or null value counts as absent. Only two different non-empty texts, or a value that is not a string, give a 400. Request errors now name the field and the message index (`messages[N]`) (thanks @dblaber).
+- A checkpoint whose vision tower is in plain HF format (BF16, no EXL3 tower) now runs vision when `vision_k6.safetensors` from the stock 4.05 pack is in the model folder. Without that file, `--vision` stops at start with a message that names the file and the `hf download` command. The engine runs the stock EXL3 tower from `vision_k6.safetensors` and does not use the HF tower of the checkpoint; images are exact only when the HF tower holds the stock weights. The loader also accepts BF16 for the patch embedding and the vision biases and converts them to F16 at load (thanks @OleksKon).
+- `repetition_penalty` at `1` or null is now accepted and has no effect, like `presence_penalty` and `frequency_penalty`
+  at `0`. It was refused as an unknown field. Any other value returns HTTP 400.
+
+### Measurements
+
+Every speed number above except the last two bullets of Speed is on the 4.05 pack, measured with an A/B script on one machine (Strix Halo, 128 GB), alternating the old and
+new build in balanced order, with the balanced power profile. The tables for both packs, with the run counts and the GPU clock,
+are in `docs/RESULTS.md`.
+
 ## v0.31.0 (2026-11-02)
 
 Release v0.31.0 is the engine of train 31. It follows v0.30.0.

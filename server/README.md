@@ -201,7 +201,8 @@ The server protects itself against a bad client:
   A field in the request always wins over the server default. See [Server defaults](#server-defaults).
 - `seed`: an unsigned 64-bit integer. An omitted or null seed uses fresh system entropy.
   Every response and stream chunk reports the selected value as `seed`.
-- `presence_penalty`, `frequency_penalty`: the server accepts these fields only when they are `0` or null. They have
+- `presence_penalty`, `frequency_penalty`, `repetition_penalty`: the server accepts `presence_penalty` and
+  `frequency_penalty` only when they are `0` or null, and `repetition_penalty` only when it is `1` or null. They have
   no effect, because the engine has no penalty sampler. Any other value gets HTTP 400.
 - `max_tokens` or `max_completion_tokens`: a positive integer. The default is 128 when the request has neither field.
   The flag `--default-max-tokens N|max` changes the default (see [Server defaults](#server-defaults)).
@@ -342,7 +343,7 @@ The template replays assistant `reasoning_content` inside `<think>` for every tu
 
 The server renders the checkpoint's real chat template.
 It accepts system, user, assistant, and tool messages.
-It also accepts text content blocks, assistant `reasoning_content`, and assistant `tool_calls`.
+It also accepts text content blocks, assistant `reasoning_content` (or `reasoning`, its alias), and assistant `tool_calls`.
 With `--vision`, it also accepts image content parts. See [Image input](#image-input).
 It rejects video, unsupported sampling controls, and unknown fields.
 

@@ -601,7 +601,10 @@ struct PrefillLinear {
         std::fprintf(stderr,"prefill GEMM supports EXL3 K3..8 only\n");std::abort();
       }
       job.S = 1; job.partial = partial+po; job.xh = xh+xo;
-      po += (size_t)job.R*job.O; xo += (size_t)job.R*job.I;
+      // A fused group never writes the fp32 partial (PrefillGemmOutKernel keeps the tile in registers and LDS), so
+      // only an unfused group takes workspace; the fused jobs point at its start.
+      if (!fused) po += (size_t)job.R*job.O;
+      xo += (size_t)job.R*job.I;
       jobs.push_back(job);
       const int fs = j < front_s.size() ? front_s[j] : 0;
       if (j > 0 && (fs > 0) != front) {

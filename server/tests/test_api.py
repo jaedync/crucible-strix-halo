@@ -96,6 +96,32 @@ class ApiTests(unittest.TestCase):
                         self.assertEqual(caught.exception.status, 400)
                         self.assertEqual(str(caught.exception), f"{field} must be 0. Crucible has no penalty sampler.")
 
+    def test_repetition_penalty_at_one_or_null_is_the_same_request(self):
+        # repetition_penalty is the third name for the same missing sampler. Its neutral value is 1, not 0.
+        chat = self.valid(seed=7)
+        completion = dict(model="crucible", prompt="hello", max_tokens=8, temperature=0, seed=7)
+        for kind, body in (("chat", chat), ("completion", completion)):
+            expected = validate_request(body, kind, "crucible")
+            for value in (1, 1.0, None):
+                with self.subTest(kind=kind, value=value):
+                    self.assertEqual(validate_request(body | {"repetition_penalty": value}, kind, "crucible"),
+                                     expected)
+        names = {field.name for field in dataclasses.fields(Request)}
+        self.assertNotIn("repetition_penalty", names)
+
+    def test_repetition_penalty_other_than_one_is_refused(self):
+        bad = (1.1, 0.9, 0, 2, -1, float("nan"), float("inf"), float("-inf"), True, False, "1", [1], {}, [1.0])
+        message = "repetition_penalty must be 1. Crucible has no penalty sampler."
+        for kind in ("chat", "completion"):
+            body = self.valid() if kind == "chat" else dict(model="crucible", prompt="hello", max_tokens=8)
+            for value in bad:
+                with self.subTest(kind=kind, value=value):
+                    with self.assertRaises(ApiError) as caught:
+                        validate_request(body | {"repetition_penalty": value}, kind, "crucible")
+                    self.assertEqual(caught.exception.param, "repetition_penalty")
+                    self.assertEqual(caught.exception.status, 400)
+                    self.assertEqual(str(caught.exception), message)
+
     def test_bad_content(self):
         for messages in ([], [dict(role="tool", content="x")],
                          [dict(role="user", content=[dict(type="image_url", image_url="x")])]):

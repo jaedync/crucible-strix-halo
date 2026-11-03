@@ -1,5 +1,5 @@
 // qsa-attn bench reference: QsaUnionBuildKernel and QsaUnionHalfQKernel copied verbatim from the v0.30.0 kernels
-// (engine/layers/kernels/prefill_qsa_union.h lines 22-67 and 226-460). bench/qsa_attn.hip checks the engine
+// (engine/layers/kernels/prefill_qsa_union.h of the v0.30.0 tag: the two kernels are found by name, because later edits moved the lines). bench/qsa_attn.hip checks the engine
 // kernels byte for byte against these copies, so a later engine edit cannot move the reference.
 #pragma once
 #include "../../engine/layers/kernels/prefill_qsa_union.h"

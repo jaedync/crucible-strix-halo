@@ -1186,6 +1186,12 @@ class BatchSpecDecoder : public BatchMtpSlots {
     size_t origin = 0;           // the prompt row at MTP position 0
     bool continued = false;      // the warm-up continued restored MTP history (CRUCIBLE_SPEC_STATS)
     int mtp_restarts = 0;        // FitMtp restarts; the MTP history then starts after row 0
+    // CRUCIBLE_DRAFT_CHAIN lead: the engine epoch of the first MTP pass launched for the next round (0: none), and
+    // the state it was launched from; GreedyDrafts takes its choice only when the state still matches.
+    uint64_t lead = 0;
+    int lead_mpos = 0;
+    size_t lead_base = 0;
+    std::vector<int> lead_ctoks;
     // The MTP cache holds the pairs of every row from row 0 on (batch_mtp_history.h).
     bool Full() const { return origin == 0 && !mtp_off && mtp_restarts == 0; }
   };
@@ -1348,7 +1354,30 @@ class BatchSpecDecoder : public BatchMtpSlots {
       s.resumed_accepted += int(output.size()) - 1;
       if (s.resumed_steps % 8 == 0) s.resumed = false;
     }
+    s.lead = 0;
+    if (engine_.DraftLead()) Lead(s);
     return output;
+  }
+  // CRUCIBLE_DRAFT_CHAIN lead: launches the first MTP pass of the next greedy Propose now (the step's tokens go to
+  // the server while it runs). The same checks as Propose: Pending holds (ctoks end with the last token), FitMtp,
+  // the depth bound. The pass writes the MTP cache rows of the pending pairs, as the next Propose would; its choice
+  // and its last stack (stk row kMaxRows) wait for GreedyDrafts. A step that never comes leaves only those rows.
+  void Lead(State& s) {
+    if (s.mtp_off || s.spec <= 0 || s.sampling.temperature > 0 || !s.proposal.consumed || s.ctoks.empty() ||
+        s.ctoks.size() > size_t(kMaxRows))
+      return;
+    const int rc = int(s.ctoks.size());
+    FitMtp(s, rc, std::max(s.spec, s.lookup));
+    const int bound = BoundedDraftDepth(std::max(s.spec, s.lookup), engine_.Context(), int(engine_.Length()), s.mpos,
+                                        rc, engine_.StreamMtpRows(s.slot));
+    if (bound <= 0) return;
+    engine_.SelectStream(s.slot);
+    float* stk = stk_[s.slot];
+    engine_.Mtp(stk, s.ctoks.data(), rc, s.mpos, true, false, stk + size_t(kMaxRows) * kWide);
+    s.lead = engine_.LeadEpoch();
+    s.lead_mpos = s.mpos;
+    s.lead_base = engine_.Length();
+    s.lead_ctoks = s.ctoks;
   }
   // Draft head pass counters: the host time of one head call, where the call already returns host values
   // (the choice and the margin), so these reads add no wait. Counters only.
@@ -1501,7 +1530,7 @@ class BatchSpecDecoder : public BatchMtpSlots {
         }
       } else {
         c.q = DraftAcceptProb(c.margin);
-        c.open = c.depth > 1 && c.q * kDraftNextPrior >= s.draft_q;
+        c.open = c.depth > 1 && c.q * engine_.DraftPrior() >= s.draft_q;
       }
       // No chain call follows a stop ID.
       if (!p.lookup && !c.drafts.empty() && crucible::IsStopToken(s.stops, c.drafts.front())) c.open = false;
@@ -1537,7 +1566,7 @@ class BatchSpecDecoder : public BatchMtpSlots {
         } else {
           c.q *= DraftAcceptProb(margin);
           keep = c.q >= s.draft_q;
-          c.open = keep && k + 1 < c.depth && c.q * kDraftNextPrior >= s.draft_q;
+          c.open = keep && k + 1 < c.depth && c.q * engine_.DraftPrior() >= s.draft_q;
         }
         if (keep) c.drafts.push_back(next);
         else c.open = false;
@@ -1559,7 +1588,12 @@ class BatchSpecDecoder : public BatchMtpSlots {
   std::vector<int> GreedyDrafts(State& s, int depth, int copy_depth, bool& lookup) {
     float* stk = stk_[s.slot];
     const int rc = int(s.ctoks.size());
-    std::vector<int> drafts{Timed(s, [&] { return engine_.Mtp(stk, s.ctoks.data(), rc, s.mpos, true, false); })[rc - 1]};
+    // CRUCIBLE_DRAFT_CHAIN lead: the pass already ran for this exact state; take its choice (and its kept stack).
+    const uint64_t epoch = std::exchange(s.lead, 0);
+    const bool led = epoch != 0 && epoch == engine_.LeadEpoch() && s.lead_mpos == s.mpos &&
+                     s.lead_base == engine_.Length() && s.lead_ctoks == s.ctoks;
+    std::vector<int> drafts{led ? Timed(s, [&] { return engine_.MtpLeadWait(epoch).token; })
+                                : Timed(s, [&] { return engine_.Mtp(stk, s.ctoks.data(), rc, s.mpos, true, false); })[rc - 1]};
     s.mpos += rc;
     auto copied = Lookup(s, copy_depth);
     if (copied.size() > 1 && copied.front() == drafts.front()) {
@@ -1568,17 +1602,20 @@ class BatchSpecDecoder : public BatchMtpSlots {
       return copied;
     }
     if (depth <= 0) return {};
+    const auto chain = [&](int k, const int* previous) {
+      const bool kept = led && k == 1;  // the lead copied its last stack to stk row kMaxRows; H() is scratch since
+      if (!kept) CopyRows(engine_, stk, kMaxRows, k == 1 ? rc - 1 : 0, 1);
+      return Timed(s, [&] { return engine_.Mtp(stk + size_t(kMaxRows) * kWide, previous, 1, s.mpos + k - 1, true, false); })[0];
+    };
     if (s.value)
       return ValueChain(s, s.greedy_cal, drafts.front(), engine_.DraftMargin(), depth, [&](int k, int previous) {
-        CopyRows(engine_, stk, kMaxRows, k == 1 ? rc - 1 : 0, 1);
-        const int next = Timed(s, [&] { return engine_.Mtp(stk + size_t(kMaxRows) * kWide, &previous, 1, s.mpos + k - 1, true, false); })[0];
+        const int next = chain(k, &previous);
         return std::pair<int, float>{next, engine_.DraftMargin()};
       });
     float q = DraftAcceptProb(engine_.DraftMargin());
     for (int k = 1; k < depth; ++k) {
-      if (q * kDraftNextPrior < s.draft_q || crucible::IsStopToken(s.stops, drafts.back())) break;
-      CopyRows(engine_, stk, kMaxRows, k == 1 ? rc - 1 : 0, 1);
-      const int next = Timed(s, [&] { return engine_.Mtp(stk + size_t(kMaxRows) * kWide, &drafts.back(), 1, s.mpos + k - 1, true, false); })[0];
+      if (q * engine_.DraftPrior() < s.draft_q || crucible::IsStopToken(s.stops, drafts.back())) break;
+      const int next = chain(k, &drafts.back());
       q *= DraftAcceptProb(engine_.DraftMargin());
       if (q < s.draft_q) break;
       drafts.push_back(next);
@@ -1746,6 +1783,12 @@ inline int BatchedServe(const std::string& checkpoint, int context, int streams,
                         const std::vector<int>& draft_blocks={}, int state_write_delay_ms=0) {
   // each slot's MTP cache holds the positions that the server's default window needs, not the context.
   const int mtp_rows = crucible::MtpSlotRows(context, mtp_window);
+  // A vision tower of plain HF tensors cannot run: say so before the model loads, not after.
+  if (vision)
+    if (const std::string fault = crucible::VisionTowerFault(checkpoint); !fault.empty()) {
+      std::fprintf(stderr, "serve error: --vision: %s\n", fault.c_str());
+      return 2;
+    }
   Engine engine(checkpoint, context, prefill_rows, mtp_rows);
   if (vision) engine.EnableVision(checkpoint);
   const size_t cache_budget = size_t(cache_mib) << 20;

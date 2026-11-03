@@ -315,7 +315,9 @@ def main():
     vision = None
     if args.vision:
         from . import vision as vision_module
-        from .vision import MAX_PIXELS, MAX_IMAGES, MAX_IMAGE_BYTES
+        from .vision import MAX_PIXELS, MAX_IMAGES, MAX_IMAGE_BYTES, tower_fault
+        if fault := tower_fault(args.checkpoint):
+            parser.error("--vision: " + fault)
         # The image tokens of one request must fit the context (review F2: no aggregate pixel cap otherwise).
         vision = vision_module.VisionSettings(
             max_image_tokens=args.ctx, max_pixels=args.vision_max_pixels or MAX_PIXELS,

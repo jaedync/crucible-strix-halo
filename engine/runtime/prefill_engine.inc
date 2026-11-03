@@ -581,7 +581,7 @@ const Engine::MtpPrefillPlan* Engine::MtpPrefillPlanFor(int R) {
     front.push_back(mtp.fh.front_s);
   }
   for (size_t j=0; j<jobs.size(); ++j) jobs[j].S=front[j];  // carried through PackJobs, reset by Build
-  const auto groups=crucible::PackJobs(jobs,xh_capacity_,partial_capacity_,
+  const auto groups=crucible::PackJobs(jobs,xh_capacity_,partial_plan_floats_,
                                        [](const LinJob& a,const LinJob& b) { return (a.S>0)==(b.S>0); });
   if (groups.empty()) return nullptr;
   auto p=std::make_unique<MtpPrefillPlan>();

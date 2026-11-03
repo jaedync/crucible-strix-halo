@@ -21,6 +21,9 @@ Another model family adds `engine/model/<name>/`.
   runtime model descriptor and no dynamic shapes on the hot path.
 - `docs/FLASHNEXT_FORWARD.md` defines the equations and shapes.
 - The loader checks metadata before it uses a tensor.
+- Vision patch embedding and linear biases may be BF16; the loader converts them to F16 once (`bf16_half.h`).
+- `vision_k6.safetensors` owns its tensor names (`AddFile(file, wins)`): an index shard that repeats them, such as an HF
+  vision tower, is ignored. An HF tower without that file stops `--vision` before the model loads (`VisionTowerFault`).
 
 ## Allowed includes
 

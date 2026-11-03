@@ -256,9 +256,13 @@ class Checkpoint {
     }
   }
 
-  void AddFile(const std::string& file) {
+  // Maps the tensors of an extra file over the index. wins: the file owns its names, so a shard that the index lists
+  // and that repeats them (a third-party checkpoint with an HF vision tower, plus vision_k6.safetensors) is not an
+  // error when its header loads later; the file's tensor is the one that Info returns. Call before any other header loads.
+  void AddFile(const std::string& file, bool wins = false) {
     CheckFile(file);
     LoadHeader(file);
+    if (wins) wins_.insert(file);
     for (const auto& [n, t] : tensors_) if (t.file == file) shard_of_[n] = file;
   }
   bool Has(const std::string& name) const { return shard_of_.count(name) != 0; }
@@ -433,7 +437,8 @@ class Checkpoint {
   void LoadHeader(const std::string& file) {
     if (maps_.count(file)) return;
     for (auto& [name, ti] : ParseHeader(file, dir_ + "/" + file))
-      if (!tensors_.emplace(name, ti).second) Fail(dir_ + "/" + file, name, "duplicate tensor name across checkpoint shards");
+      if (!tensors_.emplace(name, ti).second && !wins_.count(tensors_.at(name).file))
+        Fail(dir_ + "/" + file, name, "duplicate tensor name across checkpoint shards");
   }
   // Maps path under the key file and returns its tensors in header order.
   std::vector<std::pair<std::string, TensorInfo>> ParseHeader(const std::string& file, const std::string& path) {
@@ -507,6 +512,7 @@ class Checkpoint {
   std::unordered_map<std::string, std::string> shard_of_;
   std::unordered_map<std::string, TensorInfo> tensors_;
   std::map<std::string, Map> maps_;
+  std::unordered_set<std::string> wins_;
   bool no_mapped_reads_ = false;
   std::unordered_map<std::string, std::vector<uint8_t>> small_;
 };

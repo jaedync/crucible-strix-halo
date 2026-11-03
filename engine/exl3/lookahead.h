@@ -150,6 +150,13 @@ class LookaheadRunner {
     if (hold_) LookaheadHoldKernel<<<policy.blocks,256,0,stream_>>>(state_);
     else LookaheadKernel<<<policy.blocks,256,0,stream_>>>(state_);
   }
+  // CRUCIBLE_DRAFT_CHAIN lead: the stop kernel without the host wait. The helper blocks end when stream 0 reaches
+  // the stop kernel (they only read weights), and a later Start queues behind them on stream_.
+  void StopAsync() {
+    if (!running_) return;
+    LookaheadStopKernel<<<1,1>>>(state_);
+    running_=false;
+  }
   void Stop() {
     if (!running_) return;
     LookaheadStopKernel<<<1,1>>>(state_);

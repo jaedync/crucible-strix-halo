@@ -4,6 +4,7 @@ These documents are part of the public source tree.
 
 | Document | Content |
 |---|---|
+| [QUICKSTART.md](QUICKSTART.md) | From a new machine to a running server, step by step, with a check after each step |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | The modules, the data flow, the exactness rules, serving, caches and speculative decoding |
 | [how-it-got-fast.md](how-it-got-fast.md) | Six ideas behind the speed, in plain words |
 | [RESULTS.md](RESULTS.md) | Release data, method, hardware limits and the dated history of earlier tables |
@@ -18,6 +19,7 @@ These documents are part of the public source tree.
 | [FLASHNEXT_FORWARD.md](FLASHNEXT_FORWARD.md) | The forward pass of Qwen3.8-Flash-Next and its MTP head |
 | [OPENAI_CLIENTS.md](OPENAI_CLIENTS.md) | How to connect an OpenAI-compatible client |
 | [SESSION_REPLAY.md](SESSION_REPLAY.md) | The conversation cache and session replay |
+| [ABLITERATED.md](ABLITERATED.md) | The opt-in abliterated mode for both packs: how to turn it on, the measured costs on 4.05 and the responsibility note |
 | [THIRD_PARTY.md](THIRD_PARTY.md) | Third-party software and the model license |
 | [oracle/](oracle/) | The fp64 oracle tables of Gate 1 |
 

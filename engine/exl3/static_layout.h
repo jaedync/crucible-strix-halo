@@ -28,6 +28,8 @@ template<class Checkpoint> class StaticLayout {
  public:
   // hc8: the HC sites hold int8 blocks (hc8_layout.h) in place of fp16 fn and up.
   explicit StaticLayout(Checkpoint& ck, bool hc8 = false) : ck_(ck), hc8_(hc8) {}
+  // CRUCIBLE_DRAFT_CHAIN hc8: the MTP layer's sites and its mixer hold int8 blocks, the trunk keeps fp16.
+  void SetHc8(bool hc8) { hc8_ = hc8; }
   size_t bytes() const { return bytes_; }
   void Raw(const std::string& n) { Add(Payload(n)); }
   void F32(const std::string& n) {
@@ -96,12 +98,12 @@ template<class Checkpoint> class StaticLayout {
   }
   void Add(size_t b) { bytes_ = CheckedBytesAdd(bytes_, AlignWeightBytes(b)); }
   Checkpoint& ck_;
-  const bool hc8_;
+  bool hc8_;
   size_t bytes_ = 0;
 };
 
 template<class Checkpoint>
-size_t ExpectedStaticBytes(Checkpoint& ck, int layers, bool hc8 = false) {
+size_t ExpectedStaticBytes(Checkpoint& ck, int layers, bool hc8 = false, bool mtp_hc8 = false) {
   if (layers <= 0)
     throw std::invalid_argument("static layout geometry is invalid");
   StaticLayout<Checkpoint> layout(ck, hc8);
@@ -112,8 +114,10 @@ size_t ExpectedStaticBytes(Checkpoint& ck, int layers, bool hc8 = false) {
   layout.F32("mtp.pre_fc_norm_embedding.weight");
   layout.F32("mtp.pre_fc_norm_hidden.weight");
   layout.Lin("mtp.fc_embedding"); layout.Lin("mtp.fc_hidden");
+  layout.SetHc8(hc8 || mtp_hc8);
   layout.Layer("mtp.layers.0.", IsQsa(kMtpLayer));
   layout.Hc("mtp.hyper_connection_mixer.", false);
+  layout.SetHc8(hc8);
   layout.Hc(p + "hyper_connection_mixer.", false);
   layout.Lin("lm_head");
   return layout.bytes();

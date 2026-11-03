@@ -1,6 +1,6 @@
 # Crucible
 
-An inference engine for EXL3 checkpoints of Qwen3.8-Flash-Next on one AMD Strix Halo APU. It gives exact output and fast long-context agent work.
+An inference engine for EXL3 checkpoints of Qwen3.8-Flash-Next on one AMD Strix Halo APU. It is built for fast long-context agent work.
 
 Crucible runs **EXL3** checkpoints of **Qwen3.8-Flash-Next** on **AMD Strix Halo**: one **Ryzen AI Max+ 395** with a
 **Radeon 8060S** (**gfx1151**) and 128 GB of unified memory. It uses its own **ROCm/HIP** kernels in C++20 and no other
@@ -8,16 +8,16 @@ engine. A local OpenAI-compatible server gives chat, streaming, function calls a
 research software for one GPU architecture. It is not a general model backend or a production service.
 
 [How it got fast](docs/how-it-got-fast.md) · [Results](docs/RESULTS.md) · [Rivals](docs/RIVALS.md) ·
-[Quality](docs/QUALITY.md) · [Changelog](CHANGELOG.md) · [Architecture](docs/ARCHITECTURE.md) · [Build guide](docs/BUILD.md)
+[Quality](docs/QUALITY.md) · [Changelog](CHANGELOG.md) · [Architecture](docs/ARCHITECTURE.md) · [Setup guide](docs/QUICKSTART.md) · [Build guide](docs/BUILD.md)
 
 ## Speed of this release
 
-Release v0.31.0. Measured Nov 1 to 2, 2026 on the build of this release, balanced power profile (GPU clock about 2.29 to 2.32 GHz).
-Each value is the median of 2 runs. The server ran 4 sessions of 262,144 tokens with image input and speculative decoding (MTP)
-on, as in daily use, with prefill launches of 8,192 rows on the 4.05 pack (`CRUCIBLE_PF_LAUNCH_ROWS=8192+128`); on the 3.05 pack each build used its default (16,384 rows for v0.31.0 and v0.30.0, 8,192 rows for v0.26.0 and v0.22.0). Every row uses prompts that no
-cache has seen, except the re-send row. The v0.30.0, v0.26.0 and v0.22.0 columns are earlier releases, measured with the same tool
-(4.05 pack: v0.30.0 on Oct 31, 2026, the other two in the run series of Oct 27 to 28, 2026; 3.05 pack: all three the same night as v0.31.0, Nov 1 to 2,
-2026, with the public files and no tuned draft head file). What changed since v0.30.0 is in the [Changelog](CHANGELOG.md).
+Release v0.32.0. The tables below are the release ladder of the earlier releases, one column each. The ladder row of v0.32.0 is not in this table: the ladder run of Nov 3 did not complete, and the row comes with v0.33.0. The numbers of v0.32.0 are the ranges and the charts below, from the runs by context length. Those runs were measured Nov 3, 2026 on the build of this release, balanced power profile (GPU clock about 2.30 to 2.32 GHz). The vision loader fix of this release came after these runs; it changes only the vision load path, not prefill or decode.
+In the tables, each value is the median of 2 runs. The server ran 4 sessions of 262,144 tokens with image input and speculative decoding (MTP)
+on, as in daily use, with the public files and no tuned draft head file. The v0.32.0 runs also set two options that are off by default in this release: `CRUCIBLE_DRAFT_HEAD=q2` and `CRUCIBLE_DRAFT_CHAIN=hc8,lead` (see the [Changelog](CHANGELOG.md)); the earlier runs did not. The v0.32.0 runs also set `CRUCIBLE_PLE_HOST=1` and `CRUCIBLE_COMPACT_STATE=1`, which are part of the measured configuration. With the defaults (no `CRUCIBLE_DRAFT_HEAD` and no `CRUCIBLE_DRAFT_CHAIN`) we expect decode as in v0.31.0; we did not measure the defaults. The v0.32.0 runs used prefill launches of 16,384 rows (`CRUCIBLE_PF_LAUNCH_ROWS=16384+128`, the default); the earlier columns used the settings of their own time (4.05 pack: 8,192 rows; 3.05 pack: 16,384 rows for v0.31.0 and v0.30.0, 8,192 rows for v0.26.0 and v0.22.0). Every row uses prompts that no
+cache has seen, except the re-send row. The v0.31.0, v0.30.0, v0.26.0 and v0.22.0 columns are earlier releases, measured with the same tool
+(4.05 pack: v0.31.0 on Nov 1, 2026, v0.30.0 on Oct 31, 2026, the other two in the run series of Oct 27 to 28, 2026; 3.05 pack: all four on Nov 1 to 2,
+2026, with the public files and no tuned draft head file). What changed since v0.31.0 is in the [Changelog](CHANGELOG.md).
 
 **4.05 bpw pack (the higher-quality option)**
 
@@ -49,17 +49,17 @@ cache has seen, except the re-send row. The v0.30.0, v0.26.0 and v0.22.0 columns
 
 Two runs per cell is a small sample. Decode with 1 session changes between runs and between prompts, because the draft head predicts some text better than other text. In the run series of Oct 27 to
 28, 11 builds span 60.5 to 66.9 tok/s on the 4.05 code row, so a difference of that size in the decode rows is not a result. The cold prefill rows and the re-send row move less. The 4.05 code row
-comes from the decode chart (v0.22.0 and v0.26.0 Oct 29, v0.30.0 Oct 31, v0.31.0 Nov 1). Against v0.30.0 in the runs by context length (same tool and prompts; v0.30.0 on Nov 1; v0.31.0 on Nov 1 for the
-4.05 pack and on the morning of Nov 2 for the 3.05 pack, a repeat, see [Results](docs/RESULTS.md#decode-by-context-length)), the prefill rate of v0.31.0 changes by +1.6% to +4.5% on the 4.05 pack and by +2.6% to +4.7% on the 3.05 pack, per context length from 32K to 250K (ratio of the medians). The
-release changes the attention step of prefill only. The decode path is unchanged; in the same runs the decode rate changes by -0.2% to +2.1% on the 4.05 pack and by -0.3% to +0.4% on the 3.05 pack. The 1-session decode rows of the 3.05 table read 1.8% (code) and 3.7% (prose) lower than v0.30.0; the 2 runs of those cells differ by 3% to 7%, so that is not a result. Decode with 4
-sessions on the 4.05 pack reads 117.6 tok/s, against 102.4 for v0.30.0 (Oct 31; the two runs gave 98.3 and 106.6) and 106.9 for v0.26.0; we do not claim a change. All 3.05 columns ran with the public files and no tuned draft head file. All values use the balanced power profile; the performance profile gives
+comes from the decode chart (v0.22.0 and v0.26.0 Oct 29, v0.30.0 Oct 31, v0.31.0 Nov 1). Against v0.31.0 in the runs by context length (same tool and prompts; 4.05 pack: v0.31.0 measured Nov 1, v0.32.0 on Nov 3; 3.05 pack: v0.31.0 measured Nov 2, v0.32.0 on Nov 3, see
+[Results](docs/RESULTS.md#decode-by-context-length)), the prefill rate of v0.32.0 changes by +1.0% to +3.4% on the 4.05 pack and by -1.9% to -1.0% on the 3.05 pack, per context length from 32K to 250K (ratio of the medians),
+and the decode rate changes by +2.8% to +4.7% on the 4.05 pack and by +0.9% to +2.6% on the 3.05 pack. On the 4.05 pack these changes include the three settings named above (launch rows, draft head, draft chain), which the v0.31.0 runs did not use; the decode changes on both packs include the draft head and the draft chain. On the 3.05 pack both builds used 16,384 launch rows, and prefill reads 1.0% to 1.9% lower at every length with a higher GPU clock. The runs are on different nights (Nov 2 and Nov 3) and there is no same-night comparison, so we do not know yet if this is a loss. Decode with 4
+sessions on the 4.05 pack reads 117.6 tok/s for v0.31.0 (Nov 1), 102.4 for v0.30.0 (Oct 31; the two runs gave 98.3 and 106.6) and 106.9 for v0.26.0; this row varies between runs, so a difference of one table value is not a result by itself. All 3.05 columns ran with the public files and no tuned draft head file. All values use the balanced power profile; the performance profile gives
 other prefill rates ([Rivals](docs/RIVALS.md#the-power-profile-run-of-oct-26-2026)). More data, the method and the older tables are in [Results](docs/RESULTS.md).
 
 **Prefill by context length, 4.05 bpw pack** (tokens per second, median of 4 runs per point for v0.22.0 and v0.26.0, run of Oct 28 to 29;
-2 runs per point for v0.30.0, run of Oct 31, and for v0.31.0, run of Nov 1, 2026). Lines: v0.22.0 purple, v0.26.0 teal, v0.30.0 orange, v0.31.0 yellow.
+2 runs per point for v0.30.0, run of Oct 31, for v0.31.0, run of Nov 1, and for v0.32.0, run of Nov 3, 2026). Lines: v0.22.0 purple, v0.26.0 teal, v0.30.0 orange, v0.31.0 yellow, v0.32.0 blue.
 
 ```mermaid
-%%{init: {"theme": "base", "themeVariables": {"xyChart": {"backgroundColor": "#0b0f14", "titleColor": "#e6edf3", "xAxisLabelColor": "#c9d1d9", "yAxisLabelColor": "#c9d1d9", "xAxisTitleColor": "#c9d1d9", "yAxisTitleColor": "#c9d1d9", "xAxisLineColor": "#3b4552", "yAxisLineColor": "#3b4552", "xAxisTickColor": "#3b4552", "yAxisTickColor": "#3b4552", "plotColorPalette": "#6f42c1, #1abc9c, #f78166, #ffe083"}}}}%%
+%%{init: {"theme": "base", "themeVariables": {"xyChart": {"backgroundColor": "#0b0f14", "titleColor": "#e6edf3", "xAxisLabelColor": "#c9d1d9", "yAxisLabelColor": "#c9d1d9", "xAxisTitleColor": "#c9d1d9", "yAxisTitleColor": "#c9d1d9", "xAxisLineColor": "#3b4552", "yAxisLineColor": "#3b4552", "xAxisTickColor": "#3b4552", "yAxisTickColor": "#3b4552", "plotColorPalette": "#6f42c1, #1abc9c, #f78166, #ffe083, #58a6ff"}}}}%%
 xychart-beta
     title "Prefill (tokens/s)"
     x-axis ["32k", "64k", "128k", "192k", "250k"]
@@ -68,24 +68,26 @@ xychart-beta
     line [1626, 1604, 1567, 1526, 1448]
     line [1700, 1701, 1664, 1624, 1536]
     line [1749, 1754, 1723, 1683, 1576]
+    line [1808, 1801, 1760, 1723, 1592]
 ```
 
-**Decode by context length, 4.05 bpw pack** (tokens per second, median of up to 4 samples for v0.22.0 and v0.26.0, up to 6 for v0.30.0 and v0.31.0; v0.22.0 and v0.26.0 from the run of
-Oct 29, 2026, v0.30.0 from the run of Oct 31, 2026, v0.31.0 from the run of Nov 1, 2026; v0.22.0 purple, v0.26.0 teal, v0.30.0 orange, v0.31.0 yellow).
+**Decode by context length, 4.05 bpw pack** (tokens per second, median of up to 4 samples for v0.22.0 and v0.26.0, up to 6 for v0.30.0, v0.31.0 and v0.32.0; v0.22.0 and v0.26.0 from the run of
+Oct 29, 2026, v0.30.0 from the run of Oct 31, 2026, v0.31.0 from the run of Nov 1, 2026, v0.32.0 from the run of Nov 3, 2026; v0.22.0 purple, v0.26.0 teal, v0.30.0 orange, v0.31.0 yellow, v0.32.0 blue).
 
 ```mermaid
-%%{init: {"theme": "base", "themeVariables": {"xyChart": {"backgroundColor": "#0b0f14", "titleColor": "#e6edf3", "xAxisLabelColor": "#c9d1d9", "yAxisLabelColor": "#c9d1d9", "xAxisTitleColor": "#c9d1d9", "yAxisTitleColor": "#c9d1d9", "xAxisLineColor": "#3b4552", "yAxisLineColor": "#3b4552", "xAxisTickColor": "#3b4552", "yAxisTickColor": "#3b4552", "plotColorPalette": "#6f42c1, #1abc9c, #f78166, #ffe083"}}}}%%
+%%{init: {"theme": "base", "themeVariables": {"xyChart": {"backgroundColor": "#0b0f14", "titleColor": "#e6edf3", "xAxisLabelColor": "#c9d1d9", "yAxisLabelColor": "#c9d1d9", "xAxisTitleColor": "#c9d1d9", "yAxisTitleColor": "#c9d1d9", "xAxisLineColor": "#3b4552", "yAxisLineColor": "#3b4552", "xAxisTickColor": "#3b4552", "yAxisTickColor": "#3b4552", "plotColorPalette": "#6f42c1, #1abc9c, #f78166, #ffe083, #58a6ff"}}}}%%
 xychart-beta
     title "Decode (tokens/s)"
     x-axis ["32k", "64k", "128k", "192k", "250k"]
-    y-axis "tokens/s" 50 --> 75
+    y-axis "tokens/s" 50 --> 80
     line [64.6, 56.1, 57.3, 54.0, 58.1]
     line [58.4, 55.4, 53.8, 53.9, 57.9]
     line [68.4, 66.1, 63.3, 61.9, 61.2]
     line [69.0, 66.6, 63.9, 62.9, 61.9]
+    line [71.8, 68.6, 66.8, 64.7, 64.3]
 ```
 
-All 4 builds got the same prompts. On the same prompts and the same reply text, v0.30.0 decodes 1.06 to 1.08 times as fast as v0.26.0 from 64K to 250K, and 1.07 times at 32K in run 2 (1.20 with run 1, in which v0.26.0 read low). The v0.30.0 and v0.31.0 lines hold up to 6 samples per point; the other two hold up to 4. v0.26.0 read low in run 1 at 32K (47.2 and 51.6 tok/s, the others 62.9
+All 5 builds got the same prompts. On the same prompts and the same reply text, v0.30.0 decodes 1.06 to 1.08 times as fast as v0.26.0 from 64K to 250K, and 1.07 times at 32K in run 2 (1.20 with run 1, in which v0.26.0 read low). The v0.30.0, v0.31.0 and v0.32.0 lines hold up to 6 samples per point; the other two hold up to 4. The v0.32.0 run set the options named above (draft head, draft chain, launch rows); the others did not. v0.26.0 read low in run 1 at 32K (47.2 and 51.6 tok/s, the others 62.9
 to 64.7); the cause is not found. The third question of each unit of the run of Oct 29 was invalid (a 10-token reply, no decode
 number). The 3.05 chart and the data are in [Results](docs/RESULTS.md#decode-by-context-length).
 
@@ -93,7 +95,7 @@ number). The 3.05 chart and the data are in [Results](docs/RESULTS.md#decode-by-
 
 Our own measurements of Halogen 0.18.14 and Gufo 0.22.0 on the same machine, with the same prompts and client, Oct 23 to 26,
 2026. The GPU clock was similar; in the prefill rows Halogen ran about 3% higher. Each value is the median of 2 rounds. Each
-Crucible value is the 4.05 pack and the Crucible build of that date (v0.26.0 or a build of Oct 25), older than v0.31.0. Bold marks the fastest.
+Crucible value is the 4.05 pack and the Crucible build of that date (v0.26.0 or a build of Oct 25), older than v0.32.0. Bold marks the fastest.
 
 | Row | Halogen 0.18.14 | Gufo 0.22.0 | Crucible, same run | Measured |
 |---|---:|---:|---:|---|
@@ -104,12 +106,12 @@ Crucible value is the 4.05 pack and the Crucible build of that date (v0.26.0 or 
 | Cold prefill, 32K, performance power profile (tok/s), Crucible build of Oct 25 | **2,121** | 1,843 | 1,870 | Oct 26 |
 
 Halogen leads one-session decode and cold prefill at equal bits. It stores the layers that mix the hidden streams in 6 bits, and
-its pack has 4.16 bits per weight. Crucible leads with 4 and 8 sessions. At equal bits (4.05), Halogen also leads decode with speculation on code (104.9 against 89.1 tok/s). The 3.05 pack has a lower KL divergence than the pack of Halogen (see below). All rows, dates, packs and the method are in [Rivals](docs/RIVALS.md). Newer versions exist (Halogen 0.18.18, Gufo v0.27.0, both Oct 29, 2026); we measured neither, and we did not measure the rival values again for v0.31.0. Thank you to the authors of Halogen and Gufo: their engines made this comparison possible.
+its pack has 4.16 bits per weight. Crucible leads with 4 and 8 sessions. At equal bits (4.05), Halogen also leads decode with speculation on code (104.9 against 89.1 tok/s). The 3.05 pack has a lower KL divergence than the pack of Halogen (see below). All rows, dates, packs and the method are in [Rivals](docs/RIVALS.md). Newer versions exist (Halogen 0.18.18, Gufo v0.27.0, both Oct 29, 2026); we measured neither, and we did not measure the rival values again for v0.32.0. Thank you to the authors of Halogen and Gufo: their engines made this comparison possible.
 
 ## Why Crucible
 
-- **The output is exact.** Speculative decoding changes the speed, not the tokens: the target model checks every draft token, and
-  only checked tokens commit. Batching, load and speculation depth do not change the tokens. Each speed change must give
+- Batching, cache state and speculation do not change the tokens of a request. Speculative decoding changes the speed, not the tokens: the target model checks every draft token, and
+  only checked tokens commit. Load and speculation depth do not change the tokens either. Each speed change must give
   byte-identical tokens on a fixed gate set before it merges ([exactness rules](docs/ARCHITECTURE.md#exactness-rules)).
   [Session replay](docs/SESSION_REPLAY.md) lists the cases in which a cache resume gives other tokens than a cold prompt.
 - **Quality per bit.** KL divergence from the 16-bit (BF16) model, on 896 text positions, scored by us on Oct 24 to 25, 2026 (lower is closer). Gufo 0.22.0
@@ -126,6 +128,8 @@ its pack has 4.16 bits per weight. Crucible leads with 4 and 8 sessions. At equa
   across a restart.
 
 ## Quick start
+
+**New machine?** Follow the [setup guide](docs/QUICKSTART.md): each step has a check, for a person or an LLM agent.
 
 ### Build
 
@@ -153,7 +157,7 @@ curl -sS http://127.0.0.1:8790/v1/chat/completions -H 'Content-Type: application
   -d '{"model":"crucible","messages":[{"role":"user","content":"Say hello."}],"temperature":0,"max_tokens":32}'
 ```
 
-With 4 sessions of 262K tokens and `--vision` on the 4.05 pack, set `CRUCIBLE_PF_LAUNCH_ROWS=8192+128`. The default (16384+128) grows the stage arena from 2,346 to 4,656 MiB.
+With 4 sessions of 262K tokens and `--vision` on the 4.05 pack, no launch-row setting is needed. The default (`16384+128`) fits 4 sessions of 262K with `--vision` on the 4.05 pack (stage arena 2,174 MiB); `8192+128` uses 1,439 MiB and gives a slower cold prefill.
 
 **Security.** The server binds to `127.0.0.1:8790`. `--host ADDRESS` selects another address and prints a warning when it is not
 loopback. The server has no authentication and no TLS. Do not expose it to a network.

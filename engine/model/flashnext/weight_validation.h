@@ -1,7 +1,10 @@
 // CPU-only validation must finish before device allocation or tensor conversion.
 #pragma once
+#include <filesystem>
+
 #include "../../exl3/safetensors.h"
 #include "../../exl3/decode_support.h"
+#include "bf16_half.h"
 #include "geometry.h"
 #include "load_plan.h"
 
@@ -31,6 +34,60 @@ inline int ValidateLinear(st::Checkpoint& ck, const std::string& p, int I, int O
   ck.ReadBytes(p + ".mul1", &marker, sizeof(marker));
   if (marker != 0x83DCD12D) ck.Error(p + ".mul1", "unsupported mul1 codebook constant");
   return K;
+}
+
+// The text that stops a --vision start on a checkpoint that stores the vision tower as plain HF tensors.
+// The EXL3 tower of the stock weights is the file vision_k6.safetensors of the quantized repo (server/vision.py has the same text).
+inline std::string VisionTowerMissingText() {
+  return "this checkpoint stores the vision tower as plain BF16 tensors (for example model.visual.blocks.0.attn.qkv.weight), "
+         "and the engine runs the EXL3 tower. Put the file vision_k6.safetensors in the model folder: "
+         "hf download turboderp/Qwen3.8-Flash-Next-exl3 vision_k6.safetensors --revision 4.05bpw_h6_ng6 --local-dir <model folder>. "
+         "The images are exact only when the weights of the HF tower are the stock weights; the engine does not compare them";
+}
+
+// True for a tower of plain HF tensors with no EXL3 tower beside it.
+inline bool VisionTowerIsHf(st::Checkpoint& ck, const std::string& P) {
+  return !ck.Has(P + "blocks.0.attn.q_proj.trellis") && ck.Has(P + "blocks.0.attn.qkv.weight");
+}
+
+// Empty when the tower can run. Reads the index only (no tensor header), so the server can ask before it loads the model.
+inline std::string VisionTowerFault(const std::string& dir) {
+  if (std::filesystem::exists(std::filesystem::path(dir) / "vision_k6.safetensors")) return "";
+  st::Checkpoint ck(dir);
+  return VisionTowerIsHf(ck, "model.visual.") ? VisionTowerMissingText() : "";
+}
+
+// The vision tower: fixed geometry and one EXL3 width for every linear.
+inline void ValidateVision(st::Checkpoint& ck, const std::string& P) {
+  if (VisionTowerIsHf(ck, P)) ck.Error(P + "blocks.0.attn.qkv.weight", VisionTowerMissingText());
+  int k = 0;
+  auto VisionHalf = [&](const std::string& n, const std::vector<int64_t>& shape) {
+    if (ck.Require(n, {"F16", "BF16"}, shape).dtype == "BF16") ReadHalfTensor(ck, n);
+  };
+  auto lin = [&](const std::string& n, int I, int O) {
+    const int kn = ValidateLinear(ck, n, I, O);
+    if (k && kn != k) ck.Error(n + ".trellis", "every vision linear must use the same EXL3 width");
+    if (kn < 3 || kn > 6) ck.Error(n + ".trellis", "vision GEMMs need EXL3 K3..6");
+    k = kn;
+    VisionHalf(n + ".bias", {O});
+  };
+  // The patch embedding and the biases are F16 for the kernels. A BF16 tensor is converted once at load
+  // (Loader::Concat16); this check reads it first, so a value that does not fit in F16 stops the load here.
+  VisionHalf(P + "patch_embed.proj.weight", {1152, 3, 2, 16, 16});
+  VisionHalf(P + "patch_embed.proj.bias", {1152});
+  ck.Require(P + "pos_embed.weight", {"F16", "BF16"}, {2304, 1152});
+  for (int i = 0; i < 27; ++i) {
+    const std::string B = P + "blocks." + std::to_string(i) + ".";
+    for (const char* n : {"attn.q_proj", "attn.k_proj", "attn.v_proj", "attn.proj"}) lin(B + n, 1152, 1152);
+    lin(B + "mlp.linear_fc1", 1152, 4352);
+    lin(B + "mlp.linear_fc2", 4352, 1152);
+    for (const char* n : {"norm1.weight", "norm1.bias", "norm2.weight", "norm2.bias"})
+      ck.Require(B + n, {"F16", "BF16"}, {1152});
+  }
+  lin(P + "merger.linear_fc1", 4608, 4608);
+  lin(P + "merger.linear_fc2", 4608, kHidden);
+  ck.Require(P + "merger.norm.weight", {"F16", "BF16"}, {1152});
+  ck.Require(P + "merger.norm.bias", {"F16", "BF16"}, {1152});
 }
 
 inline void ValidateHc(st::Checkpoint& ck, const std::string& p, bool inject) {

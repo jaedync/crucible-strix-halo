@@ -121,13 +121,15 @@ def number(value, field, low, high):
         raise ApiError(f"{field} must be a finite number in [{low},{high}].", field)
     return float(value)
 
-# Some clients (SillyTavern) send both penalties in every request. The engine has no penalty sampler, so only
-# "off" is accepted: 0 or null. The check keeps nothing, so the Request is the same as without the field.
-PENALTY_FIELDS = ("presence_penalty", "frequency_penalty")
+# Some clients (SillyTavern and other OpenAI-compatible clients) send a penalty in every request. The engine has no
+# penalty sampler, so only the neutral value is accepted: 0 for presence_penalty and frequency_penalty, 1 for
+# repetition_penalty, or null. The check keeps nothing, so the Request is the same as without the field.
+PENALTY_FIELDS = {"presence_penalty": 0, "frequency_penalty": 0, "repetition_penalty": 1}
 
 def penalty_off(value, field):
-    if value is not None and not (type(value) in (int, float) and value == 0):  # NaN is not equal to 0
-        raise ApiError(f"{field} must be 0. Crucible has no penalty sampler.", field)
+    neutral = PENALTY_FIELDS[field]
+    if value is not None and not (type(value) in (int, float) and value == neutral):  # NaN is not equal to neutral
+        raise ApiError(f"{field} must be {neutral}. Crucible has no penalty sampler.", field)
 
 def boolean(value, field):
     if type(value) is not bool:

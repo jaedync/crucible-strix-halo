@@ -121,13 +121,23 @@ An unknown key inside `chat_template_kwargs` or `stream_options` also returns HT
 The error names the object and the keys that the object accepts.
 The server refuses a field that it cannot apply instead of ignoring it, because the field could change the prompt.
 A field that another OpenAI-compatible server accepts can fail here.
-`presence_penalty` and `frequency_penalty` do not follow this rule.
-The server accepts them at `0` or null, and they have no effect.
-Any other value returns HTTP 400.
+`presence_penalty`, `frequency_penalty` and `repetition_penalty` do not follow this rule.
+The server accepts `presence_penalty` and `frequency_penalty` at `0` or null, and `repetition_penalty` at `1` or null.
+They have no effect. Any other value returns HTTP 400.
 The server refuses `response_format` and `user` at any value, so a client or a proxy must remove both before it
 sends the request.
 The thinking on/off field has one accepted name: `enable_thinking`.
 A different name, such as `think`, returns HTTP 400.
+
+A history message takes `role`, `content`, and `reasoning_content`.
+An assistant message also takes `tool_calls`. A tool message also takes `tool_call_id` and `name`.
+`reasoning` is an alias of `reasoning_content`, because LiteLLM, Hermes, and other engines name the field `reasoning`.
+Send one of the two, or the same text in both: the prompt is the same as for `reasoning_content` alone.
+An empty string or `null` in either field counts as absent, as proxies send `null` for unset fields.
+Two different non-empty texts return HTTP 400, because the server cannot know which text the client means.
+A value that is not a string, `null`, or empty also returns HTTP 400.
+A message field outside this list returns HTTP 400 with the message index, the role, and the field names, for example:
+`messages[2] (assistant) has unsupported fields: foo. This role accepts: content, reasoning, reasoning_content, role, tool_calls.`
 
 The server can drop thinking from a chat request that asks for it, so do not assume that `reasoning_content` is
 present.

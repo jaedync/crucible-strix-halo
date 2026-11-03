@@ -30,6 +30,12 @@ inline int Serve(const std::string& ckpt, const ServeSettings& settings) {
   static_assert(kPrefillAuto == kServePrefillAuto && kMaxPrefillRows == kServeMaxPrefillRows);
   const int ctx = settings.ctx;
   const size_t cache_budget = size_t(settings.cache_mib) << 20;
+  // A vision tower of plain HF tensors cannot run: say so before the model loads, not after.
+  if (settings.vision)
+    if (const std::string fault = crucible::VisionTowerFault(ckpt); !fault.empty()) {
+      std::fprintf(stderr, "serve error: --vision: %s\n", fault.c_str());
+      return 2;
+    }
   Engine eng(ckpt, ctx, settings.prefill_rows);
   // As in batch serve: a lazy compact MTP cache would fail on memory at a request, not at startup.
   try { eng.EnsureServeMtpCaches(); }

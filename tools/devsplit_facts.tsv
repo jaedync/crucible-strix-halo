@@ -41,6 +41,7 @@ _ZN8crucible11QsaSpanArgsERKNS_13PackedQsaArgsEj	2	any
 _ZN8crucible11QsaSpanArgsERKNS_7QsaArgsEj	2	any
 _ZN8crucible11QsaSpanBaseERKNS_13PackedQsaArgsEj	1	any
 _ZN8crucible11QsaSpanBaseERKNS_7QsaArgsEj	1	any
+_ZN8crucible12DraftQCenterEi	0	32:2:5
 _ZN8crucible12LinScaleLaneEPK6__halfiPS0_	1	any
 _ZN8crucible12MoeSgMidRowsILi8EEEvPKNS_6LinJobERS2_iii	2	32:-53687091:-2147483648
 _ZN8crucible12MoeSgMidRowsILi8EEEvPKNS_6LinJobERS2_iii	3	32:-134217728:134217728

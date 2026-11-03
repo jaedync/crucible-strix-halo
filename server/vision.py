@@ -8,7 +8,9 @@ import binascii
 from dataclasses import dataclass
 import hashlib
 import io
+import json
 import math
+from pathlib import Path
 import struct
 from .api import ApiError
 
@@ -34,8 +36,28 @@ MAX_IMAGE_TOKENS = 262144
 # of 2560x1440; each is often 1 to 2 MB of PNG, and base64 adds a third.
 VISION_BODY_MIB = 256
 VISION_BODY_MIB_MAX = 1024
+# A checkpoint that stores the tower as plain HF tensors. The same text is in engine/model/flashnext/weight_validation.h.
+TOWER_MISSING = (
+    "this checkpoint stores the vision tower as plain BF16 tensors (for example model.visual.blocks.0.attn.qkv.weight), "
+    "and the engine runs the EXL3 tower. Put the file vision_k6.safetensors in the model folder: "
+    "hf download turboderp/Qwen3.8-Flash-Next-exl3 vision_k6.safetensors --revision 4.05bpw_h6_ng6 --local-dir <model folder>. "
+    "The images are exact only when the weights of the HF tower are the stock weights; the engine does not compare them")
 DECODE_ERROR = "The image could not be decoded."
 ALLOWED_FORMATS = ("PNG", "JPEG", "WEBP", "GIF", "BMP")  # no EPS (Ghostscript) and no rare decoders
+
+
+def tower_fault(checkpoint):
+    """TOWER_MISSING when --vision cannot run on this folder, else None. Reads the index only; the engine checks the rest."""
+    folder = Path(checkpoint)
+    if (folder / "vision_k6.safetensors").exists():
+        return None
+    try:
+        names = json.loads((folder / "model.safetensors.index.json").read_text())["weight_map"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if "model.visual.blocks.0.attn.qkv.weight" in names and "model.visual.blocks.0.attn.q_proj.trellis" not in names:
+        return TOWER_MISSING
+    return None
 
 
 @dataclass(frozen=True)
