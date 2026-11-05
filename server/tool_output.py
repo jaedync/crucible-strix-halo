@@ -116,6 +116,10 @@ class ToolOutput:
         self.stream = ToolCallStream(request, self.definitions) if stream else None
         self.deltas = []
 
+    def open_call(self):
+        """True inside a <tool_call> block that the model has not closed yet."""
+        return self.calls_text is not None and self.calls_text.count(START) > self.calls_text.count(END)
+
     def take_deltas(self):
         """Tool-call deltas that are ready to send now (stream mode)."""
         deltas, self.deltas = self.deltas, []

@@ -183,6 +183,11 @@ def main():
                         help="Server default thinking budget. A request's own budget wins.")
     parser.add_argument("--stream-tool-calls", choices=("on", "off"), default="on",
                         help="Stream tool-call ids, names and string arguments as they are written (default on).")
+    parser.add_argument("--end-of-turn-guard", choices=("on", "off"), default="on",
+                        help="An end-of-turn token (<|im_end|>) that the model writes inside its reasoning (16 a reply) "
+                             "or inside an open tool call (4 a reply) is kept as text and generation goes on, as in "
+                             "Halogen. A model that quotes a chat template then does not end its reply there "
+                             "(default on; off: the token ends the reply, as before).")
     parser.add_argument("--max-requests-per-client", type=int, default=0, choices=range(0, 65), metavar="0..64",
                         help="Open completion requests per client address (0, the default: no limit). "
                              "All loopback clients share one address.")
@@ -394,7 +399,7 @@ def main():
                     default_thinking=args.default_thinking == "on", max_body_mib=args.max_body_mib,
                     thinking_answer_room=None if room == "auto" else int(room),
                     max_thinking_tokens=args.max_thinking_tokens, min_thinking_tokens=args.min_thinking_tokens,
-                    stream_tool_calls=args.stream_tool_calls == "on",
+                    stream_tool_calls=args.stream_tool_calls == "on", end_of_turn_guard=args.end_of_turn_guard == "on",
                     max_requests_per_client=args.max_requests_per_client, vision=vision,
                     default_mtp_prefix=args.mtp_window, capture=capture, allowed_hosts=allowed_hosts,
                     defaults=defaults, client_request_id_header=request_id_header)))

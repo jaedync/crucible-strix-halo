@@ -35,6 +35,7 @@ class CompletionResponse:
         self.think = ThinkSplitter(request.kind == "chat" and request.enable_thinking)
         self.reasoning_tokens = 0
         self.closed = None  # the ThinkCap when the server closed the think block
+        self.end_of_turn_kept = dict(reasoning=0, tool_call=0)  # http.keep_end_of_turn
         self.token_time = None
         self.headers_sent = False
 
@@ -124,6 +125,10 @@ class CompletionResponse:
                                                            reasoning_closed_by=self.closed.by)
         elif self.request.thinking_skipped_by:
             usage["completion_tokens_details"] = dict(reasoning_skipped_by=self.request.thinking_skipped_by)
+        kept = sum(self.end_of_turn_kept.values())
+        if kept:
+            # Halogen's field: end-of-turn tokens that the server wrote as text instead of ending the reply.
+            usage["completion_tokens_details"] = usage.get("completion_tokens_details", {}) | dict(end_of_turn_kept=kept)
         if "cached_tokens" in event:
             cached = event["cached_tokens"]
             if type(cached) is not int or not 0 <= cached <= self.prompt_count:

@@ -510,6 +510,13 @@ def tool_pass_line(request_id, streamed, calls, reasons):
                                                     reasons=sorted(set(reasons))))
 
 
+def end_of_turn_kept_line(request_id, where, completion_tokens, kept):
+    """The end-of-turn guard wrote an end-of-turn token as text (http.keep_end_of_turn): where it was ("reasoning"
+    or "tool_call"), the reply's output count after the text, and the count kept there so far. No model text."""
+    return "crucible_end_of_turn_kept " + json.dumps(dict(request_id=request_id, where=where,
+                                                           completion_tokens=completion_tokens, kept=kept))
+
+
 def request_line(first_turn, event, closed=None, cont_turn=None, cont_event=None):
     """The crucible_turn line of a request whose think block the server closed, or that the server logs itself.
 
