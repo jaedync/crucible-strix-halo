@@ -16,6 +16,7 @@ class ModelTokenizer:
         if content_special_tokens not in MODES:
             raise ValueError("content_special_tokens must be text or parse.")
         path = Path(checkpoint) / "tokenizer.json"
+        self.tokenizer_path = path
         self.tokenizer = Tokenizer.from_file(str(path))
         self.content = ContentEncoder(self.tokenizer, path) if content_special_tokens == "text" else None
         self.template = ChatTemplate(checkpoint)
@@ -120,6 +121,16 @@ class ModelTokenizer:
             body = self.tokenizer.encode(text + "\n", add_special_tokens=False).ids
         close = self.tokenizer.encode("\n\n", add_special_tokens=False).ids
         return tuple(body) + (self.tokenizer.token_to_id(THINK_END),) + tuple(close)
+
+    def end_of_turn_text_ids(self, token_id):
+        """The string of an end-of-turn token ("<|im_end|>") as plain characters, for the end-of-turn guard
+        (http.keep_end_of_turn). The text mode encodes that string so when a client sends it back in its history."""
+        cache = self.__dict__.setdefault("_end_of_turn_text", {})
+        if token_id not in cache:
+            content = getattr(self, "content", None) or ContentEncoder(self.tokenizer, self.tokenizer_path)
+            name = self.tokenizer.id_to_token(token_id)
+            cache[token_id] = tuple(content.text_tokenizer().encode(name, add_special_tokens=False).ids)
+        return cache[token_id]
 
     def remember_output(self, ids, message):
         """Text mode: remember which special-token strings of the returned answer and reasoning the model wrote as

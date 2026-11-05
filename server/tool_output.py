@@ -116,6 +116,27 @@ class ToolOutput:
         self.stream = ToolCallStream(request, self.definitions) if stream else None
         self.deltas = []
 
+    def open_call(self):
+        """True inside a <tool_call> block that the model has not closed yet. parse_calls ends a block at the first
+        </tool_call> after its start tag, whatever the arguments hold, so this walks that same structure: the start
+        tag inside an argument value (a path, a quoted template) does not open a block."""
+        text = self.calls_text
+        if text is None:
+            return False
+        pos = 0
+        while True:
+            while pos < len(text) and text[pos].isspace():
+                pos += 1
+            if pos == len(text):
+                return False
+            if not text.startswith(START, pos):
+                # Between calls: text that is not the start tag is not a block, but the model may be writing one.
+                return START.startswith(text[pos:])
+            end = text.find(END, pos + len(START))
+            if end < 0:
+                return True
+            pos = end + len(END)
+
     def take_deltas(self):
         """Tool-call deltas that are ready to send now (stream mode)."""
         deltas, self.deltas = self.deltas, []

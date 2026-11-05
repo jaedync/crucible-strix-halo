@@ -19,7 +19,7 @@ Other kernels and ROCm versions are not tested.
 ## Build
 
 ```sh
-docker build -t crucible:v0.33.0 .
+docker build -t crucible:v0.33.1 .
 ```
 
 The build needs no GPU. It clones the tag in `CRUCIBLE_VERSION` and runs `make engine` for gfx1151.
@@ -27,11 +27,11 @@ These build arguments change the defaults:
 
 | Argument | Default | Content |
 |---|---|---|
-| `CRUCIBLE_VERSION` | `v0.33.0` | The release tag to build |
+| `CRUCIBLE_VERSION` | `v0.33.1` | The release tag to build |
 | `BUILD_JOBS` | `1` | Parallel HIP compiles. Each compile needs some GB of RAM. |
 | `ROCM_IMAGE` | `docker.io/rocm/dev-ubuntu-24.04:7.2.4` | The base image of the build and the run |
 
-Example: `docker build --build-arg BUILD_JOBS=2 -t crucible:v0.33.0 .`
+Example: `docker build --build-arg BUILD_JOBS=2 -t crucible:v0.33.1 .`
 
 ## Model
 
@@ -47,7 +47,7 @@ docker run --rm \
   --security-opt seccomp=unconfined \
   -v "$CKPT":/models/pack:ro \
   -p 127.0.0.1:8790:8790 \
-  crucible:v0.33.0 \
+  crucible:v0.33.1 \
   /models/pack --host 0.0.0.0 --port 8790 --ctx 32768
 ```
 

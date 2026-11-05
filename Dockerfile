@@ -1,6 +1,6 @@
 # Container image of Crucible for gfx1151, built from a pinned release tag.
 # The image holds no model: mount an EXL3 pack as a volume (docs/DOCKER.md).
-ARG CRUCIBLE_VERSION=v0.33.0
+ARG CRUCIBLE_VERSION=v0.33.1
 ARG ROCM_IMAGE=docker.io/rocm/dev-ubuntu-24.04:7.2.4
 
 FROM ${ROCM_IMAGE} AS build

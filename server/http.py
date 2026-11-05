@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler
 from os.path import basename
 from traceback import extract_tb
 from . import anthropic, metrics
-from .api import DEFAULTS, LEGACY_MODEL, MTP_WINDOW, ApiError, validate_request
+from .api import DEFAULTS, LEGACY_MODEL, MTP_WINDOW, STOP_IDS, ApiError, validate_request
 from .hosts import REFUSED, host_allowed
 from .request_id import DEFAULT_CLIENT_REQUEST_ID_HEADER
 from .response import CompletionResponse
@@ -27,6 +27,12 @@ KEEPALIVE_SECONDS = 10
 FIRST_EVENT_SECONDS = 3600
 # Between the events of a running job; the engine watchdogs stop a stalled command sooner.
 NEXT_EVENT_SECONDS = 360
+# The end-of-turn guard (Halogen 0.13.4). The tokenizer has one token for <|im_end|>, so a model that
+# quotes a ChatML template in its reasoning writes the real end-of-turn token, and the reply ended there: finish
+# "stop", no content, no tool call. The guard keeps that token as its text and the model goes on, at most this many
+# times a reply in each place. Past the limit the token ends the reply as before. An end-of-turn token in the answer
+# itself, outside an open tool call, always ends the reply.
+END_OF_TURN_KEPT = dict(reasoning=16, tool_call=4)
 # Anthropic Messages token count (Claude-style clients and gateways ask it before each request; some add ?beta=true).
 COUNT_TOKENS_PATH = "/v1/messages/count_tokens"
 # RA-7: open connections at one time (one thread each), and the time to send the request head and body. The 30 s
@@ -82,8 +88,10 @@ class Service:
     def __init__(self, backend, tokenizer, model="crucible", clamp_max_tokens=False, default_thinking=False,
                  max_body_mib=1, thinking_answer_room=None, max_thinking_tokens=None, stream_tool_calls=True,
                  max_requests_per_client=0, vision=None, default_mtp_prefix=MTP_WINDOW, capture=None, allowed_hosts=None,
-                 defaults=DEFAULTS, min_thinking_tokens=0, client_request_id_header=DEFAULT_CLIENT_REQUEST_ID_HEADER):
+                 defaults=DEFAULTS, min_thinking_tokens=0, client_request_id_header=DEFAULT_CLIENT_REQUEST_ID_HEADER,
+                 end_of_turn_guard=True):
         self.backend, self.tokenizer, self.model = backend, tokenizer, model
+        self.end_of_turn_guard = end_of_turn_guard  # serve --end-of-turn-guard (see Handler.keep_end_of_turn)
         self.client_request_id_header = client_request_id_header  # request_id.resolve_client_request_id_header()
         self.allowed_hosts = allowed_hosts  # hosts.parse_allowed_hosts(): None accepts any Host header
         self.capture = capture  # serve --draft-capture: None unless the operator turns it on
@@ -543,17 +551,27 @@ def handler_for(service):
                     job, job_prompt, first_id = self.jobs[-1], resumed, len(output.ids)
                     event = self.wait_event(job, first=True)
                     continue
+                outcome = (self.keep_end_of_turn(request, prompt_ids, job_prompt, output, job, token, first_id,
+                                                 options, cap) if token in STOP_IDS else None)
+                if outcome == "ended":
+                    # The kept text matched the client's stop string: the reply ends here, as without the guard.
+                    self.end_stopped(cap, prompt_ids, output)
+                    return
+                if outcome == "continued":
+                    job, job_prompt, first_id = self.jobs[-1], prompt_ids + output.ids, len(output.ids)
+                    event = self.wait_event(job, first=True)
+                    continue
                 output.token(token, event.get("crucible_t"))
                 if getattr(request, "top_logprobs", 0) and "logprobs" in event:
                     output.scores = event["logprobs"]
-                if cap and not first_id and not output.think.thinking and getattr(job, "think_cap", None) is not None:
+                # A guard continuation (keep_end_of_turn) can carry the cap too, so this holds for any job.
+                if cap and not output.think.thinking and getattr(job, "think_cap", None) is not None:
                     # The model closed its own think block: no continuation comes, so the batch worker must not
                     # hold new chunks for one at the cap token.
                     job.think_cap = None
                 if output.stop_filter.stopped:
                     # The resident worker drains canceled jobs before its next request.
-                    self.log_turn(cap, prompt_ids, output, dict(finish_reason="stop"))
-                    output.finish(self.opened_count(dict(finish_reason="stop"), prompt_ids))
+                    self.end_stopped(cap, prompt_ids, output)
                     return
                 if cap and output.think.thinking and len(output.ids) == cap.tokens:
                     job_prompt = self.close_thinking(request, prompt_ids, output, cap, options)
@@ -576,12 +594,61 @@ def handler_for(service):
             think block before the cap, the answer goes on in a new job from the prompt and the output so far.
             Returns the new job's prompt, or None when the reply ends here."""
             room = request.max_tokens - len(output.ids)
-            if (first_id or getattr(job, "bounded_at", None) != len(output.ids) or room < 1 or output.think.thinking or
+            # bounded_at counts the job's own tokens; a guard continuation (keep_end_of_turn) starts at first_id.
+            bounded = getattr(job, "bounded_at", None)
+            if (bounded is None or first_id + bounded != len(output.ids) or room < 1 or output.think.thinking or
                     event.get("finish_reason") != "length"):
                 return None
             continuation = prompt_ids + output.ids
             self.jobs.append(service.backend.submit(continuation, replace(request, max_tokens=room), **options))
             return continuation
+
+        def end_stopped(self, cap, prompt_ids, output):
+            """End the reply on the client's stop string: the per-token check, and the kept text of the guard."""
+            self.log_turn(cap, prompt_ids, output, dict(finish_reason="stop"))
+            output.finish(self.opened_count(dict(finish_reason="stop"), prompt_ids))
+
+        def keep_end_of_turn(self, request, prompt_ids, job_prompt, output, job, token, first_id, options, cap):
+            """The end-of-turn guard (END_OF_TURN_KEPT). The model wrote an end-of-turn token inside its reasoning or
+            inside an open tool call: write the token's text instead and go on in a new engine job from the prompt
+            and the output so far.
+
+            "continued" means a new job carries the reply. "ended" means the kept text matched the client's stop
+            string, so the reply ends here. None means the token ends the reply as usual.
+
+            The engine stops a job on its stop IDs, so the token is the job's last one. The text is the token's
+            string encoded as plain characters, as the next turn encodes it when the client sends that text back.
+            """
+            if not getattr(service, "end_of_turn_guard", False) or request.kind != "chat":
+                return None
+            text_ids = getattr(service.tokenizer, "end_of_turn_text_ids", None)
+            where = ("reasoning" if output.think.thinking else
+                     "tool_call" if output.tools is not None and output.tools.open_call() else None)
+            if where is None or text_ids is None or output.end_of_turn_kept[where] >= END_OF_TURN_KEPT[where]:
+                return None
+            text = list(text_ids(token))
+            room = request.max_tokens - len(output.ids) - len(text)
+            # The cap closes the block at one exact count (complete()); text that passes it would skip that close.
+            if room < 1 or (cap and output.think.thinking and len(output.ids) + len(text) >= cap.tokens):
+                return None
+            done = self.wait_event(job)
+            if service.validate_event(done, output.ids + [token], len(job_prompt), request, first_id) is not None:
+                raise ApiError("The engine returned a token after an end-of-turn token.", status=500)
+            for piece in text:
+                output.token(piece)
+            output.end_of_turn_kept[where] += 1
+            turn = getattr(self.jobs[0], "turn", None)
+            metrics.emit(metrics.end_of_turn_kept_line(turn.get("request_id") if isinstance(turn, dict) else None,
+                                                        where, len(output.ids), output.end_of_turn_kept[where]))
+            if output.stop_filter.stopped:
+                # A client stop string that the kept text matched ends the reply, as it does on the token path.
+                return "ended"
+            follow = replace(request, max_tokens=room)
+            # The cap counts the output of the whole reply; a job counts its own tokens.
+            left = cap.tokens - len(output.ids) if cap and output.think.thinking else 0
+            self.jobs.append(service.backend.submit(prompt_ids + output.ids, follow, **options,
+                                                    **(dict(think_cap=left) if left > 0 else {})))
+            return "continued"
 
         def opened_count(self, event, prompt_ids):
             """event with the first job's restore as cached_tokens, for a reply with no done event of that job (a

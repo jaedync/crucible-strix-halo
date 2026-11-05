@@ -212,6 +212,29 @@ void Identical() {
   }
 }
 
+// A: a scoring request (top_logprobs, greedy, one token) that resumes at its End point reports the top-N of the
+// saved logits row, as the cold run did. The engine's logits buffer holds a later decode's row by then (on the GPU,
+// an auto scoring request after a 256-token greedy run of the same prompt gave the top-N of a later step).
+void ScoringAtEnd() {
+  Fixture f;
+  auto scored = Prompt(10, 1, 1);
+  scored.top_logprobs = 5;
+  std::vector<BatchEvent> cold;
+  f.Run(1, scored, &cold);
+  assert(cold.front().token && cold.front().logprobs.size() == 5 && !cold.back().end_resume);
+  // A greedy run of the same prompt resumes at the End point and decodes; its last step leaves another row.
+  const auto [plain, plain_done] = f.Run(2, Prompt(10, 1, 4));
+  assert(plain.size() == 4 && plain.front() == *cold.front().token && plain_done.end_resume);
+  assert(f.engine.last != std::vector<int>{*cold.front().token});
+  std::vector<BatchEvent> again;
+  const auto [ids, done] = f.Run(3, scored, &again);
+  assert(done.end_resume && ids == std::vector<int>{*cold.front().token});
+  assert(again.front().logprobs.size() == cold.front().logprobs.size());
+  for (size_t i = 0; i < cold.front().logprobs.size(); ++i)
+    assert(again.front().logprobs[i].id == cold.front().logprobs[i].id &&
+           again.front().logprobs[i].logprob == cold.front().logprobs[i].logprob);
+}
+
 // A: a deferred open reports the whole prompt; its prefill command publishes the first token with no cursor.
 void Deferred() {
   Fixture f;
@@ -1278,6 +1301,7 @@ int main() {
   MarginCutKeepsItsBuffer();
   ImageEndResume();
   Identical();
+  ScoringAtEnd();
   Deferred();
   Speculative();
   AffinityAndStage();

@@ -3,6 +3,51 @@
 Releases are numbered `v0.<train>.<fix>`. This file lists the newest release first.
 The same text is in the notes of each release on GitHub.
 
+## v0.33.1 (2026-11-05)
+
+Release v0.33.1 is a patch release of v0.33.0. It has two fixes and one server option that is on by default.
+The fixes are the end-of-turn guard and the top-N log-probabilities of a scoring request that the cache
+answers in full. Thanks @m-max for both reports and for the pull request.
+
+### Fixes
+
+- End-of-turn guard (thanks @m-max). A model can write an end-of-turn token (`<|im_end|>` or
+  `<|endoftext|>`) inside its reasoning or inside a tool call, for example when it quotes a chat template. The reply
+  then ended at once, with finish reason `stop`, no content and no tool call. The server now keeps that token as plain
+  text and the model goes on. The limit is 16 times for each reply in the reasoning and 4 times for each reply in a
+  tool call. After the limit the token ends the reply as before, and an end-of-turn token in the answer itself always
+  ends the reply. The guard acts on chat requests only, not on `/v1/completions`, and not when the kept text would pass
+  the thinking cap or leave no room for the reply. Each kept token starts a new engine job, so on a busy server a kept
+  token can add a short delay (not measured). The option is `--end-of-turn-guard on|off` (default on); `off` gives the old behavior. The count of kept tokens is in
+  `usage.completion_tokens_details.end_of_turn_kept`, and each kept token writes one `crucible_end_of_turn_kept` line
+  to stderr with no model text. Two fixes to the pull request are in this release. A tool call whose argument holds a
+  call tag, such as a path or a quoted template, no longer looks open after it closes. A `stop` string of the client
+  that the kept text matches now ends the reply.
+- Scoring log-probabilities on a cache hit (thanks @m-max). A `/v1/completions` request with `logprobs` or
+  `top_logprobs` (`max_tokens` 1, temperature 0) whose whole prompt the cache answered returned the top-N list of a
+  later decode step, not of the end of the prompt. The token was right, the list and the value of the chosen token
+  were wrong. The engine now reads the saved row of the prompt end. Every release since v0.26.0 has this fault.
+  A request that the cache does not answer in full, a chat request and a sampled request were not affected.
+  On an older release, send `cache_control` `bypass` with the scoring request. This release fixes the top-N list only.
+  The token difference after a session replay stays a documented limit (`docs/SESSION_REPLAY.md`).
+- The `Dockerfile` default release tag and the build lines in `docs/DOCKER.md` are v0.33.1.
+
+### Speed
+
+- This release has no new speed numbers. The numbers in the [README](README.md) tables and charts are the v0.33.0
+  numbers. The one engine change reads a saved row on the path of a temperature 0 request that asks for
+  log-probabilities, and no other request runs it. The guard runs in the server and acts only on an end-of-turn token.
+  This release changes no prefill or decode arithmetic. We did not run a new speed measurement for it.
+
+### Checks
+
+- A token gate of a test build with the scoring fix, against the engine of daily use, gave byte-identical greedy tokens on
+  both packs (4.05 and 3.05). The same test build gave the same top-N list for a cache hit and for a `bypass` request
+  on two synthetic prompts. The engine source of that test build is the same as in this release, except the version
+  string. The numbers are results of that test binary, not of the build of this release.
+- `make test-cpu` passes on the export tree and `make test-fast` on the private tree. The export scan with gitleaks
+  reports no finding.
+
 ## v0.33.0 (2026-11-04)
 
 Release v0.33.0 is the engine of train 33. It follows v0.32.0.

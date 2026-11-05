@@ -490,6 +490,18 @@ code in `usage.tool_call_invalid` (for example `incomplete_call`, `parameter_tag
 If deltas of a call already went out, the stream ends with `finish_reason` `length`, not `stop`.
 Clients such as Pi then do not run the partial call. Pi sends the model an error result and asks it to issue the call again.
 
+The end-of-turn guard (`--end-of-turn-guard on`, the default) handles a model that writes an end-of-turn token
+(`<|im_end|>` or `<|endoftext|>`) inside its reasoning or inside an open tool call, for example when it quotes a chat
+template. The server keeps that token as plain text and the model goes on. This happens at most 16 times in the
+reasoning and 4 times in a tool call for each reply. After that limit the token ends the reply as before. An
+end-of-turn token in the answer itself always ends the reply. The guard acts on chat requests only, not on
+`/v1/completions`. It does not act when the kept text would pass the thinking cap or leave no room for the reply
+(`max_tokens`); the token then ends the reply as before. The kept tokens are counted in
+`usage.completion_tokens_details.end_of_turn_kept` and each one writes a `crucible_end_of_turn_kept` line to stderr,
+with no model text. A client `stop` string that the kept text matches ends the reply. Each kept token starts a new
+engine job, so on a busy server a kept token can add a short delay (not measured). Use `--end-of-turn-guard off` for
+the old behavior: the token ends the reply.
+
 The client must execute each function and send one tool result for each call ID.
 Include the assistant message and its `tool_calls` before these results.
 Use `{"role":"tool","tool_call_id":"call_...","content":"42"}` for a result.

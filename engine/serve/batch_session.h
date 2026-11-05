@@ -1732,13 +1732,14 @@ class BatchSession {
                                              std::move(outputs)});
     return true;
   }
-  // `saved`: the row's logits, copied already (fix A); else they are copied from the engine's row `row`.
+  // `saved`: the row's logits, copied already (fix A); else they are copied from the engine's row `row`. An End
+  // resume runs no row, so the engine's buffer then holds a later step's logits: the saved row is the only source.
   int Sample(Request& state, int greedy, int row, const std::shared_ptr<const std::vector<float>>& saved = nullptr) {
     if (state.options.sampling.temperature == 0) {
       if (greedy < 0 || greedy >= kVocab) throw std::runtime_error("engine returned an invalid token ID");
       if (state.options.top_logprobs) {
         // The row the sampler would copy. The token stays the device's greedy ID; the event carries both.
-        state.top = TopLogprobs(engine_.CopyLogits(1, row), state.options.top_logprobs);
+        state.top = TopLogprobs(saved ? *saved : engine_.CopyLogits(1, row), state.options.top_logprobs);
       }
       return greedy;
     }
