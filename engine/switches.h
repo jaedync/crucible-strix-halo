@@ -84,6 +84,7 @@ inline constexpr SwitchInfo kSwitches[] = {
   {"CRUCIBLE_PF_STAGE_SHARE", K::kLayout, "on", "runtime", 0, 20, SR, "0: separate prefill stage arenas"},
   {"CRUCIBLE_PF_TILES", K::kExactSpeed, "auto", "exl3", 0, 20, SR, "prefill GEMM tiles: six integers"},
   {"CRUCIBLE_PLE_BF16", K::kProfile, "unset", "model", 129, 24, SR, "BF16 n-gram table of the original weights (file, read only; needs CRUCIBLE_PLE_HOST=1)"},
+  {"CRUCIBLE_PLE_FETCH", K::kExactSpeed, "0", "model", 0, 20, SR, "PLE host gather reads (needs CRUCIBLE_PLE_HOST=1): 1 hints every page of a gather in blocks of 64 rows with 2 blocks in flight per part (a plain gather hints a page once, so a hinted page that the kernel evicted is read by one synchronous fault at a time); 2 also splits gathers of 160 rows or more over the 16 gather parts; same bytes"},
   {"CRUCIBLE_PLE_HOST", K::kLayout, "0", "model", 0, 20, SR, "1: PLE table on the host (the long profiles set it)"},
   {"CRUCIBLE_PLE_TRACE", K::kDiagnostic, "off", "model", 0, 0, SR, "PLE host gather timings on stderr"},
   {"CRUCIBLE_PROFILE", K::kDiagnostic, "off", "cli", 0, 0, SR, "stage timings on stderr"},

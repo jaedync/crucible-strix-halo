@@ -7,6 +7,16 @@
 // the row size: a row can cross a page edge, and the hints cover both pages.
 // The file must stay unchanged while the engine runs: a truncated file makes a
 // later row read fail with SIGBUS, and a rewritten file changes the rows.
+//
+// CRUCIBLE_PLE_FETCH (SetFetch, default 0): the batched read of a new prompt's rows
+// A plain gather hints a page only the first time it
+// sees it; a page that was hinted once and later evicted is then read by a
+// synchronous fault, one at a time (62 us on the test machine NVMe, 110 us on the test machine), which is
+// the 45 ms that a new 30 token prompt waits. Mode 1 hints every page of the gather
+// (a hint on a resident page costs 0.4 us) in blocks, so the reads of the next block
+// are in flight while the rows of this block are copied. Mode 2 also splits a gather
+// of 160 rows or more over the 16 gather parts, so the reads and the copies run in
+// parallel even when a hint does not queue a read. The copied bytes are the same.
 #pragma once
 #include <fcntl.h>
 #include <pthread.h>
@@ -108,9 +118,20 @@ class PleHostTable {
   static constexpr int kParts = 16;
   static constexpr size_t kPoolRows = 1024;
   static constexpr size_t kPage = 4096;
+  // Fetch modes: a part hints kFetchAhead blocks of kFetchBlock rows before it copies the first, then one block per
+  // copied block. At most kParts x kFetchAhead x kFetchBlock = 2,048 rows (up to 2 pages each, for a row on a page
+  // edge) are in flight at any time. A plain gather has every page of its slice in flight. Mode 2 splits gathers of
+  // kFetchParMin rows (10 tokens) or more; decode and verify gathers (up to 8 tokens) stay on one thread.
+#ifdef PLE_FETCH_BLOCK_FOR_BENCH  // bench/ple_cold_probe.cpp sweeps the block size at build time
+  static constexpr size_t kFetchBlock = PLE_FETCH_BLOCK_FOR_BENCH;
+#else
+  static constexpr size_t kFetchBlock = 64;
+#endif
+  static constexpr size_t kFetchAhead = 2;
+  static constexpr size_t kFetchParMin = 160;
 
   PleHostTable(const std::string& path, size_t row_bytes, std::vector<PleSegment> segments)
-      : row_(row_bytes) {
+      : row_(row_bytes), path_(path) {
     if (row_bytes == 0 || segments.empty()) throw std::invalid_argument("PLE host table geometry is empty");
     const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) throw std::runtime_error("cannot open PLE table " + path + ": " + std::strerror(errno));
@@ -164,8 +185,29 @@ class PleHostTable {
   PleHostTable& operator=(const PleHostTable&) = delete;
 
   // Diagnostic sums over all parts since construction (nanoseconds, pages).
-  struct Stats { std::atomic<uint64_t> hint_ns{0}, copy_ns{0}, fresh_pages{0}; };
+  // max_ahead_rows: the most rows that a fetch part hinted and had not yet copied. major_faults: major faults of the
+  // gather threads while they copy (a plain gather counts the copy phase only).
+  struct Stats {
+    std::atomic<uint64_t> hint_ns{0}, copy_ns{0}, fresh_pages{0}, major_faults{0}, max_ahead_rows{0};
+  };
   Stats& stats() { return stats_; }
+
+  // 0: plain gather (default); 1: hint every page in blocks; 2: also split gathers of kFetchParMin rows or more.
+  void SetFetch(int mode) {
+    if (mode < 0 || mode > 2) throw std::invalid_argument("PLE fetch mode must be 0, 1 or 2");
+    fetch_.store(mode, std::memory_order_relaxed);
+  }
+  int Fetch() const { return fetch_.load(std::memory_order_relaxed); }
+
+  // Tests and benches only: unmaps the file's pages from this process and drops the clean page-cache pages of
+  // this one file (POSIX_FADV_DONTNEED), so the next read is cold. The engine never calls it.
+  void EvictForTest() {
+    madvise(const_cast<uint8_t*>(base_), size_, MADV_DONTNEED);
+    const int fd = open(path_.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    close(fd);
+  }
 
   int64_t Rows() const { return rows_; }
   size_t Segments() const { return segs_.size(); }
@@ -219,6 +261,11 @@ class PleHostTable {
   void Gather(const int64_t* rows, size_t n, uint8_t* out) {
     for (size_t i = 0; i < n; ++i)
       if (rows[i] < 0 || rows[i] >= rows_) throw std::out_of_range("PLE row index is out of range");
+    const int fetch = Fetch();
+    if (fetch > 0) {
+      GatherFetch(rows, n, out, fetch);
+      return;
+    }
     // A major fault means the kernel evicted a page that we had hinted once.
     // Forget all hints, so the next gathers queue their reads again.
     if (stale_.exchange(false, std::memory_order_relaxed))
@@ -238,6 +285,57 @@ class PleHostTable {
     const auto it = std::upper_bound(segs_.begin(), segs_.end(), r,
                                      [](int64_t v, const PleSegment& s) { return v < s.first_row; }) - 1;
     return it->file_offset + size_t(r - it->first_row) * row_;
+  }
+
+  void GatherFetch(const int64_t* rows, size_t n, uint8_t* out, int mode) {
+    const bool split = n >= kPoolRows || (mode >= 2 && n >= kFetchParMin);
+    if (!split) {
+      FetchPart(rows, 0, n, out);
+      return;
+    }
+    if (!pool_) pool_ = std::make_unique<GatherPool>(kParts - 1);
+    const int parts = pool_->Parts();
+    pool_->Run([&](int k) { FetchPart(rows, n * k / parts, n * (k + 1) / parts, out); });
+  }
+
+  void HintRow(int64_t r) const {
+    const size_t o = Offset(r);
+    const size_t p0 = o / kPage, p1 = (o + row_ - 1) / kPage;
+    madvise(const_cast<uint8_t*>(base_) + p0 * kPage, (p1 - p0 + 1) * kPage, MADV_WILLNEED);
+  }
+
+  // Rows [b, e): every page is hinted (no seen filter), kFetchAhead blocks ahead of the copy. A page that is
+  // resident, or already queued, costs one cheap call; a page that was evicted is read again, in flight with the
+  // others, so the copy takes minor faults on pages whose read is queued. Without out, only the hints are sent.
+  void FetchPart(const int64_t* rows, size_t b, size_t e, uint8_t* out) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const long major0 = out ? MajorFaults() : 0;
+    std::chrono::steady_clock::duration hint_time{};
+    size_t hinted = b;
+    auto hint_to = [&](size_t upto) {
+      const auto h0 = std::chrono::steady_clock::now();
+      for (; hinted < upto; ++hinted) HintRow(rows[hinted]);
+      hint_time += std::chrono::steady_clock::now() - h0;
+    };
+    if (!out) {
+      hint_to(e);
+      stats_.fresh_pages += e - b;
+      return;
+    }
+    uint64_t max_ahead = 0;
+    for (size_t s = b; s < e; s += kFetchBlock) {
+      hint_to(std::min(e, s + kFetchAhead * kFetchBlock));
+      max_ahead = std::max<uint64_t>(max_ahead, hinted - s);
+      const size_t end = std::min(e, s + kFetchBlock);
+      for (size_t i = s; i < end; ++i) std::memcpy(out + i * row_, base_ + Offset(rows[i]), row_);
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    stats_.major_faults += MajorFaults() - major0;
+    stats_.hint_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(hint_time).count();
+    stats_.copy_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0 - hint_time).count();
+    stats_.fresh_pages += e - b;
+    uint64_t seen = stats_.max_ahead_rows.load(std::memory_order_relaxed);
+    while (max_ahead > seen && !stats_.max_ahead_rows.compare_exchange_weak(seen, max_ahead)) {}
   }
 
   // The first touch of a page queues its read with MADV_WILLNEED, so one thread
@@ -261,7 +359,10 @@ class PleHostTable {
     if (!out) return;
     const long major = MajorFaults();
     for (size_t i = b; i < e; ++i) std::memcpy(out + i * row_, base_ + Offset(rows[i]), row_);
-    if (MajorFaults() != major) stale_.store(true, std::memory_order_relaxed);
+    if (const long faults = MajorFaults() - major) {
+      stale_.store(true, std::memory_order_relaxed);
+      stats_.major_faults += faults;
+    }
     const auto t2 = std::chrono::steady_clock::now();
     stats_.hint_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
     stats_.copy_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
@@ -320,7 +421,8 @@ class PleHostTable {
       }
       piece.erase(std::remove_if(piece.begin(), piece.end(), [&](int64_t r) { return r < 0 || r >= rows_; }),
                   piece.end());
-      Part(piece.data(), 0, piece.size(), nullptr);
+      if (Fetch() > 0) FetchPart(piece.data(), 0, piece.size(), nullptr);
+      else Part(piece.data(), 0, piece.size(), nullptr);
     }
   }
 
@@ -331,6 +433,8 @@ class PleHostTable {
   };
 
   const size_t row_;
+  std::string path_;
+  std::atomic<int> fetch_{0};
   size_t size_ = 0;
   int64_t rows_ = 0;
   std::vector<PleSegment> segs_;

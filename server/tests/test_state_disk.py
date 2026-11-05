@@ -426,6 +426,79 @@ class StateDiskTest(unittest.TestCase):
             clock[0] += 1
             self.assertTrue(backend._staged(job))
 
+    def test_a_slot_wait_does_not_use_up_the_time_of_a_read_that_starts_late(self):
+        """a long turn waited about 90 s for a slot while the engine said
+        "reading" ("freeing": the read had no host room yet). The read started when the slot freed, but _staged counted
+        the 90 s against STAGE_WAIT_SECONDS and let the turn open in the same poll. The open then found no ready state
+        (Lookup miss, not_saved), the read ended 0.5 s later and expired unused, and the turn prefilled cold. The wait for
+        a read that is in flight must start when the turn has a free slot (and when the read starts), not at the first
+        "reading" reply."""
+        clock = [0.0]
+        started = []
+
+        def state(payload=None):
+            if clock[0] < 100: return batch_backend.StageReply("reading", "freeing", 100000)  # no room for the read yet
+            if not started: started.append(clock[0])
+            return batch_backend.StageReply("ready" if clock[0] - started[0] >= 0.5 else "reading",
+                                            "start" if clock[0] == started[0] else "-", 100000)
+
+        clock[0] = 0.0
+        backend, job, opened = self.waiting_backend(state, clock)
+        backend._stage = lambda payload, *args: state(payload)
+        with patch.object(batch_backend.time, "monotonic", side_effect=lambda: clock[0]):
+            while clock[0] < 100:  # no free slot: only _stage_ahead polls
+                self.assertFalse(backend._admit())
+                clock[0] += 0.5
+            backend.free_contexts.append(40000)
+            while not opened and clock[0] < 200:
+                backend._admit()
+                clock[0] += 0.05
+        self.assertTrue(opened)
+        self.assertEqual(job.turn["state_disk"], "ready")  # the turn opened on the finished read, not beside it
+        self.assertLess(opened[0] - 100, 2)
+
+    def test_a_none_reply_wait_does_not_use_up_the_time_of_a_read_that_starts_late(self):
+        """The journal of req 1468 (Nov 2, 15:21:34 to 15:22:37): the stage replies were "none" with reason
+        "protected" every 5.5 s for 62 s (the host cache refused room for the read), then "reading" with reason
+        "start" at the moment the slot freed. `since` was the time of the first reply, so the same poll opened the turn
+        (91.5 s after its first poll). The read ended 0.47 s later and expired unused; the turn prefilled cold."""
+        clock = [0.0]
+        started = []
+
+        def state(payload=None):
+            if clock[0] < 100: return batch_backend.StageReply("none", "protected", 100000)
+            if not started: started.append(clock[0])
+            return batch_backend.StageReply("ready" if clock[0] - started[0] >= 0.5 else "reading",
+                                            "start" if clock[0] == started[0] else "-", 100000)
+
+        backend, job, opened = self.waiting_backend(state, clock)
+        backend._stage = lambda payload, *args: state(payload)
+        with patch.object(batch_backend.time, "monotonic", side_effect=lambda: clock[0]):
+            while clock[0] < 100:
+                self.assertFalse(backend._admit())
+                clock[0] += 0.5
+            backend.free_contexts.append(40000)
+            while not opened and clock[0] < 200:
+                backend._admit()
+                clock[0] += 0.05
+        self.assertTrue(opened)
+        self.assertEqual(job.turn["state_disk"], "ready")
+        self.assertLess(opened[0] - 100, 2)
+
+    def test_a_read_that_never_starts_still_ends_the_wait(self):
+        """The bound stays: a turn with a free slot waits at most 2 * STAGE_WAIT_SECONDS for a read that never ends,
+        so one stuck read cannot hold the FIFO (batch_backend._admit) for good."""
+        clock = [0.0]
+        backend, job, opened = self.waiting_backend(lambda payload=None: "reading", clock)
+        backend.free_contexts.append(40000)
+        with patch.object(batch_backend.time, "monotonic", side_effect=lambda: clock[0]):
+            while not opened and clock[0] < 500:
+                backend._admit()
+                clock[0] += 0.05
+        self.assertTrue(opened)
+        self.assertLessEqual(opened[0], 2 * batch_backend.STAGE_WAIT_SECONDS + 1)
+        self.assertGreater(opened[0], batch_backend.STAGE_WAIT_SECONDS - 1)
+
     def test_stop_fits_the_service_stop_time(self):
         """A service unit stops with TimeoutStopSec=120. The engine flushes for at most 75 s, the server
         waits a little longer, then kills it (a tier engine waits after SIGTERM)."""

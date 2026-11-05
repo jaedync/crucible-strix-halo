@@ -560,21 +560,31 @@ class BatchedEngineBackend(EngineBackend):
                 (record["state"] == "ready" and now - record["polled"] >= STAGE_REFRESH_SECONDS) or
                 (record["state"] == "none" and now - record["polled"] >= none_poll)):
             state, reason, tokens, tag = self._stage(job.payload, position, read, self._job_tag(job))
-            if record is None: record = self.staging[id(job)] = dict(state=state, since=now, polled=now)
+            if record is None: record = self.staging[id(job)] = dict(state=state, since=now, polled=now, wait_from=now,
+                                                                    reason=reason, slot_from=None)
             else:
                 # The engine dropped the ready read and reads it again (a "reading" reply after "ready" or after a
                 # gap in the polls): a new wait.
                 if state == "reading" and (record["state"] == "ready" or
                                            now - record["polled"] >= STAGE_REFRESH_SECONDS):
-                    record["since"] = now
-                record.update(state=state, polled=now)
+                    record["since"] = record["wait_from"] = now
+                # the bound of the wait counts from the start of this read, not from the first "reading"
+                # reply (a turn that waits for a slot polls "reading"/"freeing" for minutes while the read has no
+                # room): a new reply reason is progress (writing, freeing, start), as is the first poll of a turn that
+                # holds a free slot. A turn with a free slot waits at most 2 * STAGE_WAIT_SECONDS.
+                if state != "reading" or record["state"] != "reading" or record["reason"] != reason:
+                    record["wait_from"] = now
+                record.update(state=state, polled=now, reason=reason)
             job.turn["state_disk"] = state
             job.turn["state_disk_wait_s"] = now - record["since"]
             job.turn["state_disk_reason"] = reason
             job.turn["state_disk_polls"] = job.turn.get("state_disk_polls", 0) + 1
             job.turn["state_disk_tokens"] = tokens
             if tag: job.turn["state_disk_tag"] = tag
-        return record["state"] != "reading" or now - record["since"] > STAGE_WAIT_SECONDS
+        if opening and record["slot_from"] is None and record["state"] == "reading":
+            record["slot_from"], record["wait_from"] = now, now
+        return record["state"] != "reading" or (now - record["wait_from"] > STAGE_WAIT_SECONDS or
+                                                (record["slot_from"] is not None and now - record["slot_from"] > 2 * STAGE_WAIT_SECONDS))
 
     def _job_tag(self, job):
         """Fix 2 (cause.md item 10): the turn's tag on the engine's stage and host_evict lines and on its turn line

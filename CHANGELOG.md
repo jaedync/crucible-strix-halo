@@ -3,6 +3,74 @@
 Releases are numbered `v0.<train>.<fix>`. This file lists the newest release first.
 The same text is in the notes of each release on GitHub.
 
+## v0.33.0 (2026-11-04)
+
+Release v0.33.0 is the engine of train 33. It follows v0.32.0.
+It has one speed option, one speed change for a second chat, and three fixes. The option is a read hint for the n-gram
+(PLE) table when the table is in host memory. The change for a second chat is the late copy of the shared header point.
+The fixes are the start-time memory message, a reply with no tokens in the vision check, and the fixed-state size on the
+start line. The two draft switches and the smaller arena of v0.32.0 are in this release too.
+
+### Speed
+
+- `CRUCIBLE_PLE_FETCH=1` (opt-in, default 0; needs `CRUCIBLE_PLE_HOST=1`) adds a read hint to the host gather of the n-gram
+  table. The bytes are the same. In the runs by context length (Nov 3, 2026, same tool and prompts, public files) the rate
+  against v0.32.0 changes by +1.5% to +2.6% for prefill and by +1.7% to +2.9% for decode on the 3.05 pack, at every length
+  from 32K to 250K. On the 4.05 pack prefill changes by -1.8% to +1.9% and decode by -3.2% to +0.4%; prefill reads 1.2%
+  higher at 32K and 1.8% lower at 192K, and decode reads equal at 32K and 3.2% lower at 250K. The two runs are on the same
+  day but not in one session, so we do not claim a gain or a loss on that pack.
+- The late copy of the shared header point lets a second cold chat use the header point of its first block, also when
+  the server runs several slots. It acts only with `CRUCIBLE_EXACT_RESUME=1`. A night run of Nov 1 to 2, 2026 measured a
+  test build of Nov 1, 2026 with this change against the train 32 engine, both with `CRUCIBLE_EXACT_RESUME=1`. All of
+  its checks passed: the token gates on both packs, the exact-extend load, short and long groups on both packs, and 4
+  pairs of the burst and sequential times to first token, pooled at 0.927 of the old build (7.3% lower). These are
+  numbers of that test build, not of the build of this release. The runs by context length did not set
+  `CRUCIBLE_EXACT_RESUME`, so the tables and the charts do not include this change.
+- The v0.33.0 column of the [README](README.md) tables and the charts is the release ladder and the runs by context
+  length, measured Nov 3, 2026 on the build of this release, balanced power profile (GPU clock 2,289 to 2,295 MHz for
+  the ladder), with the public files and no tuned draft head file.
+  The v0.32.0 column of the same tables is the ladder run of Nov 3, 2026. It has no 4-session value on the 4.05 pack
+  (one session of each run stopped early) and one run on the 3.05 pack. The runs use `CRUCIBLE_DRAFT_HEAD=q2`,
+  `CRUCIBLE_DRAFT_CHAIN=hc8,lead` and `CRUCIBLE_PF_LAUNCH_ROWS=16384+128`, as v0.32.0 did.
+- The engine of this release adds the mem-error text, the fixed-state field and the HF vision loader after the chart
+  binary was built. These changes act at start or at load and change no prefill or decode arithmetic.
+
+### Exactness and checks
+
+- The output tokens of a request do not change with the PLE read hint: it reads the same table bytes. The late copy of
+  the header point keeps the exact state (296 rows restored in both packs of the night run) and the token gates and
+  exact-extend groups passed on both packs.
+- The engine of this release is the build that our own server ran in daily use on Nov 4, 2026, plus the start-time
+  and load changes named under Speed. We publish after that day.
+- `make test-cpu` passes on the export tree and `make test-fast` on the private tree. The export scan with gitleaks reports no finding.
+
+### Fixes
+
+- The start-time memory refusal names the free host and device memory, the size of the state that does not fit, and a
+  setting that the same check accepts. The example is a 1-stream 256K request in Docker (8.5 GiB free, 9 GiB reserve):
+  the message now says that all of the state is already allocated, and that a lower `--streams` or `--ctx` cannot help.
+  The accept or refuse decision does not change.
+- The vision token check fails only a reply with no tokens. A reply that ends with a natural stop after a few tokens no
+  longer fails the check.
+- The compact-state start line prints the fixed part of one slot's state as `fixed_state_bytes=<n>`, after
+  `logical_state_bytes`. The field carries sizes only, never request content. A dashboard can draw the KV band and the
+  recurrent band separately.
+- A `Dockerfile` builds the engine for gfx1151 from a pinned release tag and installs the HTTP server; the image
+  holds no model. `docs/DOCKER.md` lists the tested versions and the run line.
+- `tests/draft_tally_test.cpp` compiles with g++ 13 and glibc 2.39 (Ubuntu 24.04). The compiler read the comma in the
+  compared type as a second macro argument. A second pair of parentheses keeps the argument whole, and the test checks the
+  same thing. This is a test-only fix, with no change to the engine. The public CPU tests job failed on this line
+  (thanks @m-max).
+- The cache rule in `docs/ARCHITECTURE.md` names its exception: a turn that resumes from the
+  answer of an earlier turn (session replay) keeps the rows that the decode path wrote for that answer, so a later
+  restore of that session is not bitwise equal to a cold prefill. A hit on a snapshot or a block entry
+  still gives the same bits as a miss. Docs only (thanks @m-max).
+
+### Measurements
+
+The speed numbers above are on one machine (Strix Halo, 128 GB) with the balanced power profile and the same tool as
+v0.32.0. The tables for both packs, with the run counts and the GPU clock, are in `docs/RESULTS.md`.
+
 ## v0.32.0 (2026-11-03)
 
 Release v0.32.0 is the engine of train 32. It follows v0.31.0.

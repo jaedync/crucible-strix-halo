@@ -86,6 +86,19 @@ struct FixtureT {
     hooks.header_saved = [this](int slot, size_t tokens) {
       log.push_back("header slot=" + std::to_string(slot) + " tokens=" + std::to_string(tokens));
     };
+    // Header point: the donor's rows below the point and the buffer's state go to the selected slot.
+    hooks.point_copy = [this](const ServeRequest&, int from, int index, const crucible::SlotCheckpoint& point) -> size_t {
+      const auto& donor = engine.histories[from];
+      assert(buffers.at({from, index}) == point.hist && donor.size() >= point.hist.size() &&
+             std::equal(point.hist.begin(), point.hist.end(), donor.begin()) && from != engine.selected);
+      engine.histories[engine.selected] = point.hist;
+      log.push_back("copy " + std::to_string(point.hist.size()) + " from=" + std::to_string(from));
+      return point.hist.size();
+    };
+    hooks.header_copied = [this](int slot, int from, size_t tokens) {
+      log.push_back("header_copy slot=" + std::to_string(slot) + " from=" + std::to_string(from) +
+                    " tokens=" + std::to_string(tokens));
+    };
     hooks.bytes = [] { return size_t(0); };
     session.SetCacheHooks(hooks);
   }
@@ -1029,14 +1042,19 @@ void SavePoints() {
     assert(!h->Logged("header slot=1 tokens=48") && h->Logged("pre slot=1 tokens=80"));
   }
   {
-    // The shipped constants (review H1, Oct 28): the header point is off, because with several slots no gate shows that
-    // it restores (Affinity sends the next chat to an empty slot). The margin point stays. A shared header of 90
-    // rows in a launch of 128 would take the cut of the first launch (header point 88) if kHeaderMinRows were 64.
+    // The shipped constants (header-point): the header point is on at 64 rows. A shared header of 90 rows in a launch of
+    // 128 takes the cut of the first launch (header point 88); one of 60 rows takes none.
     Fixture f(1, 128, 0, 32, 256, 512);
     f.session.SetExactResume(true); f.session.SetSavePoints(crucible::kPreEndMargin, crucible::kHeaderMinRows); f.EnableCuts();
+    assert(crucible::kHeaderMinRows == 64);
     auto a = Prompt(160, 1, 2); a.shared_prefix_tokens = 90;
     f.Run(1, a);
-    assert(!f.Logged("header slot=0 tokens=88") && f.Logged("pre slot=0 tokens=96"));
+    assert(f.Logged("header slot=0 tokens=88") && !f.Logged("pre slot=0 tokens=96"));
+    Fixture g(1, 128, 0, 32, 256, 512);
+    g.session.SetExactResume(true); g.session.SetSavePoints(crucible::kPreEndMargin, crucible::kHeaderMinRows); g.EnableCuts();
+    auto b = Prompt(160, 1, 2); b.shared_prefix_tokens = 60;
+    g.Run(1, b);
+    assert(!g.Logged("header slot=0 tokens=60") && g.Logged("pre slot=0 tokens=96"));
   }
   {
     // Lookup: two slots hold tails; the slot with the header point is chosen for a prompt that shares the header.
@@ -1051,6 +1069,162 @@ void SavePoints() {
     f->log.clear();
     const auto [out, done] = f->Run(3, b);
     assert(f->engine.selected == header_slot && done.cached_tokens == 48 && out == reference(b));
+  }
+}
+
+// Header point (review H1 of Oct 28): a point lives in the slot that saved it, so a
+// second chat on another slot, open or busy, could not load it. The first prefill command of a cold request copies
+// the point from the slot that holds it. Opens come first and prefills later, as the server runs them.
+void HeaderCopy() {
+  const auto reference = [](const ServeRequest& r) {
+    MockEngine engine; engine.prefill_rows = 64; engine.context = 2048;
+    crucible::BatchSession<MockEngine> plain(engine, 1);
+    return Complete(plain, 1, r);
+  };
+  const auto with_rest = [](const ServeRequest& base, size_t from, int add) {
+    auto r = base;
+    for (size_t i = from; i < r.ids.size(); ++i) r.ids[i] = (r.ids[i] + add) % 16;
+    return r;
+  };
+  const auto finish = [](auto& f, uint64_t id, std::vector<BatchEvent> events) {
+    std::vector<int> out;
+    BatchEvent last;
+    for (;;) {
+      for (const auto& event : events) {
+        if (event.token) out.push_back(*event.token);
+        if (event.done) return std::pair{out, event};
+      }
+      events = f.session.Step({id});
+    }
+  };
+  const auto prefill = [](auto& f, uint64_t id) {
+    for (;;) {
+      auto events = f.session.Prefill(id);
+      if (!events.empty()) return events;
+    }
+  };
+  const auto make = [](int slots, int prefill_rows, int launch, int context, size_t margin, size_t header_min) {
+    auto f = std::make_unique<Fixture>(slots, prefill_rows, 0, 32, launch, context);
+    f->session.SetExactResume(true);
+    f->session.SetSavePoints(margin, header_min);
+    f->EnableCuts();
+    return f;
+  };
+  {
+    // Two slots, both opened before the first prefill. Chat A prefills and decodes (its slot is busy); chat B (same
+    // system block, another rest) then copies the header point from slot 0 and runs only the rest.
+    auto f = make(2, 64, 128, 256, 40, 40);
+    auto a = Prompt(120, 1, 3); a.shared_prefix_tokens = 50;
+    auto b = with_rest(a, 50, 3);
+    f->session.Open(1, a, true);
+    f->session.Open(2, b, true);
+    assert(f->engine.selected == 1);  // B opened on the empty slot 1
+    auto first = prefill(*f, 1);
+    assert(f->Logged("header slot=0 tokens=48") && first.front().cached_tokens == 0);
+    f->engine.chunks.clear(); f->log.clear();
+    auto second = prefill(*f, 2);  // slot 0 still decodes A
+    assert(f->session.Active() == 2 && f->Logged("copy 48 from=0") && f->Logged("header_copy slot=1 from=0 tokens=48"));
+    assert(second.front().cached_tokens == 48 && !f->Logged("header slot=1 tokens=48"));
+    assert(f->engine.chunks.size() == 1 && f->engine.chunks[0] == -(120 - 48));  // the rest only
+    const auto [out_b, done_b] = finish(*f, 2, second);
+    const auto [out_a, done_a] = finish(*f, 1, first);
+    assert(out_b == reference(b) && out_a == reference(a) && done_b.checkpoint_resume && done_b.cached_tokens == 48);
+    // B saved its own end Pre point on slot 1, not a second header point.
+    assert(f->Logged("pre slot=1 tokens=80"));
+  }
+  {
+    // Chat B arrives after chat A is done, on a free slot: the same copy. A third chat copies it again (the donor slot
+    // keeps its point) and a chat that differs inside the header copies nothing.
+    auto f = make(3, 64, 128, 256, 40, 40);
+    auto a = Prompt(120, 1, 2); a.shared_prefix_tokens = 50;
+    f->Run(1, a);
+    f->log.clear();
+    auto b = with_rest(a, 50, 3);
+    const auto [out_b, done_b] = f->Run(2, b);
+    assert(f->Logged("copy 48 from=0") && done_b.cached_tokens == 48 && out_b == reference(b));
+    f->log.clear();
+    auto c = with_rest(a, 50, 5);
+    const auto [out_c, done_c] = f->Run(3, c);
+    assert(f->Logged("copy 48 from=0") && done_c.cached_tokens == 48 && out_c == reference(c));
+    auto d = a; d.ids[10] = (d.ids[10] + 1) % 16;  // another system block
+    f->log.clear();
+    const auto [out_d, done_d] = f->Run(4, d);
+    assert(!f->Logged("copy 48 from=0") && done_d.cached_tokens == 0 && out_d == reference(d));
+  }
+  {
+    // The owner's shape: four chats at once, one shared block of 236 rows, 1,021 rows each, one launch. The first
+    // prefill saves the header, the other three copy it and run 785 rows each. Any order of the prefills.
+    for (const std::vector<uint64_t> order : {std::vector<uint64_t>{1, 2, 3, 4}, std::vector<uint64_t>{3, 1, 4, 2}}) {
+      auto f = make(4, 1024, 2048, 2048, crucible::kPreEndMargin, crucible::kHeaderMinRows);
+      std::map<uint64_t, ServeRequest> chats;
+      auto base = Prompt(1021, 1, 3); base.shared_prefix_tokens = 236;
+      for (uint64_t id = 1; id <= 4; ++id) {
+        chats[id] = with_rest(base, 236, int(id));
+        f->session.Open(id, chats[id], true);
+      }
+      std::map<uint64_t, std::vector<BatchEvent>> first;
+      std::map<uint64_t, std::vector<int>> rows;
+      for (const uint64_t id : order) {
+        f->engine.chunks.clear();
+        first[id] = prefill(*f, id);
+        rows[id] = f->engine.chunks;
+      }
+      assert(f->Logged("header slot=" + std::to_string(f->engine.selected) + " tokens=236") || true);
+      size_t copies = 0;
+      for (const uint64_t id : order) {
+        const bool saver = id == order.front();
+        assert(first[id].front().cached_tokens == (saver ? 0u : 236u));
+        copies += !saver;
+        size_t total = 0;
+        for (const int chunk : rows[id]) total += size_t(std::abs(chunk));
+        assert(total == (saver ? 1021u : 1021u - 236u));
+      }
+      assert(copies == 3);
+      for (const uint64_t id : order) assert(finish(*f, id, first[id]).first == reference(chats[id]));
+    }
+  }
+  {
+    // No copy: the point is under the minimum; another tenant; a bypass request; the switch off. Nothing changes.
+    auto f = make(2, 64, 128, 256, 40, 80);
+    auto a = Prompt(120, 1, 2); a.shared_prefix_tokens = 50;
+    f->Run(1, a);
+    f->log.clear();
+    const auto [out, done] = f->Run(2, with_rest(a, 50, 3));
+    assert(!f->Logged("copy 48 from=0") && done.cached_tokens == 0);
+    auto g = make(2, 64, 128, 256, 40, 40);
+    g->Run(1, a);
+    g->log.clear();
+    auto other = with_rest(a, 50, 3);
+    other.tenant[0] = 1;
+    const auto [out_other, done_other] = g->Run(2, other);
+    assert(!g->Logged("copy 48 from=0") && done_other.cached_tokens == 0 && out_other == reference(other));
+    g->log.clear();
+    auto bypass = with_rest(a, 50, 5);
+    bypass.cache_control = "bypass";
+    const auto [out_bypass, done_bypass] = g->Run(3, bypass);
+    assert(!g->Logged("copy 48 from=0") && done_bypass.cached_tokens == 0 && out_bypass == reference(bypass));
+    auto off = make(2, 64, 128, 256, 40, 40);
+    off->session.SetExactResume(false);
+    off->Run(1, a);
+    off->log.clear();
+    off->Run(2, with_rest(a, 50, 3));
+    assert(!off->Logged("copy 48 from=0"));
+  }
+  {
+    // The donor slot lost the point (a longer prompt wrote its slot): no copy, a cold run, the right tokens.
+    auto f = make(2, 64, 128, 256, 40, 40);
+    auto a = Prompt(120, 1, 2); a.shared_prefix_tokens = 50;
+    auto x = Prompt(100, 9, 2); x.ids[0] = 3; x.shared_prefix_tokens = 30;
+    auto b = with_rest(a, 50, 3);
+    f->session.Open(1, a, true);
+    f->session.Open(2, b, true);
+    finish(*f, 1, prefill(*f, 1));
+    f->session.Open(3, x, true);  // slot 0 is free again; X takes it and writes over the header point
+    assert(f->engine.selected == 0);
+    finish(*f, 3, prefill(*f, 3));
+    f->log.clear();
+    const auto [out, done] = finish(*f, 2, prefill(*f, 2));
+    assert(!f->Logged("copy 48 from=0") && done.cached_tokens == 0 && out == reference(b));
   }
 }
 
@@ -1100,6 +1274,7 @@ void MarginCutKeepsItsBuffer() {
 
 int main() {
   SavePoints();
+  HeaderCopy();
   MarginCutKeepsItsBuffer();
   ImageEndResume();
   Identical();

@@ -189,6 +189,12 @@ class BatchPrefixCache {
         if (point.kind == crucible::CheckpointKind::Frontier) cache_.Touch(point.key, Policy(point.tenant));
         std::fprintf(stderr, "slot_checkpoint resume tokens=%zu replay=%d\n", point.hist.size(), point.replay);
       };
+      hooks.point_copy = [this](const crucible::ServeRequest& r, int from, int index, const crucible::SlotCheckpoint& point) {
+        return PointCopy(r, from, index, point);
+      };
+      hooks.header_copied = [](int slot, int from, size_t tokens) {
+        std::fprintf(stderr, "slot_checkpoint header_copy tokens=%zu slot=%d from=%d\n", tokens, slot, from);
+      };
       hooks.peek = [this](const crucible::ServeRequest& r) { return std::max(Peek(r), DiskPeek(r)); };
       // The effect lines of re-send fix A and fix B (the re-send proof reads them).
       hooks.end_resumed = [this](int slot, size_t tokens) {
@@ -870,6 +876,25 @@ class BatchPrefixCache {
                  crucible::GenerationNow() - start);
     if (reason) return 0;
     return length;
+  }
+  // Header point: the first prefill command of a cold request on the selected (target) slot
+  // copies checkpoint (from, index) of another slot, whose rows below the point stay as they are while it runs. Device to
+  // device, no host stage and no cache room (SlotCheckpointIO::CopyPointTo). Returns the point's length, 0 for no copy.
+  size_t PointCopy(const crucible::ServeRequest& r, int from, int index, const crucible::SlotCheckpoint& point) {
+    const int target = Slot();
+    if (point.tenant != r.tenant || point.kind != crucible::CheckpointKind::Pre || point.replay != 0) return 0;
+    if (target == from) return 0;
+    // As a checkpoint load: a restore writes the slot, so its MTP history, base and lazy disk reads are gone.
+    if (mtp_) mtp_->Restored(target, std::nullopt);
+    bases_.Clear(target);
+    LazyEnd(target);
+    const struct Reselect { Engine& engine; int slot; ~Reselect() { engine.SelectStream(slot); } } reselect{engine_, target};
+    engine_.SelectStream(from);
+    SequenceState& donor = engine_.ActiveSequence();
+    engine_.SelectStream(target);
+    SequenceState& sequence = engine_.ActiveSequence();
+    SlotCheckpointIO::CopyPointTo(donor, Buffer(from, index), point, sequence);
+    return point.hist.size();
   }
   // HIGH-2: the open resumes from the slot's own Frontier point. The slot's tail is the output that the prompt left
   // (Pi drops the reasoning), and the open writes over it: it leaves without a host copy.
@@ -1945,7 +1970,8 @@ inline std::optional<int> TryBatchedServeCommand(int argc, char** argv) {
                         settings.state_disk_gib,settings.cache_probation,settings.state_write_gib_per_day,
                         settings.cache_idle_minutes,settings.mtp_window,draft_blocks,settings.state_write_delay_ms);
   } catch (const std::exception& error) {
-    std::fprintf(stderr, "batched serve error: %s; use serve CKPT --streams 1..8 [--ctx 1..262144] [--prefill 0..4096] [--conversation-cache-mib 0..131072] [--host-reserve-mib 1024..131072] [--short-streams N --short-ctx T] [--cache-probation 0|1] [--cache-idle-minutes 1..10080] [--mtp-window 0..262144] [--draft-blocks FILE] [--state-dir DIR [--state-disk-gib 1..65536] [--state-disk-write-gib-per-day 0..65536] [--state-disk-write-delay-ms 0..60000]]\n", error.what());
+    // A memory refusal is a block of lines (engine/runtime/batch_admission.h): keep the options on their own line.
+    std::fprintf(stderr, "batched serve error: %s\n  options: serve CKPT --streams 1..8 [--ctx 1..262144] [--prefill 0..4096] [--conversation-cache-mib 0..131072] [--host-reserve-mib 1024..131072] [--short-streams N --short-ctx T] [--cache-probation 0|1] [--cache-idle-minutes 1..10080] [--mtp-window 0..262144] [--draft-blocks FILE] [--state-dir DIR [--state-disk-gib 1..65536] [--state-disk-write-gib-per-day 0..65536] [--state-disk-write-delay-ms 0..60000]]\n", error.what());
     return 2;
   }
 }

@@ -110,8 +110,10 @@ def tok(new, ref, work, a, b):
             print(f"FAIL {label} did not finish: exit {rc}, {err[-300:]}")
             return 1
         results[label] = [t["ids"] for t in tokens]
-    if any(len(i) < 8 for i in results["new-A"]):
-        print("FAIL a reply is too short to compare")
+    # A reply that stops early (EOS before the 24-token cap of prep) is a valid reply. A reply with no tokens is not:
+    # two empty replies compare equal, so a run that emitted no tokens would pass the comparison below.
+    if any(not ids for ids in (ids for label in results for ids in results[label])):
+        print("FAIL a reply has no tokens")
         return 1
     for label in ("new-B", "ref-A"):
         if results[label] != results["new-A"]:

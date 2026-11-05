@@ -2,6 +2,8 @@
 
 The engine's own messages are fixed English texts. A text outside this list could quote request content in the future,
 so the server never logs it. test_engine_messages_cover_the_serve_path keeps the list in step with engine/.
+A start-time memory refusal carries measured sizes, so it is not in this list: the engine prints it to stderr before any
+request, and the server logs it as "other". Do not add a prefix for a text with numbers.
 
 Rule for engine authors: a message that can contain a token ID (or any other request value) must be a fixed KNOWN text,
 or a PREFIX whose suffix is never request data. An unknown text is logged as a 16-hex sha256 prefix, and the hash of a
@@ -24,6 +26,7 @@ KNOWN = frozenset((
     'Truncate cannot cross committed recurrent state',
     'Truncate cannot grow token history',
     'a frontier copy must restore the donor point',
+    'a header copy must restore the donor point',
     'a pre-end cut needs core parts of more than 8 rows',
     'all sequence slots are in use',
     'an MTP lead needs CRUCIBLE_DRAFT_CHAIN lead, a scored call and the q block head',
@@ -68,7 +71,6 @@ KNOWN = frozenset((
     'CRUCIBLE_PACKED_ROWS must be 8 to 16',
     'batch speculation is not supported yet; use --spec 0',
     'batch speculation needs draft_head 64k, draft_adapt 0, and draft_q > 0',
-    'batch states exceed the shared memory budget; reduce streams, context, or cache budget',
     'batch step contains a duplicate or inactive request',
     'batch step must contain one to eight active requests',
     'batch stream ID is out of range',

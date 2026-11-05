@@ -203,13 +203,14 @@ inline constexpr size_t kPreEndMinTokens = 32768;
 //   If the nearest multiple of 4 cannot be a cut, up to `kPreMarginSlack` rows further back are tried.
 // - The header point sits at the end of the shared system block (`shared_prefix_tokens`, rounded down to a multiple
 //   of 4), if the block is at least `kHeaderMinRows` rows: a later prompt with the same block, and a different rest,
-//   resumes there and not from row 0. It is OFF by default (kHeaderMinRows = 0, review H1 of Oct 28): with several
-//   slots the next chat opens on an empty slot and no GPU run restored it. It returns as its own change, with a proof.
+//   resumes there and not from row 0. A point lives in the slot that saved it, with the rows below it, so the next
+//   chat on another slot (open, or busy) cannot load it (review H1 of Oct 28: it never restored). The first prefill
+//   command of a cold request therefore copies the point from the slot that holds it (HeaderDonor, HeaderCopy), whatever slot the open chose and whether the donor slot is busy.
 // - A free slot with such a point, whose resident tail is at most `kHeaderSlotTail` rows, is preferred to the slot
 //   left longest ago (Affinity): the tail that the open overwrites costs at most that much to build again.
 inline constexpr size_t kPreEndMargin = 64;
 inline constexpr size_t kPreMarginSlack = 16;
-inline constexpr size_t kHeaderMinRows = 0;
+inline constexpr size_t kHeaderMinRows = 64;
 inline constexpr size_t kHeaderSlotTail = 2048;
 
 // The output rows that an expected tail counts at most: the reserve stays near the usual tail, and a longer
@@ -286,6 +287,13 @@ struct BatchCacheHooks {
   std::function<void(int slot, size_t tokens)> pre_saved;
   // Optional, log line only (save points): a prompt saved the shared-header point at `tokens`.
   std::function<void(int slot, size_t tokens)> header_saved;
+  // Optional, with the checkpoint hooks (header-point): copies the rows and the fixed state of checkpoint (`from`, `index`)
+  // of another slot, which may be busy, into the selected slot, which holds nothing yet. The point is a prefix of the
+  // request; its donor slot keeps every row below it. Returns the point's length, or 0 when it copied nothing. It may
+  // select the donor's stream; the session selects the target again on every exit.
+  std::function<size_t(const ServeRequest&, int from, int index, const SlotCheckpoint&)> point_copy;
+  // Optional, log line only (header-point): the first prefill command of a request copied the header point.
+  std::function<void(int slot, int from, size_t tokens)> header_copied;
   // Optional: totals and the latest save try. A capture or tail hook that tried a save raises `attempts`.
   std::function<BatchCacheStatus()> status;
   // Optional: a slot resume or a slot checkpoint served `tokens` (0: the slot held nothing for the
@@ -673,6 +681,11 @@ class BatchSession {
     engine_.SelectStream(state.slot);
     prefill_cursor_.reset();
     if (state.end_outputs) return ResumeEnd(state);
+    // Header point: a cold request takes the shared header from the slot that holds it, before its first launch.
+    if (!state.header_tried && state.cursor == 0) {
+      state.header_tried = true;
+      if (state.cached == 0) HeaderCopy(state);
+    }
     const int prefill = engine_.PrefillRows();
     const int step = prefill > 0 ? prefill : kMaxRows;
     const auto& ids = state.options.ids;
@@ -1155,6 +1168,7 @@ class BatchSession {
     bool grid_point = false;  // resumed from a Grid checkpoint
     bool core_point = false;  // resumed from an End or Pre checkpoint on a core-part cut, no pending rows
     bool pre_done = false;    // a Pre or header cut was taken: the request takes no other Pre point (save points)
+    bool header_tried = false;  // the first prefill command looked for a header point on another slot (header-point)
     std::shared_ptr<const PromptOutputs> end_outputs;  // fix A: the End point's outputs; set until the first token
     std::shared_ptr<const PromptOutputs> outputs;      // fix A: this prompt's outputs, for its End point
     bool end_resumed = false;  // fix A: the open restored the whole prompt (the event's end_resume)
@@ -1260,6 +1274,50 @@ class BatchSession {
     const size_t point = shared / tile * tile;
     if (point <= state.cursor || point >= size_t(step) || request.ids.size() <= point + size_t(kMaxRows)) return 0;
     return checkpoints_.Holds(Key(request, std::span<const int>(request.ids.data(), point)), request.tenant) ? 0 : point;
+  }
+  // Header point: the Pre point of another slot, `header_min_` rows or more, at most the
+  // shared header of `request`, that a cold prompt resumes from as it resumes from its own slot's point (PointFits).
+  // The longest wins, the lowest slot on a tie. The donor may be busy: the rows below its point never change.
+  std::optional<std::pair<int, int>> HeaderDonor(const Request& state, int own) const {
+    const ServeRequest& request = state.options;
+    if (!exact_resume_ || !header_min_ || !cache_.point_copy || !cache_.checkpoint_save || request.cache_control != "auto" ||
+        !request.images.empty() || request.shared_prefix_tokens < int(header_min_))
+      return std::nullopt;
+    const std::vector<int> key = Key(request, request.ids);
+    std::optional<std::pair<int, int>> donor;
+    size_t longest = 0;
+    for (int from = 0; from < slots_; ++from) {
+      if (from == own) continue;
+      const auto best = checkpoints_.Best(from, key, request.tenant, [&](const SlotCheckpoint& point) {
+        return point.kind == CheckpointKind::Pre && point.replay == 0 && point.hist.size() >= header_min_ &&
+               point.hist.size() <= size_t(request.shared_prefix_tokens) && PointFits(request, key, point);
+      });
+      if (best && checkpoints_.At(from, *best).hist.size() > longest)
+        donor = {from, *best}, longest = checkpoints_.At(from, *best).hist.size();
+    }
+    return donor;
+  }
+  // Runs in the first prefill command of a cold request, on its selected slot. The request then starts as an open
+  // that loaded the point from its own slot does (Open: core point, tail start), so its plan and its bits are the same.
+  void HeaderCopy(Request& state) {
+    const auto donor = HeaderDonor(state, state.slot);
+    if (!donor) return;
+    const auto [from, index] = *donor;
+    const SlotCheckpoint& point = checkpoints_.At(from, index);
+    const double start = Clock();
+    const size_t tokens = cache_.point_copy(state.options, from, index, point);
+    engine_.SelectStream(state.slot);
+    if (!tokens) return;
+    if (tokens != point.hist.size()) throw std::logic_error("a header copy must restore the donor point");
+    state.cached = state.cursor = tokens;
+    state.from_checkpoint = true;
+    state.from_tail = true;
+    state.core_point = BulkResumes(tokens, state.options.ids.size());
+    state.diag.miss = "none";
+    state.restore += Clock() - start;
+    if (cache_.header_copied) cache_.header_copied(state.slot, from, tokens);
+    // The draft state of the open assumed a cold start; a restored prefix starts a fresh MTP warm-up (Open's rule).
+    if (state.spec) spec_.open(state.id, state.slot, state.options, state.cached);
   }
   // b-cut lever 1 (exact resume): an End point on the tile grid whose last chunk piece has more than 8 rows (or is a
   // whole chunk) is exact for any extension of more than 8 rows (BestPoint), so the Pre launch of 9 to 12 rows is not
@@ -1553,31 +1611,34 @@ class BatchSession {
   // MEDIUM-2: a Frontier point resumes only where the host rule (Find) would restore a host frontier of its length,
   // so the slot and the host give the same restore for one prompt.
   std::optional<int> BestPoint(int slot, const ServeRequest& request, std::span<const int> key) const {
-    return checkpoints_.Best(slot, key, request.tenant, [&](const SlotCheckpoint& point) {
-      // Exact resume: an End point off the core grid is not a prefill state of a longer prompt (resume-exact);
-      // a prompt that repeats it whole still resumes there (fix A).
-      // an End point that resumes as bulk rows (BulkResumes) is exact off the grid too.
-      // a Pre point is off the grid now (PreEndPoint), and 8 new rows or fewer run the small-row kernels
-      // where the cold prompt runs bulk rows (its own Pre cut leaves more than 8), so a point of either kind needs
-      // a multiple of the QSA tile rows and more than 8 new rows; the next older point (a Pre point) serves.
-      // the new rows before the cold plan's small-row tail (BulkEnd) must be more than 8, and an End point
-      // must hold bulk rows only: a prompt of 8 rows or fewer, or one that ended in a small-row tail, ran those rows
-      // with the small-row kernels, which a longer cold prompt runs as bulk rows.
-      const size_t at = point.hist.size();
-      // a core point (bulk rows, no head) that leaves 8 rows or fewer
-      // before the end of the cold plan's bulk rows would run them with the small-row kernels where cold runs bulk
-      // rows. The point is refused; the next older point or the host cache serves.
-      if (!exact_resume_ && (point.kind == CheckpointKind::End || point.kind == CheckpointKind::Pre) &&
-          point.replay == 0 && at < key.size() && BulkResumes(at, key.size()) && BulkEnd(key.size()) > at &&
-          BulkEnd(key.size()) - at <= size_t(kMaxRows))
-        return false;
-      if (exact_resume_ && (point.kind == CheckpointKind::End || point.kind == CheckpointKind::Pre) &&
-          at < key.size() &&
-          !(point.replay == 0 && at % size_t(kQsaUnionTileRows) == 0 && BulkEnd(key.size()) > at + size_t(kMaxRows) &&
-            (point.kind == CheckpointKind::Pre || (at > size_t(kMaxRows) && BulkEnd(at) == at))))
-        return false;
-      return point.kind != CheckpointKind::Frontier || (cache_.frontier_fits && cache_.frontier_fits(request, point));
-    });
+    return checkpoints_.Best(slot, key, request.tenant,
+                             [&](const SlotCheckpoint& point) { return PointFits(request, key, point); });
+  }
+  // The resume rules for one point of the prompt `key` (BestPoint, and the header donors of another slot).
+  bool PointFits(const ServeRequest& request, std::span<const int> key, const SlotCheckpoint& point) const {
+    // Exact resume: an End point off the core grid is not a prefill state of a longer prompt (resume-exact);
+    // a prompt that repeats it whole still resumes there (fix A).
+    // an End point that resumes as bulk rows (BulkResumes) is exact off the grid too.
+    // a Pre point is off the grid now (PreEndPoint), and 8 new rows or fewer run the small-row kernels
+    // where the cold prompt runs bulk rows (its own Pre cut leaves more than 8), so a point of either kind needs
+    // a multiple of the QSA tile rows and more than 8 new rows; the next older point (a Pre point) serves.
+    // the new rows before the cold plan's small-row tail (BulkEnd) must be more than 8, and an End point
+    // must hold bulk rows only: a prompt of 8 rows or fewer, or one that ended in a small-row tail, ran those rows
+    // with the small-row kernels, which a longer cold prompt runs as bulk rows.
+    const size_t at = point.hist.size();
+    // a core point (bulk rows, no head) that leaves 8 rows or fewer
+    // before the end of the cold plan's bulk rows would run them with the small-row kernels where cold runs bulk
+    // rows. The point is refused; the next older point or the host cache serves.
+    if (!exact_resume_ && (point.kind == CheckpointKind::End || point.kind == CheckpointKind::Pre) &&
+        point.replay == 0 && at < key.size() && BulkResumes(at, key.size()) && BulkEnd(key.size()) > at &&
+        BulkEnd(key.size()) - at <= size_t(kMaxRows))
+      return false;
+    if (exact_resume_ && (point.kind == CheckpointKind::End || point.kind == CheckpointKind::Pre) &&
+        at < key.size() &&
+        !(point.replay == 0 && at % size_t(kQsaUnionTileRows) == 0 && BulkEnd(key.size()) > at + size_t(kMaxRows) &&
+          (point.kind == CheckpointKind::Pre || (at > size_t(kMaxRows) && BulkEnd(at) == at))))
+      return false;
+    return point.kind != CheckpointKind::Frontier || (cache_.frontier_fits && cache_.frontier_fits(request, point));
   }
   // frontier-copy: the longest Frontier point of another slot that the host rule
   // accepts for `request` (the lowest slot on a tie), when it is longer than the host state and this slot's own

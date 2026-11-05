@@ -8,17 +8,60 @@
     if (!host_available) throw std::runtime_error("cannot read available host memory; batch admission is disabled");
     size_t device_free, device_total;
     HIP_OK(hipMemGetInfo(&device_free, &device_total));
-    uint64_t added = 0;
-    for (int slot = int(sequences_.size()); slot < count; ++slot)
-      added += SequenceState::ServeBytes(SlotContext(slot, count, short_count, short_ctx), compact_state_, mtp_rows_);
+    uint64_t added = 0, slots_state = 0, allocated = 0, first_slot = 0;
     std::vector<int> contexts;
     for (int slot = 0; slot < count; ++slot) contexts.push_back(SlotContext(slot, count, short_count, short_ctx));
-    added += VisionReserveBytes(contexts);  // zero without --vision
-    for (int slot = 0; slot < std::min(count, int(sequences_.size())); ++slot) {
-      const auto& state = *sequences_[size_t(slot)];
-      added += MissingMtpCacheBytes(state.mtp_capacity, state.compact_state, state.qc.contains(kLayers));
+    for (int slot = 0; slot < count; ++slot) {
+      const uint64_t bytes = SequenceState::ServeBytes(contexts[size_t(slot)], compact_state_, mtp_rows_);
+      slots_state += bytes;
+      if (slot < int(sequences_.size())) {
+        // An existing compact slot may still lack its MTP cache, so it holds less than its whole state.
+        const auto& state = *sequences_[size_t(slot)];
+        const uint64_t missing =
+            MissingMtpCacheBytes(state.mtp_capacity, state.compact_state, state.qc.contains(kLayers));
+        allocated += bytes - missing;
+        first_slot = bytes - missing;  // every existing slot is slot 0 here: ConfigureServeStreams runs once
+        added += missing;
+      } else {
+        added += bytes;
+      }
     }
-    const auto error = BatchAdmissionError(std::min<uint64_t>(*host_available, device_free), added, unused_cache_budget);
+    added += VisionReserveBytes(contexts);  // zero without --vision
+    AdmissionMemory memory;
+    memory.host_free = *host_available;
+    memory.device_free = device_free;
+    memory.states_bytes = slots_state;
+    memory.allocated_bytes = allocated;
+    memory.first_slot_bytes = first_slot;
+    memory.new_states_bytes = added;
+    memory.cache_budget = unused_cache_budget;
+    memory.streams = count;
+    memory.context = ctx_;
+    // A fresh start at a suggested setting, charged by the same code: slot 0 before the check, the other slots, the
+    // vision reserve and slot 0's missing MTP cache after it. The user keeps every other option, so a candidate must
+    // satisfy the server's rule for short streams (0 < --short-ctx < --ctx and --short-streams below --streams); a
+    // short slot keeps kMaxRows rows above --short-ctx, which can be more than the candidate's full context.
+    const auto try_setting = [this, short_count, short_ctx](int streams, int context) -> AdmissionCharge {
+      AdmissionCharge charge;
+      if (streams < 1 || (short_count > 0 && (short_count >= streams || short_ctx < 1 || short_ctx >= context))) {
+        charge.allowed = false;
+        return charge;
+      }
+      std::vector<int> slot_contexts;
+      for (int slot = 0; slot < streams; ++slot)
+        slot_contexts.push_back(slot < streams - short_count ? context : short_ctx + kMaxRows);
+      for (const int slot_context : slot_contexts)
+        charge.states_bytes += SequenceState::ServeBytes(slot_context, compact_state_, mtp_rows_);
+      charge.first_slot_bytes = SequenceState::ServeBytes(slot_contexts[0], compact_state_, mtp_rows_) -
+          MissingMtpCacheBytes(SequenceState::MtpCapacity(slot_contexts[0], mtp_rows_), compact_state_, false);
+      for (size_t slot = 1; slot < slot_contexts.size(); ++slot)
+        charge.new_states_bytes += SequenceState::ServeBytes(slot_contexts[slot], compact_state_, mtp_rows_);
+      charge.new_states_bytes += MissingMtpCacheBytes(
+          SequenceState::MtpCapacity(slot_contexts[0], mtp_rows_), compact_state_, false);
+      charge.new_states_bytes += VisionReserveBytes(slot_contexts);
+      return charge;
+    };
+    const auto error = BatchAdmissionError(memory, try_setting);
     if (!error.empty()) throw std::runtime_error(error);
     // Existing slots keep the full context; short slots are always new, so they come last.
     if (short_count && int(sequences_.size()) > count - short_count)

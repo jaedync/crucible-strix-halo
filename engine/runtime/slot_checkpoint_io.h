@@ -5,6 +5,7 @@
 // written once. So these spans at p, with the rows that the slot keeps, are the bytes that a full snapshot at p
 // restores: ConversationStateIO::Spans writes the same raw ring and the same pool floats up to the block of p.
 #pragma once
+#include <array>
 #include "conversation_snapshot.h"
 #include "slot_checkpoints.h"
 
@@ -131,6 +132,41 @@ struct SlotCheckpointIO {
     target.gdn_lazy = true;
     target.hist = std::move(hist);
     target.retained = buffer.retained;
+  }
+
+  // Header point: `target` takes the state of Pre or End checkpoint `point` of another
+  // stream (`donor`, which may be busy), at any multiple of 4 rows. The donor keeps every row below the point, and `buffer`
+  // holds the fixed state, the compact raw ring and the pool block of the point (Save). So the target gets the rows below
+  // the point from the donor (the bytes of a snapshot at the point: K, V, raw rows, pool groups), then Restore writes the
+  // buffer over it, as a restore into the donor's own slot does. The pool block that holds the point comes from the buffer
+  // because the donor wrote later rows into it. Trunk QSA layers only; a speculative request warms its MTP rows again.
+  // Every check comes before the first write to the target.
+  static void CopyPointTo(const SequenceState& donor, const Buffer& buffer, const crucible::SlotCheckpoint& point,
+                          SequenceState& target) {
+    if (&target == &donor) throw std::logic_error("header point copy needs a target slot that is not the donor");
+    const size_t length = point.hist.size();
+    if (!length || buffer.position != length || donor.hist.size() < length ||
+        !std::equal(point.hist.begin(), point.hist.end(), donor.hist.begin()))
+      throw std::logic_error("header point rows are no longer on the donor slot");
+    if (length > size_t(target.capacity)) throw std::runtime_error("header point copy target has too few rows");
+    if (ConversationStateIO::Layout(donor, false) != ConversationStateIO::Layout(target, false))
+      throw std::runtime_error("snapshot cache layout changed");
+    std::vector<std::pair<const void*, void*>> rows;
+    std::vector<size_t> sizes;
+    for (const auto& [layer, cache] : donor.qc) {
+      if (layer == kLayers) continue;
+      const auto& other = target.qc.at(layer);
+      const auto spans = QsaSnapshotSpans(0, cache.raw_slots, length);
+      const std::array<std::pair<const void*, void*>, 4> pairs{{{cache.k, other.k}, {cache.v, other.v},
+                                                                   {cache.ik_raw, other.ik_raw}, {cache.ik_pool, other.ik_pool}}};
+      for (size_t i = 0; i < 4; ++i)
+        if (spans[i].bytes) rows.push_back(pairs[i]), sizes.push_back(spans[i].bytes);
+    }
+    for (size_t i = 0; i < rows.size(); ++i)
+      HIP_OK(hipMemcpyAsync(rows[i].second, rows[i].first, sizes[i], hipMemcpyDeviceToDevice, 0));
+    target.hist = point.hist;
+    Restore(target, buffer, point);
+    HIP_OK(hipStreamSynchronize(0));
   }
 
  private:

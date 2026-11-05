@@ -767,6 +767,17 @@ class Loader {
     return false;
   }
 
+  // CRUCIBLE_PLE_FETCH (ple_host.h): 1 hints every page of a gather in blocks, 2 also splits gathers of 160 rows or
+  // more over the gather parts. The bytes do not change.
+  static int PleFetch() {
+    try {
+      return RowPolicyInt("CRUCIBLE_PLE_FETCH", 0, 0, 2);
+    } catch (const std::invalid_argument& error) {
+      Die(error.what());
+    }
+    return 0;
+  }
+
   static const char* PleBf16() {
     try {
       return PleBf16Path(crucible::SwitchText("CRUCIBLE_PLE_BF16"), PleHost());
@@ -783,6 +794,7 @@ class Loader {
     try {
       const PleBf16File f = CheckPleBf16File(path, tensor, rows);
       e.host = std::make_shared<PleHostTable>(path, kPleBf16RowBytes, std::vector<PleSegment>{{0, f.rows, f.offset}});
+      e.host->SetFetch(PleFetch());
     } catch (const std::exception& error) {
       Die(error.what());
     }
@@ -805,6 +817,7 @@ class Loader {
     }
     try {
       e.host = std::make_shared<PleHostTable>(dir_ + "/" + Info(shards[0]).file, row, segments);
+      e.host->SetFetch(PleFetch());
     } catch (const std::exception& error) {
       Die(error.what());
     }

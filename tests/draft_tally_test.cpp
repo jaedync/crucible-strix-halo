@@ -65,7 +65,7 @@ int main() {
     DraftTally t;
     t.Round(std::vector<int>{1}, 5, 0, false);
     t.Round(std::vector<int>{1}, -1, 0, false);
-    assert(t.length == std::array<long, 8>{});
+    assert((t.length == std::array<long, 8>{}));
   }
   return 0;
 }

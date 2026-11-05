@@ -17,7 +17,7 @@ REGISTRY = 'engine/switches.h'
 RAW_READ = re.compile(r'\b(?:secure_)?getenv\s*\(\s*([^()]*?)\s*\)|\b(environ)\b')
 
 # Lower it when a switch name leaves engine/ and kernels/. Never raise it. Target: 65 or fewer (user, Oct 10).
-SWITCH_CEILING = 59  # merge rule: retire-pf19 left 54, CRUCIBLE_DEBUG_NONFINITE adds one,
+SWITCH_CEILING = 60  # merge rule: retire-pf19 left 54, CRUCIBLE_DEBUG_NONFINITE adds one,
 # CRUCIBLE_PLE_BF16 (16-bit n-gram table) adds one,
 # CRUCIBLE_EXACT_RESUME (exact resume of off-grid End points, exactly one new switch) adds one,
 # CRUCIBLE_MOE_B128 (moe-b128: exact decode expert body A/B, default 3 in train 28, 12 in train 30, 0 is the rollback, decide_by 20) adds one
@@ -29,6 +29,7 @@ SWITCH_CEILING = 59  # merge rule: retire-pf19 left 54, CRUCIBLE_DEBUG_NONFINITE
 # CRUCIBLE_DRAFT_HEAD (default exl3, decide_by 20) adds one,
 # CRUCIBLE_PERSISTENT_GDN_WAVES (build macro) goes
 # CRUCIBLE_DRAFT_CHAIN (lead, stop in one switch, decide_by 20) adds one;
+# CRUCIBLE_PLE_FETCH (default 0, decide_by 20) adds one;
 # needs the merge rule's OK (the coordinator decides)
 
 # (file, argument of the raw read): number of reads. Delete entries as reads move to engine/switches.h.

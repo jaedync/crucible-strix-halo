@@ -196,8 +196,8 @@ class Engine {
     std::fprintf(stderr, "weights %.2f GB, context %d, prefill rows %d\n", m_.bytes / 1e9, ctx_, prefill_rows_);
     std::fprintf(stderr, "prefill: %s\n", prefill_path_.c_str());
     if (compact_state_)
-      std::fprintf(stderr, "sequence storage: CRUCIBLE_COMPACT_STATE=1 raw_slots=%d mtp=lazy logical_state_bytes=%zu\n",
-                   kQsaRawSlots, SequenceState::Bytes(ctx_, true, false, mtp_rows_));
+      std::fprintf(stderr, "sequence storage: CRUCIBLE_COMPACT_STATE=1 raw_slots=%d mtp=lazy logical_state_bytes=%zu fixed_state_bytes=%zu\n",
+                   kQsaRawSlots, SequenceState::Bytes(ctx_, true, false, mtp_rows_), SequenceState::FixedBytes());
     if (mtp_rows_ > 0 && mtp_rows_ < ctx_) std::fprintf(stderr, "sequence storage: mtp_rows=%d of context %d\n", mtp_rows_, ctx_);
     const char* warmup = crucible::SwitchText("CRUCIBLE_WARMUP");
     if (!warmup || std::string(warmup) != "0") WarmUp();
@@ -1772,11 +1772,12 @@ class Engine {
       auto& st = m_.ple.host->stats();
       const auto now = std::chrono::steady_clock::now();
       std::fprintf(stderr, "ple host gather: %d rows, %.3f ms since start, %.3f ms waited (sum hint %.3f ms, "
-                   "copy %.3f ms, fresh pages %llu)\n", R,
+                   "copy %.3f ms, fresh pages %llu, fetch %d, major faults %llu)\n", R,
                    std::chrono::duration<double, std::milli>(now - ple_gather_start_).count(),
                    std::chrono::duration<double, std::milli>(now - waited).count(),
                    st.hint_ns.exchange(0) / 1e6, st.copy_ns.exchange(0) / 1e6,
-                   (unsigned long long)st.fresh_pages.exchange(0));
+                   (unsigned long long)st.fresh_pages.exchange(0), m_.ple.host->Fetch(),
+                   (unsigned long long)st.major_faults.exchange(0));
     }
     return ple_packed_;
   }
