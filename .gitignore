@@ -9,3 +9,5 @@ ref/fixtures/
 .coverage
 .coverage
 scratch/
+/.crucible/
+dist/

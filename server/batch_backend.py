@@ -59,6 +59,9 @@ STAGE_REASON = re.compile(r"[a-z0-9_]{1,24}")
 # A stopping engine writes its states to disk for up to 75 s (engine/serve/batched_serve.h kStateFlushSeconds). The server
 # waits 85 s, then kills it: the whole stop fits in a systemd TimeoutStopSec=120 with a margin.
 STATE_FLUSH_SECONDS = 85
+# The idle ping (engine op "ping"): when the worker has no work and the engine sent nothing for this long, it asks. The
+# server sets a lower value from --watchdog-stall-seconds (a fifth of the stall time), so that a ping always fits it.
+PING_IDLE_SECONDS = 10.0
 
 
 @dataclass
@@ -92,6 +95,7 @@ class BatchedEngineBackend(EngineBackend):
     state_disk = False  # the disk tier; set from the engine's ready event
     stage_job = False  # the engine takes a stage "job" tag (fix 2); set from the ready event
     stage_jobs = 0  # the last stage job tag (_job_tag)
+    ping_idle_seconds = PING_IDLE_SECONDS
     def __init__(self, executable, checkpoint, context=32768, *, streams=8, output_timeout=30, prefill=None,
                  conversation_cache_mib=0, short_streams=0, short_ctx=0, packed_op="verify_step",
                  session_replay=False, slot_resume=None, slot_checkpoints=None, prefill_interleave=0,
@@ -228,6 +232,19 @@ class BatchedEngineBackend(EngineBackend):
         self.state_disk = bool(getattr(self, "requested_state_dir", None)) and ready.get("state_disk") is True
         if self.state_disk: self.flush_seconds = STATE_FLUSH_SECONDS
         self.stage_job = self.state_disk and ready.get("stage_job") is True
+        # An engine before the ping op does not name it, so it never gets the command (the pattern of stage_job).
+        self.ping_op = ready.get("ping") is True
+
+    def session_counts(self):
+        return len(self.active), self.streams
+
+    def _ping(self):
+        """The idle ping: no fields, no state change. The reply is one batch_end of op ping; anything else is fatal."""
+        self.process.stdin.write('{"op":"ping"}\n')
+        self.process.stdin.flush()
+        reply = self._next()
+        if not (isinstance(reply, dict) and reply.get("event") == "batch_end" and reply.get("op") == "ping"):
+            raise ProtocolError("The engine returned an unexpected ping reply.")
 
     def submit(self, ids, request, cache_prefix_tokens=0, shared_prefix_tokens=0, log_turn=True, image_offsets=(),
                after=None, think_cap=None, client_request_id=None):
@@ -822,7 +839,9 @@ class BatchedEngineBackend(EngineBackend):
                 progress = self._cancelled()
                 while self._admit(): progress = True
                 progress = self._schedule() or progress
-                if not progress: self.closed.wait(.005)
+                if not progress:
+                    if self.ping_op and time.monotonic() - self.last_event_at >= self.ping_idle_seconds: self._ping()
+                    else: self.closed.wait(.005)
         except Exception as error:
             if not self.closed.is_set():
                 metrics.emit(metrics.worker_error_line(error))

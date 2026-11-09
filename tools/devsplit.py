@@ -49,13 +49,23 @@ class StepFailed(Exception):
     pass
 
 
-def run(cmd, what, stdin=None):
-    """Run one step; returns (seconds, stdout). A failure prints the tool output and raises StepFailed."""
+def run(cmd, what, stdin=None, out=None):
+    """Run one step; returns (seconds, stdout). A failure prints the tool output and raises StepFailed.
+
+    `out` is the file that the step writes. It is removed before the step, and the step fails when it exits 0 and leaves
+    no output (a killed compiler child does that under hipcc, and a wrapper can hide the signal)."""
+    if out is not None:
+        Path(out).unlink(missing_ok=True)
     t0 = time.monotonic()
     r = subprocess.run([str(c) for c in cmd], capture_output=True, text=True, input=stdin)
     dt = time.monotonic() - t0
     if r.returncode:
         sys.stderr.write(f"devsplit: {what} failed (rc {r.returncode}):\n{r.stdout[-3000:]}{r.stderr[-6000:]}")
+        raise StepFailed(what)
+    if out is not None and (not Path(out).is_file() or Path(out).stat().st_size == 0):
+        Path(out).unlink(missing_ok=True)
+        sys.stderr.write(f"devsplit: {what} exited 0 but wrote no output ({out}); the compiler may have been killed (out of memory?):\n"
+                         f"{r.stdout[-3000:]}{r.stderr[-6000:]}")
         raise StepFailed(what)
     return dt, r.stdout
 
@@ -210,7 +220,7 @@ def ipsccp_defines(back_end):
     """
     cmd = ["-emit-llvm-bc" if str(t) == "-emit-obj" else str(t) for t in back_end]
     cmd = cmd[:2] + ["-mllvm", "-print-after=ipsccp", "-mllvm", "-print-module-scope"] + cmd[2:]
-    out, started, tail = [], False, collections.deque(maxlen=20)
+    out, started, complete, tail = [], False, False, collections.deque(maxlen=20)
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, errors="replace")
     try:
         for line in proc.stderr:
@@ -218,17 +228,22 @@ def ipsccp_defines(back_end):
                 tail.append(line)
             if line.startswith("; *** IR Dump After"):
                 if started:
+                    complete = True
                     break
                 started = True
             elif started and line.startswith("define "):
                 out.append(line.rstrip("\n"))
             elif started and line.startswith("attributes #"):
+                complete = True
                 break
     finally:
         proc.kill()
         proc.wait()
     if not started:
         sys.stderr.write(f"devsplit: IPSCCP dump failed (rc {proc.returncode}):\n{''.join(tail)}")
+        raise StepFailed("IPSCCP dump")
+    if not complete:
+        sys.stderr.write("devsplit: IPSCCP dump cut off before its last line (the compiler was killed?); the facts would be partial.\n")
         raise StepFailed("IPSCCP dump")
     return "\n".join(out)
 
@@ -288,6 +303,8 @@ def main(argv=None):
     work.mkdir(parents=True, exist_ok=True)
     (work / "cache").mkdir(exist_ok=True)
     args.out.parent.mkdir(parents=True, exist_ok=True)
+    if not (args.derive or args.derive_facts or args.device_only):
+        args.out.unlink(missing_ok=True)  # an old engine must not stay in place when this build fails
     try:
         plan = driver_plan(args.hipcc, flags, args.out, Path.cwd())
     except (RuntimeError, OSError) as error:
@@ -317,9 +334,9 @@ def build(args, plan, llvm, work, t_all):
         host_opts = strip_opts(host_opts, ("-o", "-fcuda-include-gpubinary"))
         host_cmd = [*host_opts, "-fcuda-include-gpubinary", placeholder, "-o", host_o, "-x", "hip", host_src]
         if not serial:
-            host_future = pool.submit(run, host_cmd, "host compile")
+            host_future = pool.submit(run, host_cmd, "host compile", out=host_o)
     bc = work / "dev0.bc"
-    dt, _ = run(device_front_end(plan["device"], bc), "device front end")
+    dt, _ = run(device_front_end(plan["device"], bc), "device front end", out=bc)
     log(f"device front end {dt:.1f}s")
     t_parse = time.monotonic()
     nm = llvm / "llvm-nm"
@@ -372,7 +389,7 @@ def build(args, plan, llvm, work, t_all):
 
     def compile_part(job):
         part, obj, cmd, cached = job
-        dt, _ = run(cmd, f"back end of {part.name}")
+        dt, _ = run(cmd, f"back end of {part.name}", out=obj)
         os.replace(obj, cached)
         return part.name, dt
 
@@ -385,15 +402,15 @@ def build(args, plan, llvm, work, t_all):
     first = next(i for i, t in enumerate(lld) if t.endswith(".o"))
     lld[first:first + 1] = objs
     t_link = time.monotonic()
-    run([*lld, "-o", hsaco], "lld")
+    run([*lld, "-o", hsaco], "lld", out=hsaco)
     if args.device_only:
         log(f"device only: {time.monotonic() - t_all:.1f}s -> {hsaco}")
         return 0
     hipfb = work / "dev.hipfb"
     bundler = [t for t in plan["bundler"] if not t.startswith("-output=") and t.startswith("-input=") <= (t == "-input=/dev/null")]
-    run([*bundler, f"-input={hsaco}", f"-output={hipfb}"], "bundler")
+    run([*bundler, f"-input={hsaco}", f"-output={hipfb}"], "bundler", out=hipfb)
     log(f"lld and bundler {time.monotonic() - t_link:.1f}s")
-    dt, _ = host_future.result() if host_future else run(host_cmd, "host compile")
+    dt, _ = host_future.result() if host_future else run(host_cmd, "host compile", out=host_o)
     log(f"host compile {dt:.1f}s")
     run([llvm / "llvm-objcopy", "--update-section", f".hip_fatbin={hipfb}", host_o], "objcopy")
     link = strip_opts(plan["link"], ("-o",))
@@ -402,7 +419,7 @@ def build(args, plan, llvm, work, t_all):
     if len(objs_in_link) != 1:
         raise RuntimeError(f"expected one host object in the link command, found {len(objs_in_link)}")
     link[objs_in_link[0]] = str(host_o)
-    run([*link, "-o", args.out], "link")
+    run([*link, "-o", args.out], "link", out=args.out)
     prune_cache(work / "cache", objs, len(objs))
     log(f"done {time.monotonic() - t_all:.1f}s -> {args.out}")
     return 0

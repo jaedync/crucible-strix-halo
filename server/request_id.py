@@ -8,6 +8,11 @@ DEFAULT_CLIENT_REQUEST_ID_HEADER = "X-Client-Request-Id"
 HEADER_NAME = re.compile(r"[A-Za-z0-9-]{1,64}")
 
 
+# Headers that carry a credential. The value of the id header goes to the log lines (a 401 line names it), so one of
+# these would write the key that a client tried, or the valid key of a gateway, to the journal.
+CREDENTIAL_HEADERS = frozenset({"authorization", "proxy-authorization", "x-api-key", "cookie", "set-cookie"})
+
+
 class HeaderNameError(ValueError):
     pass
 
@@ -22,4 +27,7 @@ def resolve_client_request_id_header(flag, environ):
         source, name = CLIENT_REQUEST_ID_HEADER_ENV, environ.get(CLIENT_REQUEST_ID_HEADER_ENV) or DEFAULT_CLIENT_REQUEST_ID_HEADER
     if not HEADER_NAME.fullmatch(name):
         raise HeaderNameError(f"{source}: {name[:40]!r} is not a header name (1 to 64 letters, digits or hyphens)")
+    if name.lower() in CREDENTIAL_HEADERS:
+        raise HeaderNameError(f"{source}: {name!r} carries a credential, and the id is written to the log. "
+                              "Name another header, for example X-Request-Id.")
     return name

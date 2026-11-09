@@ -3,6 +3,104 @@
 Releases are numbered `v0.<train>.<fix>`. This file lists the newest release first.
 The same text is in the notes of each release on GitHub.
 
+## v0.34.0 (2026-11-09)
+
+Release v0.34.0 is the engine of train 34. It follows v0.33.1.
+It has a security hardening of the server, the installer and the update, and it makes the measured speed configuration the
+default of the service. The security changes are listed first. The speed paragraph names the numbers.
+
+### Security
+
+- API key. A key is required for an address that is not loopback, except in the Docker image. Give the key as a file with
+  `--api-key-file PATH`. Without it, a start on such an address exits with code 2 before the model loads. Every route but
+  `GET /health` then needs the key.
+- Docker. The image allows `--host 0.0.0.0` (and `::`) with no key, so the `docker run` line of v0.33 keeps working.
+  The start prints one `WARNING` line that says a published port on all addresses is an open server. Publish the port
+  only to `127.0.0.1` (`-p 127.0.0.1:8790:8790`), or use a key. A key stays optional in the container: mount a key file
+  and pass `--api-key-file` to reach the port from other machines. See [docs/DOCKER.md](docs/DOCKER.md).
+  The switch also needs the file `/.dockerenv` or `/run/.containerenv`, so it does nothing on a host.
+  Do not use `--network host` with no key: the container then opens the network of the host.
+- Docker and the Host list. The image has no Host list by default, so with no key a web page can reach a published port
+  through DNS rebinding. The service outside Docker (`./crucible setup` and `./crucible start`) has a Host list by default.
+  To turn the list on in the image, set `-e CRUCIBLE_ALLOWED_HOSTS=localhost,127.0.0.1,[::1]`, or use a key
+  (`--api-key-file`). The Dockerfile sets no default.
+- Uninstall removes less. `install.sh uninstall --remove-models` and `./crucible uninstall --remove-models` remove the
+  pack folders that setup makes. They no longer remove the whole models folder. They remove the state folder only when
+  setup made it (setup writes a record in `.crucible/state-dir.json`). A folder that holds other files, such as
+  `~/.cache`, is refused as a state folder at setup. A pack that you keep stays, also when the models folder is the
+  install folder itself or is reached through a link. The command stops with exit 1 when the server does not stop. The
+  uninstall of an old install (made before `./crucible uninstall` existed) now takes the lock of the update and stops
+  when an update was cut off.
+  `--remove-models` also looks inside the state folder: it removes the folder only when it holds nothing but what the
+  engine writes there (`write-ledger` and the identity folders). Otherwise it keeps the folder and says why.
+- Update keeps your files. The update stops with exit 1 and a list when a file of yours (tracked by git or not) is in a
+  folder that the update replaces, for example `docs/` or `tools/`. Before, the update deleted such a file. Files at
+  the top level are carried over as before. Tool caches such as `__pycache__` are not counted.
+- Update changes the Python packages after your yes. pip no longer changes `.venv` before the question. The update
+  records the exact old versions first (`pip freeze --all`, so pip, setuptools and wheel too). A rollback puts them back
+  and removes the packages that the new requirements added.
+- `install.sh` stops when it runs as root (exit 2). It downloads over https only: a redirect to `http://` is refused.
+  It stops (exit 4) when the files that `git clone` fetched are not the commit of the release tag, for example when a
+  branch has the name of the tag. It asks for sudo once for all missing packages, not once for the tools and once for the
+  libraries. With `--source-build` it still downloads the release list and the manifest (not the engine) and refuses a
+  tag whose commit is not the commit in the manifest.
+- `install.sh` finds a `python3` that cannot make a venv (stock Ubuntu has no `python3-venv`). On Debian and Ubuntu it
+  adds `python3-venv` to the one package question. Before, setup stopped at the venv step.
+- The timer template `crucible-update.service` runs `./crucible update --yes`. It ran `make update` before.
+- Connection limits. A request head must arrive within 10 seconds. A server with a key holds at most 16 connections
+  for each address that have not sent the key (after a grace time of 2 seconds), and closes the oldest connection of
+  the busiest address when all 256 slots are full. When every address holds one connection, only a connection older than
+  the grace time can be closed, and a new connection is refused with HTTP 503 if none is. An IPv6 `/64` counts as one
+  address. A server with no key has the head limit only.
+- Host list for the service. `./crucible setup` and `./crucible start` start the server with
+  `--allowed-host localhost,127.0.0.1,[::1]` and the bind address. This stops DNS rebinding. Add the name of a reverse
+  proxy with `./crucible setup --allowed-host NAME`. The remote access guide in the repository (`docs/REMOTE_ACCESS.md`) has the steps.
+  When the service runs and a setting changed (the list, the key or the address), `setup` restarts the service, so the
+  running server uses the new setting. `setup --api-key` on a configured host now starts the server in the same run.
+  A server that you start with `python -m server` is not changed.
+- Request-ID header. The server refuses `Authorization`, `Proxy-Authorization`, `x-api-key`, `Cookie` and `Set-Cookie`
+  as the name of the client request-ID header.
+- The `crucible` command checks a whole value with `fullmatch` (for example a tag). A trailing newline is
+  not accepted any more.
+
+### Speed
+
+- Measured speed. The [README](README.md) speed tables have a v0.34.0 column. It is the ladder run of Nov 7, 2026 on a
+  build of this release (it differs from the release engine in the version text only), with the public files, the
+  balanced power profile and the six words below. The GPU clock was 2,303 MHz on the 4.05 pack and 2,292 MHz on the 3.05
+  pack. Against v0.33.0, decode with 4 sessions reads +3.9% on the 4.05 pack and +9.0% on the 3.05 pack, decode at 32K
+  reads +3.8% (4.05 prose) and +3.8% (3.05 code), and the cold prefill rates are within 1.1% on both packs
+  (4.05 at 32K: -1.1%; the two runs of that row differ by 1.1% themselves). Serial decode with no speculation is
+  within 0.5%. The charts and the by-length text of the README still show v0.33.0, because no chart run was made for
+  this release.
+- The service has the measured configuration. `./crucible start` and the `docker run` line of docs/DOCKER.md set the words of
+  the README speed table: `CRUCIBLE_PLE_HOST=1`, `CRUCIBLE_COMPACT_STATE=1`, `CRUCIBLE_PLE_FETCH=1`, `CRUCIBLE_DRAFT_HEAD=q2`,
+  `CRUCIBLE_DRAFT_CHAIN=hc8,lead` and `CRUCIBLE_PF_LAUNCH_ROWS=16384+128`, with 4 streams of 262,144 tokens,
+  `--conversation-cache-mib 9700` and `--host-reserve-mib 11264`. The 4.05 pack no longer pins 8,192 launch rows. The draft
+  words change drafts only (the verify pass checks every draft). In the engine they stay off unless set.
+  A word that you set in the environment of `./crucible start` stays as you set it; the six words are defaults.
+- `python -m server` keeps `--conversation-cache-mib` at 0 (off). It now prints one NOTICE line at start that names the
+  flag and the value of the service, because a server with no cache prefills a whole conversation again on every turn.
+
+### Build
+
+- The engine `build-info` records the compile settings (`GPU_ARCH`, `HIPFLAGS`, `CPPFLAGS`, `LDFLAGS`, `LDLIBS`,
+  `ROCM_PATH`), the hipcc variables `HIPCC_COMPILE_FLAGS_APPEND`, `HIPCC_LINK_FLAGS_APPEND`, `HIP_CLANG_PATH` and
+  `HIP_DEVICE_LIB_PATH`, and the version of
+  `hipcc`. `make release-engine` refuses an engine that was built with other settings than the defaults, and an
+  engine whose compiler version is unknown.
+- The fault test (`tools/service_faulttest.py`) step N9 runs its server under `timeout`, in the session of the driver,
+  so the server ends at its life limit even when the driver is killed.
+
+### Known issues
+
+- While the service starts (systemd state `activating`, for example during the model load after a boot), `./crucible doctor`
+  and `./crucible setup` report the check "GPU memory is free" (`gpu-free`) as failed, because the starting server already
+  holds GPU memory. Wait until `./crucible service status` shows `active (running)`, then run the command again.
+- When `./crucible setup` changes a setting while the service runs, and setup stops before its end (for example during a
+  download), a second run of `./crucible setup` does not restart the service. The server then keeps the old setting. Restart it
+  with `./crucible service restart`.
+
 ## v0.33.1 (2026-11-05)
 
 Release v0.33.1 is a patch release of v0.33.0. It has two fixes and one server option that is on by default.

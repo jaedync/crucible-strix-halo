@@ -338,7 +338,7 @@ class StartLineTest(unittest.TestCase):
     def test_strict_mode_lists_the_hosts(self):
         text = self.start("--allowed-host", "Localhost,127.0.0.1:08790")
         self.assertIn("Host check: only localhost, 127.0.0.1:8790", text)
-        self.assertNotIn("off", text)
+        self.assertNotIn("Host check: off", text)  # the conversation-cache notice also holds the word "off"
 
 
 if __name__ == "__main__":

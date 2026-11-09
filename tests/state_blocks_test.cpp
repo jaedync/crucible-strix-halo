@@ -90,6 +90,7 @@ StateDiskOptions Options(char id, const std::string& name) {
   options.identity = std::string(64, id);
   options.directory = DirName(id);
   options.min_tokens = 4;
+  options.free_reserve = uint64_t(64) << 20;  // the default 16 GiB would make the tests depend on the free space of the host disk
   options.io_threads = 3;
   options.log = logs.Sink();
   options.block_rows = kRows;

@@ -1,4 +1,5 @@
 """Local-only HTTP endpoints. Client disconnects never leave unread engine output."""
+import ipaddress
 import json
 import math
 import queue
@@ -39,6 +40,16 @@ COUNT_TOKENS_PATH = "/v1/messages/count_tokens"
 # socket timeout is per operation, so a client that sends one byte every 25 s held a thread for ever.
 MAX_CONNECTIONS = 256
 READ_DEADLINE_SECONDS = 60
+# A client has this long to send the request head (the request line and the headers). It is not a limit for the body
+# (READ_DEADLINE_SECONDS from the end of the head), and never for a response: the deadline is gone when the head is in.
+HEAD_DEADLINE_SECONDS = 10
+# With an API key: connections that have not passed the key check are the open door of the server. One address may hold
+# this many of them longer than the grace time. A newer connection from that address then closes its oldest one. A full
+# pool closes the oldest connection of the address that holds most of them, so the key holder always gets in.
+# The grace time lets a burst of new connections send their first request. /health does not pass the check.
+UNKEYED_PER_ADDRESS = 16
+UNKEYED_ROOM_WAIT_SECONDS = 0.25
+UNKEYED_GRACE_SECONDS = 2.0
 WATCH_SECONDS = 1.0
 # SH-2: a refused body up to this size is read and discarded, so the close does not reset the connection before the
 # client reads the error. A larger one is not worth the bandwidth; the read deadline bounds the time either way.
@@ -79,18 +90,83 @@ class ReadDeadlines:
                 for connection in late:
                     del self.deadlines[connection]
             for connection in late:
-                try:
-                    connection.shutdown(socket.SHUT_RDWR)  # the blocked read returns, and the handler closes
-                except OSError:
-                    pass
+                close_connection(connection)
+
+def address_key(address):
+    """The address that the limits count. An IPv6 client owns a whole /64 (a host gets any address of it), so the /64 is one
+    address. An IPv4-mapped address counts as its IPv4 address. Anything else (None, a bad text) counts as it is."""
+    try:
+        ip = ipaddress.ip_address(address.partition("%")[0])
+    except (AttributeError, ValueError):
+        return address
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        return str(ip.ipv4_mapped)
+    if ip.version == 6:
+        return str(ipaddress.ip_network((int(ip) >> 64 << 64, 64)))
+    return str(ip)
+
+
+class Unkeyed:
+    """The connections that have not passed the key check, oldest first. Only a server with a key uses it."""
+    def __init__(self):
+        self.lock, self.items = threading.Lock(), {}  # connection -> (address key, time of arrival)
+
+    def add(self, connection, address, now=None):
+        """Register a new connection. Returns the connections to close: the oldest ones of this address above the limit."""
+        now = time.monotonic() if now is None else now
+        address = address_key(address)
+        with self.lock:
+            old = [c for c, (a, t) in self.items.items() if a == address and now - t >= UNKEYED_GRACE_SECONDS]
+            drop = old[:max(0, len(old) - UNKEYED_PER_ADDRESS + 1)]
+            for c in drop:
+                del self.items[c]
+            self.items[connection] = (address, now)
+        return drop
+
+    def for_room(self, now=None):
+        """The connection to close for a new one when the pool is full, removed, or None (the caller refuses the new one).
+
+        An address with two connections or more is a crowd: the oldest connection of the busiest address goes, at any age.
+        When every address holds one connection, only a connection older than the grace time goes, so a slow key holder
+        is safe from a client with many addresses."""
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            counts = {}
+            for a, _ in self.items.values():
+                counts[a] = counts.get(a, 0) + 1
+            if not counts:
+                return None
+            busiest = max(counts, key=counts.get)
+            if counts[busiest] >= 2:
+                victim = next(c for c, (a, _) in self.items.items() if a == busiest)
+            else:
+                old = [c for c, (_, t) in self.items.items() if now - t >= UNKEYED_GRACE_SECONDS]
+                if not old:
+                    return None
+                victim = old[0]
+            del self.items[victim]
+            return victim
+
+    def keyed(self, connection):
+        with self.lock:
+            self.items.pop(connection, None)
+
+
+def close_connection(connection):
+    try:
+        connection.shutdown(socket.SHUT_RDWR)  # the blocked read returns, and the handler closes
+    except OSError:
+        pass
+
 
 class Service:
     def __init__(self, backend, tokenizer, model="crucible", clamp_max_tokens=False, default_thinking=False,
                  max_body_mib=1, thinking_answer_room=None, max_thinking_tokens=None, stream_tool_calls=True,
                  max_requests_per_client=0, vision=None, default_mtp_prefix=MTP_WINDOW, capture=None, allowed_hosts=None,
                  defaults=DEFAULTS, min_thinking_tokens=0, client_request_id_header=DEFAULT_CLIENT_REQUEST_ID_HEADER,
-                 end_of_turn_guard=True):
+                 end_of_turn_guard=True, api_key=None):
         self.backend, self.tokenizer, self.model = backend, tokenizer, model
+        self.api_key = api_key  # api_key.KeyGate or None: every route but /health needs the key when it is set
         self.end_of_turn_guard = end_of_turn_guard  # serve --end-of-turn-guard (see Handler.keep_end_of_turn)
         self.client_request_id_header = client_request_id_header  # request_id.resolve_client_request_id_header()
         self.allowed_hosts = allowed_hosts  # hosts.parse_allowed_hosts(): None accepts any Host header
@@ -268,8 +344,11 @@ def trace_since(query):
     return since
 
 def error_body(error):
-    return dict(error=dict(message=str(error), type="invalid_request_error" if error.status < 500 else "server_error",
-                           param=error.param, code=None))
+    kind = getattr(error, "kind", None)  # AuthError: authentication_error
+    body = dict(error=dict(message=str(error), type=kind or ("invalid_request_error" if error.status < 500
+                                                             else "server_error"), param=error.param, code=None))
+    # An Anthropic client reads {"type":"error","error":{...}}; an OpenAI client reads {"error":{...}}. One body fits both.
+    return dict(type="error", **body) if kind else body
 
 def declared_length(headers):
     """The one valid Content-Length of a body without Transfer-Encoding, or None."""
@@ -295,6 +374,7 @@ BUSY = (b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n
 def handler_for(service):
     slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
     deadlines = ReadDeadlines()
+    unkeyed = Unkeyed() if service.api_key is not None else None
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -304,8 +384,20 @@ def handler_for(service):
             super().setup()
             self.connection.settimeout(30)
             self.admitted = slots.acquire(blocking=False)
+            if unkeyed is not None:
+                address = self.client_address[0] if isinstance(getattr(self, "client_address", None), tuple) else None
+                if not self.admitted:  # a full pool: close the oldest connection that has not passed the key check
+                    victim = unkeyed.for_room()
+                    if victim is not None:
+                        close_connection(victim)
+                    # A victim that closed a moment ago frees its slot as soon as its handler ends: wait for it. With no victim,
+                    # wait only a short time (a slot may be on its way), then refuse the new connection.
+                    self.admitted = slots.acquire(timeout=2 if victim is not None else UNKEYED_ROOM_WAIT_SECONDS)
+                if self.admitted:
+                    for victim in unkeyed.add(self.connection, address):
+                        close_connection(victim)
             if self.admitted:
-                deadlines.watch(self.connection, READ_DEADLINE_SECONDS)
+                deadlines.watch(self.connection, min(HEAD_DEADLINE_SECONDS, READ_DEADLINE_SECONDS))
 
         def handle(self):
             if not self.admitted:
@@ -318,9 +410,19 @@ def handler_for(service):
 
         def finish(self):
             deadlines.done(self.connection)
+            if unkeyed is not None:
+                unkeyed.keyed(self.connection)
             if self.admitted:
                 slots.release()
             super().finish()
+
+        def parse_request(self):
+            """The head is in: the body has READ_DEADLINE_SECONDS more. (Every JSON answer closes the connection, so the
+            deadline that setup arms is the one of the only head that a connection sends.)"""
+            ok = super().parse_request()
+            if ok and hasattr(self, "connection"):  # a handler built without a socket (a unit test) has none
+                deadlines.watch(self.connection, READ_DEADLINE_SECONDS)
+            return ok
 
         def request_read(self):
             """The request head and body are in: the read deadline no longer applies."""
@@ -404,10 +506,19 @@ def handler_for(service):
             if not host_allowed(self.headers.get("Host"), service.allowed_hosts):
                 raise ApiError(REFUSED, status=403)
 
-        def send_json(self, status, body):
+        def authorize(self):
+            """The API key check (api_key.py). It runs after the Host check and before anything reads or parses a body."""
+            if service.api_key is not None:
+                service.api_key.check(self.headers)
+                if unkeyed is not None and hasattr(self, "connection"):
+                    unkeyed.keyed(self.connection)  # a connection with the key is not counted and not closed for room
+
+        def send_json(self, status, body, headers=None):
             encoded = json.dumps(body, ensure_ascii=True, allow_nan=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
             self.send_header("Content-Length", str(len(encoded)))
             self.send_header("Connection", "close")
             self.end_headers()
@@ -429,7 +540,7 @@ def handler_for(service):
                     self.sse(error_body(error))
                     self.sse("[DONE]")
                 else:
-                    self.send_json(error.status, error_body(error))
+                    self.send_json(error.status, error_body(error), getattr(error, "headers", None))
                     self.discard_body()
             except (BrokenPipeError, ConnectionResetError, TimeoutError):
                 pass  # Error output has the same disconnect semantics as successful output.
@@ -440,6 +551,8 @@ def handler_for(service):
             try:
                 self.local_host()
                 path, _, query = self.path.partition("?")
+                if path != "/health":
+                    self.authorize()  # /health shows only ok or 503: systemd tools and proxies poll it
                 if path == "/v1/crucible/trace":
                     self.send_json(200, dict(object="crucible.trace", data=service.backend.trace.since(trace_since(query))))
                     return
@@ -481,6 +594,7 @@ def handler_for(service):
 
         def read_body(self):
             self.local_host()
+            self.authorize()
             if self.headers.get("Transfer-Encoding"):
                 raise ApiError("Use Content-Length. Chunked request bodies are not supported.")
             lengths = self.headers.get_all("Content-Length", [])
@@ -779,6 +893,9 @@ def handler_for(service):
             started = admitted = finished = False
             address = self.client_address[0] if isinstance(getattr(self, "client_address", None), tuple) else None
             try:
+                if service.api_key is not None:
+                    self.local_host()  # also for an unknown path: it needs the key before it says 404
+                    self.authorize()
                 utility = {COUNT_TOKENS_PATH: self.count_tokens, "/tokenize": self.tokenize, "/v1/tokenize": self.tokenize,
                            "/apply-template": self.apply_template}.get(self.path.partition("?")[0])
                 if utility is not None:

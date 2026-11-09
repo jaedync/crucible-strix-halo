@@ -64,6 +64,7 @@ StateDiskOptions Options() {
   options.identity = std::string(64, '7');
   options.directory = std::string(16, '7') + "-" + std::string(16, '7') + "-" + std::string(16, '7');
   options.min_tokens = 12;
+  options.free_reserve = uint64_t(64) << 20;  // the default 16 GiB would make the tests depend on the free space of the host disk
   options.log = [](const std::string&) {};
   // The tier logic is under test, not the host disk: a fixed 1 TiB of free space, whatever the real filesystem holds.
   // A test of the reserve or the full path sets its own free_space after this.

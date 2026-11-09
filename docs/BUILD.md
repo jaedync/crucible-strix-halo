@@ -32,6 +32,9 @@ The output is `build/engine/crucible`.
 The device code compiles in parallel parts, and an edit rebuilds only the parts it touches.
 The number of parallel compiles follows `make -j` (default 1). On the test machine, build with `make -j 1` only.
 The ISA is the same as with plain `hipcc`. Run `make SPLIT=0` for plain `hipcc`.
+
+Every `hipcc` recipe runs through `tools/hipcc_checked.sh`. `hipcc` exits 0 when the system kills its compiler (for example out of memory). The helper removes the old output first and fails when the compiler leaves no output. The engine recipe also writes `build/engine/crucible.build-info` (commit, clean tree, hash). `make release-engine` refuses an engine that does not match its commit.
+
 After a kernel change:
 
 1. Build. If the build stops with `argument facts drift`, run `make -j 8 split-facts` (the test machine: `make -j 1 split-facts`) and commit `tools/devsplit_facts.tsv`.

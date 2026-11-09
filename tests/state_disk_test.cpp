@@ -94,6 +94,7 @@ StateDiskOptions Options(const std::string& identity, Logs& logs, const std::str
   options.identity = std::string(64, identity[0]);
   options.directory = DirName(identity[0]);
   options.min_tokens = 4;
+  options.free_reserve = uint64_t(64) << 20;  // the default 16 GiB would make the tests depend on the free space of the host disk
   options.io_threads = 3;
   options.log = logs.Sink();
   // The tier logic is under test, not the host disk: a fixed 1 TiB of free space, whatever the real filesystem holds.

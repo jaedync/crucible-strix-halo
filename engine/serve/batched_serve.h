@@ -1869,7 +1869,7 @@ inline int BatchedServe(const std::string& checkpoint, int context, int streams,
   if (disk) KeepRunningOnTerm();
   // "state_disk": the engine takes stage commands (the server sends them only then).
   std::printf("{\"event\":\"ready\",\"context\":%d,\"streams\":%d,\"prefill_rows\":%d,\"slot_contexts\":[%s],"
-              "\"protocol\":\"batch-v1\",\"cache_tail\":true,%s%s}\n", context, streams, engine.PrefillRows(), contexts.c_str(),
+              "\"protocol\":\"batch-v1\",\"cache_tail\":true,\"ping\":true,%s%s}\n", context, streams, engine.PrefillRows(), contexts.c_str(),
               crucible::ReadyModelJson().c_str(), disk ? ",\"state_disk\":true,\"stage_job\":true" : "");
   std::fflush(stdout);
   std::string line;
@@ -1925,6 +1925,7 @@ inline int BatchedServe(const std::string& checkpoint, int context, int streams,
                     staged.state.c_str(), staged.tokens, JsonQuote(staged.reason.empty() ? "-" : staged.reason).c_str(),
                     static_cast<unsigned long long>(staged.tag));
       }
+      else if (op == "ping") {}  // the watchdog's liveness check: no state change, the batch_end below is the reply
       else session.Close(command.request_id);
       for (const auto& event : events) PrintBatchEvent(event);
     } catch (const std::exception& error) {

@@ -24,8 +24,9 @@ These tests use recorded token scripts, not model quality or GPU performance tes
 
 - Readiness: `GET /health` returns `{"status":"ok"}` when the engine is ready, and HTTP 503 after it stops.
 
-The server does not authenticate requests.
-Keep it on loopback and do not expose it to an untrusted network.
+The server needs no key on loopback. With `--api-key-file` it needs the key on every route but `/health`:
+set the key as the API key of the client (see `server/README.md`, API key).
+Keep it on loopback or behind a reverse proxy (see `docs/REMOTE_ACCESS.md`). Do not expose it to an untrusted network.
 See `server/README.md` for server startup.
 
 If the agent runs on another machine, use a foreground SSH tunnel:

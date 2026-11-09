@@ -12,41 +12,41 @@ research software for one GPU architecture. It is not a general model backend or
 
 ## Speed of this release
 
-The tables and charts below show the v0.33.0 release. This is v0.33.1, a patch release that changes no prefill or decode arithmetic, so it has no column of its own (see the [Changelog](CHANGELOG.md)). The tables hold the release ladder of each release, one column each. The v0.33.0 column was measured Nov 3, 2026 on the v0.33.0 build, balanced power profile (GPU clock 2,289 to 2,295 MHz). The v0.32.0 column is the ladder run of Nov 3, 2026 on the v0.32.0 build. The 4-session row of that column has no value on the 4.05 pack: one session of each run stopped early. On the 3.05 pack it is from one of the two runs, for the same reason. The numbers of v0.32.0 in the text and in the charts come from the runs by context length. Those runs were measured Nov 3, 2026. The vision loader fix of v0.32.0 came after these runs; it changes only the vision load path, not prefill or decode.
-In the tables, each value is the median of 2 runs. The server ran 4 sessions of 262,144 tokens with image input and speculative decoding (MTP)
-on, as in daily use, with the public files and no tuned draft head file. The v0.33.0 and v0.32.0 runs set two options that are off by default in this release: `CRUCIBLE_DRAFT_HEAD=q2` and `CRUCIBLE_DRAFT_CHAIN=hc8,lead` (see the [Changelog](CHANGELOG.md)); the earlier runs did not. They also set `CRUCIBLE_PLE_HOST=1` and `CRUCIBLE_COMPACT_STATE=1`, which are part of the measured configuration. The v0.33.0 runs also set `CRUCIBLE_PLE_FETCH=1`, a host read hint for the PLE table; the v0.32.0 runs did not. With the defaults (no `CRUCIBLE_DRAFT_HEAD` and no `CRUCIBLE_DRAFT_CHAIN`) we expect decode as in v0.31.0; we did not measure the defaults. The v0.33.0 and v0.32.0 runs used prefill launches of 16,384 rows (`CRUCIBLE_PF_LAUNCH_ROWS=16384+128`, the default); the earlier columns used the settings of their own time (4.05 pack: 8,192 rows; 3.05 pack: 16,384 rows for v0.31.0 and v0.30.0, 8,192 rows for v0.26.0 and v0.22.0). Every row uses prompts that no
+The tables below show the v0.34.0 release. The v0.34.0 column was measured Nov 7, 2026 on a build of v0.34.0 (it differs from the release engine in the version text only), balanced power profile (GPU clock 2,303 MHz on the 4.05 pack and 2,292 MHz on the 3.05 pack), with the public files and the six words listed below. The charts and the by-length text below still show the v0.33.0 release, because no chart run was made for v0.34.0. The tables hold the release ladder of each release, one column each. The 4.05 code value of the v0.34.0 column is the ladder row; the older columns take that row from the decode chart. The v0.33.0 column was measured Nov 3, 2026 on the v0.33.0 build, balanced power profile (GPU clock 2,289 to 2,295 MHz). The v0.32.0 column is the ladder run of Nov 3, 2026 on the v0.32.0 build. The 4-session row of that column has no value on the 4.05 pack: one session of each run stopped early. On the 3.05 pack it is from one of the two runs, for the same reason. The numbers of v0.32.0 in the text and in the charts come from the runs by context length. Those runs were measured Nov 3, 2026. The vision loader fix of v0.32.0 came after these runs; it changes only the vision load path, not prefill or decode.
+In the tables, each value is the median of 2 runs (the v0.34.0 column: 2 runs, A and B). The server ran 4 sessions of 262,144 tokens with image input and speculative decoding (MTP)
+on, as in daily use, with the public files and no tuned draft head file. The v0.34.0, v0.33.0 and v0.32.0 runs set two options that are unset in the engine itself: `CRUCIBLE_DRAFT_HEAD=q2` and `CRUCIBLE_DRAFT_CHAIN=hc8,lead` (see the [Changelog](CHANGELOG.md)); the earlier runs did not. They change the drafts only, and the verify pass checks every draft. `./crucible start` and the [Docker](docs/DOCKER.md) run line set these two words. They also set `CRUCIBLE_PLE_HOST=1` and `CRUCIBLE_COMPACT_STATE=1`, which are part of the measured configuration. The v0.34.0 and v0.33.0 runs also set `CRUCIBLE_PLE_FETCH=1`, a host read hint for the PLE table; the v0.32.0 runs did not. `./crucible start` and the Docker run line set all six words of this paragraph, with 4 streams of 262,144 tokens, `--conversation-cache-mib 9700` and `--host-reserve-mib 11264`. If you start the engine or `python -m server` yourself with none of them (no `CRUCIBLE_DRAFT_HEAD` and no `CRUCIBLE_DRAFT_CHAIN`), we expect decode as in v0.31.0; we did not measure that. `python -m server` alone keeps the conversation cache off (`--conversation-cache-mib 0`): every follow-up turn then prefills the whole conversation again, and the server prints a notice at start. The v0.34.0, v0.33.0 and v0.32.0 runs used prefill launches of 16,384 rows (`CRUCIBLE_PF_LAUNCH_ROWS=16384+128`, the default of the engine; the service sets it by name); the earlier columns used the settings of their own time (4.05 pack: 8,192 rows; 3.05 pack: 16,384 rows for v0.31.0 and v0.30.0, 8,192 rows for v0.26.0 and v0.22.0). Every row uses prompts that no
 cache has seen, except the re-send row. The v0.32.0, v0.31.0, v0.30.0, v0.26.0 and v0.22.0 columns are earlier releases, measured with the same tool (4.05 pack: v0.32.0 on Nov 3, v0.31.0 on Nov 1, v0.30.0 on Oct 31, 2026, the other two in the run series of Oct 27 to 28, 2026; 3.05 pack: v0.33.0 and v0.32.0 on Nov 3, the others on Nov 1 to 2,
 2026, with the public files and no tuned draft head file). What changed since v0.32.0 is in the [Changelog](CHANGELOG.md).
 
 **4.05 bpw pack (the higher-quality option)**
 
-| Row | v0.33.0 | v0.32.0 | v0.31.0 | v0.30.0 | v0.26.0 | v0.22.0 |
-|---|---:|---:|---:|---:|---:|---:|
-| Cold prompt, 32K: first token (s) | 16.9 | 17.0 | 17.7 | 17.9 | 19.4 | 19.7 |
-| Cold prompt, 32K: prefill (tok/s) | 1,851 | 1,841 | 1,763 | 1,741 | 1,613 | 1,585 |
-| Cold prompt, 130K: first token (s) | 72.1 | 74.3 | 75.6 | 77.3 | 82.0 | 84.5 |
-| Cold prompt, 130K: prefill (tok/s) | 1,789 | 1,736 | 1,707 | 1,669 | 1,574 | 1,527 |
-| Same 32K prompt sent again: first token (s) | 0.020 | 0.021 | 0.021 | 0.023 | 0.014 | 1.870 |
-| Decode at 32K, 1 session, code, paired run (tok/s) | 71.7 | 71.8 | 69.0 | 68.4 | 58.4 (2 low samples) | 64.6 |
-| Decode at 32K, 1 session, prose (tok/s) | 56.3 | 57.6 | 55.2 | 53.3 | 50.5 | 50.4 |
-| Decode, 4 sessions, total (tok/s) | 113.8 | n/a | 117.6 | 102.4 | 106.9 | 106.7 |
-| Serial decode, no speculation, short context (tok/s) | 34.1 | 34.2 | 34.1 | 34.3 | 32.1 | 31.0 |
+| Row | v0.34.0 | v0.33.0 | v0.32.0 | v0.31.0 | v0.30.0 | v0.26.0 | v0.22.0 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Cold prompt, 32K: first token (s) | 17.1 | 16.9 | 17.0 | 17.7 | 17.9 | 19.4 | 19.7 |
+| Cold prompt, 32K: prefill (tok/s) | 1,831 | 1,851 | 1,841 | 1,763 | 1,741 | 1,613 | 1,585 |
+| Cold prompt, 130K: first token (s) | 72.4 | 72.1 | 74.3 | 75.6 | 77.3 | 82.0 | 84.5 |
+| Cold prompt, 130K: prefill (tok/s) | 1,782 | 1,789 | 1,736 | 1,707 | 1,669 | 1,574 | 1,527 |
+| Same 32K prompt sent again: first token (s) | 0.019 | 0.020 | 0.021 | 0.021 | 0.023 | 0.014 | 1.870 |
+| Decode at 32K, 1 session, code, paired run (tok/s) | 71.2 | 71.7 | 71.8 | 69.0 | 68.4 | 58.4 (2 low samples) | 64.6 |
+| Decode at 32K, 1 session, prose (tok/s) | 58.4 | 56.3 | 57.6 | 55.2 | 53.3 | 50.5 | 50.4 |
+| Decode, 4 sessions, total (tok/s) | 118.3 | 113.8 | n/a | 117.6 | 102.4 | 106.9 | 106.7 |
+| Serial decode, no speculation, short context (tok/s) | 34.2 | 34.1 | 34.2 | 34.1 | 34.3 | 32.1 | 31.0 |
 
 **3.05 bpw pack (the faster option)**
 
-| Row | v0.33.0 | v0.32.0 | v0.31.0 | v0.30.0 | v0.26.0 | v0.22.0 |
-|---|---:|---:|---:|---:|---:|---:|
-| Cold prompt, 32K: first token (s) | 16.7 | 16.7 | 16.8 | 16.9 | 19.2 | 18.9 |
-| Cold prompt, 32K: prefill (tok/s) | 1,870 | 1,867 | 1,858 | 1,843 | 1,628 | 1,656 |
-| Cold prompt, 130K: first token (s) | 71.3 | 72.4 | 72.8 | 74.2 | 81.5 | 81.0 |
-| Cold prompt, 130K: prefill (tok/s) | 1,809 | 1,783 | 1,771 | 1,739 | 1,583 | 1,594 |
-| Same 32K prompt sent again: first token (s) | 0.020 | 0.023 | 0.017 | 0.017 | 0.025 | 1.736 |
-| Decode at 32K, 1 session, code (tok/s) | 73.9 | 74.0 | 75.4 | 76.7 | 70.8 | 71.5 |
-| Decode at 32K, 1 session, prose (tok/s) | 60.3 | 58.9 | 57.2 | 59.4 | 58.4 | 56.3 |
-| Decode, 4 sessions, total (tok/s) | 118.3 | 130.2 (1 run) | 128.1 | 127.2 | 125.8 | 128.3 |
-| Serial decode, no speculation, short context (tok/s) | 39.3 | 39.3 | 39.2 | 39.5 | 36.5 | 35.4 |
+| Row | v0.34.0 | v0.33.0 | v0.32.0 | v0.31.0 | v0.30.0 | v0.26.0 | v0.22.0 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Cold prompt, 32K: first token (s) | 16.6 | 16.7 | 16.7 | 16.8 | 16.9 | 19.2 | 18.9 |
+| Cold prompt, 32K: prefill (tok/s) | 1,877 | 1,870 | 1,867 | 1,858 | 1,843 | 1,628 | 1,656 |
+| Cold prompt, 130K: first token (s) | 71.1 | 71.3 | 72.4 | 72.8 | 74.2 | 81.5 | 81.0 |
+| Cold prompt, 130K: prefill (tok/s) | 1,814 | 1,809 | 1,783 | 1,771 | 1,739 | 1,583 | 1,594 |
+| Same 32K prompt sent again: first token (s) | 0.015 | 0.020 | 0.023 | 0.017 | 0.017 | 0.025 | 1.736 |
+| Decode at 32K, 1 session, code (tok/s) | 76.8 | 73.9 | 74.0 | 75.4 | 76.7 | 70.8 | 71.5 |
+| Decode at 32K, 1 session, prose (tok/s) | 60.7 | 60.3 | 58.9 | 57.2 | 59.4 | 58.4 | 56.3 |
+| Decode, 4 sessions, total (tok/s) | 129.0 | 118.3 | 130.2 (1 run) | 128.1 | 127.2 | 125.8 | 128.3 |
+| Serial decode, no speculation, short context (tok/s) | 39.1 | 39.3 | 39.3 | 39.2 | 39.5 | 36.5 | 35.4 |
 
-Two runs per cell is a small sample. Decode with 1 session changes between runs and between prompts, because the draft head predicts some text better than other text. In the run series of Oct 27 to 28, 11 builds span 60.5 to 66.9 tok/s on the 4.05 code row, so a difference of that size in the decode rows is not a result. The cold prefill rows and the re-send row move less. The 4.05 code row
+Two runs per cell is a small sample. Against v0.33.0, the cold prefill rates of the v0.34.0 column are within 1.1% on both packs (the 4.05 pack reads 1.1% lower at 32K, and the two runs of that cell differ by 1.1%), decode with 4 sessions reads 3.9% higher on the 4.05 pack and 9.0% higher on the 3.05 pack, and serial decode is within 0.5%. Decode with 1 session changes between runs and between prompts, because the draft head predicts some text better than other text. In the run series of Oct 27 to 28, 11 builds span 60.5 to 66.9 tok/s on the 4.05 code row, so a difference of that size in the decode rows is not a result. The cold prefill rows and the re-send row move less. The 4.05 code row
 comes from the decode chart (v0.22.0 and v0.26.0 Oct 29, v0.30.0 Oct 31, v0.31.0 Nov 1, v0.32.0 and v0.33.0 Nov 3). Against v0.32.0 in the runs by context length (same tool and prompts; v0.32.0 measured Nov 3, v0.33.0 on Nov 3, see
 [Results](docs/RESULTS.md#decode-by-context-length)), the prefill rate of v0.33.0 changes by -1.8% to +1.9% on the 4.05 pack and by +1.5% to +2.6% on the 3.05 pack, per context length from 32K to 250K (ratio of the medians),
 and the decode rate changes by -3.2% to +0.4% on the 4.05 pack and by +1.7% to +2.9% on the 3.05 pack. On the 4.05 pack the change is not the same at each length: prefill reads 1.2% higher at 32K and 1.8% lower at 192K, and decode reads equal at 32K (+0.1%) and 3.2% lower at 250K. The two runs are on the same day but not in one session, so a part of the difference is the clock and the load. We report the ranges and do not claim a gain or a loss on that pack. On the 3.05 pack the gain holds at every length. Decode with 4
@@ -129,13 +129,14 @@ its pack has 4.16 bits per weight. Crucible leads with 4 and 8 sessions. At equa
 
 ## Quick start
 
-**New machine?** Follow the [setup guide](docs/QUICKSTART.md): each step has a check, for a person or an LLM agent.
+**New machine?** Follow the [setup guide](docs/QUICKSTART.md): each step has a check, for a person or an LLM agent. It also has a
+[one-command install](docs/QUICKSTART.md#one-command) and [Run as a service](docs/QUICKSTART.md#run-as-a-service).
 
 ### Build
 
 ```sh
 make   # needs the software under "Requirements"; writes build/engine/crucible
-# if make stops with "argument facts drift" on another ROCm, run: make SPLIT_CHECK=0
+# if make stops with "argument facts drift" on another ROCm, run: make SPLIT=0
 ```
 
 ### Download a model
@@ -157,13 +158,18 @@ curl -sS http://127.0.0.1:8790/v1/chat/completions -H 'Content-Type: application
   -d '{"model":"crucible","messages":[{"role":"user","content":"Say hello."}],"temperature":0,"max_tokens":32}'
 ```
 
-With 4 sessions of 262K tokens and `--vision` on the 4.05 pack, no launch-row setting is needed. The default (`16384+128`) fits 4 sessions of 262K with `--vision` on the 4.05 pack (stage arena 2,174 MiB); `8192+128` uses 1,439 MiB and gives a slower cold prefill.
+This line is a short test: it keeps the conversation cache off and sets none of the words of the speed table, so a long conversation prefills again on every turn. For the measured configuration, use step 6 of the [setup guide](docs/QUICKSTART.md) or the [Docker](docs/DOCKER.md) run line. With 4 sessions of 262K tokens and `--vision` on the 4.05 pack, no launch-row setting is needed. The default (`16384+128`) fits 4 sessions of 262K with `--vision` on the 4.05 pack (stage arena 2,174 MiB); `8192+128` uses 1,439 MiB and gives a slower cold prefill.
 
-**Security.** The server binds to `127.0.0.1:8790`. `--host ADDRESS` selects another address and prints a warning when it is not
-loopback. The server has no authentication and no TLS. Do not expose it to a network.
+**Security.** The server binds to `127.0.0.1:8790` and needs no key there. A key is required for an address that is not loopback, except in the Docker image. Give the key as a file (`--api-key-file PATH`);
+without it the server exits before it loads the model. With a key, every route but `GET /health` needs it.
+There is no TLS: to reach the server from other machines, use a reverse proxy ([security](SECURITY.md), [remote access](docs/REMOTE_ACCESS.md)).
+The Docker image listens on all container addresses with no key and no default Host list, and warns at start: publish its port to
+`127.0.0.1` only, or use a key ([Docker](docs/DOCKER.md)). Do not use the server as a public service.
 
 The API provides `/v1/chat/completions`, `/v1/completions`, `/v1/models` and `/tokenize`. Use `stream: true` for server-sent events
 and OpenAI `tools` definitions for function calls ([server guide](server/README.md), [OpenAI clients](docs/OPENAI_CLIENTS.md)).
+
+To watch the engine live (requests, rates, memory, engine switch), see [Kiln](https://github.com/jaedync/crucible-kiln), a dashboard and OpenAI-compatible gateway for Crucible.
 
 ### Requirements
 
@@ -209,7 +215,7 @@ by default. The commands, the timer and the details are in [UPDATES](docs/UPDATE
 - [Architecture](docs/ARCHITECTURE.md), [forward specification](docs/FLASHNEXT_FORWARD.md), [EXL3 format](docs/EXL3_FORMAT.md), [build guide](docs/BUILD.md).
 - [Third-party terms](docs/THIRD_PARTY.md). Progress report: [https://srv.jaedyn.me/strix-halo-engine-optimization/index.html](https://srv.jaedyn.me/strix-halo-engine-optimization/index.html).
 
-Limits: only the named packs and gfx1151 are qualified. The server has no authentication and no tenant isolation. The conversation
+Limits: only the named packs and gfx1151 are qualified. The server has no TLS and no tenant isolation, and one key is the only access control. The conversation
 cache is opt-in and sits in host memory unless the disk tier is on. Generated tool arguments can be invalid: the server reports the
 error and never runs a tool. A long-context timing is not a quality test.
 

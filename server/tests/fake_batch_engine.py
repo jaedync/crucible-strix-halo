@@ -22,7 +22,22 @@ disk_file = os.environ.get("FAKE_DISK_FILE")
 ready = dict(event="ready", context=contexts[0], streams=len(contexts), prefill_rows=rows, slot_contexts=contexts,
              protocol="batch-v1", cache_tail=True, model=dict(arch="qwen4_exp", vocab=248320, eos=248044, layers=48, hidden=2560))
 if state_disk: ready["state_disk"] = True
+# FAKE_PING=1: the engine takes op ping (ready names "ping": true) and answers it with one batch_end. FAKE_PING_REPLY=wrong
+# answers with a boundary of another op (the server must treat it as a protocol error).
+ping = os.environ.get("FAKE_PING") == "1"
+if ping: ready["ping"] = True
+# FAKE_LOAD_SECONDS: the engine loads this long before it sends the ready event (a cold model load).
+time.sleep(float(os.environ.get("FAKE_LOAD_SECONDS", "0")))
 print(json.dumps(ready), flush=True)
+# FAKE_EXIT_AFTER_READY=S: the engine exits with code 1 S seconds after the ready event (a crash loop).
+if os.environ.get("FAKE_EXIT_AFTER_READY"):
+    time.sleep(float(os.environ["FAKE_EXIT_AFTER_READY"]))
+    sys.exit(1)
+# FAKE_COMMAND_SECONDS: each command takes this long (a long prefill chunk); a ping and a stage command do not.
+command_seconds = float(os.environ.get("FAKE_COMMAND_SECONDS", "0"))
+# FAKE_STAGE_FULL=1: the state disk is full: a stage reply names reason "full" (nothing is read) and the flush at the end
+# of input writes nothing. Needs FAKE_STATE_DISK=1.
+stage_full = os.environ.get("FAKE_STAGE_FULL") == "1"
 disk = json.load(open(disk_file)) if state_disk and disk_file and os.path.exists(disk_file) else []
 stage_polls = {}
 staged = {}
@@ -98,6 +113,12 @@ def done_event(id, state):
 
 line_limit = int(os.environ.get("FAKE_LINE_LIMIT", "0"))
 for line in sys.stdin:
+    if ping and json.loads(line).get("op") == "ping":
+        if command_log:
+            with open(command_log, "a") as file: file.write(json.dumps(dict(op="ping")) + "\n")
+        wrong = os.environ.get("FAKE_PING_REPLY") == "wrong"
+        print(json.dumps(dict(event="batch_end", op="step" if wrong else "ping")), flush=True)
+        continue
     if state_disk and json.loads(line).get("op") == "stage":
         if command_log:
             with open(command_log, "a") as file: file.write(json.dumps(dict(op="stage", n=len(json.loads(line)["request"]["ids"]))) + "\n")
@@ -105,9 +126,12 @@ for line in sys.stdin:
         best = max((saved for saved in disk if len(saved) < len(ids) and ids[:len(saved)] == saved), key=len, default=None)
         key = tuple(ids)
         stage_polls[key] = stage_polls.get(key, 0) + 1
+        if stage_full: best = None
         state = "none" if best is None else "reading" if stage_polls[key] <= int(os.environ.get("FAKE_STAGE_READS", "2")) else "ready"
         if state == "ready": staged[key] = len(best)
-        print(json.dumps(dict(event="staged", state=state, tokens=len(best) if best else 0)), flush=True)
+        reply = dict(event="staged", state=state, tokens=len(best) if best else 0)
+        if stage_full: reply["reason"] = "full"
+        print(json.dumps(reply), flush=True)
         print(json.dumps(dict(event="batch_end", op="stage")), flush=True)
         continue
     if line_limit and len(line) - 1 > line_limit:
@@ -118,7 +142,7 @@ for line in sys.stdin:
     command = json.loads(line)
     if command_log:
         with open(command_log, "a") as file: file.write(json.dumps(command) + "\n")
-    time.sleep(float(os.environ.get("FAKE_DELAY", "0")))
+    time.sleep(float(os.environ.get("FAKE_DELAY", "0")) + command_seconds)
     op = command["op"]
     events = []
     cursor = None
@@ -292,4 +316,7 @@ for line in sys.stdin:
         sys.exit(1)
 if state_disk and disk_file:
     time.sleep(float(os.environ.get("FAKE_FLUSH_DELAY", "0")))
-    with open(disk_file, "w") as file: json.dump(disk + finished_prompts, file)
+    if stage_full:
+        print("fake engine: state flush refused: full", file=sys.stderr, flush=True)
+    else:
+        with open(disk_file, "w") as file: json.dump(disk + finished_prompts, file)

@@ -4,7 +4,8 @@ This server provides a small OpenAI-compatible API.
 It supports text chat and text completions with greedy or exact sampled decoding.
 It binds to `127.0.0.1` by default, on port 8790 unless `--port` selects another port.
 `--host ADDRESS` selects another bind address (see [Bind address](#bind-address)).
-It has no authentication and must remain local.
+It needs no key on loopback. An address that is not loopback needs an API key (see [API key](#api-key)).
+It has no TLS: use a reverse proxy for other machines (see [Remote access](../docs/REMOTE_ACCESS.md)).
 It is not a persistent service.
 
 ## Agent clients
@@ -61,7 +62,7 @@ Batches are not supported.
 The server accepts any `Host` header. A reverse proxy such as llama-swap, nginx or LiteLLM sends the `Host` header of
 its own client, for example `myserver:8080`. The server answers it with no extra setting.
 The server binds `127.0.0.1` by default, so the proxy must run on the same machine.
-To reach it from another machine, use `--host` (see [Bind address](#bind-address)).
+To reach it from another machine, use `--host` with an API key (see [Bind address](#bind-address) and [API key](#api-key)).
 
 A llama-swap config (keys checked against llama-swap's `config-schema.json`):
 
@@ -108,11 +109,30 @@ export CRUCIBLE_ALLOWED_HOSTS='127.0.0.1,localhost,[::1],myserver'
 - `--host ADDRESS` sets the bind address. The default is `127.0.0.1`, so nothing changes without the flag.
 - `ADDRESS` is an IPv4 or IPv6 literal, for example `0.0.0.0`, `::`, or `::1`. A host name or a scope id (`%eth0`) stops the start (exit 2).
 - The start line `Crucible is ready at ...` shows the real address.
-- An address that is not loopback prints one `WARNING` line at start.
-  The server has no authentication, so every machine that can reach the address can use it.
+- Loopback is 127.0.0.0/8 and `::1`. Every other address needs `--api-key-file`, also `0.0.0.0`, `::` and an
+  IPv4-mapped address such as `::ffff:127.0.0.1`. Without the flag the server exits with code 2 before it loads the model.
+  The one exception is the Docker image: there `0.0.0.0` and `::` start with no key (see [Docker](../docs/DOCKER.md)).
+- An address that is not loopback prints one `WARNING` line at start. With a key, the key is then the only protection.
+  In the Docker image with no key, the line says that a published port on all addresses is an open server.
 - Turn on strict Host mode (`--allowed-host`, above) and use a firewall that limits the port to the clients you trust.
 - `::` accepts IPv4 clients too: the server sets `IPV6_V6ONLY` to 0 on every host.
 - `--host` does not change the Host check rules.
+
+### API key
+
+- `--api-key-file PATH` names a file that holds the key. `PATH` must be absolute. `./crucible setup --bind ADDRESS`
+  (or `--api-key`) makes the file `~/.config/crucible/api-key`. The key is never in an argument, a variable, `config.json` or a log.
+- The file must be a regular file (not a link) of the user that runs the server, with mode 0600 or stricter, at most
+  1024 bytes, and one key of 32 to 256 characters from `A-Z a-z 0-9 . _ ~ + / = -`. Otherwise the server exits with code 78
+  and names the file and the rule, never the content. The server reads the file once at start and keeps only a sha256 digest.
+  To change the key, replace the file and restart.
+- With a key, every route needs it except `GET /health`: send `Authorization: Bearer KEY` or `x-api-key: KEY`.
+  If a request has both headers, both must be right. A repeated header gives 400. A missing or wrong key gives 401
+  with the same text, the header `WWW-Authenticate: Bearer` and an error body that OpenAI and Anthropic clients both read
+  (error type `authentication_error`).
+- The check runs after the Host check and before the server reads the body. The key is never logged. The 401 is one
+  `crucible_error` line with the reason `auth`.
+- The key also works on loopback (`--api-key-file` with the default host). Use it behind a reverse proxy.
 
 ### Tokenize and apply the template (`POST /tokenize`, `POST /v1/tokenize`, `POST /apply-template`)
 

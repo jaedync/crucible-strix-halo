@@ -12,6 +12,7 @@ from .engine_messages import ENGINE_REJECTED, ProtocolError
 from .api import LEGACY_MODEL, ApiError, ModelInfo, STOP_IDS
 from .hosts import ALLOWED_HOSTS_ENV
 from .request_id import CLIENT_REQUEST_ID_HEADER_ENV
+from .sd_notify import ENV_NAMES as SERVICE_ENV_NAMES
 from .pixel_files import PixelStore
 
 @dataclass
@@ -83,7 +84,9 @@ def engine_environment(environ):
     removed = sorted(name for name in environ if name.startswith("CRUCIBLE_") and name not in ENGINE_KEEP_SWITCHES)
     # A server setting, not an engine switch: the engine never sees it, and the startup line does not report it.
     removed_here = [name for name in removed if name != ALLOWED_HOSTS_ENV and name not in SERVER_ONLY_VARIABLES]
-    return {name: value for name, value in environ.items() if name not in removed}, removed_here
+    # The engine must not notify systemd: the service names (sd_notify.py) never reach it, and no note is made for them.
+    return {name: value for name, value in environ.items()
+            if name not in removed and name not in SERVICE_ENV_NAMES}, removed_here
 
 
 class EngineBackend:
@@ -108,6 +111,14 @@ class EngineBackend:
     # The serial protocol has no cancel: a first job that ran past the think cap decoded up to max_tokens for nothing
     # while its continuation waited (Discord, "thinking ignores max tokens"). The batch worker pauses a job at its cap.
     bounds_think_cap = True
+    # The watchdog (sd_notify.py) reads these. last_event_at: monotonic time of the last engine line. awaiting: the worker
+    # waits for an engine event (a command is in flight). ping_op: the engine takes op ping (ready event "ping": true).
+    last_event_at = 0.0
+    awaiting = False
+    awaiting_since = 0.0
+    ping_op = False
+    measure_gaps = False  # set when the engine is ready; the load time is not a busy gap
+    largest_busy_gap = 0.0
 
     def __init__(self, executable, checkpoint, context=32768, conversation_cache_mib=0, prefill=None, *,
                  engine_options=(), lookup=LOOKUP_DEPTH):
@@ -122,6 +133,7 @@ class EngineBackend:
         self.jobs = queue.Queue(maxsize=64)
         self.engine_events = queue.Queue(maxsize=128)
         self.fatal = None
+        self.last_event_at = time.monotonic()
         self.pixels = PixelStore()
         arguments = [str(executable), "serve", str(checkpoint), "--ctx", str(context)]
         if conversation_cache_mib:
@@ -146,8 +158,23 @@ class EngineBackend:
         except BaseException:
             self.close()
             raise
+        self.measure_gaps = True
         self.worker = threading.Thread(target=self._work, daemon=True)
         self.worker.start()
+
+    def session_counts(self):
+        """(busy sessions, sessions) for the service status line. The serial worker serves one request at a time."""
+        return (1 if self.owned_jobs else 0), 1
+
+    def _note_event(self, now):
+        """One engine line arrived. While the worker waits for the engine, the silence since the last line (or since the
+        wait began) is a busy gap. A new largest one of 1 s or more is logged: the fault test reads the last such line."""
+        if self.measure_gaps and self.awaiting:
+            gap = now - max(self.last_event_at, self.awaiting_since)
+            if gap >= 1.0 and round(gap, 1) > round(self.largest_busy_gap, 1):
+                self.largest_busy_gap = gap
+                print(f"watchdog: largest busy engine gap {gap:.1f} s", file=sys.stderr, flush=True)
+        self.last_event_at = now
 
     @staticmethod
     def check_lookup(depth):
@@ -179,6 +206,7 @@ class EngineBackend:
     def _read(self):
         try:
             for line in self.process.stdout:
+                self._note_event(time.monotonic())
                 if len(line) > 65536:
                     raise ProtocolError("The engine returned an oversized protocol event.")
                 event = json.loads(line)
@@ -195,13 +223,18 @@ class EngineBackend:
                 self.fatal = self.fatal or "The engine stopped. Check its stderr log."
 
     def _next(self):
-        for _ in range(3000):
-            try:
-                return self.engine_events.get(timeout=0.1)
-            except queue.Empty:
-                if self.fatal or self.closed.is_set():
-                    raise ProtocolError(self.fatal or "The engine was stopped.")
-        raise ProtocolError("The engine did not respond within 300 seconds.")
+        self.awaiting_since = time.monotonic()
+        self.awaiting = True
+        try:
+            for _ in range(3000):
+                try:
+                    return self.engine_events.get(timeout=0.1)
+                except queue.Empty:
+                    if self.fatal or self.closed.is_set():
+                        raise ProtocolError(self.fatal or "The engine was stopped.")
+            raise ProtocolError("The engine did not respond within 300 seconds.")
+        finally:
+            self.awaiting = False
 
     def continue_job(self, job, ids, request, **options):
         """Cancel `job` and continue its request on a new job that resumes from `job`'s own end state.

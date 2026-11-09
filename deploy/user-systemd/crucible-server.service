@@ -1,14 +1,30 @@
-# Optional template: run the server as a user unit, so that an automatic update can restart it.
-# Replace @CHECKOUT@ with the folder of your clone and @MODEL@ with the model folder.
-# Skip this file if you already run the server your own way.
-# If you installed requirements-cpu.txt in a virtual environment, replace /usr/bin/python3 with its python.
+# Written by ./crucible service install (Crucible @VERSION@). Run that command again to change it; do not edit.
 [Unit]
-Description=Crucible server
+Description=Crucible LLM server on @BIND@:@PORT@
+Documentation=file://@REPO@/docs/QUICKSTART.md
+StartLimitIntervalSec=15min
+StartLimitBurst=4
 
 [Service]
-WorkingDirectory=@CHECKOUT@
-ExecStart=/usr/bin/python3 -m server @MODEL@ --engine build/engine/crucible --ctx 32768
+Type=notify
+NotifyAccess=main
+WorkingDirectory=@REPO@
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre="@VENV_PY@" -I "@REPO@/crucible" doctor --for start --quiet
+ExecStart="@EXEC_START@" --systemd
+TimeoutStartSec=@START_TIMEOUT@
+TimeoutStopSec=120s
+KillMode=control-group
+WatchdogSec=30s
+WatchdogSignal=SIGKILL
 Restart=on-failure
+RestartSec=5s
+RestartPreventExitStatus=2 78
+LimitCORE=0
+LimitNOFILE=65536
+UMask=0077
+NoNewPrivileges=yes
+SyslogIdentifier=crucible
 
 [Install]
 WantedBy=default.target

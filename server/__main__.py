@@ -8,12 +8,16 @@ from http.server import ThreadingHTTPServer as StdlibServer
 from pathlib import Path
 import signal
 import sys
+import time
 from . import metrics, update_check
+from .api_key import (EXIT_BAD_KEY_FILE, KeyFileError, KeyGate, bind_error, container_open_bind, is_loopback,
+                      load_digest)
 from .api import MAX_COUNT, MAX_MTP_WINDOW, MTP_WINDOW, MAX_ALL, ApiError, ServerDefaults
 from .backend import EngineBackend, LOOKUP_DEPTH, MAX_CONVERSATION_CACHE_MIB
 from .batch_scheduler import INTERLEAVE_MIN_ROWS
 from .hosts import ALLOWED_HOSTS_ENV, HostError, resolve_allowed_hosts
 from .http import Service, handler_for
+from .sd_notify import Notifier, Watchdog
 from .request_id import CLIENT_REQUEST_ID_HEADER_ENV, HeaderNameError, resolve_client_request_id_header
 from .think_budget import MIN_THINKING_DEFAULT
 from .tokenization import ModelTokenizer
@@ -21,6 +25,9 @@ from .version import server_commit, server_version
 
 # serve --draft-blocks: the engine's file limit (draft_policy.h kDraftBlocksFileMax).
 DRAFT_BLOCKS_FILE_MAX = 64 * 1024
+# serve --systemd: the engine may be silent this long before the watchdog stops the feed to systemd (--watchdog-stall-seconds).
+WATCHDOG_STALL_DEFAULT = 50
+EXIT_ENGINE_STOPPED = 3  # the engine stopped or failed: the unit's Restart=on-failure starts the server again
 
 
 class ThreadingHTTPServer(StdlibServer):
@@ -30,6 +37,14 @@ class ThreadingHTTPServer(StdlibServer):
     def server_bind(self):
         socketserver.TCPServer.server_bind(self)
         self.server_name, self.server_port = str(self.server_address[0]), self.server_address[1]
+        self.http_alive_at = time.monotonic()  # the watchdog starts before the first service_actions call
+
+
+    # serve_forever calls this each 0.5 s: the watchdog (sd_notify.py) reads it to see that the HTTP loop runs.
+    http_alive_at = 0.0
+
+    def service_actions(self):
+        self.http_alive_at = time.monotonic()
 
 
 class Ipv6Server(ThreadingHTTPServer):
@@ -64,6 +79,16 @@ def listen_url(host, port):
     return f"http://{f'[{host}]' if host.version == 6 else host}:{port}/v1"
 
 
+def conversation_cache_notice(conversation_cache_mib):
+    """One line for stderr when the conversation cache is off (the default of this server), else None. A client that sends
+    follow-up turns of a long conversation then prefills the whole conversation again on every turn. ./crucible start and the
+    Docker run line of docs/DOCKER.md use the value named here (tools/crucible_cli/measured.py; a test pins both)."""
+    if conversation_cache_mib:
+        return None
+    return ("NOTICE: the conversation cache is off (--conversation-cache-mib 0, the default): every follow-up turn prefills "
+            "the whole conversation again. Add --conversation-cache-mib 9700 --host-reserve-mib 11264, as ./crucible start does.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Temporary local Crucible server (default 127.0.0.1:8790)")
     parser.add_argument("checkpoint", type=Path)
@@ -75,16 +100,26 @@ def main():
     parser.add_argument("--ctx", type=int, default=32768)
     parser.add_argument("--model-id", default="crucible")
     parser.add_argument("--host", type=listen_address, default="127.0.0.1", metavar="ADDRESS",
-                        help="Bind address: an IPv4 or IPv6 literal (default 127.0.0.1). The server has no "
-                             "authentication: an address that is not loopback (0.0.0.0, ::, a LAN address) lets every "
-                             "machine that can reach it use the server. Use --allowed-host and a firewall then.")
+                        help="Bind address: an IPv4 or IPv6 literal (default 127.0.0.1). An address that is not "
+                             "loopback (127.0.0.0/8 and ::1) needs --api-key-file: 0.0.0.0, ::, an IPv4-mapped address "
+                             "and a LAN address let every machine that can reach it use the server. "
+                             "Use --allowed-host and a firewall too.")
+    parser.add_argument("--api-key-file", type=Path, default=None, metavar="PATH",
+                        help="An absolute path of a file that holds the API key (one key of 32 to 256 characters). "
+                             "Every request but GET /health then needs it: Authorization: Bearer KEY or x-api-key: KEY. "
+                             "The file must be a regular file of the server user with mode 0600 (exit 78 otherwise). "
+                             "The key is read once at start: to change it, replace the file and restart. "
+                             "./crucible setup --bind ADDRESS makes the file.")
     parser.add_argument("--port", type=int, default=8790, help="Port (default 8790).")
     parser.add_argument("--streams", type=int, choices=range(1, 9), default=None,
                         help="Batch slots (default 1). The batched stack serves every request, including speculation.")
     parser.add_argument("--serial", action="store_true",
                         help="Serve with the serial worker: one request at a time, in a FIFO queue. It accepts draft_head "
                              "full, draft_adapt 1 and draft_q 0. Not with --streams.")
-    parser.add_argument("--conversation-cache-mib", type=int, default=0)
+    parser.add_argument("--conversation-cache-mib", type=int, default=0, metavar="MiB",
+                        help="Host memory for the saved states of conversations (default 0: off, and every follow-up "
+                             "turn prefills the whole conversation again). ./crucible start uses 9700 with "
+                             "--host-reserve-mib 11264.")
     parser.add_argument("--prefill", type=int, default=None)
     parser.add_argument("--host-reserve-mib", type=int, default=None, metavar="1024..131072",
                         help="Free host memory (MemAvailable) that each conversation cache save keeps (default 8192, "
@@ -230,7 +265,26 @@ def main():
     parser.add_argument("--default-thinking", choices=("on", "off"), default="off",
                         help="Thinking for chat requests that set no thinking field. The checkpoint template, "
                              "other engines, and Halogen use on; off keeps older clients and benchmarks unchanged.")
+    parser.add_argument("--systemd", action="store_true",
+                        help="Run as a systemd Type=notify service (the unit that ./crucible service install writes sets "
+                             "it): tell systemd when the engine is loaded and the port listens, feed the watchdog while "
+                             "the engine makes progress, and exit with code 3 when the engine stops. Needs NOTIFY_SOCKET.")
+    parser.add_argument("--watchdog-stall-seconds", type=int, default=None, metavar="10..600",
+                        help=f"With --systemd: stop feeding the systemd watchdog when the engine sent no line for this long "
+                             f"(default {WATCHDOG_STALL_DEFAULT}). A hung engine is found within this time plus WatchdogSec.")
     args = parser.parse_args()
+    # The three service names leave the environment here, so that no later child process inherits them.
+    notifier = Notifier.from_environ(os.environ)
+    if not args.systemd:
+        notifier = Notifier()  # without the flag nothing changes: the server sends nothing, whatever the environment holds
+    elif not notifier.enabled:
+        parser.error("--systemd needs NOTIFY_SOCKET (run it from a systemd Type=notify unit)" +
+                     (f": {notifier.refused}" if notifier.refused else ""))
+    if args.watchdog_stall_seconds is not None and not args.systemd:
+        parser.error("--watchdog-stall-seconds needs --systemd")
+    if args.watchdog_stall_seconds is None: args.watchdog_stall_seconds = WATCHDOG_STALL_DEFAULT
+    if not 10 <= args.watchdog_stall_seconds <= 600:
+        parser.error("--watchdog-stall-seconds must be in [10,600]")
     if args.serial and args.streams is not None:
         parser.error("--serial runs one request at a time; do not use it with --streams")
     if not args.serial and args.streams is None:
@@ -353,6 +407,20 @@ def main():
         parser.error("--port must be in [1024,65535]")
     if not args.model_id or len(args.model_id) > 200:
         parser.error("--model-id must contain 1 to 200 characters")
+    if args.api_key_file is not None:
+        args.api_key_file = args.api_key_file.expanduser()
+        if not args.api_key_file.is_absolute():
+            parser.error("--api-key-file must be an absolute path")
+    open_in_container = container_open_bind(args.host, os.environ)
+    if refusal := bind_error(args.host, args.api_key_file is not None, os.environ):
+        parser.error(refusal)
+    api_gate = None
+    if args.api_key_file is not None:
+        try:
+            api_gate = KeyGate(load_digest(args.api_key_file))
+        except KeyFileError as error:
+            print(f"server error: {error}", file=sys.stderr, flush=True)
+            return EXIT_BAD_KEY_FILE
     metrics.LOG_ENGINE_TEXT = args.log_engine_errors
     def stop(_signal, _frame):
         raise KeyboardInterrupt
@@ -360,6 +428,8 @@ def main():
     backend = None
     server = None
     capture = None
+    watchdog = None
+    exit_code = 0
     if args.draft_capture is not None:
         from .draft_capture import DraftCapture
         try:
@@ -371,6 +441,12 @@ def main():
             return 2
         print(f"draft capture: {capture.mode} mode" + (", per-token draft stats on" if args.draft_stats else ""),
               file=sys.stderr, flush=True)
+    if notice := conversation_cache_notice(args.conversation_cache_mib):
+        print(notice, file=sys.stderr, flush=True)
+    notifier.send("STATUS=loading the model")
+    if args.systemd and notifier.watchdog_seconds and args.watchdog_stall_seconds + notifier.watchdog_seconds > 90:
+        print(f"WARNING: stall {args.watchdog_stall_seconds} s + WatchdogSec {notifier.watchdog_seconds:g} s is more than "
+              "90 s: a hung engine is found later than the target.", file=sys.stderr, flush=True)
     try:
         tokenizer = ModelTokenizer(args.checkpoint, content_special_tokens=args.content_special_tokens)
         if args.serial:
@@ -395,6 +471,8 @@ def main():
                                            engine_options=engine_options,
                                            lookup=args.lookup, mtp_window=args.mtp_window)
             backend.draft_detail = args.draft_stats
+            # A ping must fit well inside the stall time (the default 50 s gives the design's 10 s).
+            if args.systemd: backend.ping_idle_seconds = min(10.0, args.watchdog_stall_seconds / 5)
         server = bind_server(args.host, args.port, handler_for(
             Service(backend, tokenizer, args.model_id, clamp_max_tokens=args.clamp_max_tokens,
                     default_thinking=args.default_thinking == "on", max_body_mib=args.max_body_mib,
@@ -403,17 +481,25 @@ def main():
                     stream_tool_calls=args.stream_tool_calls == "on", end_of_turn_guard=args.end_of_turn_guard == "on",
                     max_requests_per_client=args.max_requests_per_client, vision=vision,
                     default_mtp_prefix=args.mtp_window, capture=capture, allowed_hosts=allowed_hosts,
-                    defaults=defaults, client_request_id_header=request_id_header)))
+                    defaults=defaults, client_request_id_header=request_id_header,
+                    api_key=api_gate)))
         server.daemon_threads = True
         commit = server_commit()
         print(f"Crucible v{server_version()}" + (f" ({commit})" if commit else ""), file=sys.stderr, flush=True)
         # The switch changes prompt IDs, so the startup line records it with the address.
         print(f"Crucible is ready at {listen_url(args.host, args.port)} (content special tokens: "
               f"{args.content_special_tokens})", file=sys.stderr, flush=True)
-        if not args.host.is_loopback:
-            print(f"WARNING: listening on {args.host}, which is not loopback. The server has no authentication: "
-                  "every machine that can reach this address can use it. Use --allowed-host (strict Host mode) "
-                  "and a firewall.", file=sys.stderr, flush=True)
+        if api_gate is not None:
+            print(f"API key required for every request but GET /health (key file {args.api_key_file}).",
+                  file=sys.stderr, flush=True)
+        if open_in_container and api_gate is None:
+            print(f"WARNING: no API key, and {args.host} listens on every address of the container. A published port on "
+                  "all addresses is an open server: publish only to 127.0.0.1 (-p 127.0.0.1:8790:8790), or use "
+                  "--api-key-file.", file=sys.stderr, flush=True)
+        elif not is_loopback(args.host):
+            print(f"WARNING: listening on {args.host}, which is not loopback. Every machine that can reach this "
+                  "address can send requests, and the API key is its only protection. Use --allowed-host (strict "
+                  "Host mode), a firewall and TLS (a reverse proxy).", file=sys.stderr, flush=True)
         if allowed_hosts:
             print("Host check: only " + ", ".join(host + (":" + port if port else "") for host, port in allowed_hosts),
                   file=sys.stderr, flush=True)
@@ -422,13 +508,22 @@ def main():
         if defaults.describe():
             print("Request defaults: " + defaults.describe(), file=sys.stderr, flush=True)
         update_check.start(server_version(), disabled=args.no_update_check)
+        if args.systemd:
+            watchdog = Watchdog(notifier, backend, server, stall_seconds=args.watchdog_stall_seconds)
+            notifier.send("READY=1\nSTATUS=ready")
+            watchdog.start()
         server.serve_forever()
+        if watchdog is not None and watchdog.fatal_exit:
+            exit_code = EXIT_ENGINE_STOPPED
+            notifier.send("STOPPING=1")
     except KeyboardInterrupt:
-        pass
+        notifier.send("STOPPING=1\nSTATUS=stopping: saving conversation states (85 s at most)")
     except Exception as error:
         print(f"server error: {error}", file=sys.stderr)
         return 1
     finally:
+        if watchdog is not None:
+            watchdog.stop()
         if server is not None:
             server.server_close()
         # The capture writes its last sums before the engine stops, and the engine stops even if that fails.
@@ -438,7 +533,8 @@ def main():
         finally:
             if backend is not None:
                 backend.close()
-    return 0
+                notifier.close()
+    return exit_code
 
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -442,8 +442,8 @@ def error_line(request_id, status, message, streamed, client_request_id=None):
 # The reasons of a 4xx in the server log: a closed set, so no request text can reach the log.
 CLIENT_ERROR_REASONS = frozenset(("bad_request", "context_length", "invalid_tool_call_history", "line_too_large",
                                   "body_too_large", "length_required", "unsupported_media_type", "forbidden_host",
-                                  "not_found", "too_many_requests"))
-_STATUS_REASONS = {403: "forbidden_host", 404: "not_found", 411: "length_required", 413: "body_too_large",
+                                  "not_found", "too_many_requests", "auth"))
+_STATUS_REASONS = {401: "auth", 403: "forbidden_host", 404: "not_found", 411: "length_required", 413: "body_too_large",
                    415: "unsupported_media_type", 429: "too_many_requests"}
 _COUNT_KEYS = ("prompt_tokens", "max_tokens", "context")
 
