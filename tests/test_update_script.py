@@ -493,11 +493,13 @@ def test_units_are_not_enabled_by_themselves():
     assert "WantedBy=timers.target" in timer and "OnCalendar=" in timer and "Persistent=true" in timer
 
 
-def test_the_update_service_runs_make_update_in_the_checkout_and_names_the_restart_unit():
+def test_the_update_service_runs_crucible_update_in_the_checkout():
+    # `make update` is the old script path: the unit runs the new command,
+    # which takes a lock, keeps a journal, restarts the service itself and rolls back by itself.
     service = (UNITS / "crucible-update.service").read_text()
-    assert "ExecStart=/usr/bin/make update" in service
+    assert "ExecStart=@CHECKOUT@/crucible update --yes" in service
+    assert "make update" not in service.replace("(./crucible update --yes)", "")
     assert "WorkingDirectory=@CHECKOUT@" in service
-    assert "CRUCIBLE_RESTART_UNIT=crucible-server.service" in service
     assert "CKPT" not in service  # the timer never loads the model
 
 
@@ -521,7 +523,8 @@ def test_no_repository_file_installs_or_enables_the_units():
 
 def test_the_server_unit_template_names_its_placeholders():
     text = (UNITS / "crucible-server.service").read_text()
-    assert "@CHECKOUT@" in text and "@MODEL@" in text and "-m server" in text
+    # The file is the output of tools/crucible_cli/service.py with placeholders (tests/test_crucible_cli_service.py).
+    assert "@REPO@" in text and "@EXEC_START@" in text and "--systemd" in text
 
 
 @pytest.mark.skipif(shutil.which("systemd-analyze") is None, reason="systemd-analyze is not installed")

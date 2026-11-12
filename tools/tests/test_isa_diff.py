@@ -87,3 +87,28 @@ def test_kernel_descriptor_hash_skips_the_kernel_offset(tmp_path, monkeypatch):
     assert list(digest(0x100, 1)) == ["k.kd"]  # only .kd symbols count
     assert digest(0x100, 1) == digest(0x900, 1)  # the link layout moved the kernel: same descriptor
     assert digest(0x100, 1) != digest(0x100, 2)  # a resource field changed: different descriptor
+
+
+STUB_SYMS = isa_diff.symbol_table("""
+Symbol table '.symtab' contains 4 entries:
+   Num:    Value          Size Type    Bind   Vis       Ndx Name
+     1: 0000000000001a00  2208 FUNC    GLOBAL PROTECTED   7 _ZN8crucible3FooILi4EEEvPf
+     2: 0000000000000900    64 OBJECT  GLOBAL PROTECTED   6 _ZN8crucible3FooILi4EEEvPf.kd
+     3: 0000000000001a00     0 FUNC    GLOBAL PROTECTED   7 __devsplit_facts_p3
+     4: 0000000000000940    64 OBJECT  GLOBAL DEFAULT     6 __devsplit_facts_p3.kd
+""")
+
+
+def test_fact_stubs_of_the_split_build_are_not_functions():
+    # tools/devsplit.py adds empty stub kernels (__devsplit_facts_*): objdump may name the next kernel after one
+    assert [s[2] for s in STUB_SYMS] == ["_ZN8crucible3FooILi4EEEvPf.kd", "_ZN8crucible3FooILi4EEEvPf"]
+    text = """
+0000000000001a00 <__devsplit_facts_p3>:
+\ts_cbranch_scc1 3                                          // 000000001A00: BFA20003 <__devsplit_facts_p3+0x10>
+\ts_endpgm                                                   // 000000001A04: BFB00000
+"""
+    units = isa_diff.parse_disassembly(text, STUB_SYMS)
+    assert list(units) == ["_ZN8crucible3FooILi4EEEvPf"]
+    assert "<_ZN8crucible3FooILi4EEEvPf+0x10>" in units["_ZN8crucible3FooILi4EEEvPf"]
+    alone = "\n0000000000003000 <__devsplit_facts_p4>:\n\ts_endpgm // 000000003000: BFB00000\n"
+    assert isa_diff.parse_disassembly(alone, STUB_SYMS) == {}

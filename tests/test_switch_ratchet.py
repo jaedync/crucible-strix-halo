@@ -17,8 +17,25 @@ REGISTRY = 'engine/switches.h'
 RAW_READ = re.compile(r'\b(?:secure_)?getenv\s*\(\s*([^()]*?)\s*\)|\b(environ)\b')
 
 # Lower it when a switch name leaves engine/ and kernels/. Never raise it. Target: 65 or fewer (user, Oct 10).
-SWITCH_CEILING = 56  # merge rule: retire-pf19 left 54, CRUCIBLE_DEBUG_NONFINITE adds one,
-# CRUCIBLE_PLE_BF16 (16-bit n-gram table) adds one
+SWITCH_CEILING = 63  # merge rule: retire-pf19 left 54, CRUCIBLE_DEBUG_NONFINITE adds one,
+# CRUCIBLE_PLE_BF16 (16-bit n-gram table) adds one,
+# CRUCIBLE_EXACT_RESUME (exact resume of off-grid End points, exactly one new switch) adds one,
+# CRUCIBLE_MOE_B128 (moe-b128: exact decode expert body A/B, default 3 in train 28, 12 in train 30, 0 is the rollback, decide_by 20) adds one
+# CRUCIBLE_LAZY_SHADOW (cache-direct, the soak check of the lazy direct spill, a diagnostic; needs the merge rule's OK) adds one
+# CRUCIBLE_PERSISTENT_GDN_DEPENDENT_LDS (dead build macro) goes
+#
+# CRUCIBLE_GDN_VERIFY (default 0, decide_by 20) adds one
+# CRUCIBLE_PERSISTENT_GDN_LIMIT_LOADS (dead build macro) goes
+# CRUCIBLE_DRAFT_HEAD (default exl3, decide_by 20) adds one,
+# CRUCIBLE_PERSISTENT_GDN_WAVES (build macro) goes
+# CRUCIBLE_ROPE_MODE (YaRN rope mode; default plain is bit-identical) adds one
+# CRUCIBLE_DRAFT_CHAIN (lead, stop in one switch, decide_by 20) adds one;
+# CRUCIBLE_PLE_FETCH (default 0, decide_by 20) adds one;
+# CRUCIBLE_ABLATE_MODE (per-request abliteration: one engine process serves stock and ablated requests,
+# selected per request; the server passes it, so it must be a registered serve switch) adds one;
+# needs the merge rule's OK (the coordinator decides)
+# CRUCIBLE_SPEC_SPAN (default 8, decide_by 20) adds one;
+# it needs the merge rule's OK (the merge rule: span 13 copy path)
 
 # (file, argument of the raw read): number of reads. Delete entries as reads move to engine/switches.h.
 RAW_READS = {}
@@ -32,6 +49,7 @@ BENCH_RAW_READS = {
     ('bench/forward_rows.hip', '"FORWARD_ROWS_PROFILE"'): 1,
     ('bench/gdn_scan_pf.hip', '"GDN_HEADS"'): 2,
     ('bench/packed_rows.hip', '"VERIFY_SPLITS"'): 1,
+    ('bench/prefill_common.h', '"ENERGY_S"'): 1,   # energy loop of a measurement script; not a CRUCIBLE switch
     ('bench/prefill_dense_half.hip', '"DH_22"'): 1,
     ('bench/prefill_dense_half.hip', '"DH_HALF"'): 1,
     ('bench/prefill_dense_half.hip', '"DH_X22"'): 1,

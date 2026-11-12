@@ -123,6 +123,7 @@ __device__ __forceinline__ void PersistentGdn(ComputeContext& ct, int task, GdnA
 
   constexpr int CACHE = 0;
   constexpr bool STREAM_STORE = false;
+  constexpr int PEND = kMaxRows;  // pending rows per head in a.pend
   __shared__ float qs[128], ks[128], red[8], ob[128], part[2][128];
   const int h = task, t = ct.t, j = t & 127, hf = t >> 7, kh = h / 3;
   const int chq = kh * 128 + j, chk = 2048 + kh * 128 + j, chv = 4096 + h * 128 + j;
@@ -142,7 +143,7 @@ __device__ __forceinline__ void PersistentGdn(ComputeContext& ct, int task, GdnA
   // update they computed there, so rollback costs no state traffic and the
   // committed state is bitwise what serial decoding would hold.
   for (int i = 0; i < a.replay; ++i) {
-    const float* pe = a.pend + ((size_t)h * kMaxRows + i) * kPend;
+    const float* pe = a.pend + ((size_t)h * PEND + i) * kPend;
     if (t < 128) ks[t] = pe[t];
     ComputeBarrier(ct);
     const float decay = pe[256], beta = pe[257], cv = pe[128 + j];
@@ -151,10 +152,6 @@ __device__ __forceinline__ void PersistentGdn(ComputeContext& ct, int task, GdnA
 #pragma unroll
     for (int ii = 0; ii < 64; ++ii) {
       S[ii] *= decay;
-
-#if CRUCIBLE_PERSISTENT_GDN_LIMIT_LOADS
-      asm volatile("" ::: "memory");
-#endif
       mem += S[ii] * PersistentCoefficient(kq + ii, mem);
     }
     part[hf][j] = mem;
@@ -202,7 +199,7 @@ __device__ __forceinline__ void PersistentGdn(ComputeContext& ct, int task, GdnA
     const float decay = expf(A * softplus);
     const float beta = Sigmoid(pb);
     if (r >= a.commit) {
-      float* pe = a.pend + ((size_t)h * kMaxRows + (r - a.commit)) * kPend;
+      float* pe = a.pend + ((size_t)h * PEND + (r - a.commit)) * kPend;
       if (t < 128) {
         pe[t] = ks[t];
         pe[128 + t] = cv;
@@ -218,10 +215,6 @@ __device__ __forceinline__ void PersistentGdn(ComputeContext& ct, int task, GdnA
 #pragma unroll
     for (int i = 0; i < 64; ++i) {
       S[i] *= decay;
-
-#if CRUCIBLE_PERSISTENT_GDN_LIMIT_LOADS
-      asm volatile("" ::: "memory");
-#endif
       mem += S[i] * PersistentCoefficient(kq + i, mem);
     }
     part[hf][j] = mem;
@@ -231,10 +224,6 @@ __device__ __forceinline__ void PersistentGdn(ComputeContext& ct, int task, GdnA
     float y = 0.f;
 #pragma unroll
     for (int i = 0; i < 64; ++i) {
-
-#if CRUCIBLE_PERSISTENT_GDN_LIMIT_LOADS
-      asm volatile("" ::: "memory");
-#endif
       S[i] += PersistentCoefficient(kq + i, y) * delta;
       y += S[i] * PersistentCoefficient(qq + i, y);
     }

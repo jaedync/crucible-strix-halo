@@ -19,9 +19,15 @@
   } while (0)
 
 namespace {
+// TMPDIR first (the test machine /tmp is a small shared tmpfs that is often full), then /tmp.
+std::string TempDir() {
+  const char* dir = std::getenv("TMPDIR");
+  return dir && *dir ? dir : "/tmp";
+}
+
 std::string WriteFile(const std::vector<uint8_t>& bytes) {
-  char path[] = "/tmp/ple_host_testXXXXXX";
-  const int fd = mkstemp(path);
+  std::string path = TempDir() + "/ple_host_testXXXXXX";
+  const int fd = mkstemp(path.data());
   if (fd < 0 || write(fd, bytes.data(), bytes.size()) != (ssize_t)bytes.size()) {
     std::perror("ple_host_test setup");
     std::exit(1);

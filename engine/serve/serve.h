@@ -6,21 +6,10 @@
 #include "../runtime/generation.h"
 #include "../runtime/prefill_rows.h"
 #include "serve_settings.h"
+#include "serve_line.h"
 #include "../runtime/conversation_admission.h"
 #include "../switches.h"
 
-// Image requests carry file paths, not pixels, so every line has one limit.
-inline bool ServeLine(std::string& line, bool& oversized) {
-  constexpr size_t kMaxLine = 2 * 1024 * 1024;
-  line.clear();
-  oversized = false;
-  char c;
-  while (std::cin.get(c)) {
-    if (c == '\n') return true;
-    if (line.size() < kMaxLine) line += c; else oversized = true;
-  }
-  return !line.empty() || oversized;
-}
 inline std::string VisionDoneFields(size_t images, double seconds) {
   char text[96];
   std::snprintf(text, sizeof(text), ",\"images\":%zu,\"vision_seconds\":%.9f", images, seconds);
@@ -30,6 +19,12 @@ inline int Serve(const std::string& ckpt, const ServeSettings& settings) {
   static_assert(kPrefillAuto == kServePrefillAuto && kMaxPrefillRows == kServeMaxPrefillRows);
   const int ctx = settings.ctx;
   const size_t cache_budget = size_t(settings.cache_mib) << 20;
+  // A vision tower of plain HF tensors cannot run: say so before the model loads, not after.
+  if (settings.vision)
+    if (const std::string fault = crucible::VisionTowerFault(ckpt); !fault.empty()) {
+      std::fprintf(stderr, "serve error: --vision: %s\n", fault.c_str());
+      return 2;
+    }
   Engine eng(ckpt, ctx, settings.prefill_rows);
   // As in batch serve: a lazy compact MTP cache would fail on memory at a request, not at startup.
   try { eng.EnsureServeMtpCaches(); }
@@ -47,17 +42,24 @@ inline int Serve(const std::string& ckpt, const ServeSettings& settings) {
                  settings.host_reserve_mib);
   size_t requests = 0, hits = 0, saved_tokens = 0;
   HIP_OK(hipDeviceSynchronize());
-  std::printf("{\"event\":\"ready\",\"context\":%d,\"cache_tail\":true,%s}\n", ctx, crucible::ReadyModelJson().c_str());
+  // the line limit follows the context (serve_line.h); the server reads it from "line_bytes".
+  crucible::ServeLineReader reader(0, crucible::ServeLineBytes(ctx));
+  std::printf("{\"event\":\"ready\",\"context\":%d,\"cache_tail\":true,\"line_bytes\":%zu,%s%s}\n", ctx, reader.Limit(),
+              crucible::ReadyModelJson().c_str(), eng.AblateRequests() ? ",\"ablate_request\":1" : "");
   std::fflush(stdout);
   std::string line;
   bool oversized;
-  while (ServeLine(line, oversized)) {
+  while (reader.Next(line, oversized)) {
     SequenceState* bound = nullptr;
     try {
-      if (oversized) throw std::runtime_error("request exceeds the 2 MiB JSON-line limit");
+      if (oversized) throw std::runtime_error("request exceeds the serve JSON-line limit");
       const ServeRequest request = ParseServeRequest(line, ctx, settings.policy);
       if (!request.images.empty() && !eng.HasVision())
         throw std::runtime_error("this engine runs without the vision tower; start serve with --vision 1");
+      // The request's mode; serial serve runs on the selected stream.
+      eng.SetStreamAblate(std::max(0, eng.ActiveStream()), request.ablate == 1);
+      // Y2: the request's RoPE mode; a change resets the stream first.
+      crucible::ApplyStreamRope(eng, std::max(0, eng.ActiveStream()), request.rope);
       // Image tokens key the cache by their pixels, so two images never share an entry.
       const std::vector<int> cache_key = CacheKey(request.ids, request.images);
       const auto key_of = [&](const std::vector<int>& hist) { return CacheKey(hist, request.images); };

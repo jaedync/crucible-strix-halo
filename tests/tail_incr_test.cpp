@@ -73,6 +73,7 @@ struct SequenceState {
   std::vector<int> hist;
   RetainedPrefix retained;
   std::map<int, float*> gstate, ghist, gpend;
+  bool gdn_lazy = false;  // as engine/runtime/sequence_state.h
   std::map<int, QsaCache> qc;
   std::vector<DeviceSpan> FixedSpans() const {
     std::vector<DeviceSpan> spans;
@@ -516,6 +517,83 @@ void CopyToRefuses() {
   assert(target.hist == point.hist);
 }
 
+// Header point: CopyPointTo gives another slot the bytes that a restore of the same
+// checkpoint writes into the donor's own slot, for every byte a resumed prefill reads: the rows below the point (K, V,
+// raw rows, pool groups, the pool block that holds the point), the compact ring and the fixed state. The donor ran on
+// past the point, so its own rows above it, its ring and the pool block of the point differ from the checkpoint.
+void CopyPointEqualsSlotRestore(bool compact, bool mtp, size_t f) {
+  constexpr int kRows = 4096;
+  Engine e;
+  for (int i = 0; i < 3; ++i) e.sequences_.push_back(std::make_unique<SequenceState>(kRows, compact, i == 0 ? mtp : false));
+  SequenceState& s = *e.sequences_[0];       // the donor
+  SequenceState& ref = *e.sequences_[1];     // the donor's twin: an in-slot restore
+  SequenceState& copy = *e.sequences_[2];    // CopyPointTo
+  const size_t n = f + 700;
+  for (SequenceState* who : {&s, &ref}) Forward(*who, 0, f, 1);
+  SlotCheckpointIO::Buffer buffer(SlotCheckpointIO::Bytes(s));
+  SlotCheckpointIO::Save(s, buffer);
+  const SlotCheckpoint point{s.hist, {}, 0, false, CheckpointKind::Pre, 1, {}};
+  for (SequenceState* who : {&s, &ref}) Forward(*who, f, n, 3);
+  Forward(copy, 0, kRows, 7);  // another session's rows in every span
+  const SlotBytes donor_before(s);
+  SlotCheckpointIO::Restore(ref, buffer, point);
+  const int pinned_before = copies;
+  SlotCheckpointIO::CopyPointTo(s, buffer, point, copy);
+  assert(copies == pinned_before && SlotBytes(s) == donor_before);  // no host stage; the donor is read only
+  assert(copy.hist == point.hist && copy.gdn_lazy && SlotBytes(copy).SameGdn(SlotBytes(ref)) && copy.ple == ref.ple);
+  for (const auto& [l, layer] : ref.layers) {
+    if (l == kLayers) continue;
+    const auto& other = copy.layers.at(l);
+    assert(std::equal(layer.k.begin(), layer.k.begin() + std::ptrdiff_t(f * 512), other.k.begin()));
+    assert(std::equal(layer.v.begin(), layer.v.begin() + std::ptrdiff_t(f * 512), other.v.begin()));
+    const size_t raw = compact ? layer.raw.size() : f * 128;
+    assert(std::equal(layer.raw.begin(), layer.raw.begin() + std::ptrdiff_t(raw), other.raw.begin()));
+    const size_t pool = ((f + 127) / 128) * 4096;  // the groups below f and the block that holds it
+    assert(std::equal(layer.pool.begin(), layer.pool.begin() + std::ptrdiff_t(pool), other.pool.begin()));
+  }
+  // The MTP layer is never copied (a speculative request warms it again).
+  if (mtp) assert(!copy.qc.contains(kLayers));
+}
+void CopyPointRefuses() {
+  constexpr int kRows = 4096;
+  Engine e;
+  e.sequences_.push_back(std::make_unique<SequenceState>(kRows, false, false));
+  e.sequences_.push_back(std::make_unique<SequenceState>(kRows, false, false));
+  e.sequences_.push_back(std::make_unique<SequenceState>(128, false, false));  // too few rows
+  e.sequences_.push_back(std::make_unique<SequenceState>(kRows, true, false));  // another trunk layout
+  SequenceState& s = *e.sequences_[0];
+  SequenceState& target = *e.sequences_[1];
+  SequenceState& small = *e.sequences_[2];
+  SequenceState& compact = *e.sequences_[3];
+  const size_t f = 236;
+  Forward(s, 0, f, 1);
+  SlotCheckpointIO::Buffer buffer(SlotCheckpointIO::Bytes(s));
+  SlotCheckpointIO::Save(s, buffer);
+  const SlotCheckpoint point{s.hist, {}, 0, false, CheckpointKind::Pre, 1, {}};
+  Forward(s, f, 900, 3);
+  Forward(target, 0, kRows, 7);
+  Forward(small, 0, 128, 7);
+  Forward(compact, 0, kRows, 7);
+  const auto refuses = [&](SequenceState& donor, SequenceState& to, const SlotCheckpoint& at, auto error) {
+    const SlotBytes before(to);
+    bool threw = false;
+    try { SlotCheckpointIO::CopyPointTo(donor, buffer, at, to); }
+    catch (const decltype(error)&) { threw = true; }
+    assert(threw && SlotBytes(to) == before);
+  };
+  refuses(s, s, point, std::logic_error(""));  // the donor as its own target
+  SlotCheckpoint other = point;
+  other.hist[5] += 1;
+  refuses(s, target, other, std::logic_error(""));  // rows gone from the donor
+  SlotCheckpoint longer = point;
+  longer.hist.resize(f + 4);
+  refuses(s, target, longer, std::logic_error(""));  // the buffer holds another position
+  refuses(s, small, point, std::runtime_error(""));
+  refuses(s, compact, point, std::runtime_error(""));
+  SlotCheckpointIO::CopyPointTo(s, buffer, point, target);  // the good copy still runs
+  assert(target.hist == point.hist);
+}
+
 // An earlier change: a checkpoint buffer with a tail (fix A keeps the MTP carry after the spans) takes spans only
 // up to the tail, and a save never writes the tail.
 void SaveKeepsTheTail() {
@@ -546,6 +624,10 @@ int main() {
       for (bool target_mtp : {false, true})
         for (bool truncated : {false, true}) CopyToEqualsHostCopy(compact, donor_mtp, target_mtp, truncated);
   CopyToRefuses();
+  for (bool compact : {false, true})
+    for (bool mtp : {false, true})
+      for (size_t f : {232, 236, 1024, 1028, 2048 + 4}) CopyPointEqualsSlotRestore(compact, mtp, f);
+  CopyPointRefuses();
   for (bool compact : {false, true})
     for (bool mtp : {false, true})
       for (bool with_base : {false, true})

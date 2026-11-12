@@ -233,7 +233,7 @@ void CheckMergedLaunch() {
   assert((eng.chunks == std::vector<int>{64, 64, 16, 6}));
   eng.chunks.clear();
   CheckPrompt(eng, 150, 8, 0, false);
-  assert((eng.chunks == std::vector<int>{64, 64, 22}));
+  assert((eng.chunks == std::vector<int>{64, 64, 16, 6}));  // F3: the 6-row tail is its own (small-row) launch
   eng.chunks.clear();
   CheckPrompt(eng, 150, 8, 0, true);  // warm-up from 0: the grid
   assert((eng.chunks == std::vector<int>{16, 16, 16, 16, 16, 16, 16, 16, 16, 6}));

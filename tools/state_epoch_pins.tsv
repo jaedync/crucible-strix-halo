@@ -1,0 +1,5 @@
+# Pins of the state epoch (engine/runtime/state_epoch.h). One row: the computed epoch, the epoch to use, the evidence.
+# A pin lets a binary whose machine code differs keep the epoch of an older binary. Add a row only when the
+# state-equality gate (tools/state_equality_gate.py, the state-equality night unit) ran on both binaries
+# and showed byte-equal state files and byte-equal next tokens on both packs. Name the gate run in the third column.
+# Columns are separated by one tab. Lines that start with # are notes.

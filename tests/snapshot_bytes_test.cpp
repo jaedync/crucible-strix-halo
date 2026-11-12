@@ -295,6 +295,121 @@ int main() {
     assert(shorter.size() == want.size() - 1);
   }
   assert(PinnedCount() == 0);
+  {
+    // lazy extents. The snapshot holds the eager bytes in host chunks and reads the lazy device
+    // rows through one staging buffer when a user walks them. Sizes that divide the chunk and sizes that do not.
+    LazyStaging::Instance().ResetPeak();
+    for (const size_t lazy_bytes : {2 * kChunk, 2 * kChunk + 777, kChunk - 1, size_t(1), 3 * kChunk / 2}) {
+      for (const size_t head : {size_t(0), size_t(13), kChunk - 5, kChunk}) {
+        const size_t tail = 4099;
+        std::vector<uint8_t> device(head + lazy_bytes + tail);
+        for (size_t i = 0; i < device.size(); ++i) device[i] = uint8_t(i * 29 + 5);
+        std::atomic<int> reads = 0;
+        auto source = std::make_shared<LazySource>([&](const void* from, void* to, size_t n) {
+          assert(IsPinned(to, n) && n <= kChunk);  // the staging buffer is pinned and never larger than a chunk
+          ++reads;
+          std::memcpy(to, from, n);
+        }, 4096);
+        std::vector<SnapshotBytes::Part> parts;
+        if (head) parts.push_back({device.data(), head});
+        SnapshotBytes::Part lazy{device.data() + head, lazy_bytes};
+        lazy.lazy = source;
+        parts.push_back(lazy);
+        parts.push_back({device.data() + head + lazy_bytes, tail});
+        std::vector<SnapshotRange> copies;
+        SnapshotBytes bytes = SnapshotBytes::Compose(parts, copies);
+        // The lazy rows are in no copy: only the head and the tail go to host chunks.
+        size_t copied = 0;
+        for (const auto& copy : copies) copied += copy.bytes;
+        assert(bytes.size() == device.size() && copied == head + tail && bytes.HostBytes() == head + tail);
+        assert(bytes.LazyBytes() == lazy_bytes && !bytes.Flat() && reads == 0);
+        CopySnapshotRanges(copies, bytes, true);
+        assert(reads == 0);
+        // The whole snapshot, and ranges that start and end inside the lazy extent and at its edges.
+        assert(bytes.Copy() == device);
+        const int whole_reads = reads;
+        assert(whole_reads == int((lazy_bytes + kChunk - 1) / kChunk));
+        for (const size_t offset : {size_t(0), head, head + 1, head + lazy_bytes - 1, head + lazy_bytes / 2}) {
+          for (const size_t count : {size_t(1), lazy_bytes / 3 + 1, kChunk + 1}) {
+            if (offset + count > device.size()) continue;
+            std::vector<uint8_t> got(count);
+            bytes.ForEachPiece(offset, count, [&](const SnapshotChunk& chunk, size_t inside, size_t n, size_t at) {
+              std::memcpy(got.data() + at, chunk.host + inside, n);
+            });
+            assert(got == std::vector<uint8_t>(device.begin() + std::ptrdiff_t(offset),
+                                               device.begin() + std::ptrdiff_t(offset + count)));
+          }
+        }
+        // A copy of a lazy snapshot is flat, host-resident and equal.
+        const SnapshotBytes flat = bytes;
+        assert(flat.Flat() && flat.HostBytes() == device.size() && flat.Copy() == device);
+        // The device rows end: the snapshot keeps its host bytes and loses its lazy ones.
+        source->Invalidate();
+        assert(!source->Valid());
+        try { (void)bytes.Copy(); assert(false); } catch (const SnapshotLost&) {}
+        assert(bytes.HostBytes() == head + tail);
+      }
+    }
+    // One reader thread holds one staging buffer: the host bytes of a lazy read are bounded by the thread count.
+    assert(LazyStaging::Instance().Peak() == 1 && LazyStaging::Instance().Buffers() == 1);
+    {
+      std::vector<uint8_t> device(3 * kChunk + 1, 7);
+      auto source = std::make_shared<LazySource>([](const void* from, void* to, size_t n) { std::memcpy(to, from, n); }, 4096);
+      SnapshotBytes::Part lazy{device.data(), device.size()};
+      lazy.lazy = source;
+      std::vector<SnapshotRange> none;
+      const SnapshotBytes bytes = SnapshotBytes::Compose({lazy}, none);
+      assert(none.empty() && bytes.HostBytes() == 0 && PinnedCount() == 1);  // the staging buffer only
+      std::vector<std::thread> threads;
+      for (int t = 0; t < 4; ++t) threads.emplace_back([&] { for (int i = 0; i < 3; ++i) assert(bytes.Copy() == device); });
+      for (auto& t : threads) t.join();
+      assert(LazyStaging::Instance().Peak() <= 4 && PinnedCount() <= 4);
+      // Invalidate waits for the read in progress: the caller that writes the rows is never ahead of a reader.
+      std::promise<void> inside, release;
+      auto gate = release.get_future().share();
+      auto held = std::make_shared<LazySource>([&](const void* from, void* to, size_t n) {
+        inside.set_value();
+        gate.wait();
+        std::memcpy(to, from, n);
+      }, 4096);
+      std::vector<uint8_t> small(16, 3);
+      SnapshotBytes::Part part{small.data(), small.size()};
+      part.lazy = held;
+      const SnapshotBytes one = SnapshotBytes::Compose({part}, none);
+      auto reading = std::async(std::launch::async, [&] { return one.Copy(); });
+      inside.get_future().wait();
+      auto ending = std::async(std::launch::async, [&] { held->Invalidate(); });
+      assert(ending.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout);
+      release.set_value();
+      assert(reading.get() == small);  // the read in progress finished with the bytes it began with
+      ending.get();
+      try { (void)one.Copy(); assert(false); } catch (const SnapshotLost&) {}
+    }
+    {
+      // Shadow mode (a soak check): the eager copy of the rows is kept, and each piece that the writer reads must equal it.
+      std::vector<uint8_t> device(2 * kChunk + 5);
+      for (size_t i = 0; i < device.size(); ++i) device[i] = uint8_t(i * 31 + 7);
+      const auto shadow = [&](LazySource& source) {
+        source.AddShadow(device.data(), std::vector<uint8_t>(device));
+      };
+      auto make = [&](const std::shared_ptr<LazySource>& source) {
+        SnapshotBytes::Part lazy{device.data(), device.size()};
+        lazy.lazy = source;
+        std::vector<SnapshotRange> none;
+        return SnapshotBytes::Compose({lazy}, none);
+      };
+      auto same = std::make_shared<LazySource>([](const void* from, void* to, size_t n) { std::memcpy(to, from, n); }, 4096);
+      shadow(*same);
+      assert(make(same).Copy() == device && same->Mismatches() == 0 && same->Reads() > 1);
+      auto changed = std::make_shared<LazySource>([](const void* from, void* to, size_t n) { std::memcpy(to, from, n); }, 4096);
+      shadow(*changed);
+      const SnapshotBytes walk = make(changed);
+      device[kChunk + 3] ^= 0x10;  // a row that changed after the eager copy
+      try { (void)walk.Copy(); assert(false); } catch (const SnapshotLost&) {}
+      assert(changed->Mismatches() == 1);
+      assert(changed->Valid() == false);  // a source that disagreed with its shadow gives no more bytes
+    }
+  }
   // Moves transfer chunks without a copy.
   SnapshotBytes first(10);
   const auto* host = first.Chunks().front().host;

@@ -28,7 +28,7 @@ CPU_TESTS += build/bench/static_layout build/bench/test_migration_wait
 # headers as prerequisites: one header edit would rebuild every program (34 min to 3 h).
 DEPFILES := $(addsuffix .d,$(HIP_BINARIES) $(PINNED_HC_BINARIES) $(CPU_BINARIES))
 
-.PHONY: update rollback isa-check split-groups all engine binaries benchmarks cpu-tests gpu-tests test test-fast test-server test-cpu test-reference test-gpu help
+.PHONY: update rollback isa-check split-groups split-facts all engine binaries benchmarks cpu-tests gpu-tests test test-fast release-engine test-server test-service test-cpu test-reference test-gpu help
 all: engine
 engine: build/engine/crucible
 binaries: $(HIP_BINARIES) $(CPU_BINARIES)
@@ -57,21 +57,48 @@ SPLIT_PARTS ?= 64
 # on any other machine.
 SPLIT_JOBS ?= $(or $(patsubst -j%,%,$(filter -j%,$(MAKEFLAGS))),1)
 SPLIT_GROUPS ?= tools/devsplit_groups.tsv
+# Argument facts of the one-module build: each part gets a stub kernel that passes
+# them, so IPSCCP finds the same facts in a part as in one module. SPLIT_CHECK=1 (default) also runs IPSCCP on the
+# whole module next to the part compiles and stops the build when a part sees other facts (`make split-facts`
+# fixes that). SPLIT_CHECK=0 skips the check (8 to 14 s on the test machine with -j 8) in an edit loop.
+SPLIT_FACTS ?= tools/devsplit_facts.tsv
+SPLIT_CHECK ?= 1
 SPLIT_WORK ?= build/engine/split
+STATE_EPOCH ?= 1
 ENGINE_FLAGS = $(CPPFLAGS) $(HIPFLAGS) -std=c++20 --offload-arch=$(GPU_ARCH) --rocm-path=$(ROCM_PATH) -I$(ROCM_PATH)/include -MMD -MP -MF $@.d $< $(LDFLAGS) $(LDLIBS)
-ENGINE_HIPCC = $(HIPCC) $(ENGINE_FLAGS)
-build/engine/crucible: engine/engine.hip Makefile tools/devsplit.py tools/devsplit_ir.py tools/devsplit_groups.tsv
+# Every hipcc recipe runs through tools/hipcc_checked.sh: hipcc exits 0 when its clang child is killed (out of memory),
+# so the helper removes the old output first and fails when the compiler leaves none.
+HIPCC_CHECKED = bash tools/hipcc_checked.sh $@
+ENGINE_HIPCC = $(HIPCC_CHECKED) $(HIPCC) $(ENGINE_FLAGS)
+# The engine recipe also writes build/engine/crucible.build-info (commit, clean tree, hash of the binary); release-engine reads it.
+ENGINE_STAMP = $(PYTHON) -I tools/release_engine.py stamp
+# The end of the stamp also records the compiler, its version, the compile settings and ROCM_PATH; it reads the hipcc environment
+# variables (HIPCC_COMPILE_FLAGS_APPEND, HIP_CLANG_PATH and the like) itself. A release refuses non-default values and an unknown compiler version.
+shq = $(subst ','\'',$(1))
+ENGINE_STAMP_END = $(ENGINE_STAMP) end --binary $@ --hipcc='$(call shq,$(HIPCC))' --gpu-arch='$(call shq,$(GPU_ARCH))' --hipflags='$(call shq,$(HIPFLAGS))' --cppflags='$(call shq,$(CPPFLAGS))' --ldflags='$(call shq,$(LDFLAGS))' --ldlibs='$(call shq,$(LDLIBS))' --rocm-path='$(call shq,$(ROCM_PATH))'
+build/engine/crucible: engine/engine.hip Makefile tools/devsplit.py tools/devsplit_ir.py tools/devsplit_groups.tsv tools/devsplit_facts.tsv
 	@mkdir -p $(@D)
+	@rm -f $@
+	@$(ENGINE_STAMP) begin --binary $@
 ifeq ($(SPLIT),1)
-	@$(PYTHON) -I tools/devsplit.py --out $@ --work $(SPLIT_WORK) --parts $(SPLIT_PARTS) -j $(SPLIT_JOBS) --groups $(SPLIT_GROUPS) --hipcc $(HIPCC) -- $(ENGINE_FLAGS); \
+	@$(PYTHON) -I tools/devsplit.py --out $@ --work $(SPLIT_WORK) --parts $(SPLIT_PARTS) -j $(SPLIT_JOBS) --groups $(SPLIT_GROUPS) --facts $(SPLIT_FACTS) $(if $(filter 1,$(SPLIT_CHECK)),--check) --hipcc $(HIPCC) -- $(ENGINE_FLAGS); \
 	rc=$$?; if [ $$rc -eq 2 ]; then echo "devsplit could not plan the build, using hipcc"; $(ENGINE_HIPCC) -o $@; else exit $$rc; fi
 else
 	$(ENGINE_HIPCC) -o $@
 endif
+# Stamp the state epoch into the binary (tools/state_epoch.py, engine/runtime/state_epoch.h): the SSD conversation cache
+# keeps its states over a new binary that has the same epoch. A failed stamp removes the binary, so an unstamped one
+# does not stay behind. STATE_EPOCH=0 skips the stamp (the binary then uses its own sha256 as the epoch: the old rule).
+ifneq ($(STATE_EPOCH),0)
+	@$(PYTHON) -I tools/state_epoch.py stamp $@ || { rm -f $@; exit 1; }
+endif
+	@$(ENGINE_STAMP_END)
 
 # After a kernel change: `make isa-check` builds the engine with plain hipcc (about 20 min) and compares the ISA of
 # every kernel with the split build. If a kernel differs, run
 # `make split-groups CHANGED=<file>`, which writes the kernels that need one part to tools/devsplit_groups.tsv.
+# `make split-facts` writes tools/devsplit_facts.tsv (the test machine: about 40 s with -j 8, 110 s with -j 1): run it when the
+# build stops with "argument facts drift", and commit the file.
 build/engine/crucible.mono: engine/engine.hip Makefile
 	@mkdir -p $(@D)
 	$(ENGINE_HIPCC) -o $@
@@ -80,10 +107,12 @@ isa-check: build/engine/crucible build/engine/crucible.mono
 split-groups: engine/engine.hip
 	@test -n "$(CHANGED)" || { echo 'Set CHANGED=<file with the names of the changed kernels>.' >&2; exit 2; }
 	$(PYTHON) -I tools/devsplit.py --derive $(CHANGED) --groups $(SPLIT_GROUPS) --out build/engine/crucible --work build/engine/split-derive --hipcc $(HIPCC) -- $(ENGINE_FLAGS)
+split-facts: engine/engine.hip
+	$(PYTHON) -I tools/devsplit.py --derive-facts --facts $(SPLIT_FACTS) -j $(SPLIT_JOBS) --out build/engine/crucible --work build/engine/split-derive --hipcc $(HIPCC) -- $(ENGINE_FLAGS)
 
 build/%: %.hip Makefile
 	@mkdir -p $(@D)
-	$(HIPCC) $(CPPFLAGS) $(HIPFLAGS) -std=c++20 --offload-arch=$(GPU_ARCH) --rocm-path=$(ROCM_PATH) -I$(ROCM_PATH)/include -MMD -MP -MF $@.d $< $(LDFLAGS) $(LDLIBS) -o $@
+	$(HIPCC_CHECKED) $(HIPCC) $(CPPFLAGS) $(HIPFLAGS) -std=c++20 --offload-arch=$(GPU_ARCH) --rocm-path=$(ROCM_PATH) -I$(ROCM_PATH)/include -MMD -MP -MF $@.d $< $(LDFLAGS) $(LDLIBS) -o $@
 
 build/%: %.cpp Makefile
 	@mkdir -p $(@D)
@@ -101,19 +130,39 @@ update:
 rollback:
 	@env -u MAKEFLAGS -u MFLAGS bash tools/update.sh --rollback
 
+# make release-engine: build the engine for the release tag in VERSION and write the three release files to dist/.
+# Run it on a commit that carries the tag vVERSION, with a clean tree. RELEASE_LIBDIRS names folders that hold the
+# libraries ROCm needs when ROCM_PATH does not (for example fmt). The release refuses an engine whose build-info (written by
+# the engine recipe) shows another commit, a dirty tree or another hash: delete build/engine/crucible and run it again. Upload the files of dist/ to the release of the tag.
+RELEASE_TAG = v$(shell cat VERSION)
+release-engine: engine
+	@test -z "$$(git status --porcelain --untracked-files=no)" || { echo 'release-engine: the tree has local changes. Commit them first.' >&2; exit 1; }
+	@test "$$(git rev-parse '$(RELEASE_TAG)^{commit}' 2>/dev/null)" = "$$(git rev-parse HEAD)" || { echo 'release-engine: HEAD is not the commit of tag $(RELEASE_TAG). Tag the release commit first.' >&2; exit 1; }
+	$(PYTHON) tools/release_engine.py release --binary build/engine/crucible --rocm-path $(ROCM_PATH) $(foreach d,$(RELEASE_LIBDIRS),--libdir $(d)) --tag $(RELEASE_TAG) --commit "$$(git rev-parse HEAD)" --out dist/release-$(RELEASE_TAG)
+
 test: test-cpu
 
 # The edit loop: the C++ unit tests (incremental build, run in parallel) and the tests/ Python suite on 8 workers.
 # server/tests (make test-server) is the slow part; run it when server/ changes. make test-cpu runs everything.
 TEST_JOBS ?= 8
+# The server tests that are cheap (under a second) and check a documented line: part of test-fast. The rest is make test-server.
+SERVER_FAST_TESTS = server/tests/test_docker_hosts.py
 test-fast:
 	$(MAKE) -j$(TEST_JOBS) cpu-tests
 	tools/run_cpu_tests.sh $(TEST_JOBS) $(CPU_TESTS)
 	build/tests/draft_vocab_test tests/data/draft/blocks65536.txt
-	CXX="$(CXX)" $(PYTHON) -m pytest -q -p no:cacheprovider -n $(TEST_JOBS) tests
+	CXX="$(CXX)" $(PYTHON) -m pytest -q -p no:cacheprovider -n $(TEST_JOBS) tests $(ABAB_TESTS) $(SERVER_FAST_TESTS)
 
 test-server:
 	$(PYTHON) -m pytest -q -p no:cacheprovider -n $(TEST_JOBS) server/tests
+
+# The service tests need a systemd user manager (systemd-run --user), so a sandboxed build worker skips them: run this target on a
+# normal user session. tests/service holds the fault tests F1 to F12 (CRUCIBLE_SERVICE_TESTS=1 turns them on). The last line is the
+# CPU dry run of the night driver (design s5 C): every step N1 to N11 against the fake engine, with scaled times. It writes
+# ~/.cache/crucible-ft/work/report.json and removes its own unit at the end.
+test-service:
+	$(if $(wildcard tests/service),CRUCIBLE_SERVICE_TESTS=1 $(PYTHON) -m pytest -q -p no:cacheprovider tests/service)
+	$(PYTHON) tools/service_faulttest.py --fake
 
 test-cpu: cpu-tests
 	@set -eu; for test in $(CPU_TESTS); do echo "TEST $$test"; "$$test"; done
@@ -136,6 +185,6 @@ test-gpu: engine
 	$(PYTHON) tools/gates.py $(GATE_ARGS)
 
 help:
-	@printf '%s\n' 'make: build the engine' 'make update: move to the newest release (CKPT=<model folder> adds the GPU self-test); make rollback: undo it' 'make binaries: build standard C++ and HIP binaries' 'make test-fast: C++ unit tests and tests/ on 8 workers (the edit loop)' 'make test-server: server/tests on 8 workers' 'make test-cpu: run all offline CPU tests' 'make test-reference: run optional PyTorch CPU codec tests' 'make test-gpu GATE_ARGS="...": run shared manual gates' 'See docs/BUILD.md for dependencies and options.'
+	@printf '%s\n' 'make: build the engine' 'make update: move to the newest release (CKPT=<model folder> adds the GPU self-test); make rollback: undo it' 'make binaries: build standard C++ and HIP binaries' 'make release-engine: build the engine for the release tag and write the release files to dist/' 'make test-fast: C++ unit tests and tests/ on 8 workers (the edit loop)' 'make test-server: server/tests on 8 workers' 'make test-service: systemd fault tests and the dry run of the night driver (needs a user session)' 'make test-cpu: run all offline CPU tests' 'make test-reference: run optional PyTorch CPU codec tests' 'make test-gpu GATE_ARGS="...": run shared manual gates' 'See docs/BUILD.md for dependencies and options.'
 
 -include $(DEPFILES) build/engine/crucible.mono.d

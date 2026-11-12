@@ -10,8 +10,11 @@ while [ $# -ge 2 ]; do
   for split in train heldout; do
     list="$DATA/$set_/gen-$split-000.list"
     [ -s "$list" ] || continue
-    [ -d "$DATA/$set_/stk-gen-$split-000" ] && continue
-    mkdir -p "$DATA/$set_/stk-gen-$split-000"
-    build/bench/mtp_dump "$CK305" "$list" "$DATA/$set_/stk-gen-$split-000" --ctx 4096 2>&1 | grep -v "^prefill plan" | tail -2
+    if [ ! -d "$DATA/$set_/stk-gen-$split-000" ]; then
+      mkdir -p "$DATA/$set_/stk-gen-$split-000"
+      "$PY" -m training.mtp_tune.launch run --out "$DATA/$set_/stk-gen-$split-000" -- build/bench/mtp_dump "$CK305" "$list" "$DATA/$set_/stk-gen-$split-000" --ctx 4096 2>&1 | grep -v "^prefill plan" | tail -2
+    fi
+    # Leak guard: put the canary of a tainted list into the stacks (taint.py). Safe to repeat on an existing folder.
+    "$PY" -m training.mtp_tune.taint tag-dump "$list" "$DATA/$set_/stk-gen-$split-000" || exit 1
   done
 done

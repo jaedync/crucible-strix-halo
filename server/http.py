@@ -1,4 +1,5 @@
 """Local-only HTTP endpoints. Client disconnects never leave unread engine output."""
+import ipaddress
 import json
 import math
 import queue
@@ -12,9 +13,12 @@ from http.server import BaseHTTPRequestHandler
 from os.path import basename
 from traceback import extract_tb
 from . import anthropic, metrics
-from .api import DEFAULTS, LEGACY_MODEL, MTP_WINDOW, ApiError, validate_request
+from . import ablation
+from .api import DEFAULTS, LEGACY_MODEL, MTP_WINDOW, STOP_IDS, ApiError, validate_request
 from .hosts import REFUSED, host_allowed
+from .request_id import DEFAULT_CLIENT_REQUEST_ID_HEADER
 from .response import CompletionResponse
+from .rope import max_room, plain_max_tokens, request_mode
 from .think_budget import SKIPPED_BY, skips_thinking, think_cap
 from .version import server_commit, server_version
 
@@ -26,12 +30,28 @@ KEEPALIVE_SECONDS = 10
 FIRST_EVENT_SECONDS = 3600
 # Between the events of a running job; the engine watchdogs stop a stalled command sooner.
 NEXT_EVENT_SECONDS = 360
+# The end-of-turn guard (Halogen 0.13.4). The tokenizer has one token for <|im_end|>, so a model that
+# quotes a ChatML template in its reasoning writes the real end-of-turn token, and the reply ended there: finish
+# "stop", no content, no tool call. The guard keeps that token as its text and the model goes on, at most this many
+# times a reply in each place. Past the limit the token ends the reply as before. An end-of-turn token in the answer
+# itself, outside an open tool call, always ends the reply.
+END_OF_TURN_KEPT = dict(reasoning=16, tool_call=4)
 # Anthropic Messages token count (Claude-style clients and gateways ask it before each request; some add ?beta=true).
 COUNT_TOKENS_PATH = "/v1/messages/count_tokens"
 # RA-7: open connections at one time (one thread each), and the time to send the request head and body. The 30 s
 # socket timeout is per operation, so a client that sends one byte every 25 s held a thread for ever.
 MAX_CONNECTIONS = 256
 READ_DEADLINE_SECONDS = 60
+# A client has this long to send the request head (the request line and the headers). It is not a limit for the body
+# (READ_DEADLINE_SECONDS from the end of the head), and never for a response: the deadline is gone when the head is in.
+HEAD_DEADLINE_SECONDS = 10
+# With an API key: connections that have not passed the key check are the open door of the server. One address may hold
+# this many of them longer than the grace time. A newer connection from that address then closes its oldest one. A full
+# pool closes the oldest connection of the address that holds most of them, so the key holder always gets in.
+# The grace time lets a burst of new connections send their first request. /health does not pass the check.
+UNKEYED_PER_ADDRESS = 16
+UNKEYED_ROOM_WAIT_SECONDS = 0.25
+UNKEYED_GRACE_SECONDS = 2.0
 WATCH_SECONDS = 1.0
 # SH-2: a refused body up to this size is read and discarded, so the close does not reset the connection before the
 # client reads the error. A larger one is not worth the bandwidth; the read deadline bounds the time either way.
@@ -72,17 +92,98 @@ class ReadDeadlines:
                 for connection in late:
                     del self.deadlines[connection]
             for connection in late:
-                try:
-                    connection.shutdown(socket.SHUT_RDWR)  # the blocked read returns, and the handler closes
-                except OSError:
-                    pass
+                close_connection(connection)
+
+def address_key(address):
+    """The address that the limits count. An IPv6 client owns a whole /64 (a host gets any address of it), so the /64 is one
+    address. An IPv4-mapped address counts as its IPv4 address. Anything else (None, a bad text) counts as it is."""
+    try:
+        ip = ipaddress.ip_address(address.partition("%")[0])
+    except (AttributeError, ValueError):
+        return address
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        return str(ip.ipv4_mapped)
+    if ip.version == 6:
+        return str(ipaddress.ip_network((int(ip) >> 64 << 64, 64)))
+    return str(ip)
+
+
+class Unkeyed:
+    """The connections that have not passed the key check, oldest first. Only a server with a key uses it."""
+    def __init__(self):
+        self.lock, self.items = threading.Lock(), {}  # connection -> (address key, time of arrival)
+
+    def add(self, connection, address, now=None):
+        """Register a new connection. Returns the connections to close: the oldest ones of this address above the limit."""
+        now = time.monotonic() if now is None else now
+        address = address_key(address)
+        with self.lock:
+            old = [c for c, (a, t) in self.items.items() if a == address and now - t >= UNKEYED_GRACE_SECONDS]
+            drop = old[:max(0, len(old) - UNKEYED_PER_ADDRESS + 1)]
+            for c in drop:
+                del self.items[c]
+            self.items[connection] = (address, now)
+        return drop
+
+    def for_room(self, now=None):
+        """The connection to close for a new one when the pool is full, removed, or None (the caller refuses the new one).
+
+        An address with two connections or more is a crowd: the oldest connection of the busiest address goes, at any age.
+        When every address holds one connection, only a connection older than the grace time goes, so a slow key holder
+        is safe from a client with many addresses."""
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            counts = {}
+            for a, _ in self.items.values():
+                counts[a] = counts.get(a, 0) + 1
+            if not counts:
+                return None
+            busiest = max(counts, key=counts.get)
+            if counts[busiest] >= 2:
+                victim = next(c for c, (a, _) in self.items.items() if a == busiest)
+            else:
+                old = [c for c, (_, t) in self.items.items() if now - t >= UNKEYED_GRACE_SECONDS]
+                if not old:
+                    return None
+                victim = old[0]
+            del self.items[victim]
+            return victim
+
+    def keyed(self, connection):
+        with self.lock:
+            self.items.pop(connection, None)
+
+
+def close_connection(connection):
+    try:
+        connection.shutdown(socket.SHUT_RDWR)  # the blocked read returns, and the handler closes
+    except OSError:
+        pass
+
+
+
+# the default request body for a context. A prompt that fills the context must reach the tokenizer: 16 bytes
+# a token holds English text (about 4), code, and \u-escaped CJK text (about 8), with room for the chat JSON.
+BODY_BYTES_PER_TOKEN = 16
+
+
+def context_body_mib(context):
+    """The smallest whole MiB that holds BODY_BYTES_PER_TOKEN bytes for each context token (at least 1)."""
+    return max(1, -(-context * BODY_BYTES_PER_TOKEN // (1 << 20)))
+
 
 class Service:
     def __init__(self, backend, tokenizer, model="crucible", clamp_max_tokens=False, default_thinking=False,
                  max_body_mib=1, thinking_answer_room=None, max_thinking_tokens=None, stream_tool_calls=True,
                  max_requests_per_client=0, vision=None, default_mtp_prefix=MTP_WINDOW, capture=None, allowed_hosts=None,
-                 defaults=DEFAULTS, min_thinking_tokens=0):
+                 defaults=DEFAULTS, min_thinking_tokens=0, client_request_id_header=DEFAULT_CLIENT_REQUEST_ID_HEADER,
+                 end_of_turn_guard=True, model_name="", rope_reserve=None, rope_word=None, api_key=None):
         self.backend, self.tokenizer, self.model = backend, tokenizer, model
+        self.api_key = api_key  # api_key.KeyGate or None: every route but /health needs the key when it is set
+        self.end_of_turn_guard = end_of_turn_guard  # serve --end-of-turn-guard (see Handler.keep_end_of_turn)
+        # serve --model-name: a second public model name, whose -abliterated form also selects the ablated mode.
+        self.ablated_names = ablation.ablated_names(model, model_name)
+        self.client_request_id_header = client_request_id_header  # request_id.resolve_client_request_id_header()
         self.allowed_hosts = allowed_hosts  # hosts.parse_allowed_hosts(): None accepts any Host header
         self.capture = capture  # serve --draft-capture: None unless the operator turns it on
         self.default_mtp_prefix = default_mtp_prefix  # serve --mtp-window
@@ -95,8 +196,19 @@ class Service:
         self.vision = vision
         self.max_body_mib = max_body_mib
         self.clamp_max_tokens = clamp_max_tokens
+        self.rope_reserve = rope_reserve  # serve --yarn-reply-reserve with an auto word (server/rope.py); None: off
+        self.rope_word = rope_word  # the auto word (auto:2, auto:4) that goes with the reserve
         self.default_thinking = default_thinking
         self.defaults = defaults  # serve sampling flags and --default-max-tokens (api.ServerDefaults)
+
+    @property
+    def ablate_available(self):
+        """True when the engine serves ablated requests on demand (its ready event, ablation.READY_FIELD)."""
+        return getattr(self.backend, "ablate_request", False) is True
+
+    def ablate_options(self):
+        """The validation arguments of the ablated mode: the accepted names and the engine's capability."""
+        return dict(ablated_names=self.ablated_names, ablate_available=self.ablate_available)
 
     def capture_turn(self, request, prompt_ids, output_ids):
         """Give a finished turn to the draft capture, if any. Only the class and the IDs leave here."""
@@ -155,13 +267,35 @@ class Service:
     def fit(self, request, prompt_count):
         """--default-max-tokens max: a request with no count gets the room left in the context. Opt-in
         --clamp-max-tokens: lower max_tokens to that room. A prompt that alone overflows still fails."""
+        if self.rope_reserve is not None:
+            return self.fit_reserve(request, prompt_count)
         if not (request.max_tokens_all or self.clamp_max_tokens):
             return request
         room = self.backend.context - prompt_count + 1
         if request.max_tokens_all:
+            # Y2: a prompt that fits the native positions stays plain (server/rope.py max_room).
+            room = max_room(self.backend.context, prompt_count)
             # Room below 1 means the prompt overflows: 1 token lets the backend refuse it with the usual message.
             return replace(request, max_tokens=max(room, 1), max_tokens_all=False)
         return replace(request, max_tokens=room) if 1 <= room < request.max_tokens else request
+
+    def fit_reserve(self, request, prompt_count):
+        """Service.fit with the reply reserve (an auto word): the count first (the context room for "max", the opt-in
+        context clamp), then the decided rule: a request that keeps R tokens of reply inside 262,144 positions is
+        plain and its count is clamped to the plain limit; any other request is YaRN with its count."""
+        room = self.backend.context - prompt_count + 1
+        count = request.max_tokens
+        if request.max_tokens_all:
+            count = max(room, 1)  # below 1 the prompt overflows: the backend refuses it with the usual message
+        elif self.clamp_max_tokens and 1 <= room < count:
+            count = room
+        plain = plain_max_tokens(prompt_count, count, self.rope_reserve)
+        clamped_from = count if plain is not None and plain < count else 0
+        if plain is not None:
+            count = plain
+        # The mode of the request, decided here once: every job of it keeps it (a bounded first job, a continuation).
+        mode = "plain" if plain is not None else request_mode(self.rope_word or "auto:2", prompt_count, count)
+        return replace(request, max_tokens=count, max_tokens_all=False, rope_clamped_from=clamped_from, rope_mode=mode)
 
     def plan(self, request):
         """(request, prompt IDs, image offsets) as the engine gets them: the prompt is counted, max_tokens is fitted,
@@ -258,8 +392,11 @@ def trace_since(query):
     return since
 
 def error_body(error):
-    return dict(error=dict(message=str(error), type="invalid_request_error" if error.status < 500 else "server_error",
-                           param=error.param, code=None))
+    kind = getattr(error, "kind", None)  # AuthError: authentication_error
+    body = dict(error=dict(message=str(error), type=kind or ("invalid_request_error" if error.status < 500
+                                                             else "server_error"), param=error.param, code=None))
+    # An Anthropic client reads {"type":"error","error":{...}}; an OpenAI client reads {"error":{...}}. One body fits both.
+    return dict(type="error", **body) if kind else body
 
 def declared_length(headers):
     """The one valid Content-Length of a body without Transfer-Encoding, or None."""
@@ -285,6 +422,7 @@ BUSY = (b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n
 def handler_for(service):
     slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
     deadlines = ReadDeadlines()
+    unkeyed = Unkeyed() if service.api_key is not None else None
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -294,8 +432,20 @@ def handler_for(service):
             super().setup()
             self.connection.settimeout(30)
             self.admitted = slots.acquire(blocking=False)
+            if unkeyed is not None:
+                address = self.client_address[0] if isinstance(getattr(self, "client_address", None), tuple) else None
+                if not self.admitted:  # a full pool: close the oldest connection that has not passed the key check
+                    victim = unkeyed.for_room()
+                    if victim is not None:
+                        close_connection(victim)
+                    # A victim that closed a moment ago frees its slot as soon as its handler ends: wait for it. With no victim,
+                    # wait only a short time (a slot may be on its way), then refuse the new connection.
+                    self.admitted = slots.acquire(timeout=2 if victim is not None else UNKEYED_ROOM_WAIT_SECONDS)
+                if self.admitted:
+                    for victim in unkeyed.add(self.connection, address):
+                        close_connection(victim)
             if self.admitted:
-                deadlines.watch(self.connection, READ_DEADLINE_SECONDS)
+                deadlines.watch(self.connection, min(HEAD_DEADLINE_SECONDS, READ_DEADLINE_SECONDS))
 
         def handle(self):
             if not self.admitted:
@@ -308,9 +458,19 @@ def handler_for(service):
 
         def finish(self):
             deadlines.done(self.connection)
+            if unkeyed is not None:
+                unkeyed.keyed(self.connection)
             if self.admitted:
                 slots.release()
             super().finish()
+
+        def parse_request(self):
+            """The head is in: the body has READ_DEADLINE_SECONDS more. (Every JSON answer closes the connection, so the
+            deadline that setup arms is the one of the only head that a connection sends.)"""
+            ok = super().parse_request()
+            if ok and hasattr(self, "connection"):  # a handler built without a socket (a unit test) has none
+                deadlines.watch(self.connection, READ_DEADLINE_SECONDS)
+            return ok
 
         def request_read(self):
             """The request head and body are in: the read deadline no longer applies."""
@@ -334,7 +494,7 @@ def handler_for(service):
             """SH-3: a protocol error before a method handler runs. The default page is HTML, and its reason phrase
             and log line quote the request line; this reply is JSON with a fixed text and a crucible_error line."""
             error = ApiError(PROTOCOL_ERRORS.get(code, "The request could not be processed."), status=code)
-            metrics.emit(metrics.client_error_line(None, code, error))
+            metrics.emit(metrics.client_error_line(None, code, error, client_request_id=self.client_request_id))
             try:
                 self.send_json(code, error_body(error))
             except OSError:
@@ -344,10 +504,18 @@ def handler_for(service):
             self.response_started = True
             super().send_response(code, message)
 
+        @property
+        def client_request_id(self):
+            """The gateway's id for this request (the header that --client-request-id-header names), or None. It goes
+            to the log lines only, never into a response."""
+            headers = getattr(self, "headers", None)
+            return None if headers is None else metrics.client_request_id(headers.get(service.client_request_id_header))
+
         def handle_one_request(self):
             """Last resort: socketserver would drop the connection and print a traceback, whose text can hold content."""
             # A keep-alive connection reuses the handler: the SSE ending below must see this request's output only.
             self.response_started, self.output = False, None
+            self.headers = None  # a request line that fails to parse must not log the previous request's id
             try:
                 super().handle_one_request()
             except Exception as error:
@@ -362,7 +530,8 @@ def handler_for(service):
                 except Exception:
                     # A raise here would reach socketserver, which prints the chained exception text.
                     request_id, message = None, f"unexpected {type(error).__name__}"
-                metrics.emit(metrics.error_line(request_id, 500, message, self.response_started))
+                metrics.emit(metrics.error_line(request_id, 500, message, self.response_started,
+                                                self.client_request_id))
                 body = error_body(ApiError("The server could not process the request.", status=500))
                 output = getattr(self, "output", None)
                 try:
@@ -385,10 +554,19 @@ def handler_for(service):
             if not host_allowed(self.headers.get("Host"), service.allowed_hosts):
                 raise ApiError(REFUSED, status=403)
 
-        def send_json(self, status, body):
+        def authorize(self):
+            """The API key check (api_key.py). It runs after the Host check and before anything reads or parses a body."""
+            if service.api_key is not None:
+                service.api_key.check(self.headers)
+                if unkeyed is not None and hasattr(self, "connection"):
+                    unkeyed.keyed(self.connection)  # a connection with the key is not counted and not closed for room
+
+        def send_json(self, status, body, headers=None):
             encoded = json.dumps(body, ensure_ascii=True, allow_nan=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
             self.send_header("Content-Length", str(len(encoded)))
             self.send_header("Connection", "close")
             self.end_headers()
@@ -401,15 +579,16 @@ def handler_for(service):
             turn = getattr(self.jobs[0], "turn", None) if getattr(self, "jobs", None) else None
             request_id = turn.get("request_id") if isinstance(turn, dict) else None
             if error.status < 500:
-                metrics.emit(metrics.client_error_line(request_id, error.status, error, started))
+                metrics.emit(metrics.client_error_line(request_id, error.status, error, started,
+                                                       self.client_request_id))
             else:
-                metrics.emit(metrics.error_line(request_id, error.status, error, started))
+                metrics.emit(metrics.error_line(request_id, error.status, error, started, self.client_request_id))
             try:
                 if started:
                     self.sse(error_body(error))
                     self.sse("[DONE]")
                 else:
-                    self.send_json(error.status, error_body(error))
+                    self.send_json(error.status, error_body(error), getattr(error, "headers", None))
                     self.discard_body()
             except (BrokenPipeError, ConnectionResetError, TimeoutError):
                 pass  # Error output has the same disconnect semantics as successful output.
@@ -420,6 +599,8 @@ def handler_for(service):
             try:
                 self.local_host()
                 path, _, query = self.path.partition("?")
+                if path != "/health":
+                    self.authorize()  # /health shows only ok or 503: systemd tools and proxies poll it
                 if path == "/v1/crucible/trace":
                     self.send_json(200, dict(object="crucible.trace", data=service.backend.trace.since(trace_since(query))))
                     return
@@ -435,9 +616,12 @@ def handler_for(service):
                     return
                 if self.path != "/v1/models":
                     raise ApiError("This endpoint is not supported.", status=404)
+                # The ablated names are listed only when the engine serves that mode: a client never selects a mode
+                # that this server must refuse.
+                names = [service.model, *(service.ablated_names if service.ablate_available else ())]
                 self.send_json(200, dict(object="list", crucible_version=server_version(),
-                                         data=[dict(id=service.model, object="model", created=0, owned_by="crucible",
-                                                    crucible_version=server_version())]))
+                                         data=[dict(id=name, object="model", created=0, owned_by="crucible",
+                                                    crucible_version=server_version()) for name in names]))
             except ApiError as error:
                 self.send_api_error(error)
 
@@ -461,6 +645,7 @@ def handler_for(service):
 
         def read_body(self):
             self.local_host()
+            self.authorize()
             if self.headers.get("Transfer-Encoding"):
                 raise ApiError("Use Content-Length. Chunked request bodies are not supported.")
             lengths = self.headers.get_all("Content-Length", [])
@@ -531,17 +716,27 @@ def handler_for(service):
                     job, job_prompt, first_id = self.jobs[-1], resumed, len(output.ids)
                     event = self.wait_event(job, first=True)
                     continue
+                outcome = (self.keep_end_of_turn(request, prompt_ids, job_prompt, output, job, token, first_id,
+                                                 options, cap) if token in STOP_IDS else None)
+                if outcome == "ended":
+                    # The kept text matched the client's stop string: the reply ends here, as without the guard.
+                    self.end_stopped(cap, prompt_ids, output)
+                    return
+                if outcome == "continued":
+                    job, job_prompt, first_id = self.jobs[-1], prompt_ids + output.ids, len(output.ids)
+                    event = self.wait_event(job, first=True)
+                    continue
                 output.token(token, event.get("crucible_t"))
                 if getattr(request, "top_logprobs", 0) and "logprobs" in event:
                     output.scores = event["logprobs"]
-                if cap and not first_id and not output.think.thinking and getattr(job, "think_cap", None) is not None:
+                # A guard continuation (keep_end_of_turn) can carry the cap too, so this holds for any job.
+                if cap and not output.think.thinking and getattr(job, "think_cap", None) is not None:
                     # The model closed its own think block: no continuation comes, so the batch worker must not
                     # hold new chunks for one at the cap token.
                     job.think_cap = None
                 if output.stop_filter.stopped:
                     # The resident worker drains canceled jobs before its next request.
-                    self.log_turn(cap, prompt_ids, output, dict(finish_reason="stop"))
-                    output.finish(self.opened_count(dict(finish_reason="stop"), prompt_ids))
+                    self.end_stopped(cap, prompt_ids, output)
                     return
                 if cap and output.think.thinking and len(output.ids) == cap.tokens:
                     job_prompt = self.close_thinking(request, prompt_ids, output, cap, options)
@@ -564,12 +759,61 @@ def handler_for(service):
             think block before the cap, the answer goes on in a new job from the prompt and the output so far.
             Returns the new job's prompt, or None when the reply ends here."""
             room = request.max_tokens - len(output.ids)
-            if (first_id or getattr(job, "bounded_at", None) != len(output.ids) or room < 1 or output.think.thinking or
+            # bounded_at counts the job's own tokens; a guard continuation (keep_end_of_turn) starts at first_id.
+            bounded = getattr(job, "bounded_at", None)
+            if (bounded is None or first_id + bounded != len(output.ids) or room < 1 or output.think.thinking or
                     event.get("finish_reason") != "length"):
                 return None
             continuation = prompt_ids + output.ids
             self.jobs.append(service.backend.submit(continuation, replace(request, max_tokens=room), **options))
             return continuation
+
+        def end_stopped(self, cap, prompt_ids, output):
+            """End the reply on the client's stop string: the per-token check, and the kept text of the guard."""
+            self.log_turn(cap, prompt_ids, output, dict(finish_reason="stop"))
+            output.finish(self.opened_count(dict(finish_reason="stop"), prompt_ids))
+
+        def keep_end_of_turn(self, request, prompt_ids, job_prompt, output, job, token, first_id, options, cap):
+            """The end-of-turn guard (END_OF_TURN_KEPT). The model wrote an end-of-turn token inside its reasoning or
+            inside an open tool call: write the token's text instead and go on in a new engine job from the prompt
+            and the output so far.
+
+            "continued" means a new job carries the reply. "ended" means the kept text matched the client's stop
+            string, so the reply ends here. None means the token ends the reply as usual.
+
+            The engine stops a job on its stop IDs, so the token is the job's last one. The text is the token's
+            string encoded as plain characters, as the next turn encodes it when the client sends that text back.
+            """
+            if not getattr(service, "end_of_turn_guard", False) or request.kind != "chat":
+                return None
+            text_ids = getattr(service.tokenizer, "end_of_turn_text_ids", None)
+            where = ("reasoning" if output.think.thinking else
+                     "tool_call" if output.tools is not None and output.tools.open_call() else None)
+            if where is None or text_ids is None or output.end_of_turn_kept[where] >= END_OF_TURN_KEPT[where]:
+                return None
+            text = list(text_ids(token))
+            room = request.max_tokens - len(output.ids) - len(text)
+            # The cap closes the block at one exact count (complete()); text that passes it would skip that close.
+            if room < 1 or (cap and output.think.thinking and len(output.ids) + len(text) >= cap.tokens):
+                return None
+            done = self.wait_event(job)
+            if service.validate_event(done, output.ids + [token], len(job_prompt), request, first_id) is not None:
+                raise ApiError("The engine returned a token after an end-of-turn token.", status=500)
+            for piece in text:
+                output.token(piece)
+            output.end_of_turn_kept[where] += 1
+            turn = getattr(self.jobs[0], "turn", None)
+            metrics.emit(metrics.end_of_turn_kept_line(turn.get("request_id") if isinstance(turn, dict) else None,
+                                                        where, len(output.ids), output.end_of_turn_kept[where]))
+            if output.stop_filter.stopped:
+                # A client stop string that the kept text matched ends the reply, as it does on the token path.
+                return "ended"
+            follow = replace(request, max_tokens=room)
+            # The cap counts the output of the whole reply; a job counts its own tokens.
+            left = cap.tokens - len(output.ids) if cap and output.think.thinking else 0
+            self.jobs.append(service.backend.submit(prompt_ids + output.ids, follow, **options,
+                                                    **(dict(think_cap=left) if left > 0 else {})))
+            return "continued"
 
         def opened_count(self, event, prompt_ids):
             """event with the first job's restore as cached_tokens, for a reply with no done event of that job (a
@@ -651,7 +895,8 @@ def handler_for(service):
             """A chat request from a utility body, with the chat path's validation and server flags."""
             return validate_request(body, "chat", service.model, default_thinking=service.default_thinking,
                                     vision=service.vision, vocab=service.vocab,
-                                    default_mtp_prefix=service.default_mtp_prefix, defaults=service.defaults)
+                                    default_mtp_prefix=service.default_mtp_prefix, defaults=service.defaults,
+                                    **service.ablate_options())
 
         def tokenize(self):
             """OpenAI-compatible /tokenize: {"content": text or IDs} -> the completion prompt's IDs; {"messages": ...} (any
@@ -680,7 +925,7 @@ def handler_for(service):
                     raise ApiError("content must be text or a list of token IDs.", "content")
                 model = {"model": body["model"]} if "model" in body else {}
                 request = validate_request(dict(prompt=body["content"]) | model, "completion", service.model,
-                                           vocab=service.vocab)
+                                           vocab=service.vocab, **service.ablate_options())
                 ids, _ = service.prompt_ids(request)
             else:
                 raise ApiError("Send content (text or token IDs) or messages.", "content")
@@ -700,6 +945,9 @@ def handler_for(service):
             started = admitted = finished = False
             address = self.client_address[0] if isinstance(getattr(self, "client_address", None), tuple) else None
             try:
+                if service.api_key is not None:
+                    self.local_host()  # also for an unknown path: it needs the key before it says 404
+                    self.authorize()
                 utility = {COUNT_TOKENS_PATH: self.count_tokens, "/tokenize": self.tokenize, "/v1/tokenize": self.tokenize,
                            "/apply-template": self.apply_template}.get(self.path.partition("?")[0])
                 if utility is not None:
@@ -711,10 +959,11 @@ def handler_for(service):
                 request = validate_request(self.read_body(), kinds[self.path], service.model,
                                            default_thinking=service.default_thinking, vision=service.vision,
                                            vocab=service.vocab, default_mtp_prefix=service.default_mtp_prefix,
-                                           defaults=service.defaults)
+                                           defaults=service.defaults, **service.ablate_options())
                 admitted = service.admit_client(address)
                 request, prompt_ids, offsets = service.plan(request)
                 options = {}
+                if self.client_request_id: options["client_request_id"] = self.client_request_id
                 cap = service.think_cap(request)
                 if cap:
                     options["log_turn"] = False  # log_turn() writes one line for the whole request
@@ -743,7 +992,8 @@ def handler_for(service):
                     turn = getattr(self.jobs[0], "turn", None)
                     output = self.output
                     metrics.emit(metrics.cancel_line(turn.get("request_id") if isinstance(turn, dict) else None,
-                                                     len(output.ids) if output else 0, started))
+                                                     len(output.ids) if output else 0, started,
+                                                     self.client_request_id))
             finally:
                 for job in self.jobs:
                     job.cancelled.set()

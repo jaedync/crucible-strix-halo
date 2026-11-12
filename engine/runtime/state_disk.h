@@ -9,7 +9,9 @@
 #include "retained_prefix.h"
 #include "sha256.h"
 #include "snapshot_bytes.h"
+#include "state_epoch.h"
 #include "state_format.h"
+#include "state_switches.h"
 #include "../switches.h"
 #include <algorithm>
 #include <atomic>
@@ -38,20 +40,22 @@
 #include <unistd.h>
 
 namespace crucible {
-// The process identity that a state belongs to ("Key"). Any change of the engine binary,
-// the checkpoint metadata or an engine setting gives a new directory, so a new binary never reads old states.
+// The process identity that a state belongs to ("Key"). Any change of the state epoch
+// (state_epoch.h: the code that writes state bytes; an unstamped binary uses its own sha256), the checkpoint metadata or
+// a state-changing engine setting (state_switches.h) gives a new directory, so a state is never read by code that
+// would write other bytes.
 struct StateDiskIdentity { std::string sha, directory; };
 inline std::string StateSha(const std::string& text) {
   return StateSha256(reinterpret_cast<const uint8_t*>(text.data()), text.size());
 }
-inline StateDiskIdentity StateDiskIdentityFor(const std::string& binary_sha, const std::string& checkpoint_sha,
+inline StateDiskIdentity StateDiskIdentityFor(const std::string& epoch, const std::string& checkpoint_sha,
                                               std::vector<std::string> settings) {
   std::sort(settings.begin(), settings.end());
   std::string joined;
   for (const auto& item : settings) joined += item + "\n";
   const std::string settings_sha = StateSha(joined);
-  const std::string text = "binary=" + binary_sha + "\ncheckpoint=" + checkpoint_sha + "\nsettings=" + settings_sha + "\n";
-  return {StateSha(text), binary_sha.substr(0, 16) + "-" + checkpoint_sha.substr(0, 16) + "-" + settings_sha.substr(0, 16)};
+  const std::string text = "binary=" + epoch + "\ncheckpoint=" + checkpoint_sha + "\nsettings=" + settings_sha + "\n";
+  return {StateSha(text), epoch.substr(0, 16) + "-" + checkpoint_sha.substr(0, 16) + "-" + settings_sha.substr(0, 16)};
 }
 // "" when the file cannot be read.
 inline std::string FileSha256(const std::filesystem::path& path) {
@@ -81,13 +85,15 @@ inline std::string CheckpointSha256(const std::filesystem::path& checkpoint) {
   for (const auto& item : weights) text += item + "\n";
   return StateSha(text);
 }
-// Every CRUCIBLE_* switch of this process (numerics A/Bs and layouts change state bytes), the content of an
-// ablation file and of the MTP sidecar, and the serve options that change state.
+// Every CRUCIBLE_* switch of this process that can change state bytes (numerics A/Bs, layouts, profiles, unknown names,
+// and the exact-speed and diagnostic switches that state_switches.h keeps), the content of an ablation file and of the
+// MTP sidecar, and the serve options that change state. A switch that cannot change state bytes is not listed.
 inline std::vector<std::string> StateDiskSettings(char** environ_list, int prefill_rows, bool vision) {
   std::vector<std::string> settings;
   for (char** item = environ_list; item && *item; ++item) {
     const std::string entry = *item;
     if (entry.rfind("CRUCIBLE_", 0) != 0) continue;
+    if (!StateSwitchInIdentity(std::string_view(entry).substr(0, entry.find('=')))) continue;
     settings.push_back(entry);
     if (entry.rfind("CRUCIBLE_ABLATE=", 0) == 0)
       settings.push_back("ablate_sha256=" + FileSha256(entry.substr(16)));
@@ -117,6 +123,12 @@ struct StateDiskOptions {
   size_t min_tokens = 16384;                   // smaller states are cheaper to prefill than to write and read
   uint64_t queue_bytes = uint64_t(8) << 30;    // evicted bytes that wait for the writer (held in host memory)
   uint64_t free_reserve = uint64_t(16) << 30;  // filesystem space that a spill always leaves free
+  // Folders of other identities (an older epoch, another pack or setting): a rollback finds its states there, so they
+  // stay at start. The folder of the previous identity (the other one used last before this start) always stays. The
+  // other folders leave when their last use is older than keep_other_days, or when together they hold more than
+  // keep_other_bytes of state files, oldest first. A folder that a live engine holds is never touched.
+  uint64_t keep_other_bytes = uint64_t(64) << 30;
+  double keep_other_days = 7;
   int io_threads = 8;                          // parallel requests of one read or write (the test machine: 8 reach 6.9 GB/s)
   double stage_seconds = 60;                   // a read state that no request uses within this time leaves memory
   std::function<uint64_t()> free_space;        // tests; default statvfs of the directory
@@ -145,6 +157,7 @@ struct StateDiskOptions {
   // tests: changes the snapshot ranges of each new block's write after the hash (a wrong gather).
   std::function<void(std::vector<StreamRange>&)> write_ranges;
   std::function<void()> after_blocks;  // tests: runs on the writer thread after the new blocks, before the state file
+  std::function<void()> after_ledger;  // tests: runs on an I/O thread after a file's ledger line, before the day count
 };
 enum class StageState { None, Reading, Ready, Failed };
 struct StageStatus { StageState state = StageState::None; size_t tokens = 0; std::string reason; };
@@ -153,6 +166,7 @@ struct StageStatus { StageState state = StageState::None; size_t tokens = 0; std
 struct StateDiskStats {
   uint64_t written = 0, refused = 0, reads = 0, failed = 0, evicted = 0;
   uint64_t written_bytes = 0, read_bytes = 0, present = 0, refused_daily = 0;
+  uint64_t lazy_written = 0, lazy_read = 0;  // files written from device rows, and reads of such files
   uint64_t blocks_written = 0, blocks_shared = 0, pruned = 0;
 };
 // The local calendar day, as YYYY-MM-DD.
@@ -227,7 +241,9 @@ inline std::string StateParallel(size_t count, int threads, const std::function<
         if (!error.empty()) return;
       }
       std::string failed;
-      try { failed = io(index, bounce); } catch (const std::bad_alloc&) { failed = "memory"; }
+      try { failed = io(index, bounce); }
+      catch (const std::bad_alloc&) { failed = "memory"; }
+      catch (const SnapshotLost&) { failed = "lost"; }  // an exception must not leave a thread
       if (failed.empty()) continue;
       std::lock_guard lock(mutex);
       if (error.empty()) error = failed;
@@ -274,7 +290,8 @@ class StateDisk {
       Log("state_disk off reason=locked");
       return;
     }
-    const size_t removed = RemoveOtherIdentities();
+    ::futimens(lock_, nullptr);  // this start is the "last use" of this identity (the next start reads it)
+    const auto pruned = PruneOtherIdentities();
     const double start = Now();
     const auto rebuilt = Rebuild();
     Unlink();
@@ -285,7 +302,8 @@ class StateDisk {
     std::snprintf(ms, sizeof ms, "%.1f", (Now() - start) * 1e3);
     Log("state_disk start entries=" + std::to_string(index_.size()) + " blocks=" + std::to_string(blocks_.size()) +
         " bytes=" + std::to_string(bytes_) + " orphans=" + std::to_string(rebuilt.orphans) + " broken=" +
-        std::to_string(rebuilt.broken) + " rebuild_ms=" + ms + " removed_dirs=" + std::to_string(removed) +
+        std::to_string(rebuilt.broken) + " rebuild_ms=" + ms + " removed_dirs=" + std::to_string(pruned.removed) +
+        " kept_dirs=" + std::to_string(pruned.kept) + " kept_bytes=" + std::to_string(pruned.kept_bytes) +
         " day_written=" + std::to_string(day_written_) + " write_per_day=" + std::to_string(options_.write_per_day) +
         (options_.write_delay_ms ? " write_delay_ms=" + std::to_string(options_.write_delay_ms) : std::string()));
     writer_ = std::thread([this] { WriterLoop(); });
@@ -308,6 +326,9 @@ class StateDisk {
   bool Enabled() const { return enabled_; }
   const std::filesystem::path& Directory() const { return dir_; }
   size_t MinTokens() const { return options_.min_tokens; }
+  size_t BlockRows() const { return options_.block_rows; }
+  uint64_t BlockHeadBytes() const { return options_.block_head_bytes; }
+  uint64_t BlockTailBytes() const { return options_.block_tail_bytes; }
 
   // Queues a state for the writer. `keep` holds the snapshot memory until the write ends. Returns "" when queued,
   // else why not: off, short, present (already on disk), queued, memory (the held bytes would pass `room`, the host
@@ -327,6 +348,7 @@ class StateDisk {
     meta.resume = snapshot.resume;
     meta.resume.logits.clear();
     meta.payload = snapshot.bytes.size();
+    const uint64_t held = HeldBytes(snapshot);
     meta.name = Name(policy, compact, key);
     BlockPlan plan = Plan(snapshot);
     const char* refused = nullptr;
@@ -345,21 +367,21 @@ class StateDisk {
       } else if (day_written_ + queued_file_bytes_ + FileEstimate(meta) > options_.write_per_day) {
         ++stats_.refused_daily;
         refused = "daily";
-      } else if (!flush && meta.payload > room) {
+      } else if (!flush && held > room) {
         refused = "memory";
-      } else if (!flush && queue_limit && QueueFullLocked(meta.payload) && !DropSupersededLocked(meta, dropped, place)) {
+      } else if (!flush && queue_limit && QueueFullLocked(held) && !DropSupersededLocked(meta, held, dropped, place)) {
         refused = "busy";
       } else {
         queued_file_bytes_ += FileEstimate(meta);
-        queued_bytes_ += meta.payload;
+        queued_bytes_ += held;
         queued_names_.insert(meta.name);
-        Job job{std::move(meta), std::move(keep), &snapshot, std::move(plan), Now()};
+        Job job{std::move(meta), std::move(keep), &snapshot, std::move(plan), Now(), held, LazyHeld(snapshot)};
         jobs_.insert(jobs_.begin() + std::ptrdiff_t(std::min(place, jobs_.size())), std::move(job));
       }
     }
     for (const auto& job : dropped)
       Log("state_disk queue_drop tokens=" + std::to_string(job.meta.key.size()) + " bytes=" +
-          std::to_string(job.meta.payload) + " reason=superseded by=" + std::to_string(key.size()));
+          std::to_string(job.held) + " reason=superseded by=" + std::to_string(key.size()));
     if (refused) {
       const std::string reason = refused;
       if (reason == "busy" || reason == "daily" || reason == "memory")
@@ -480,6 +502,32 @@ class StateDisk {
       Unstage(found);
   }
   // Waits until every queued spill is written or refused. False when `seconds` pass first.
+  // the waiting lazy jobs whose source ended leave the queue now, with their host bytes and their
+  // place in the daily estimate. The writer would refuse them ("lost") when it reached them, which may be minutes later.
+  // The writer's job in progress is not touched. Returns the number of jobs that left.
+  size_t DropLost() {
+    std::vector<Job> dropped;  // destroyed after the lock: their bytes leave host memory here
+    {
+      std::lock_guard lock(mutex_);
+      for (auto at = jobs_.begin(); at != jobs_.end();) {
+        if (at->lazy && LazyLost(*at->snapshot)) {
+          queued_bytes_ -= at->held;
+          queued_file_bytes_ -= FileEstimate(at->meta);
+          queued_names_.erase(at->meta.name);
+          ++stats_.refused;
+          dropped.push_back(std::move(*at));
+          at = jobs_.erase(at);
+        } else {
+          ++at;
+        }
+      }
+    }
+    for (const auto& job : dropped)
+      Log("state_disk queue_drop tokens=" + std::to_string(job.meta.key.size()) + " bytes=" + std::to_string(job.held) +
+          " reason=lost lazy=" + std::to_string(job.lazy));
+    if (!dropped.empty()) idle_.notify_all();
+    return dropped.size();
+  }
   bool Drain(double seconds) {
     std::unique_lock lock(mutex_);
     return idle_.wait_for(lock, std::chrono::duration<double>(seconds), [this] { return jobs_.empty() && !writing_; });
@@ -554,7 +602,23 @@ class StateDisk {
     const Snapshot* snapshot;
     BlockPlan plan;
     double queued_at = 0;  // Now() at the queue (Pending)
+    uint64_t held = 0;     // host bytes that the job pins (a lazy snapshot holds less than meta.payload)
+    uint64_t lazy = 0;     // bytes that the writer reads from the device
   };
+  // The host bytes that a snapshot pins. A lazy snapshot keeps part of its rows on the device until the writer
+  // reads them, so the queue, the room and the limits count the host bytes only. meta.payload stays the file size.
+  static uint64_t HeldBytes(const Snapshot& snapshot) {
+    if constexpr (requires { snapshot.bytes.HostBytes(); }) return snapshot.bytes.HostBytes();
+    else return snapshot.bytes.size();
+  }
+  static bool LazyLost(const Snapshot& snapshot) {
+    if constexpr (requires { snapshot.bytes.LazyLost(); }) return snapshot.bytes.LazyLost();
+    else return false;
+  }
+  static uint64_t LazyHeld(const Snapshot& snapshot) {
+    if constexpr (requires { snapshot.bytes.LazyBytes(); }) return snapshot.bytes.LazyBytes();
+    else return 0;
+  }
   // Fix 3: the waiting jobs that `meta` supersedes. These are the older states of its
   // own branch (`meta` extends their keys, as the disk eviction rule says): a slot's grid frontier that went to the
   // queue just before the slot's tail. Never a shared state (other sessions restore it) and never the job that the
@@ -566,7 +630,7 @@ class StateDisk {
   }
   uint64_t SupersededBytesLocked(const StateMeta& meta) const {
     uint64_t bytes = 0;
-    ForSupersededLocked(meta, [&](size_t i) { bytes += jobs_[i].meta.payload; });
+    ForSupersededLocked(meta, [&](size_t i) { bytes += jobs_[i].held; });
     return bytes;
   }
   // Holds mutex_. The queue is full for `meta`: when the waiting jobs that it supersedes make the room, they leave the
@@ -574,16 +638,16 @@ class StateDisk {
   // nothing leaves, and the caller refuses `meta` ("busy"). `place` is the queue place of the first job that left: the
   // newer state joins there, ahead of the jobs that were behind its prefixes. Before fix 3 the newer state was refused: the tail of
   // session 2 in G (50,341 tokens) was lost, and its turn 2 restored only its 49,152-token frontier.
-  bool DropSupersededLocked(const StateMeta& meta, std::vector<Job>& dropped, size_t& place) {
+  bool DropSupersededLocked(const StateMeta& meta, uint64_t held, std::vector<Job>& dropped, size_t& place) {
     const uint64_t leaving = SupersededBytesLocked(meta);
-    if (!leaving || QueueFullLocked(meta.payload, leaving)) return false;
+    if (!leaving || QueueFullLocked(held, leaving)) return false;
     std::vector<size_t> drop;
     ForSupersededLocked(meta, [&](size_t i) { drop.push_back(i); });
     place = drop.front();
     dropped.reserve(drop.size());  // no allocation between the first and the last change of the counters
     for (auto it = drop.rbegin(); it != drop.rend(); ++it) {
       Job& job = jobs_[*it];
-      queued_bytes_ -= job.meta.payload;
+      queued_bytes_ -= job.held;
       queued_file_bytes_ -= FileEstimate(job.meta);
       queued_names_.erase(job.meta.name);
       dropped.push_back(std::move(job));
@@ -685,7 +749,9 @@ class StateDisk {
   // Charges `bytes` that this process wrote: the shared ledger at once (a crash later does not lose them,
   // a review L2) and today's count.
   void Charge(uint64_t bytes) {
+    std::lock_guard charge(charge_mutex_);  // ledger line and day count in one order: a later line is never added to twice
     const uint64_t day = LedgerAdd(bytes);
+    if (options_.after_ledger) options_.after_ledger();
     std::lock_guard lock(mutex_);
     RollDay();
     day_written_ = std::max(day, day_written_ + bytes);
@@ -757,10 +823,14 @@ class StateDisk {
     return name.size() > 6 && (name.ends_with(".block") || name.find(".block.tmp.") != std::string::npos ||
                                name.find(".block.dead.") != std::string::npos);
   }
-  // Directories of other identities (another binary, checkpoint or setting) leave at start, unless a live engine
-  // holds their lock. Only state and block files, temporary files and the lock are removed; anything else stays.
-  size_t RemoveOtherIdentities() {
-    size_t removed = 0;
+  // Directories of other identities (another epoch, checkpoint or setting) stay at start, within the limits of
+  // StateDiskOptions::keep_other_*. The previous identity (the other folder with the newest last use) always stays; a
+  // folder that a live engine holds is skipped. Only state and block files, temporary files and the lock are removed;
+  // anything else stays. The last use of a folder is the newest modification time of its lock and its state files.
+  struct PruneCounts { size_t removed = 0, kept = 0; uint64_t kept_bytes = 0; };
+  PruneCounts PruneOtherIdentities() {
+    struct Other { std::filesystem::path path; uint64_t bytes = 0; time_t used = 0; int fd = -1; bool cut = false, gone = false; };
+    std::vector<Other> others;
     std::error_code error;
     for (const auto& item : std::filesystem::directory_iterator(options_.root, error)) {
       const std::string name = item.path().filename();
@@ -768,14 +838,56 @@ class StateDisk {
           !IdentityDirectory(name)) continue;
       const int fd = ::open((item.path() / ".lock").c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW);
       if (fd >= 0 && ::flock(fd, LOCK_EX | LOCK_NB) != 0) { ::close(fd); continue; }
-      for (const auto& file : std::filesystem::directory_iterator(item.path(), error))
+      Other other{item.path(), 0, 0, fd};
+      struct stat info{};
+      if (fd >= 0 && ::fstat(fd, &info) == 0) other.used = info.st_mtim.tv_sec;
+      bool any = fd >= 0;
+      for (const auto& file : std::filesystem::directory_iterator(item.path(), error)) {
+        if (!StateFileName(file.path().filename()) || !file.is_regular_file(error) ||
+            ::lstat(file.path().c_str(), &info) != 0) continue;
+        other.bytes += uint64_t(info.st_size);
+        other.used = std::max<time_t>(other.used, info.st_mtim.tv_sec);
+        any = true;
+      }
+      if (!any && ::lstat(item.path().c_str(), &info) == 0) other.used = info.st_mtim.tv_sec;
+      others.push_back(std::move(other));
+    }
+    std::vector<size_t> order(others.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    // Newest last use first; a tie goes by name so that the choice does not depend on the directory order.
+    std::sort(order.begin(), order.end(), [&](size_t x, size_t y) {
+      return others[x].used != others[y].used ? others[x].used > others[y].used : others[x].path > others[y].path;
+    });
+    const auto remove = [&](Other& other) {
+      other.cut = true;
+      for (const auto& file : std::filesystem::directory_iterator(other.path, error))
         if (StateFileName(file.path().filename()) && file.is_regular_file(error))
           std::filesystem::remove(file.path(), error);
-      std::filesystem::remove(item.path() / ".lock", error);
-      if (fd >= 0) ::close(fd);
-      removed += std::filesystem::remove(item.path(), error) ? 1 : 0;
+      std::filesystem::remove(other.path / ".lock", error);
+      other.gone = std::filesystem::remove(other.path, error);
+    };
+    PruneCounts counts;
+    const time_t now = ::time(nullptr);
+    uint64_t kept_other = 0;  // bytes of the folders that the byte limit counts: all but the previous identity
+    // order[0] is the previous identity: it stays. The age limit takes the others that were not used for long.
+    for (size_t rank = 1; rank < order.size(); ++rank) {
+      Other& other = others[order[rank]];
+      if (double(now - other.used) > options_.keep_other_days * 86400) { remove(other); counts.removed += other.gone; }
+      else kept_other += other.bytes;
     }
-    return removed;
+    // The byte limit takes the oldest of the rest first.
+    for (size_t rank = order.size(); rank-- > 1 && kept_other > options_.keep_other_bytes;) {
+      Other& other = others[order[rank]];
+      if (other.cut) continue;
+      kept_other -= std::min(kept_other, other.bytes);
+      remove(other);
+      counts.removed += other.gone;
+    }
+    for (Other& other : others) {
+      if (other.fd >= 0) ::close(other.fd);
+      if (!other.cut) { ++counts.kept; counts.kept_bytes += other.bytes; }
+    }
+    return counts;
   }
 
   using Aligned = std::unique_ptr<uint8_t, void (*)(void*)>;
@@ -975,6 +1087,7 @@ class StateDisk {
   void Forget(typename std::map<std::string, StateMeta>::iterator found) {
     bytes_ -= found->second.file_bytes;
     const StateMeta gone = std::move(found->second);
+    lazy_names_.erase(found->first);  // the read counter only knows files that are in the index
     index_.erase(found);
     for (const auto& name : gone.blocks)
       if (const auto block = blocks_.find(name); block != blocks_.end()) {
@@ -1064,7 +1177,7 @@ class StateDisk {
         std::unique_lock lock(mutex_);
         work_.wait(lock, [this] { return stop_ || !jobs_.empty(); });
         if (stop_) {
-          for (const auto& dropped : jobs_) queued_bytes_ -= dropped.meta.payload;
+          for (const auto& dropped : jobs_) queued_bytes_ -= dropped.held;
           jobs_.clear();
           queued_names_.clear();
           idle_.notify_all();
@@ -1073,28 +1186,34 @@ class StateDisk {
         job = std::move(jobs_.front());
         jobs_.pop_front();
         writing_ = true;
-        writing_bytes_ = job.meta.payload;
+        writing_bytes_ = job.held;
         writing_meta_ = job.meta;
         writing_at_ = job.queued_at;
       }
       if (options_.before_write) options_.before_write();
       if (options_.write_delay_ms) std::this_thread::sleep_for(std::chrono::milliseconds(options_.write_delay_ms));
       std::string result;
-      try { result = Write(job); } catch (const std::bad_alloc&) { result = "result=refused reason=memory"; }
+      try { result = Write(job); }
+      catch (const std::bad_alloc&) { result = "result=refused reason=memory"; }
+      catch (const SnapshotLost&) { result = "result=refused reason=lost"; }  // the slot rows changed
       Unlink();  // the blocks that a refused write unpinned
       std::string line = "state_disk spill tokens=" + std::to_string(job.meta.key.size()) + " bytes=" +
                          std::to_string(job.meta.payload) + " " + result;
+      // the snapshot memory leaves before the queue count falls, so a save never counts a state as free while
+      // the writer still pins it. `writing_` stays true until the end, so Drain still waits.
+      job.keep.reset();
       {
         std::lock_guard lock(mutex_);
-        queued_bytes_ -= job.meta.payload;
+        queued_bytes_ -= job.held;
         writing_bytes_ = 0;
         writing_meta_.reset();
         queued_file_bytes_ -= FileEstimate(job.meta);
         queued_names_.erase(job.meta.name);
         ++(result.starts_with("ms=") ? stats_.written : stats_.refused);
+        if (job.lazy && result.starts_with("ms=")) ++stats_.lazy_written, lazy_names_.insert(job.meta.name);
         line += " day_written=" + std::to_string(day_written_) + " total_written=" + std::to_string(stats_.written_bytes);
       }
-      job.keep.reset();
+      if (job.lazy) line += " lazy=" + std::to_string(job.lazy);
       Log(line);
       {
         std::lock_guard lock(mutex_);
@@ -1129,7 +1248,8 @@ class StateDisk {
       if (stopping_) { failed = "stopped"; break; }
       const size_t length = std::min<uint64_t>(kChunk, entry.bytes - index * kChunk), padded = StateRoundUp(length);
       uint8_t* source = bounce.Get();
-      GatherRanges(snapshot.bytes, ranges, index * kChunk, length, source);
+      try { GatherRanges(snapshot.bytes, ranges, index * kChunk, length, source); }
+      catch (const SnapshotLost&) { failed = "lost"; break; }  // the temp file goes below
       std::memset(source + length, 0, padded - length);
       hash.Update(source, length);
       header.sums[index] = StateChecksum(source, length);
@@ -1205,10 +1325,11 @@ class StateDisk {
     const BlockPlan& plan = job.plan;
     // Step 2: the digests, without mutex_, from host memory (a composed snapshot gives the digest of its flat copy).
     std::vector<StateDigest> digests(plan.blocks.size());
-    StateParallel(plan.blocks.size(), options_.io_threads, [&](size_t index, StateBounce&) -> std::string {
+    const std::string unhashed = StateParallel(plan.blocks.size(), options_.io_threads, [&](size_t index, StateBounce&) -> std::string {
       digests[index] = DigestRanges(snapshot.bytes, plan.blocks[index].ranges);
       return "";
     });
+    if (!unhashed.empty()) return "result=refused reason=" + unhashed;  // memory, or lost
     const double hash_ms = (Now() - start) * 1e3;
     StateMeta meta = job.meta;
     std::vector<StateBlockEntry> entries;
@@ -1370,6 +1491,10 @@ class StateDisk {
         if (snapshot) stats_.read_bytes += meta.payload, day_read_ += meta.payload;
         if (snapshot) std::snprintf(text + std::strlen(text), sizeof text - std::strlen(text), " day_read=%llu",
                                     static_cast<unsigned long long>(day_read_));
+        if (snapshot && lazy_names_.contains(name)) {
+          ++stats_.lazy_read;
+          std::snprintf(text + std::strlen(text), sizeof text - std::strlen(text), " lazy=1");
+        }
         const auto found = staged_.find(name);
         if (found != staged_.end() && found->second.pinned) {
           Unpin(found->second.meta.blocks);
@@ -1505,6 +1630,7 @@ class StateDisk {
   int lock_ = -1;
   bool enabled_ = false;
   mutable std::mutex mutex_;
+  std::mutex charge_mutex_;  // Charge only; taken before mutex_
   std::condition_variable work_, idle_;
   bool stop_ = false, writing_ = false;
   std::atomic<bool> stopping_ = false;
@@ -1514,6 +1640,7 @@ class StateDisk {
   std::vector<std::filesystem::path> doomed_;
   std::deque<Job> jobs_;
   std::set<std::string> queued_names_;
+  std::set<std::string> lazy_names_;  // files of this process that were written from device rows (read counter)
   uint64_t queued_bytes_ = 0, queued_file_bytes_ = 0;
   uint64_t writing_bytes_ = 0;  // the part of queued_bytes_ that the writer writes now
   std::optional<StateMeta> writing_meta_;  // the state that the writer writes now (Pending)

@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 286" width="480" height="286" role="img" aria-label="Line chart: Cold prefill of a 32K prompt, by release, in tokens per second: 4.05 bpw from 1,585 at v0.22.0 to 1,831 at v0.34.0; 3.05 bpw from 1,656 at v0.22.0 to 1,877 at v0.34.0. Oct 27 to Nov 7, 2026." font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif">
+<title>Line chart: Cold prefill of a 32K prompt, by release, in tokens per second: 4.05 bpw from 1,585 at v0.22.0 to 1,831 at v0.34.0; 3.05 bpw from 1,656 at v0.22.0 to 1,877 at v0.34.0. Oct 27 to Nov 7, 2026.</title>
+<rect x="0.5" y="0.5" width="479" height="285" rx="6" fill="#0d1117" stroke="#30363d"/>
+<text x="16" y="29" font-size="17" font-weight="600" fill="#e6edf3">Cold prefill of a 32K prompt, by release</text>
+<text x="16" y="50" font-size="15" fill="#9198a1">Oct 27 to Nov 7, 2026 · median of 2 runs</text>
+<line x1="52" y1="238.0" x2="402" y2="238.0" stroke="#21262d" stroke-width="1"/>
+<text x="44" y="243.0" font-size="15" text-anchor="end" fill="#9198a1">0</text>
+<line x1="52" y1="197.0" x2="402" y2="197.0" stroke="#21262d" stroke-width="1"/>
+<text x="44" y="202.0" font-size="15" text-anchor="end" fill="#9198a1">500</text>
+<line x1="52" y1="156.0" x2="402" y2="156.0" stroke="#21262d" stroke-width="1"/>
+<text x="44" y="161.0" font-size="15" text-anchor="end" fill="#9198a1">1,000</text>
+<line x1="52" y1="115.0" x2="402" y2="115.0" stroke="#21262d" stroke-width="1"/>
+<text x="44" y="120.0" font-size="15" text-anchor="end" fill="#9198a1">1,500</text>
+<line x1="52" y1="74.0" x2="402" y2="74.0" stroke="#21262d" stroke-width="1"/>
+<text x="44" y="79.0" font-size="15" text-anchor="end" fill="#9198a1">2,000</text>
+<text x="464" y="29" font-size="15" text-anchor="end" fill="#9198a1">tok/s</text>
+<text x="82.0" y="258" font-size="15" text-anchor="middle" fill="#9198a1">v0.22</text>
+<text x="130.3" y="258" font-size="15" text-anchor="middle" fill="#9198a1">v0.26</text>
+<text x="178.7" y="258" font-size="15" text-anchor="middle" fill="#9198a1">v0.30</text>
+<text x="227.0" y="258" font-size="15" text-anchor="middle" fill="#9198a1">v0.31</text>
+<text x="275.3" y="258" font-size="15" text-anchor="middle" fill="#9198a1">v0.32</text>
+<text x="323.7" y="258" font-size="15" text-anchor="middle" fill="#9198a1">v0.33</text>
+<text x="372.0" y="258" font-size="15" text-anchor="middle" fill="#9198a1">v0.34</text>
+<text x="227.0" y="276" font-size="15" text-anchor="middle" fill="#9198a1">release</text>
+<polyline points="82.0,108.0 130.3,105.7 178.7,95.2 227.0,93.4 275.3,87.0 323.7,86.2 372.0,87.9" fill="none" stroke="#f0875a" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="82.0" cy="108.0" r="4" fill="#f0875a"/>
+<circle cx="130.3" cy="105.7" r="4" fill="#f0875a"/>
+<circle cx="178.7" cy="95.2" r="4" fill="#f0875a"/>
+<circle cx="227.0" cy="93.4" r="4" fill="#f0875a"/>
+<circle cx="275.3" cy="87.0" r="4" fill="#f0875a"/>
+<circle cx="323.7" cy="86.2" r="4" fill="#f0875a"/>
+<circle cx="372.0" cy="87.9" r="4" fill="#f0875a"/>
+<text x="82.0" y="131.0" font-size="15" font-weight="600" text-anchor="middle" fill="#e6edf3">1,585</text>
+<text x="360.0" y="110.9" font-size="15" font-weight="600" text-anchor="start" fill="#e6edf3">1,831</text>
+<text x="411" y="101.0" font-size="15" font-weight="600" fill="#f0875a">4.05 bpw</text>
+<polyline points="82.0,102.2 130.3,104.5 178.7,86.9 227.0,85.6 275.3,84.9 323.7,84.7 372.0,84.1" fill="none" stroke="#a5b8cb" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7 4"/>
+<rect x="78.5" y="98.7" width="7" height="7" fill="#0d1117" stroke="#a5b8cb" stroke-width="2"/>
+<rect x="126.8" y="101.0" width="7" height="7" fill="#0d1117" stroke="#a5b8cb" stroke-width="2"/>
+<rect x="175.2" y="83.4" width="7" height="7" fill="#0d1117" stroke="#a5b8cb" stroke-width="2"/>
+<rect x="223.5" y="82.1" width="7" height="7" fill="#0d1117" stroke="#a5b8cb" stroke-width="2"/>
+<rect x="271.8" y="81.4" width="7" height="7" fill="#0d1117" stroke="#a5b8cb" stroke-width="2"/>
+<rect x="320.2" y="81.2" width="7" height="7" fill="#0d1117" stroke="#a5b8cb" stroke-width="2"/>
+<rect x="368.5" y="80.6" width="7" height="7" fill="#0d1117" stroke="#a5b8cb" stroke-width="2"/>
+<text x="82.0" y="90.2" font-size="15" font-weight="600" text-anchor="middle" fill="#e6edf3">1,656</text>
+<text x="360.0" y="72.1" font-size="15" font-weight="600" text-anchor="start" fill="#e6edf3">1,877</text>
+<text x="411" y="81.0" font-size="15" font-weight="600" fill="#a5b8cb">3.05 bpw</text>
+</svg>

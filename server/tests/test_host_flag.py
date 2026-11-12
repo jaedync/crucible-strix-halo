@@ -1,17 +1,30 @@
 """--host ADDRESS: the bind address (default 127.0.0.1), an IPv4 or IPv6 literal, with a warning off loopback."""
 import ipaddress
+import os
 import socket
+import tempfile
 import unittest
 from http.server import BaseHTTPRequestHandler
 from unittest.mock import patch
 
 import server.__main__ as startup
+from server.api_key import is_loopback
 from server.tests.test_server_defaults import parse
 
 
 def listening(args):
-    """The start lines, and the mock of bind_server: main() calls it with (address, port, handler)."""
-    with patch.object(startup, "bind_server") as bind:
+    """The start lines, and the mock of bind_server: main() calls it with (address, port, handler).
+
+    An address that is not loopback needs a key file (design s3), so this makes one for such a host.
+    """
+    args = list(args)
+    host = args[args.index("--host") + 1] if "--host" in args else "127.0.0.1"
+    with tempfile.TemporaryDirectory() as folder, patch.object(startup, "bind_server") as bind:
+        if "--api-key-file" not in args and not is_loopback(host):
+            path = os.path.join(folder, "api-key")
+            with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT, 0o600), "w") as handle:
+                handle.write("k" * 40 + "\n")
+            args += ["--api-key-file", path]
         bind.return_value.serve_forever.side_effect = KeyboardInterrupt
         options, err = parse(args)
     return options, err, bind
@@ -30,7 +43,8 @@ class ParseTest(unittest.TestCase):
     def test_default_binds_127_0_0_1_with_no_warning(self):
         _, err, bind = listening([])
         self.assertEqual(bind.call_args.args[:2], (ipaddress.ip_address("127.0.0.1"), 8790))
-        self.assertNotIn("no authentication", err)
+        self.assertNotIn("not loopback", err)
+        self.assertNotIn("API key", err)
         self.assertIn("ready at http://127.0.0.1:8790/v1", err)
 
     def test_ipv4_literals(self):
@@ -58,7 +72,7 @@ class ParseTest(unittest.TestCase):
 class WarningTest(unittest.TestCase):
     def warnings(self, host):
         _, err, _ = listening(["--host", host])
-        return [line for line in err.splitlines() if "no authentication" in line]
+        return [line for line in err.splitlines() if "which is not loopback" in line]
 
     def test_loopback_has_no_warning(self):
         for host in ("127.0.0.1", "127.9.9.9", "::1"):
@@ -72,6 +86,7 @@ class WarningTest(unittest.TestCase):
                 self.assertIn(host, line)
                 self.assertIn("--allowed-host", line)
                 self.assertIn("firewall", line)
+                self.assertIn("API key", line)
 
 
 class BindTest(unittest.TestCase):

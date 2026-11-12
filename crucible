@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""Crucible setup and doctor. Run ./crucible --help. Standard library only."""
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / "tools"))
+
+if sys.version_info < (3, 12):
+    sys.exit("Crucible needs Python 3.12 or newer. This is Python %d.%d. Run: python3.12 ./crucible ..." % sys.version_info[:2])
+
+from crucible_cli.cli import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:], repo=ROOT))

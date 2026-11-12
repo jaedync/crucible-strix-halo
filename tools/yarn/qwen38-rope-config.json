@@ -1,0 +1,21 @@
+{
+  "text_config": {
+    "head_dim": 256,
+    "hidden_size": 2560,
+    "num_attention_heads": 24,
+    "partial_rotary_factor": 0.25,
+    "max_position_embeddings": 262144,
+    "rope_parameters": {
+      "mrope_interleaved": true,
+      "mrope_section": [11, 11, 10],
+      "partial_rotary_factor": 0.25,
+      "rope_theta": 10000000,
+      "rope_type": "default"
+    },
+    "rope_scaling": {
+      "type": "yarn",
+      "factor": 4.0,
+      "original_max_position_embeddings": 262144
+    }
+  }
+}

@@ -1,5 +1,6 @@
 #include "../engine/serve/batch_conversation_cache.h"
 #include "../engine/runtime/sha256.h"
+#include "../engine/runtime/spec_span.h"
 #include <cstdio>
 #include <cassert>
 #include <numeric>
@@ -439,6 +440,118 @@ static void SpillRoom() {
     tight.SetSpill(hook);
     assert(save(tight, x, 64, 1 << 20) && save(tight, y, 64, 1 << 20) && save(tight, z, 64, 1 << 20));
     assert(save(tight, w, 64, reserve) && rooms == std::vector<uint64_t>{0});
+  }
+}
+
+// one floor for every host allocation, and the writer's queue in the pinned budget. The floor lifts the
+// host reserve; the queue is Outside() (the saves evict for it); a save's victims go to the writer only while the
+// cache, the queue and the new bytes stay within the budget and the spill slack; a read's victims have no such
+// limit (the read waits until the writer frees them, ReadRoom).
+static void QueueInTheBudget() {
+  const auto x = Tokens(1, 40), y = Tokens(101, 40), z = Tokens(201, 40), w = Tokens(301, 40), v = Tokens(401, 40);
+  using Entry = BatchConversationCache<Snapshot>::Entry;
+  constexpr uint64_t reserve = 1000;
+  const auto save = [](BatchConversationCache<Snapshot>& cache, const std::vector<int>& ids, size_t bytes,
+                       uint64_t available) {
+    ConversationPolicy policy;
+    policy.prefill_rows = 8;
+    return cache.Capture(ids, policy, {16, CacheRetention::Session}, bytes, available, [&] {
+      auto s = std::make_shared<Snapshot>(); s->hist.assign(ids.begin(), ids.begin() + 16);
+      s->resume.length = 16; s->resume.prompt_only = true; s->resume.prompt_boundary = ids.size() - 1;
+      return std::shared_ptr<const Snapshot>(s);
+    });
+  };
+  {
+    // The floor wins over the lower host reserve, for the save, and the reserve wins over a lower floor.
+    BatchConversationCache<Snapshot> cache(192, {}, 8, reserve);
+    cache.SetHostFloor(5000);
+    assert(cache.HostReserve() == 5000);
+    assert(!save(cache, x, 64, 5000 + 63) && cache.Status().last.refused == "host");
+    assert(save(cache, x, 64, 5000 + 64) && cache.Bytes() == 64);
+    cache.SetHostFloor(500);
+    assert(cache.HostReserve() == reserve);
+  }
+  {
+    // Review finding 1: a direct spill is bounded by MemAvailable above the floor and the margin, not by the budget. A
+    // full cache leaves at most the spill slack, and a slot tail is larger than that.
+    BatchConversationCache<Snapshot> cache(64 * 3, {}, 4, reserve);
+    cache.SetHostFloor(5000);
+    cache.SetSpillSlack(64);
+    assert(cache.DirectRoom(5000 + 100) == 100);  // no margin set
+    cache.SetDirectMargin(40);
+    assert(cache.DirectRoom(5000 + 100) == 60 && cache.DirectRoom(5040) == 0 && cache.DirectRoom(0) == 0);
+    assert(save(cache, x, 64, 1 << 20) && save(cache, y, 64, 1 << 20) && save(cache, z, 64, 1 << 20));
+    assert(cache.SpillBudgetRoom() == 64 && cache.DirectRoom(5000 + 40 + 1000) == 1000);  // 1000 > the 64 slack
+  }
+  uint64_t queued = 0;
+  std::vector<uint64_t> rooms;
+  const auto hook = [&](std::span<const int>, const ConversationPolicy&, const std::shared_ptr<const Entry>& entry,
+                        int, uint64_t room) {
+    rooms.push_back(room);
+    const bool taken = entry->memory->bytes <= room;
+    if (taken) queued += entry->memory->bytes;
+    return taken;
+  };
+  {
+    // Three entries fill the budget. The save of w evicts x: cache 128 + w 64 + queue 0 leaves 64 of the 64 slack,
+    // so x goes to the writer. The save of v finds the queue in Outside(): it evicts y and z; the slack holds y only.
+    BatchConversationCache<Snapshot> cache(64 * 3, {}, 1, reserve, false);
+    cache.SetSpill(hook);
+    cache.SetSpillSlack(64);
+    cache.SetOutside([&] { return size_t(queued); });
+    assert(cache.SpillBudgetRoom() == 64 * 4);
+    assert(save(cache, x, 64, 1 << 20) && save(cache, y, 64, 1 << 20) && save(cache, z, 64, 1 << 20) && rooms.empty());
+    assert(cache.SpillBudgetRoom() == 64);
+    assert(save(cache, w, 64, 1 << 20) && rooms == std::vector<uint64_t>{64} && queued == 64 && cache.Bytes() == 192);
+    rooms.clear();
+    assert(save(cache, v, 64, 1 << 20) && rooms == (std::vector<uint64_t>{64, 0}) && queued == 128 && cache.Bytes() == 128);
+    assert(cache.Bytes() + queued == 64 * 3 + 64);  // never over the budget and the slack
+  }
+  {
+    // Review finding 2: the first `slack` bytes of the queue are the slack's own, so a save does not evict host entries
+    // for them. Slack of two states: w evicts x to the writer, v evicts y only (z stays, it needed no room), and the
+    // total never passes the budget and the slack. u then finds the slack used up: it evicts z, which has no room.
+    rooms.clear(), queued = 0;
+    BatchConversationCache<Snapshot> cache(64 * 3, {}, 1, reserve, false);
+    cache.SetSpill(hook);
+    cache.SetSpillSlack(128);
+    cache.SetQueued([&] { return size_t(queued); });
+    const std::vector<int> u = Tokens(500, 40);
+    assert(save(cache, x, 64, 1 << 20) && save(cache, y, 64, 1 << 20) && save(cache, z, 64, 1 << 20) && rooms.empty());
+    assert(save(cache, w, 64, 1 << 20) && rooms == std::vector<uint64_t>{128} && queued == 64 && cache.Bytes() == 192);
+    rooms.clear();
+    assert(save(cache, v, 64, 1 << 20) && rooms == std::vector<uint64_t>{64} && queued == 128 && cache.Bytes() == 192);
+    assert(cache.Bytes() + queued == 64 * 3 + 128);
+    rooms.clear();
+    assert(save(cache, u, 64, 1 << 20) && rooms == std::vector<uint64_t>{0} && queued == 128 && cache.Bytes() == 192);
+    assert(cache.Bytes() + queued == 64 * 3 + 128);  // never over the budget and the slack
+    // Without a slack the whole queue counts, as SetOutside did.
+    BatchConversationCache<Snapshot> plain(64 * 3, {}, 1, reserve, false);
+    queued = 64;
+    plain.SetQueued([&] { return size_t(queued); });
+    assert(save(plain, x, 64, 1 << 20) && save(plain, y, 64, 1 << 20) && plain.Evictions() == 0 && save(plain, z, 64, 1 << 20));
+    assert(plain.Bytes() == 128 && plain.Evictions() == 1);  // the queue's 64 bytes made the save evict x
+  }
+  {
+    // A read's victims have no budget limit (the read waits for the writer): the room is the host's. A save's is 0.
+    rooms.clear(), queued = 0;
+    BatchConversationCache<Snapshot> cache(64 * 3, {}, 1, reserve, false);
+    cache.SetSpill(hook);
+    cache.SetSpillSlack(0);
+    cache.SetOutside([&] { return size_t(queued); });
+    assert(save(cache, x, 64, 1 << 20) && save(cache, y, 64, 1 << 20) && save(cache, z, 64, 1 << 20));
+    assert(cache.MakeRoom(64, 1 << 20) && rooms == std::vector<uint64_t>{(1 << 20) - reserve});
+    rooms.clear();
+    assert(save(cache, w, 64, 1 << 20) && rooms == std::vector<uint64_t>{0});
+  }
+  {
+    // No slack set: the hook gets the host room only, as before the card.
+    rooms.clear(), queued = 0;
+    BatchConversationCache<Snapshot> cache(64 * 3, {}, 1, reserve, false);
+    cache.SetSpill(hook);
+    assert(cache.SpillBudgetRoom() == UINT64_MAX);
+    assert(save(cache, x, 64, 1 << 20) && save(cache, y, 64, 1 << 20) && save(cache, z, 64, 1 << 20));
+    assert(save(cache, w, 64, reserve + 74) && rooms == std::vector<uint64_t>{74});
   }
 }
 
@@ -1126,7 +1239,34 @@ static void DeadBranchTails() {
   }
 }
 
+// Verify span (CRUCIBLE_SPEC_SPAN, runtime/spec_span.h): a solo step of up to kSpecSpanMax rows can leave that many
+// pending replay rows at the close of a request. The tail keeps them (a replay of 13 rows stopped the engine at the
+// close of a span 13 copy request). More than kSpecSpanMax rows, or a negative count, is still an engine fault.
+static void SpanReplayTail() {
+  const auto ids = Tokens(1, 40);
+  const auto saved = [&](int replay) {
+    Cache c;
+    return c.cache.CaptureTail(std::span<const int>(ids.data(), 30), c.policy, 64, size_t(9) << 30, [&] {
+      auto s = std::make_shared<Snapshot>(); s->hist.assign(ids.begin(), ids.begin() + 30);
+      s->resume.length = 30; s->resume.replay = replay; return std::shared_ptr<const Snapshot>(s); });
+  };
+  const auto refused = [&](int replay) {
+    try { saved(replay); return false; } catch (const std::runtime_error&) { return true; }
+  };
+  for (int replay = 0; replay <= kSpecSpanMax; ++replay) assert(saved(replay));
+  assert(refused(kSpecSpanMax + 1) && refused(-1));
+  {
+    Cache c;
+    assert(c.cache.CaptureTail(std::span<const int>(ids.data(), 30), c.policy, 64, size_t(9) << 30, [&] {
+      auto s = std::make_shared<Snapshot>(); s->hist.assign(ids.begin(), ids.begin() + 30);
+      s->resume.length = 30; s->resume.replay = kSpecSpanMax; return std::shared_ptr<const Snapshot>(s); }));
+    assert(c.cache.PeekTailState(ids, c.policy) == std::pair(size_t(30), kSpecSpanMax));
+    const auto found = c.cache.FindTail(ids, c.policy);
+    assert(found && found->snapshot->resume.replay == kSpecSpanMax);
+  }
+}
 int main() {
+  SpanReplayTail();
   TenantsNeverShareRam();
   LocalTenantUnchanged();
   Diagnosis();
@@ -1143,6 +1283,7 @@ int main() {
   Probation();
   SpillHook();
   SpillRoom();
+  QueueInTheBudget();
   HostReserve();
   SupersededFirst();
   HeaderFrontier();

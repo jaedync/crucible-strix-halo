@@ -194,8 +194,13 @@ In the batched stack:
 - Session replay and slot resume use the decode-time state of a finished turn.
   See [session replay](SESSION_REPLAY.md).
 
-A cache hit gives the same bits as a miss. The one accepted exception is a slot checkpoint, which the
-session replay guide describes.
+A cache hit on a snapshot or a block entry gives the same bits as a miss. Session replay is the accepted
+exception, which the [session replay](SESSION_REPLAY.md) guide describes. A turn that resumes from the answer of an
+earlier turn keeps the rows that the decode path wrote for that answer, so the state of that turn is not a cold state.
+A later restore of that state, from a slot checkpoint or a session tail, is not bitwise equal to a cold prefill of the
+same tokens. A request that repeats a whole prompt at a saved end point runs no prompt row: it gives the bits of the run
+that saved the checkpoint, not the bits of a cold prefill. `CRUCIBLE_EXACT` and `CRUCIBLE_EXACT_RESUME` do not change
+this. A request with `cache_control: "bypass"` always runs a cold prefill.
 
 ## Speculative decoding
 
@@ -215,7 +220,8 @@ The default build keeps these rules:
 - The prompt chunk schedule is a fixed function of the request. The load and other sessions never change it.
 - Packed decode rows give the same bits as one row.
   Prefill rows (WMMA) and decode rows (VALU) of different requests never share a pass.
-- A cache hit gives the same bits as a miss. Generated decode rows are never used again as prompt rows.
+- A cache hit on a snapshot or a block entry gives the same bits as a miss. The block cache never uses generated
+  decode rows as prompt rows. Session replay is the exception that the cache section names.
 
 Numerics mode: some changes give a speed gain but are not bitwise equal to the reference path.
 They are on by default. Set `CRUCIBLE_EXACT=1` to turn off all of them. The output is then bitwise equal

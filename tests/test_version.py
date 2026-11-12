@@ -92,3 +92,12 @@ def test_engine_version_header_matches_the_version_file():
 def test_the_engine_build_gets_no_version_flag():
     # A compiler flag reaches the device compile and the part cache keys (tools/devsplit.py).
     assert "ENGINE_BUILD_VERSION" not in (ROOT / "Makefile").read_text()
+
+
+def test_the_version_files_and_the_installer_pin_name_one_release():
+    # A release ships VERSION, the engine --version text, the installer pin and the Docker tag from one number.
+    number = (ROOT / "VERSION").read_text().strip()
+    header = (ROOT / "engine/cli/version.h").read_text()
+    assert f'#define ENGINE_BUILD_VERSION "{number}"' in header
+    assert f'PIN_TAG="v{number}"' in (ROOT / "install.sh").read_text()
+    assert f"ARG CRUCIBLE_VERSION=v{number}" in (ROOT / "Dockerfile").read_text()

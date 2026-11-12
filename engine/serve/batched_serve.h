@@ -3,11 +3,13 @@
 #include "batch_session.h"
 #include "batched_serve_protocol.h"
 #include "batched_serve_settings.h"
+#include "serve_line.h"
 #include "batch_conversation_cache.h"
 #include "batch_state_disk.h"
 #include "batch_mtp_history.h"
 #include "slot_base.h"
 #include "draft_tally.h"
+#include "handover_spill.h"
 #include <atomic>
 #include <csignal>
 #include "../runtime/draft_accept.h"
@@ -41,7 +43,7 @@ inline void PrintBatchEvent(const crucible::BatchEvent& event) {
                 "\"prompt_tokens\":%zu,\"completion_tokens\":%zu,\"finish_reason\":\"%s\","
                 "\"prefill_seconds\":%.9f,\"decode_seconds\":%.9f,\"cache_hit\":%s,\"cached_tokens\":%zu,"
                 "\"prefill_tokens\":%zu,\"cache_bytes\":%zu,\"restore_seconds\":%.9f,\"capture_seconds\":%.9f,"
-                "\"slot_context\":%d%s%s%s%s}\n",
+                "\"slot_context\":%d%s%s%s%s%s}\n",
                 id, generation, event.prompt_tokens, event.completion_tokens, event.stopped ? "stop" : "length",
                 event.prefill_seconds, event.decode_seconds, event.cached_tokens ? "true" : "false",
                 event.cached_tokens, event.prompt_tokens - event.cached_tokens, event.cache_bytes,
@@ -49,7 +51,8 @@ inline void PrintBatchEvent(const crucible::BatchEvent& event) {
                 !event.cached_tokens ? "" : event.cache_tail ? ",\"cache_class\":\"replay\",\"session_replay\":true"
                 : event.cache_shared ? ",\"cache_class\":\"shared\"" : ",\"cache_class\":\"session\"",
                 event.cached_tokens && event.cache_tail ? (",\"replay_rows\":" + std::to_string(event.tail_replay)).c_str() : "",
-                crucible::BatchCacheFields(event).c_str(), crucible::BatchDraftFields(event).c_str());
+                crucible::BatchCacheFields(event).c_str(), crucible::BatchDraftFields(event).c_str(),
+                crucible::BatchRopeFields(event).c_str());
   } else {
     // Only image requests add the slice count, so text opened lines stay byte-identical.
     std::printf("{\"event\":\"opened\",\"request_id\":%llu,\"slot_generation\":%llu,\"slot_context\":%d,"
@@ -79,6 +82,9 @@ struct BatchMtpSlots {
 // also hold the MTP rows of the whole prefix, so a full-window hit continues the MTP warm-up.
 class BatchPrefixCache {
  public:
+  // a direct spill leaves the tail's full blocks on the device when they cover at least this many bytes; the
+  // disk writer's staging (io_threads x one 8 MiB chunk) is the host memory beyond the rest of the state.
+  static constexpr size_t kLazyMinBytes = size_t(64) << 20, kLazyStagingBytes = size_t(64) << 20;
   using Entry = crucible::BatchConversationCache<ConversationSnapshot>::Entry;
   // `streams`: sessions that run at once, each with one protected resume point.
   // `checkpoints`: in-slot resume points (slot_checkpoints.h). Their device bytes come out of the cache budget, so
@@ -149,6 +155,7 @@ class BatchPrefixCache {
         return Resume(r, resident);
       };
       hooks.release = [this](int slot, bool resumed) { Release(slot, resumed); };
+      hooks.overwrite = [this](int slot) { LazyEnd(slot); };
     }
     hooks.key = [](const crucible::ServeRequest& r, std::span<const int> tokens) { return Key(r, tokens); };
     if (disk_)
@@ -160,6 +167,25 @@ class BatchPrefixCache {
       else cache_.Hold(Key(*r, r->ids));
     };
     hooks.request = [this](uint64_t id) { request_ = id; };
+    // The miss ledger (start plan B1a): the nearest host, lost and disk states of the prompt before its open, and the
+    // writer wait of the open's release or handover. Counters only; no decision of the cache changes.
+    hooks.ledger = [this](const crucible::ServeRequest& r) -> crucible::LedgerTiers {
+      if (r.cache_control != "auto" || r.ids.size() < 2) return {};
+      const auto key = Key(r, r.ids);
+      return disk_ ? disk_->Ledger(cache_, Query(r, key)) : cache_.LedgerOf(key, Policy(r.tenant));
+    };
+    hooks.drained = [this] {
+      const double seconds = drained_;
+      drained_ = -1;
+      return seconds;
+    };
+    // slots_durable: the disk index holds this full key. One probe for each key until the disk changes (DurableMemo).
+    hooks.durable = [this](int, std::span<const int> key, const crucible::StateTenant& tenant) {
+      if (!disk_) return false;
+      const auto stats = disk_->Disk().Stats();
+      return durable_.Held(key, tenant, stats.written + stats.lazy_written, stats.evicted + stats.pruned + stats.failed,
+                           [&] { return disk_->Disk().Present(key, Policy(tenant), disk_->Compact()); });
+    };
     if (!buffers_.empty()) {
       hooks.checkpoint_save = [this](int slot, int index) {
         SlotCheckpointIO::Save(engine_.ActiveSequence(), Buffer(slot, index));
@@ -174,6 +200,9 @@ class BatchPrefixCache {
         // A Frontier resume is a host frontier hit: a whole pool block and prefill chunk, no pending rows (LOW-2).
         if (point.kind == crucible::CheckpointKind::Frontier && !crucible::SlotFrontierGrid(point.hist.size(), rows_, point.replay))
           throw std::logic_error("slot frontier resume needs a grid point with no pending rows");
+        // the restore writes the pool block of the point on the null stream, and the lazy disk reads use their own
+        // stream: they end first, for the rows from the point's settled length up.
+        LazyLimit(slot, point.hist.size() > size_t(std::max(point.replay, 0)) ? point.hist.size() - size_t(std::max(point.replay, 0)) : 0);
         SlotCheckpointIO::Restore(engine_.ActiveSequence(), Buffer(slot, index), point);
         if (mtp_ && point.outputs && point.outputs->carry) CopyCarry(Buffer(slot, index), slot, false);
         bases_.Limit(slot, point.hist.size(), point.replay);  // an earlier change
@@ -181,6 +210,12 @@ class BatchPrefixCache {
         // what a host hit at the point would mark, and the session's shorter entries (LOW-4: no prompt key here).
         if (point.kind == crucible::CheckpointKind::Frontier) cache_.Touch(point.key, Policy(point.tenant));
         std::fprintf(stderr, "slot_checkpoint resume tokens=%zu replay=%d\n", point.hist.size(), point.replay);
+      };
+      hooks.point_copy = [this](const crucible::ServeRequest& r, int from, int index, const crucible::SlotCheckpoint& point) {
+        return PointCopy(r, from, index, point);
+      };
+      hooks.header_copied = [](int slot, int from, size_t tokens) {
+        std::fprintf(stderr, "slot_checkpoint header_copy tokens=%zu slot=%d from=%d\n", tokens, slot, from);
       };
       hooks.peek = [this](const crucible::ServeRequest& r) { return std::max(Peek(r), DiskPeek(r)); };
       // The effect lines of re-send fix A and fix B (the re-send proof reads them).
@@ -190,6 +225,9 @@ class BatchPrefixCache {
       };
       hooks.pre_saved = [](int slot, size_t tokens) {
         std::fprintf(stderr, "slot_checkpoint pre_end tokens=%zu slot=%d\n", tokens, slot);
+      };
+      hooks.header_saved = [](int slot, size_t tokens) {
+        std::fprintf(stderr, "slot_checkpoint header tokens=%zu slot=%d\n", tokens, slot);
       };
       hooks.diverged = [](size_t prompt, size_t restored, size_t tail, size_t common) {
         std::fputs(crucible::SessionReplayDivergenceLine(prompt, restored, {tail, common, prompt <= tail}).c_str(), stderr);
@@ -273,6 +311,24 @@ class BatchPrefixCache {
                  static_cast<unsigned long long>(stats.written_bytes), static_cast<unsigned long long>(stats.read_bytes),
                  static_cast<unsigned long long>(stats.present), static_cast<unsigned long long>(stats.refused_daily),
                  static_cast<unsigned long long>(disk_->Disk().DayWritten()), points);
+    // The miss ledger (start plan B1a): every state leaves with the process. Its record says whether its file is on
+    // disk now (a state that the flush did not write is lost by the stop), and the list goes to the side folder that
+    // the next start reads. Host work only, after the flush and outside its time limit (well under a second).
+    // One state_release line for each slot state: on disk now, or lost by the stop.
+    const auto stopped = [&](const char* kind, int slot, std::span<const int> key, const crucible::StateTenant& tenant,
+                             size_t prompt) {
+      const auto policy = Policy(tenant);
+      const uint64_t lineage = cache_.LineageOf(key, policy);
+      const bool durable = disk_->Disk().Present(key, policy, disk_->Compact());
+      cache_.NoteStop(key, policy, prompt, lineage, durable);
+      std::fputs(crucible::ReleaseLine(kind, slot, key.size(), durable ? "disk_queued" : "lost", durable ? "" : "stop", 0,
+                                       crucible::GenerationNow() - start, lineage).c_str(), stderr);
+    };
+    for (const auto& [slot, index, point] : frontiers) stopped("stop_frontier", slot, point.key, point.tenant, point.hist.size());
+    for (int slot = 0; slot < kMaxRows; ++slot)
+      if (const auto& held = held_.at(size_t(slot))) stopped("stop_tail", slot, held->key, held->tenant, held->state.length);
+    disk_->NoteStop(cache_);
+    disk_->SaveLedger(cache_);
   }
   // Set once, before the first request: full-window requests key, save and restore MTP history through it.
   void SetMtp(BatchMtpSlots* mtp) { mtp_ = mtp; }
@@ -308,10 +364,35 @@ class BatchPrefixCache {
   void WriteSnapshot(const ConversationSnapshot& snapshot) {
     const auto held = mtp_ ? crucible::MtpHeldOf(snapshot.resume) : std::nullopt;
     const int slot = Slot();
+    LazyEnd(slot);  // this write ends the lazy reads of the slot's rows
     if (held) ConversationStateIO::Restore(engine_, engine_.ActiveSequence(), snapshot, mtp_->Stacks(slot), mtp_->Carry(slot));
     else ConversationStateIO::Restore(engine_, engine_.ActiveSequence(), snapshot, stk_, carry_);
     if (mtp_) mtp_->Restored(slot, held);
   }
+  // the lazy snapshots of a slot read its device rows when the disk writer walks them. A
+  // snapshot reads rows [0, Rows()) of the slot, which a resumed request keeps while it runs. Every write that can change
+  // those rows (a restore, a reset, a checkpoint resume below them, a frontier copy) ends the sources first: a writer
+  // that walks an ended source refuses the write ("lost"). The end waits for the one 8 MiB read in progress, so the
+  // slot is never written while a read of it runs. Used on the device worker only.
+  void LazyTrack(int slot, const std::shared_ptr<crucible::LazySource>& source) {
+    auto& list = lazy_.at(size_t(slot));
+    std::erase_if(list, [](const auto& weak) { return weak.expired(); });
+    list.push_back(source);
+  }
+  // The rows from `kept` up can change: the sources that read past `kept` end.
+  void LazyLimit(int slot, size_t kept) {
+    auto& list = lazy_.at(size_t(slot));
+    bool ended = false;
+    for (const auto& weak : list)
+      if (const auto source = weak.lock(); source && source->Rows() > kept && source->Valid()) source->Invalidate(), ended = true;
+    std::erase_if(list, [](const auto& weak) {
+      const auto source = weak.lock();
+      return !source || !source->Valid();
+    });
+    // The jobs that wait for the writer leave the queue now (review finding 7); the one in progress ends as "lost".
+    if (ended && disk_) disk_->Disk().DropLost();
+  }
+  void LazyEnd(int slot) { LazyLimit(slot, 0); }
   SaveBase Base(int slot) const {
     auto base = bases_.Get(slot);
     return {std::move(base.snapshot), base.rows};
@@ -345,6 +426,7 @@ class BatchPrefixCache {
     // Every host restore writes the slot, so the slot's MTP history is gone unless the restore brings it back.
     if (mtp_) mtp_->Restored(Slot(), std::nullopt);
     bases_.Clear(Slot());  // the open reset the slot; a restore below sets the base again
+    LazyEnd(Slot());
     crucible::BatchRestore miss;
     miss.tier = crucible::BatchCacheTier::Host;
     if (r.ids.size() < 2) {
@@ -454,8 +536,9 @@ class BatchPrefixCache {
       copies.push_back({span.pointer, cut_->device + offset, span.bytes});
       offset += span.bytes;
     }
-    if (position % 128 || !crucible::RetainedPrefix::FromFields({position, position, window_start, 0}, cut_->retained))
-      throw std::logic_error("prefill cut needs a grid point after its window start");
+    // any position; Spans lists the pool block of a position off the 128-position grid.
+    if (!crucible::RetainedPrefix::FromFields({position, position, window_start, 0}, cut_->retained))
+      throw std::logic_error("prefill cut needs a position after its window start");
     cut_->position = position;
     return copies;
   }
@@ -520,12 +603,26 @@ class BatchPrefixCache {
                                                                                 engine_.ActiveSequence().compact_state);
     if (!disk->Enabled()) return;
     disk_ = std::move(disk);
-    // Staged reads count in the cache budget: every save makes room for them too.
+    // Staged reads count in the cache budget: every save makes room for them too. so does
+    // the writer's queue, which holds the evicted snapshots in pinned memory until their writes end (the part above the
+    // spill slack, BatchConversationCache::SetQueued). A read does not count it: the read waits until the writer frees
+    // its victims (ReadRoom Wait) before it allocates.
     cache_.SetOutside([this] { return size_t(disk_->Disk().StagedBytes()); });
+    cache_.SetQueued([this] { return size_t(cache_.Reading() ? 0 : disk_->Disk().QueuedBytes()); });
+    // one MemAvailable floor for the saves, the spills and the direct spills, as for the reads; and the
+    // queue may pin only so many bytes beyond the budget while a save allocates beside it.
+    cache_.SetHostFloor(crucible::kStageKeepFree);
+    cache_.SetSpillSlack(crucible::kSpillSlack);
+    cache_.SetDirectMargin(crucible::kDirectMargin);
+    std::fprintf(stderr, "conversation cache: host floor %llu MiB, spill slack %llu MiB\n",
+                 static_cast<unsigned long long>(cache_.HostReserve() >> 20),
+                 static_cast<unsigned long long>(crucible::kSpillSlack >> 20));
     cache_.SetSpill([this](std::span<const int> key, const crucible::ConversationPolicy& policy,
                            const std::shared_ptr<const Entry>& entry, int, uint64_t room) {
       return disk_->Spill(key, policy, entry, room, cache_.Reading());
     });
+    // The miss ledger: whether a spilled state reached the disk, the refusal word, and the lost list of the last stop.
+    disk_->Attach(cache_);
   }
   crucible::DiskQuery Query(const crucible::ServeRequest& r, std::span<const int> key) const {
     return {key, Policy(r.tenant), size_t(r.cache_prefix_tokens), crucible::BatchRestoreLimit(r), rows_, session_replay_};
@@ -588,8 +685,9 @@ class BatchPrefixCache {
     });
     std::fputs(crucible::StageLine(status, r.ids.size(), below, room, queue.job).c_str(), stderr);
     // `tag`: a read took this turn's host point earlier (host_evict tag=); the turn line carries it (state_disk_tag).
+    // Start plan B1a: the best disk state's length also for a refused read, and what the read waits for.
     return {crucible::StageName(status.state), status.state == crucible::StageState::None ? 0 : status.tokens,
-            crucible::StageReason(status.reason), read_queue_.TagOf(key)};
+            crucible::StageReason(status.reason), read_queue_.TagOf(key), status.tokens, crucible::StageWaitCause(status)};
   }
   // The stage reason when the disk refused a read-ahead point (MakeRoom "spill"): a non-fault budget word of the
   // checker where one fits.
@@ -650,25 +748,69 @@ class BatchPrefixCache {
                  held->state.replay, int(resumed), int(saved), saved ? "-" : status.last.refused.c_str(),
                  cache_.Evictions() - evictions, bytes, cache_.Bytes(), cache_.CopyBytes(), SharedOf(share, bytes),
                  crucible::GenerationNow() - start);
-    if (!saved)
-      Direct(slot, held->key, Policy(held->tenant), held->state.length, held->guarded, bytes, share,
-             [&] { return SaveSlot(sequence, held->state, stk, carry, base); });
+    // Start plan B1a: one line for each state that leaves a slot, with where it went.
+    const uint64_t lineage = cache_.LineageOf(held->key, Policy(held->tenant));
+    const auto released = [&](const char* outcome) {
+      std::fputs(crucible::ReleaseLine("tail", slot, held->state.length, outcome, saved ? "" : status.last.refused, bytes,
+                                       crucible::GenerationNow() - start, lineage).c_str(), stderr);
+    };
+    if (saved) return released("host");
+    // the full blocks of the tail stay on the device and the disk writer reads them in chunks. The host holds
+    // the rest of the state only (about 250 MB at 128K tokens), not the 3 to 5 GB snapshot that the old direct spill
+    // pinned until its write ended. this holds for
+    // a handover too. The next request overwrites the slot at once, so the release waits (bounded) until the writer
+    // has read the device rows (crucible::kHandoverDrainSeconds); when the bound passes, the write is lost as before.
+    if (disk_) {
+      const auto plan = ConversationStateIO::PlanLazy(sequence, held->state, disk_->Disk().BlockRows(),
+                                                      disk_->Disk().BlockHeadBytes(), disk_->Disk().BlockTailBytes());
+      const auto spill = crucible::PlanReleaseSpill(resumed, true, plan.bytes, kLazyMinBytes);
+      if (spill.lazy) {
+        const bool queued = Direct(slot, held->key, Policy(held->tenant), held->state.length, held->guarded, bytes, share,
+                                   [&] { return SaveLazy(slot, sequence, held->state, stk, carry, plan); }, plan.bytes);
+        if (spill.drain_seconds > 0 && queued) {
+          const double waited = crucible::GenerationNow();
+          const bool drained = crucible::DrainHandover(spill, queued, [&](double seconds) { return disk_->Drain(seconds); });
+          drained_ = std::max(drained_, 0.0) + (crucible::GenerationNow() - waited);
+          std::fprintf(stderr, "state_disk handover_drain slot=%d tokens=%zu drained=%d seconds=%.6f\n", slot, held->state.length,
+                       int(drained), crucible::GenerationNow() - waited);
+        }
+        return released(queued ? "disk_queued" : resumed ? "resident" : "lost");
+      }
+    }
+    const bool queued = Direct(slot, held->key, Policy(held->tenant), held->state.length, held->guarded, bytes, share,
+                               [&] { return SaveSlot(sequence, held->state, stk, carry, base); });
+    released(queued ? "disk_queued" : resumed ? "resident" : "lost");
+  }
+  // A save that leaves the full blocks on the device (ConversationStateIO::SaveLazy). The slot's base does not hold it.
+  std::shared_ptr<const ConversationSnapshot> SaveLazy(int slot, SequenceState& sequence, const crucible::ConversationResume& state,
+                                                       float* stk, float* carry,
+                                                       const ConversationStateIO::LazyPlan& plan) {
+    const auto source = std::make_shared<crucible::LazySource>(crucible::DeviceLazyReader(), plan.rows);
+    auto snapshot = ConversationStateIO::SaveLazy(engine_, sequence, state, stk, carry, plan, source, lazy_shadow_);
+    LazyTrack(slot, source);
+    return snapshot;
   }
   // MEDIUM-5 (BatchDiskTier::SpillDirect): the host cache refused this slot state, so it goes straight to
   // disk when the disk tier is on and host memory above the reserve holds its new bytes. Else it is lost, as before.
+  // `lazy`: the bytes of the snapshot that `save` leaves on the device (0: all of it is copied to the host).
   template<class Save>
-  void Direct(int slot, std::span<const int> key, const crucible::ConversationPolicy& policy, size_t tokens,
-              bool guarded, size_t bytes, const crucible::SharedSave& share, Save save) {
-    if (!disk_) return;
-    const uint64_t available = HostAvailable(), reserve = cache_.HostReserve();
-    const size_t need = share.host_bytes ? share.host_bytes : bytes;
+  bool Direct(int slot, std::span<const int> key, const crucible::ConversationPolicy& policy, size_t tokens,
+              bool guarded, size_t bytes, const crucible::SharedSave& share, Save save, size_t lazy = 0) {
+    if (!disk_) return false;
+    const size_t host = lazy ? bytes - lazy : share.host_bytes ? share.host_bytes : bytes;
+    // Shadow mode (CRUCIBLE_LAZY_SHADOW) keeps an eager host copy of the lazy rows too: the room check counts it.
+    const size_t need = lazy ? host + kLazyStagingBytes + (lazy_shadow_ ? lazy : 0) : host;
     const std::string refused = cache_.Status().last.refused;
-    const auto result = disk_->SpillDirect(key, policy, guarded, refused, bytes, need,
-                                           available > reserve ? available - reserve : 0, save);
-    if (result.empty()) return;
+    // the room is MemAvailable above the floor and the direct margin (DirectRoom), no budget cap.
+    const auto result = disk_->SpillDirect(key, policy, guarded, refused, bytes, need, cache_.DirectRoom(HostAvailable()), save,
+                                       lazy ? host : 0);
+    cache_.NoteSpill(key, policy, result);  // the miss ledger: the record of the refused save learns the disk's answer
+    if (result.empty()) return false;
     // Numbers and fixed words only (the key and the tenant never go to a log line).
-    std::fprintf(stderr, "state_disk direct slot=%d tokens=%zu bytes=%zu need=%zu result=%s reason=%s\n", slot,
-                 tokens, bytes, need, result == "queued" ? "queued" : "refused", result == "queued" ? "-" : result.c_str());
+    std::fprintf(stderr, "state_disk direct slot=%d tokens=%zu bytes=%zu need=%zu result=%s reason=%s lazy=%zu host=%zu\n",
+                 slot, tokens, bytes, need, result == "queued" ? "queued" : "refused", result == "queued" ? "-" : result.c_str(), lazy,
+                 host);
+    return result == "queued";
   }
   // the session frontier at `cursor` stays in the slot. Shared frontiers stay
   // host copies (other sessions restore them). A full-window request that warmed its MTP rows keeps its host copy
@@ -741,7 +883,10 @@ class BatchPrefixCache {
                  int(point.frontier.speculative), int(saved), cache_.Evictions() - evictions, bytes,
                  saved ? bytes - SharedOf(share, bytes) : 0, saved ? SharedOf(share, bytes) : 0, cache_.Bytes(),
                  crucible::GenerationNow() - start, static_cast<unsigned long long>(request_));
-    if (!saved) Direct(slot, point.key, Policy(point.tenant), length, false, bytes, share, save);
+    const bool queued = !saved && Direct(slot, point.key, Policy(point.tenant), length, false, bytes, share, save);
+    std::fputs(crucible::ReleaseLine("frontier", slot, length, saved ? "host" : queued ? "disk_queued" : "lost",
+                                     saved ? "" : cache_.Status().last.refused, bytes, crucible::GenerationNow() - start,
+                                     cache_.LineageOf(point.key, Policy(point.tenant))).c_str(), stderr);
   }
   // frontier-copy: the open on the selected (target) slot missed the host, and
   // another slot holds Frontier point (from, index) for its prefix. SlotCheckpointIO::CopyTo writes the target the
@@ -762,6 +907,7 @@ class BatchPrefixCache {
     // As Restore: every host restore writes the slot, so its MTP history and base are gone.
     if (mtp_) mtp_->Restored(target, std::nullopt);
     bases_.Clear(target);
+    LazyEnd(target);
     // The session selects the target again on every exit; this guard covers the hook alone.
     const struct Reselect { Engine& engine; int slot; ~Reselect() { engine.SelectStream(slot); } } reselect{engine_, target};
     engine_.SelectStream(from);
@@ -795,6 +941,25 @@ class BatchPrefixCache {
                  crucible::GenerationNow() - start);
     if (reason) return 0;
     return length;
+  }
+  // Header point: the first prefill command of a cold request on the selected (target) slot
+  // copies checkpoint (from, index) of another slot, whose rows below the point stay as they are while it runs. Device to
+  // device, no host stage and no cache room (SlotCheckpointIO::CopyPointTo). Returns the point's length, 0 for no copy.
+  size_t PointCopy(const crucible::ServeRequest& r, int from, int index, const crucible::SlotCheckpoint& point) {
+    const int target = Slot();
+    if (point.tenant != r.tenant || point.kind != crucible::CheckpointKind::Pre || point.replay != 0) return 0;
+    if (target == from) return 0;
+    // As a checkpoint load: a restore writes the slot, so its MTP history, base and lazy disk reads are gone.
+    if (mtp_) mtp_->Restored(target, std::nullopt);
+    bases_.Clear(target);
+    LazyEnd(target);
+    const struct Reselect { Engine& engine; int slot; ~Reselect() { engine.SelectStream(slot); } } reselect{engine_, target};
+    engine_.SelectStream(from);
+    SequenceState& donor = engine_.ActiveSequence();
+    engine_.SelectStream(target);
+    SequenceState& sequence = engine_.ActiveSequence();
+    SlotCheckpointIO::CopyPointTo(donor, Buffer(from, index), point, sequence);
+    return point.hist.size();
   }
   // HIGH-2: the open resumes from the slot's own Frontier point. The slot's tail is the output that the prompt left
   // (Pi drops the reasoning), and the open writes over it: it leaves without a host copy.
@@ -943,11 +1108,16 @@ class BatchPrefixCache {
   std::array<std::optional<Held>, kMaxRows> held_;
   std::array<size_t, kMaxRows> expected_{};  // per slot: the bytes of the tail that its request may save (Expect)
   crucible::SlotBases<ConversationSnapshot, kMaxRows> bases_;  // an earlier change
+  // CRUCIBLE_LAZY_SHADOW=1 (a soak check): a lazy spill keeps the eager copy and the writer compares its pieces with it.
+  const bool lazy_shadow_ = [] { const char* on = crucible::SwitchText("CRUCIBLE_LAZY_SHADOW"); return on && on[0] == '1'; }();
+  std::array<std::vector<std::weak_ptr<crucible::LazySource>>, kMaxRows> lazy_;  // (LazyTrack)
   crucible::BatchConversationCache<ConversationSnapshot> cache_;
   // Declared after cache_: it is destroyed first, so no writer job outlives the entries that it holds.
   std::unique_ptr<crucible::BatchDiskTier<ConversationSnapshot>> disk_;
   crucible::BatchReadQueue read_queue_;  // the waiting turns and the points that reads took
   uint64_t request_ = 0;  // the request whose open runs now (the log tag of restore and handover lines)
+  crucible::DurableMemo<crucible::StateTenant> durable_;  // the miss ledger's disk probes (hooks.durable)
+  double drained_ = -1;   // the miss ledger: seconds that releases waited for the writer since the last open (hooks.drained)
   const int rows_;
   float* const stk_;
   float* const carry_;
@@ -962,9 +1132,12 @@ class BatchSpecDecoder : public BatchMtpSlots {
   // blocks: the serve --draft-blocks selection; empty keeps the built-in 64K selection.
   explicit BatchSpecDecoder(Engine& engine, const std::vector<int>& blocks = {}) : engine_(engine) {
     for (int slot = 0; slot < kMaxRows; ++slot) {
-      stk_[slot] = Zeros<float>(size_t(kMaxRows + 1) * kWide);
+      stk_[slot] = Zeros<float>(size_t(stk_rows_) * kWide);
       carry_[slot] = Zeros<float>(kCarryFloats);
     }
+    if (crucible::SpecSpanOn())
+      std::fprintf(stderr, "verify span: %d rows for a solo step (CRUCIBLE_SPEC_SPAN=%d)\n", engine_.SpanRows(),
+                   crucible::SpecSpanRows());
     // One head for every request in last-row mode (draft_q > 0), never adapted. It changes only the drafts.
     if (blocks.empty()) {
       engine_.DraftHead({kDefaultDraftBlocks.begin(), kDefaultDraftBlocks.end()}, true, false, false);
@@ -1108,6 +1281,12 @@ class BatchSpecDecoder : public BatchMtpSlots {
     size_t origin = 0;           // the prompt row at MTP position 0
     bool continued = false;      // the warm-up continued restored MTP history (CRUCIBLE_SPEC_STATS)
     int mtp_restarts = 0;        // FitMtp restarts; the MTP history then starts after row 0
+    // CRUCIBLE_DRAFT_CHAIN lead: the engine epoch of the first MTP pass launched for the next round (0: none), and
+    // the state it was launched from; GreedyDrafts takes its choice only when the state still matches.
+    uint64_t lead = 0;
+    int lead_mpos = 0;
+    size_t lead_base = 0;
+    std::vector<int> lead_ctoks;
     // The MTP cache holds the pairs of every row from row 0 on (batch_mtp_history.h).
     bool Full() const { return origin == 0 && !mtp_off && mtp_restarts == 0; }
   };
@@ -1119,9 +1298,11 @@ class BatchSpecDecoder : public BatchMtpSlots {
   };
   void Open(uint64_t id, int slot, const crucible::ServeRequest& r, size_t cached) {
     State state;
-    state.slot = slot; state.spec = r.spec; state.draft_q = float(r.draft_q); state.ids = r.ids; state.stops = r.stop_ids;
+    // CRUCIBLE_SPEC_SPAN: a request at spec 7 drafts up to span - 1 tokens in a solo step (spec_span.h).
+    state.slot = slot; state.spec = crucible::SpanDraftDepth(r.spec, engine_.SpanRows()); state.draft_q = float(r.draft_q); state.ids = r.ids; state.stops = r.stop_ids;
     state.sampling = r.sampling;
-    state.lookup = r.lookup; state.lookup_min = r.lookup_min;
+    // The lookup copy depth maps as spec does: the serve default (7, server/backend.py LOOKUP_DEPTH) copies up to span - 1.
+    state.lookup = crucible::SpanDraftDepth(r.lookup, engine_.SpanRows()); state.lookup_min = r.lookup_min;
     state.value = r.draft_value != 0;
     state.tally.detail = r.draft_detail != 0;
     if (r.lookup) { state.history = crucible::LookupIndex(r.lookup_min); state.history.Append(r.ids); }
@@ -1212,8 +1393,25 @@ class BatchSpecDecoder : public BatchMtpSlots {
   void Pending(State& s, int last) {
     if (s.mtp_off) return;
     if (s.ctoks.empty()) s.ctoks = {last};
-    if (s.ctoks.back() != last || s.ctoks.size() > size_t(kMaxRows))
+    if (s.ctoks.back() != last || s.ctoks.size() > size_t(pend_cap_))
       throw std::logic_error("speculative draft state does not match the emitted tokens");
+  }
+  // Feeds the oldest pending pairs to the MTP in passes of at most kMaxRows rows until at most `keep` pairs are
+  // pending, and moves the rest to rows 0.. of the stacks. The MTP takes kMaxRows rows per call; after a verify span
+  // past kMaxRows rows (CRUCIBLE_SPEC_SPAN) more pairs are pending. Draft state only: the output does not change.
+  void Trim(State& s, size_t keep) {
+    if (s.mtp_off) return;
+    float* stk = stk_[s.slot];
+    for (const int n : crucible::SpanTrimPasses(int(s.ctoks.size()), int(keep))) {
+      FitMtp(s, n, 1);
+      engine_.SelectStream(s.slot);
+      engine_.Mtp(stk, s.ctoks.data(), n, s.mpos, false);
+      s.mpos += n;
+      ++s.flushes;
+      // Row by row, so a copy never overlaps its source (n >= 1).
+      for (size_t i = 0; i + size_t(n) < s.ctoks.size(); ++i) Copy(stk + i * kWide, stk + (i + size_t(n)) * kWide, kWide);
+      s.ctoks.erase(s.ctoks.begin(), s.ctoks.begin() + n);
+    }
   }
   std::optional<int> Commit(State& s, int last) {
     Pending(s, last);
@@ -1249,6 +1447,8 @@ class BatchSpecDecoder : public BatchMtpSlots {
   }
   void Flush(State& s) {
     if (s.mtp_off || s.ctoks.size() <= size_t(kMaxRows)) return;
+    // More than kMaxRows + 1 pairs only after a verify span past kMaxRows rows (CRUCIBLE_SPEC_SPAN).
+    if (s.ctoks.size() > size_t(kMaxRows) + 1) return Trim(s, s.ctoks.size() - kMaxRows);
     FitMtp(s, kMaxRows, 1);
     engine_.SelectStream(s.slot);
     float* stk = stk_[s.slot];
@@ -1262,7 +1462,10 @@ class BatchSpecDecoder : public BatchMtpSlots {
   // (G6d) runs the same Propose and Accept around one shared pass, so both apply the same policy.
   std::vector<int> Solo(State& s, int last, size_t remaining, uint64_t next) {
     const auto input = Propose(s, last, remaining, next, s.spec);
-    const auto greedy = engine_.Forward(input.data(), int(input.size()), s.replay, 1);
+    // A span past kMaxRows rows (CRUCIBLE_SPEC_SPAN) runs as one lone span of a verify pass.
+    const auto greedy = input.size() > size_t(kMaxRows)
+        ? engine_.ForwardVerifySpans({crucible::VerifySpan{s.slot, input, s.replay, 1}})
+        : engine_.Forward(input.data(), int(input.size()), s.replay, 1);
     auto output = Accept(s, 0, greedy);
     if (s.resumed && s.proposal.consumed) {
       ++s.resumed_steps;
@@ -1270,7 +1473,30 @@ class BatchSpecDecoder : public BatchMtpSlots {
       s.resumed_accepted += int(output.size()) - 1;
       if (s.resumed_steps % 8 == 0) s.resumed = false;
     }
+    s.lead = 0;
+    if (engine_.DraftLead()) Lead(s);
     return output;
+  }
+  // CRUCIBLE_DRAFT_CHAIN lead: launches the first MTP pass of the next greedy Propose now (the step's tokens go to
+  // the server while it runs). The same checks as Propose: Pending holds (ctoks end with the last token), FitMtp,
+  // the depth bound. The pass writes the MTP cache rows of the pending pairs, as the next Propose would; its choice
+  // and its last stack (stk row kMaxRows) wait for GreedyDrafts. A step that never comes leaves only those rows.
+  void Lead(State& s) {
+    if (s.mtp_off || s.spec <= 0 || s.sampling.temperature > 0 || !s.proposal.consumed || s.ctoks.empty() ||
+        s.ctoks.size() > size_t(kMaxRows))
+      return;
+    const int rc = int(s.ctoks.size());
+    FitMtp(s, rc, std::max(s.spec, s.lookup));
+    const int bound = BoundedDraftDepth(std::max(s.spec, s.lookup), engine_.Context(), int(engine_.Length()), s.mpos,
+                                        rc, engine_.StreamMtpRows(s.slot));
+    if (bound <= 0) return;
+    engine_.SelectStream(s.slot);
+    float* stk = stk_[s.slot];
+    engine_.Mtp(stk, s.ctoks.data(), rc, s.mpos, true, false, stk + size_t(kMaxRows) * kWide);
+    s.lead = engine_.LeadEpoch();
+    s.lead_mpos = s.mpos;
+    s.lead_base = engine_.Length();
+    s.lead_ctoks = s.ctoks;
   }
   // Draft head pass counters: the host time of one head call, where the call already returns host values
   // (the choice and the margin), so these reads add no wait. Counters only.
@@ -1307,6 +1533,7 @@ class BatchSpecDecoder : public BatchMtpSlots {
   // off) or SampledGeneration::Serial and Step (without lookup or snapshots).
   std::vector<int> Propose(State& s, int last, size_t remaining, uint64_t next, int cap) {
     Pending(s, last);
+    Trim(s, kMaxRows);
     s.buckets.clear();
     Proposal p;
     p.input = {last};
@@ -1357,6 +1584,7 @@ class BatchSpecDecoder : public BatchMtpSlots {
         continue;
       }
       Pending(s, last[i]);
+      Trim(s, kMaxRows);
       s.buckets.clear();
       Proposal p;
       p.input = {last[i]};
@@ -1423,7 +1651,7 @@ class BatchSpecDecoder : public BatchMtpSlots {
         }
       } else {
         c.q = DraftAcceptProb(c.margin);
-        c.open = c.depth > 1 && c.q * kDraftNextPrior >= s.draft_q;
+        c.open = c.depth > 1 && c.q * engine_.DraftPrior() >= s.draft_q;
       }
       // No chain call follows a stop ID.
       if (!p.lookup && !c.drafts.empty() && crucible::IsStopToken(s.stops, c.drafts.front())) c.open = false;
@@ -1459,7 +1687,7 @@ class BatchSpecDecoder : public BatchMtpSlots {
         } else {
           c.q *= DraftAcceptProb(margin);
           keep = c.q >= s.draft_q;
-          c.open = keep && k + 1 < c.depth && c.q * kDraftNextPrior >= s.draft_q;
+          c.open = keep && k + 1 < c.depth && c.q * engine_.DraftPrior() >= s.draft_q;
         }
         if (keep) c.drafts.push_back(next);
         else c.open = false;
@@ -1481,7 +1709,12 @@ class BatchSpecDecoder : public BatchMtpSlots {
   std::vector<int> GreedyDrafts(State& s, int depth, int copy_depth, bool& lookup) {
     float* stk = stk_[s.slot];
     const int rc = int(s.ctoks.size());
-    std::vector<int> drafts{Timed(s, [&] { return engine_.Mtp(stk, s.ctoks.data(), rc, s.mpos, true, false); })[rc - 1]};
+    // CRUCIBLE_DRAFT_CHAIN lead: the pass already ran for this exact state; take its choice (and its kept stack).
+    const uint64_t epoch = std::exchange(s.lead, 0);
+    const bool led = epoch != 0 && epoch == engine_.LeadEpoch() && s.lead_mpos == s.mpos &&
+                     s.lead_base == engine_.Length() && s.lead_ctoks == s.ctoks;
+    std::vector<int> drafts{led ? Timed(s, [&] { return engine_.MtpLeadWait(epoch).token; })
+                                : Timed(s, [&] { return engine_.Mtp(stk, s.ctoks.data(), rc, s.mpos, true, false); })[rc - 1]};
     s.mpos += rc;
     auto copied = Lookup(s, copy_depth);
     if (copied.size() > 1 && copied.front() == drafts.front()) {
@@ -1490,17 +1723,20 @@ class BatchSpecDecoder : public BatchMtpSlots {
       return copied;
     }
     if (depth <= 0) return {};
+    const auto chain = [&](int k, const int* previous) {
+      const bool kept = led && k == 1;  // the lead copied its last stack to stk row kMaxRows; H() is scratch since
+      if (!kept) CopyRows(engine_, stk, kMaxRows, k == 1 ? rc - 1 : 0, 1);
+      return Timed(s, [&] { return engine_.Mtp(stk + size_t(kMaxRows) * kWide, previous, 1, s.mpos + k - 1, true, false); })[0];
+    };
     if (s.value)
       return ValueChain(s, s.greedy_cal, drafts.front(), engine_.DraftMargin(), depth, [&](int k, int previous) {
-        CopyRows(engine_, stk, kMaxRows, k == 1 ? rc - 1 : 0, 1);
-        const int next = Timed(s, [&] { return engine_.Mtp(stk + size_t(kMaxRows) * kWide, &previous, 1, s.mpos + k - 1, true, false); })[0];
+        const int next = chain(k, &previous);
         return std::pair<int, float>{next, engine_.DraftMargin()};
       });
     float q = DraftAcceptProb(engine_.DraftMargin());
     for (int k = 1; k < depth; ++k) {
-      if (q * kDraftNextPrior < s.draft_q || crucible::IsStopToken(s.stops, drafts.back())) break;
-      CopyRows(engine_, stk, kMaxRows, k == 1 ? rc - 1 : 0, 1);
-      const int next = Timed(s, [&] { return engine_.Mtp(stk + size_t(kMaxRows) * kWide, &drafts.back(), 1, s.mpos + k - 1, true, false); })[0];
+      if (q * engine_.DraftPrior() < s.draft_q || crucible::IsStopToken(s.stops, drafts.back())) break;
+      const int next = chain(k, &drafts.back());
       q *= DraftAcceptProb(engine_.DraftMargin());
       if (q < s.draft_q) break;
       drafts.push_back(next);
@@ -1611,6 +1847,11 @@ class BatchSpecDecoder : public BatchMtpSlots {
   }
   Engine& engine_;
   const crucible::DraftCosts costs_ = crucible::DraftCosts::Default();
+  // Pending pairs a slot may hold (Pending), and the rows of its stacks: kMaxRows pairs and the chain row on the
+  // trunk path. With a verify span (CRUCIBLE_SPEC_SPAN) one solo step leaves up to span pairs, and a packed pass
+  // adds one more before Flush, so the stacks hold kPackedRows pairs and the chain row.
+  const int pend_cap_ = crucible::SpecSpanOn() ? kPackedRows : kMaxRows;
+  const int stk_rows_ = pend_cap_ + 1;
   std::array<float*, kMaxRows> stk_{}, carry_{};
   // For each slot: the MTP history that its MTP cache and carry hold, and a closed request's pending pairs.
   std::array<std::optional<crucible::MtpHeld>, kMaxRows> held_{};
@@ -1638,17 +1879,21 @@ inline void KeepRunningOnTerm() {
     std::_Exit(143);
   }).detach();
 }
-// The disk tier's options: the directory names the binary, the checkpoint and every state-changing setting.
+// The disk tier's options: the directory names the state epoch, the checkpoint and every state-changing setting.
 inline crucible::StateDiskOptions BatchStateDiskOptions(const std::string& checkpoint, const std::string& dir, int gib,
                                                         int prefill_rows, bool vision, int write_gib_per_day,
                                                         int mtp_rows, int write_delay_ms = 0) {
+  // The state epoch (state_epoch.h): stamped into the binary by the build. An unstamped binary uses its own sha256.
   const std::string binary = crucible::FileSha256("/proc/self/exe");
   if (binary.empty()) throw std::runtime_error("state disk: cannot read the engine binary");
+  bool stamped = false;
+  const std::string epoch = crucible::StateEpoch(binary, &stamped);
   auto settings = crucible::BatchStateDiskSettings(checkpoint, prefill_rows, vision, mtp_rows,
                                                    crucible::SwitchEnvironment());
   // The same-second proof's states have their own folder; the default identity does not change.
   if (write_delay_ms) settings.push_back("write_delay_ms=" + std::to_string(write_delay_ms));
-  const auto identity = crucible::StateDiskIdentityFor(binary, crucible::CheckpointSha256(checkpoint), settings);
+  const auto identity = crucible::StateDiskIdentityFor(epoch, crucible::CheckpointSha256(checkpoint), settings);
+  std::fprintf(stderr, "state_disk epoch source=%s epoch=%s\n", stamped ? "stamped" : "binary", epoch.substr(0, 16).c_str());
   crucible::StateDiskOptions options;
   options.root = dir;
   options.identity = identity.sha;
@@ -1668,6 +1913,12 @@ inline int BatchedServe(const std::string& checkpoint, int context, int streams,
                         const std::vector<int>& draft_blocks={}, int state_write_delay_ms=0) {
   // each slot's MTP cache holds the positions that the server's default window needs, not the context.
   const int mtp_rows = crucible::MtpSlotRows(context, mtp_window);
+  // A vision tower of plain HF tensors cannot run: say so before the model loads, not after.
+  if (vision)
+    if (const std::string fault = crucible::VisionTowerFault(checkpoint); !fault.empty()) {
+      std::fprintf(stderr, "serve error: --vision: %s\n", fault.c_str());
+      return 2;
+    }
   Engine engine(checkpoint, context, prefill_rows, mtp_rows);
   if (vision) engine.EnableVision(checkpoint);
   const size_t cache_budget = size_t(cache_mib) << 20;
@@ -1688,8 +1939,17 @@ inline int BatchedServe(const std::string& checkpoint, int context, int streams,
   // asks the checkpoint hooks. The line shows whether they run; there is no switch.
   const bool points = cache && cache->CheckpointsOn();
   if (points) session.SetPreEnd(crucible::kPreEndMinTokens);
-  std::fprintf(stderr, "slot_checkpoint end_resume=%d pre_end=%d pre_end_min=%zu\n", int(points), int(points),
-               points ? crucible::kPreEndMinTokens : size_t(0));
+  // CRUCIBLE_EXACT_RESUME=1 makes a longer prompt resume a slot checkpoint only at a
+  // core-grid point, so its prefill equals the cold one (BatchSession::SetExactResume). Default off.
+  const char* exact_text = crucible::SwitchText("CRUCIBLE_EXACT_RESUME");
+  if (exact_text && *exact_text && std::string(exact_text) != "0" && std::string(exact_text) != "1") {
+    std::fprintf(stderr, "serve: CRUCIBLE_EXACT_RESUME must be 0 or 1\n");
+    return 2;
+  }
+  const bool exact_resume = points && exact_text && std::string(exact_text) == "1";
+  session.SetExactResume(exact_resume);
+  std::fprintf(stderr, "slot_checkpoint end_resume=%d pre_end=%d pre_end_min=%zu exact_resume=%d\n", int(points), int(points),
+               points ? crucible::kPreEndMinTokens : size_t(0), int(exact_resume));
   BatchSpecDecoder spec(engine, draft_blocks);
   session.SetSpecHooks(spec.Hooks());
   // CRUCIBLE_PACKED_ROWS: rows of one packed verify pass (default: 16 rows from 4 decoders where the engine runs
@@ -1713,20 +1973,23 @@ inline int BatchedServe(const std::string& checkpoint, int context, int streams,
   const bool disk = cache && cache->DiskOn();
   if (disk) KeepRunningOnTerm();
   // "state_disk": the engine takes stage commands (the server sends them only then).
+  // the line limit follows the largest slot context (serve_line.h); the server reads it from "line_bytes".
+  crucible::ServeLineReader reader(0, crucible::ServeLineBytes(context));
   std::printf("{\"event\":\"ready\",\"context\":%d,\"streams\":%d,\"prefill_rows\":%d,\"slot_contexts\":[%s],"
-              "\"protocol\":\"batch-v1\",\"cache_tail\":true,%s%s}\n", context, streams, engine.PrefillRows(), contexts.c_str(),
-              crucible::ReadyModelJson().c_str(), disk ? ",\"state_disk\":true,\"stage_job\":true" : "");
+              "\"protocol\":\"batch-v1\",\"cache_tail\":true,\"line_bytes\":%zu,\"ping\":true,%s%s%s}\n", context, streams, engine.PrefillRows(),
+              contexts.c_str(), reader.Limit(), crucible::ReadyModelJson().c_str(), disk ? ",\"state_disk\":true,\"stage_job\":true" : "",
+              engine.AblateRequests() ? ",\"ablate_request\":1" : "");
   std::fflush(stdout);
   std::string line;
   bool oversized;
   const int profile_every = crucible::SwitchText("CRUCIBLE_SERVE_PROFILE") ? std::atoi(crucible::SwitchText("CRUCIBLE_SERVE_PROFILE")) : 0;
   int profiled = 0;
-  while (ServeLine(line, oversized)) {
+  while (reader.Next(line, oversized)) {
     std::string op;
     std::optional<size_t> cursor;
     const double command_start = crucible::GenerationNow();
     try {
-      if (oversized) throw std::runtime_error("request exceeds the 2 MiB JSON-line limit");
+      if (oversized) throw std::runtime_error("request exceeds the serve JSON-line limit");
       const auto command = crucible::ParseBatchCommand(line, context);
       op = command.op;
       std::vector<crucible::BatchEvent> events;
@@ -1766,10 +2029,12 @@ inline int BatchedServe(const std::string& checkpoint, int context, int streams,
       else if (op == "stage") {
         // Counts only: the read state and the length of the disk state.
         const auto staged = session.Stage(*command.request, command.position, command.read, command.job);
-        std::printf("{\"event\":\"staged\",\"state\":\"%s\",\"tokens\":%zu,\"reason\":%s,\"tag\":%llu}\n",
-                    staged.state.c_str(), staged.tokens, JsonQuote(staged.reason.empty() ? "-" : staged.reason).c_str(),
-                    static_cast<unsigned long long>(staged.tag));
+        std::printf("{\"event\":\"staged\",\"state\":\"%s\",\"tokens\":%zu,\"reason\":%s,\"tag\":%llu,\"best\":%zu,"
+                    "\"wait\":%s}\n", staged.state.c_str(), staged.tokens,
+                    JsonQuote(staged.reason.empty() ? "-" : staged.reason).c_str(), static_cast<unsigned long long>(staged.tag),
+                    staged.best_tokens, JsonQuote(staged.wait_cause).c_str());
       }
+      else if (op == "ping") {}  // the watchdog's liveness check: no state change, the batch_end below is the reply
       else session.Close(command.request_id);
       for (const auto& event : events) PrintBatchEvent(event);
     } catch (const std::exception& error) {
@@ -1815,7 +2080,8 @@ inline std::optional<int> TryBatchedServeCommand(int argc, char** argv) {
                         settings.state_disk_gib,settings.cache_probation,settings.state_write_gib_per_day,
                         settings.cache_idle_minutes,settings.mtp_window,draft_blocks,settings.state_write_delay_ms);
   } catch (const std::exception& error) {
-    std::fprintf(stderr, "batched serve error: %s; use serve CKPT --streams 1..8 [--ctx 1..262144] [--prefill 0..4096] [--conversation-cache-mib 0..131072] [--host-reserve-mib 1024..131072] [--short-streams N --short-ctx T] [--cache-probation 0|1] [--cache-idle-minutes 1..10080] [--mtp-window 0..262144] [--draft-blocks FILE] [--state-dir DIR [--state-disk-gib 1..65536] [--state-disk-write-gib-per-day 0..65536] [--state-disk-write-delay-ms 0..60000]]\n", error.what());
+    // A memory refusal is a block of lines (engine/runtime/batch_admission.h): keep the options on their own line.
+    std::fprintf(stderr, "batched serve error: %s\n  options: serve CKPT --streams 1..8 [--ctx 1..262144] [--prefill 0..4096] [--conversation-cache-mib 0..131072] [--host-reserve-mib 1024..131072] [--short-streams N --short-ctx T] [--cache-probation 0|1] [--cache-idle-minutes 1..10080] [--mtp-window 0..262144] [--draft-blocks FILE] [--state-dir DIR [--state-disk-gib 1..65536] [--state-disk-write-gib-per-day 0..65536] [--state-disk-write-delay-ms 0..60000]]\n", error.what());
     return 2;
   }
 }

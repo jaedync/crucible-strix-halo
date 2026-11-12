@@ -16,6 +16,7 @@ import torch
 from safetensors.torch import save_file
 
 from . import exl3_torch, export
+from . import taint
 from .data import Seqs
 from .mtp_model import Ckpt, Mtp, load_blocks
 
@@ -93,6 +94,10 @@ def main():
     tensors.update(export.tensors(ck, plain, a.logit_scale))
     meta = {"step": str(s["step"]), "scope": s["scope"], "k6": ",".join(sorted(k6)),
             "logit_scale": str(a.logit_scale), "source": "crucible mtp_tune requant"}
+    # Leak guard: the Hessians come from the data folders and the weights from the state (taint.py).
+    tainted = taint.run_tainted(a.data, states=[s])
+    taint.guard_output(a.out, tainted, is_dir=False)    # H13: no tainted head inside a git work tree
+    meta = taint.tag_meta(meta, tainted)
     save_file(tensors, a.out, metadata=meta)
     digest = hashlib.sha256(open(a.out, "rb").read()).hexdigest()
     print(json.dumps({"tensors": len(tensors), "sha256": digest, "report": report, **meta}))

@@ -20,6 +20,8 @@ import random
 
 from tokenizers import Tokenizer
 
+from . import taint
+
 THINK_OFF = "<think>\n\n</think>\n\n"
 
 
@@ -82,12 +84,19 @@ def main():
     ap.add_argument("--shard", type=int, default=400_000)
     ap.add_argument("--heldout", type=float, default=0.05)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--tainted", action="store_true",
+                    help="the text comes from capture data: the shards and the manifest carry the canary")
+    ap.add_argument("--public", action="store_true",
+                    help="a person states that every source is public text: the shards get the public line. "
+                         "Without --tainted and without --public the provenance is unknown and the data counts as tainted")
     a = ap.parse_args()
+    label = taint.source_label(a.tainted, a.public)
     rng = random.Random(a.seed)
     tok = Tokenizer.from_file(f"{a.ckpt}/tokenizer.json")
     mix = {k: float(v) for k, v in (p.split("=") for p in a.mix.split(","))}
     budget = {k: int(v * a.tokens) for k, v in mix.items()}
     gens = {"chat": ultrachat(a.ultrachat), "code": code_files(rng), "docs": docs(a.repo)}
+    taint.guard_output(a.out, label != "public")   # H13: output that is not stated public (unknown counts as tainted) never goes into a git work tree
     os.makedirs(a.out, exist_ok=True)
     seqs = {"train": [], "heldout": []}
     used = {k: 0 for k in mix}
@@ -114,16 +123,15 @@ def main():
         for it in items + [None]:
             if it is None or (size + len(it[2]) > a.shard and shard):
                 name = f"{split}-{k:03d}"
-                with open(f"{a.out}/{name}.list", "w") as f:
-                    for n, _, ids in shard:
-                        f.write(n + " " + ",".join(map(str, ids)) + "\n")
+                taint.write_list(f"{a.out}/{name}.list", [(n, ids) for n, _, ids in shard], a.tainted, public=a.public)
                 manifest["shards"][name] = {"seqs": len(shard), "tokens": size,
                                             "keys": sorted({key for _, key, _ in shard})}
                 shard, size, k = [], 0, k + 1
             if it is not None:
                 shard.append(it)
                 size += len(it[2])
-    json.dump(manifest, open(f"{a.out}/manifest.json", "w"), indent=1)
+    json.dump(taint.tag_doc(manifest, a.tainted), open(f"{a.out}/manifest.json", "w"), indent=1)
+    taint.mark_dir(a.out, label)
     for name, s in manifest["shards"].items():
         print(name, s["seqs"], "seqs", s["tokens"], "tokens")
     print("train tokens by kind", used)

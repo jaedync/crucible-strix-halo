@@ -3,9 +3,11 @@
 // chunks back. The chunk size bounds the memory that a snapshot holds beyond its own bytes.
 #pragma once
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -120,7 +122,8 @@ class SnapshotChunkPool {
     Free(excess);
   }
 
- private:
+ public:
+  // One pinned chunk outside the pool's count (LazyStaging).
   static SnapshotChunk Pin() {
     SnapshotChunk chunk;
     if (hipHostMalloc(&chunk.host, kChunkBytes) != 0) throw std::bad_alloc();
@@ -136,6 +139,8 @@ class SnapshotChunkPool {
 #endif
     return chunk;
   }
+
+ private:
   // Under the lock: the idle bytes are below the reserve and one more chunk fits the limit.
   bool Short() const {
     return idle_.size() * kChunkBytes < reserve_ && (pinned_ + 1) * kChunkBytes <= pinned_limit_;
@@ -209,6 +214,148 @@ class SnapshotChunkPool {
   bool stop_ = false, blocked_ = false, pinning_ = false;
 };
 
+// a lazy snapshot extent reads the device when a user walks it. The source ends when the slot
+// rows that it names can change; a read after that throws SnapshotLost (the disk writer refuses the write: "lost").
+struct SnapshotLost : std::runtime_error {
+  SnapshotLost() : std::runtime_error("snapshot source lost") {}
+};
+// The device rows that lazy extents of one snapshot read. `reader` copies `bytes` from `device` to the pinned `host`
+// and waits for that copy only (one stream event, never a device-wide sync). One read at a time; Invalidate waits for the
+// read in progress, so the caller that is about to write the rows is never ahead of a reader. `rows`: the rows of each
+// layer that the extents cover (a slot write below it ends the source).
+class LazySource {
+ public:
+  using Reader = std::function<void(const void* device, void* host, size_t bytes)>;
+  LazySource(Reader reader, size_t rows) : reader_(std::move(reader)), rows_(rows) {}
+  void Read(const void* device, void* host, size_t bytes) {
+    std::lock_guard lock(mutex_);
+    if (!valid_) throw SnapshotLost();
+    reader_(device, host, bytes);
+    ++reads_;
+    if (!shadow_.empty()) Compare(device, host, bytes);
+  }
+  // Shadow mode (a soak check, CRUCIBLE_LAZY_SHADOW): the eager copy of the rows that `device` points at. Each piece that
+  // Read gives is compared with it; a difference ends the source, so the write is refused ("lost") and the mismatch is
+  // counted. Added before the first read.
+  void AddShadow(const void* device, std::vector<uint8_t> bytes) {
+    std::lock_guard lock(mutex_);
+    shadow_.push_back({static_cast<const uint8_t*>(device), std::move(bytes)});
+  }
+  uint64_t Mismatches() const { std::lock_guard lock(mutex_); return mismatches_; }
+  uint64_t Compared() const { std::lock_guard lock(mutex_); return compared_; }
+  void Invalidate() {
+    valid_ = false;  // a reader that waits for the lock sees it at once
+    std::lock_guard lock(mutex_);
+  }
+  bool Valid() const { return valid_; }
+  size_t Rows() const { return rows_; }
+  uint64_t Reads() const { std::lock_guard lock(mutex_); return reads_; }
+ private:
+  mutable std::mutex mutex_;
+  std::atomic<bool> valid_{true};
+  void Compare(const void* device, const void* host, size_t bytes) {
+    const auto* at = static_cast<const uint8_t*>(device);
+    for (const auto& copy : shadow_) {
+      if (at < copy.device || at + bytes > copy.device + copy.bytes.size()) continue;
+      compared_ += bytes;
+      if (std::memcmp(host, copy.bytes.data() + (at - copy.device), bytes) == 0) return;
+      ++mismatches_;
+      valid_ = false;
+      std::fprintf(stderr, "state_disk lazy_shadow mismatch bytes=%zu\n", bytes);
+      throw SnapshotLost();
+    }
+  }
+  struct Shadow { const uint8_t* device; std::vector<uint8_t> bytes; };
+  Reader reader_;
+  size_t rows_;
+  uint64_t reads_ = 0, mismatches_ = 0, compared_ = 0;
+  std::vector<Shadow> shadow_;
+};
+
+// Pinned staging buffers for lazy reads: one per reader thread that walks a lazy extent, 8 MiB each, kept for the life of
+// the process (a free would synchronize the device). The host bytes of all lazy reads together are Peak() x 8 MiB.
+class LazyStaging {
+ public:
+  static LazyStaging& Instance() {
+    static auto* staging = new LazyStaging;
+    return *staging;
+  }
+  class Lease {
+   public:
+    Lease() : chunk_(Instance().Acquire()) {}
+    Lease(const Lease&) = delete;
+    Lease& operator=(const Lease&) = delete;
+    ~Lease() { Instance().Release(chunk_); }
+    const SnapshotChunk& chunk() const { return chunk_; }
+   private:
+    SnapshotChunk chunk_;
+  };
+  size_t Peak() const { std::lock_guard lock(mutex_); return peak_; }
+  size_t Buffers() const { std::lock_guard lock(mutex_); return buffers_; }
+  void ResetPeak() { std::lock_guard lock(mutex_); peak_ = leased_; }
+ private:
+  SnapshotChunk Acquire() {
+    {
+      std::lock_guard lock(mutex_);
+      if (!idle_.empty()) {
+        const SnapshotChunk chunk = idle_.back();
+        idle_.pop_back();
+        peak_ = std::max(peak_, ++leased_);
+        return chunk;
+      }
+    }
+    const SnapshotChunk chunk = SnapshotChunkPool::Pin();
+    std::lock_guard lock(mutex_);
+    ++buffers_;
+    peak_ = std::max(peak_, ++leased_);
+    return chunk;
+  }
+  void Release(SnapshotChunk chunk) {
+    std::lock_guard lock(mutex_);
+    idle_.push_back(chunk);
+    --leased_;
+  }
+  mutable std::mutex mutex_;
+  std::vector<SnapshotChunk> idle_;
+  size_t buffers_ = 0, leased_ = 0, peak_ = 0;
+};
+
+// The reader of a lazy snapshot on the device: one non-blocking stream of its own, never the null stream. Each read is a
+// hipMemcpyAsync into the pinned staging buffer and a wait for that stream only, so the decode stream and the other
+// streams of the batch never wait for a disk write (the old path copied the whole state on the null stream and
+// synchronized it). LazySource serializes the reads, so one stream is enough. Rows that it reads are final: the eager part
+// of the snapshot already waited for the null stream (CopySnapshotRanges).
+inline LazySource::Reader DeviceLazyReader() {
+#ifdef __HIPCC__
+  static hipStream_t stream = [] {
+    hipStream_t created = nullptr;
+    HIP_OK(hipStreamCreateWithFlags(&created, hipStreamNonBlocking));
+    return created;
+  }();
+  return [](const void* device, void* host, size_t bytes) {
+    // A failed read loses this write only (the writer refuses it); it must not end the server as HIP_OK would.
+    if (hipMemcpyAsync(host, device, bytes, hipMemcpyDeviceToHost, stream) != hipSuccess ||
+        hipStreamSynchronize(stream) != hipSuccess) {
+      (void)hipGetLastError();
+      throw SnapshotLost();
+    }
+  };
+#else
+  return [](const void* device, void* host, size_t bytes) { std::memcpy(host, device, bytes); };
+#endif
+}
+
+// The eager copy of device rows for shadow mode: pageable host memory, on the null stream (a synchronous copy).
+inline std::vector<uint8_t> DeviceShadowCopy(const void* device, size_t bytes) {
+  std::vector<uint8_t> copy(bytes);
+#ifdef __HIPCC__
+  HIP_OK(hipMemcpy(copy.data(), device, bytes, hipMemcpyDeviceToHost));
+#else
+  std::memcpy(copy.data(), device, bytes);
+#endif
+  return copy;
+}
+
 // A pinned chunk that goes back to the pool when its last user goes.
 class PinnedChunk {
  public:
@@ -240,7 +387,13 @@ struct SnapshotRange { const void* device; size_t bytes, offset; };
 class SnapshotBytes {
  public:
   // A logical part for Compose: `bytes` at `device`. With `from`, that snapshot holds the same bytes at `from_offset`.
-  struct Part { const void* device = nullptr; size_t bytes = 0; const SnapshotBytes* from = nullptr; size_t from_offset = 0; };
+  struct Part {
+    const void* device = nullptr;
+    size_t bytes = 0;
+    const SnapshotBytes* from = nullptr;
+    size_t from_offset = 0;
+    std::shared_ptr<LazySource> lazy = {};  // no host copy; a user reads the device rows through `lazy`
+  };
   SnapshotBytes() = default;
   explicit SnapshotBytes(size_t size) {
     for (size_t at = 0; at < size; at += SnapshotChunkPool::kChunkBytes)
@@ -275,19 +428,23 @@ class SnapshotBytes {
   // to `copies`. From a part with `from`, it shares the extents of `from` that use a whole chunk; it copies the rest
   // of that part, as it copies a part without `from`. So a shared chunk holds only bytes of this snapshot.
   static SnapshotBytes Compose(const std::vector<Part>& parts, std::vector<SnapshotRange>& copies) {
-    struct Segment { std::shared_ptr<const PinnedChunk> shared; const uint8_t* device; size_t bytes; };
+    struct Segment { std::shared_ptr<const PinnedChunk> shared; const uint8_t* device; size_t bytes; std::shared_ptr<LazySource> lazy; };
     std::vector<Segment> plan;
     size_t own = 0;
     const auto copy = [&](const void* device, size_t bytes) {
       if (!bytes) return;
       auto* at = static_cast<const uint8_t*>(device);
-      if (!plan.empty() && !plan.back().shared && plan.back().device + plan.back().bytes == at)
+      if (!plan.empty() && !plan.back().shared && !plan.back().lazy && plan.back().device + plan.back().bytes == at)
         plan.back().bytes += bytes;
       else
-        plan.push_back({nullptr, at, bytes});
+        plan.push_back({nullptr, at, bytes, nullptr});
       own += bytes;
     };
     for (const auto& part : parts) {
+      if (part.lazy) {
+        if (part.bytes) plan.push_back({nullptr, static_cast<const uint8_t*>(part.device), part.bytes, part.lazy});
+        continue;
+      }
       if (!part.from) {
         copy(part.device, part.bytes);
         continue;
@@ -295,7 +452,7 @@ class SnapshotBytes {
       part.from->ForEachExtent(part.from_offset, part.bytes, [&](const Extent& extent, size_t inside, size_t count,
                                                                  size_t at) {
         if (WholeChunk(extent) && inside == 0 && count == extent.bytes)
-          plan.push_back({extent.owner, static_cast<const uint8_t*>(part.device) + at, count});
+          plan.push_back({extent.owner, static_cast<const uint8_t*>(part.device) + at, count, nullptr});
         else
           copy(static_cast<const uint8_t*>(part.device) + at, count);
       });
@@ -307,6 +464,10 @@ class SnapshotBytes {
     for (const auto& segment : plan) {
       if (segment.shared) {
         out.Push(segment.shared, 0, segment.bytes);
+        continue;
+      }
+      if (segment.lazy) {
+        out.PushLazy(segment.lazy, segment.device, segment.bytes);
         continue;
       }
       copies.push_back({segment.device, segment.bytes, out.size_});
@@ -322,6 +483,20 @@ class SnapshotBytes {
   }
 
   size_t size() const { return size_; }
+  // The bytes that this snapshot holds in host memory (its lazy extents hold none until a user walks them).
+  size_t HostBytes() const {
+    size_t bytes = 0;
+    for (const auto& extent : extents_)
+      if (extent.owner) bytes += extent.bytes;
+    return bytes;
+  }
+  size_t LazyBytes() const { return size_ - HostBytes(); }
+  // A lazy extent whose source ended (the slot rows changed): a write of this snapshot is refused ("lost").
+  bool LazyLost() const {
+    for (const auto& extent : extents_)
+      if (extent.lazy && !extent.lazy->Valid()) return true;
+    return false;
+  }
   bool empty() const { return size_ == 0; }
   // Tests shorten a copy to model a corrupt snapshot.
   void pop_back() {
@@ -333,7 +508,8 @@ class SnapshotBytes {
       starts_.pop_back();
     }
   }
-  // One chunk per extent, in logical order. In a flat snapshot, chunk i holds the logical bytes from i x 8 MB.
+  // One chunk per extent, in logical order. In a flat snapshot, chunk i holds the logical bytes from i x 8 MB. A lazy
+  // extent has an empty chunk here (host null).
   const std::vector<SnapshotChunk>& Chunks() const { return chunks_; }
   bool Flat() const {
     for (size_t index = 0; index < extents_.size(); ++index)
@@ -343,22 +519,36 @@ class SnapshotBytes {
   // Calls f(chunk, offset_in_chunk, bytes, offset_in_range) for each chunk piece of [offset, offset + bytes).
   template<class F> void ForEachPiece(size_t offset, size_t bytes, F f) const {
     ForEachExtent(offset, bytes, [&](const Extent& extent, size_t inside, size_t count, size_t at) {
+      if (!extent.owner) {
+        // A lazy extent: the device rows go through one staging buffer, in pieces of at most one chunk. The callback
+        // takes each piece before the next read. SnapshotLost leaves from here when the slot rows changed.
+        const LazyStaging::Lease lease;
+        for (size_t done = 0; done < count;) {
+          const size_t piece = std::min(count - done, SnapshotChunkPool::kChunkBytes);
+          extent.lazy->Read(extent.device + inside + done, lease.chunk().host, piece);
+          f(lease.chunk(), size_t(0), piece, at + done);
+          done += piece;
+        }
+        return;
+      }
       f(extent.owner->Get(), extent.inside + inside, count, at);
     });
   }
   // Logical bytes in chunks that another snapshot also uses: an eviction of this snapshot does not free them.
-  size_t HeldElsewhere() const { return size_ - OwnBytes(); }
+  size_t HeldElsewhere() const { return HostBytes() - OwnBytes(); }
   // Logical bytes that an eviction of this snapshot frees: its chunks that no other snapshot uses and that are not in
   // `kept` (the chunks that a save keeps, ShareableOwners). O(E log E) in the extents.
   size_t OwnBytes(std::span<const void* const> kept = {}) const {
     std::vector<const void*> owners;
     owners.reserve(extents_.size());
-    for (const auto& extent : extents_) owners.push_back(extent.owner.get());
+    for (const auto& extent : extents_)
+      if (extent.owner) owners.push_back(extent.owner.get());
     std::sort(owners.begin(), owners.end());
     std::vector<const void*> sorted_kept(kept.begin(), kept.end());
     std::sort(sorted_kept.begin(), sorted_kept.end());
     size_t own = 0;
     for (const auto& extent : extents_) {
+      if (!extent.owner) continue;  // lazy: no host memory
       const void* owner = extent.owner.get();
       const auto [first, last] = std::equal_range(owners.begin(), owners.end(), owner);
       if (extent.owner.use_count() > last - first) continue;  // another snapshot holds this chunk too
@@ -393,9 +583,15 @@ class SnapshotBytes {
   bool operator==(const SnapshotBytes& other) const { return size_ == other.size_ && Copy() == other.Copy(); }
 
  private:
-  struct Extent { std::shared_ptr<const PinnedChunk> owner; size_t inside, bytes; };
+  // `owner` null: a lazy extent of `bytes` device bytes at `device` (read through `lazy`).
+  struct Extent {
+    std::shared_ptr<const PinnedChunk> owner;
+    size_t inside, bytes;
+    std::shared_ptr<LazySource> lazy = {};
+    const uint8_t* device = nullptr;
+  };
   static bool WholeChunk(const Extent& extent) {
-    return extent.inside == 0 && extent.bytes == SnapshotChunkPool::kChunkBytes;
+    return extent.owner && extent.inside == 0 && extent.bytes == SnapshotChunkPool::kChunkBytes;
   }
   // Calls f(extent, offset_in_extent, bytes, offset_in_range) for each extent piece of [offset, offset + bytes).
   template<class F> void ForEachExtent(size_t offset, size_t bytes, F f) const {
@@ -410,9 +606,15 @@ class SnapshotBytes {
       done += count;
     }
   }
+  void PushLazy(std::shared_ptr<LazySource> lazy, const uint8_t* device, size_t bytes) {
+    chunks_.push_back({});
+    starts_.push_back(size_);
+    extents_.push_back({nullptr, 0, bytes, std::move(lazy), device});
+    size_ += bytes;
+  }
   // Appends an extent; one that continues the last extent in the same chunk joins it.
   void Push(std::shared_ptr<const PinnedChunk> owner, size_t inside, size_t bytes) {
-    if (!extents_.empty() && extents_.back().owner == owner &&
+    if (!extents_.empty() && extents_.back().owner && extents_.back().owner == owner &&
         extents_.back().inside + extents_.back().bytes == inside) {
       extents_.back().bytes += bytes;
     } else {

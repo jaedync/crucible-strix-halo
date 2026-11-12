@@ -94,10 +94,13 @@ inline BatchedServeCommand ParseBatchCommand(const std::string& line, int contex
     fields.erase("job");
     if (fields != std::set<std::string>{"op", "request"} || (!command.request && !command.refusal))
       throw std::runtime_error("stage requires a request and no request ID");
+  } else if (command.op == "ping") {
+    // The service watchdog (ready event: "ping":true): no fields, no state change, only the batch_end reply.
+    if (fields != std::set<std::string>{"op"}) throw std::runtime_error("ping takes no fields");
   } else if (command.op == "close" || command.op == "prefill" || command.op == "spec_step") {
     if (fields != std::set<std::string>{"op", "request_id"} || !command.request_id)
       throw std::runtime_error("close and prefill require a positive request ID");
-  } else throw std::runtime_error("batch op must be open, prefill, step, verify_step, spec_step, stage, or close");
+  } else throw std::runtime_error("batch op must be open, prefill, step, verify_step, spec_step, stage, ping, or close");
   return command;
 }
 }  // namespace crucible

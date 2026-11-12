@@ -26,7 +26,24 @@ int main() {
   // Fix 2 (cause.md item 10): the server's tag of the turn, for the stage and host_evict lines.
   const auto tagged = ParseBatchCommand(R"({"op":"stage","request":{"ids":[1,2],"max_tokens":3,"spec":0},"position":0,"read":1,"job":42})", 32);
   assert(tagged.job == 42 && tagged.read);
+  // ping (service watchdog): no fields, no state change. It parses to an empty command.
+  const auto ping = ParseBatchCommand(R"({"op":"ping"})", 32);
+  assert(ping.op == "ping" && ping.request_id == 0 && ping.request_ids.empty() && !ping.request && !ping.refusal &&
+         ping.every == 0 && ping.position == 0 && ping.read && ping.job == 0);
+  assert(ParseBatchCommand(R"({ "op" : "ping" })", 32).op == "ping");
   for (const auto& bad : {
+    R"({"op":"ping","request_id":1})",
+    R"({"op":"ping","request_ids":[1]})",
+    R"({"op":"ping","request":{"ids":[1,2],"max_tokens":3,"spec":0}})",
+    R"({"op":"ping","every":8})",
+    R"({"op":"ping","position":0})",
+    R"({"op":"ping","read":1})",
+    R"({"op":"ping","job":1})",
+    R"({"op":"ping","unknown":1})",
+    R"({"op":"ping","op":"ping"})",
+    R"({"op":"ping"} [])",
+    R"({"op":"Ping"})",
+    R"({"request_id":1})",
     R"({"op":"stage","request_id":1,"request":{"ids":[1,2],"max_tokens":3,"spec":0}})",
     R"({"op":"stage"})",
     R"({"op":"stage","request":{"ids":[1,2],"max_tokens":3,"spec":0},"read":2})",

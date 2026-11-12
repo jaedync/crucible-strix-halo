@@ -97,7 +97,7 @@ def logged(backend, body, **service):
 
 
 class TurnLogTest(unittest.TestCase):
-    """A log collector joins a crucible_turn line to its own request record by prompt and completion, so each request writes one line
+    """The gateway joins a crucible_turn line to its gateway row by prompt and completion, so each request writes one line
     with the counts that the client sees."""
 
     def test_closed_turn_writes_one_line_with_client_totals(self):
@@ -149,7 +149,7 @@ class TurnLogTest(unittest.TestCase):
     def test_capped_turn_with_no_room_reports_the_restore(self):
         # max_tokens 1 with thinking. The cap closes the block at token 1 with no
         # room left, so the server cancels the job before its done event. The line and the reply still name the
-        # restore of the opened event (2 of 3 prompt tokens), not cached null (a cold turn in the gateway).
+        # restore of the opened event (2 of 3 prompt tokens), not cached null (a cold turn for the gateway).
         backend = SequenceBackend(([REASON], "length", 0, 2))
         reply, turns = logged(backend, chat(max_tokens=1))
         self.assertEqual(reply["usage"]["prompt_tokens_details"], dict(cached_tokens=2))

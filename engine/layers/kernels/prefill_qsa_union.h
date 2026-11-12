@@ -5,6 +5,7 @@
 // tiles. A per-block bit mask keeps each row's own selection exact.
 #pragma once
 #include "prefill_qsa.h"
+#include "qsa_union_lds.h"
 #include <cstdlib>
 #include <string>
 
@@ -459,15 +460,296 @@ QsaUnionHalfQKernel(QsaPrefill a, QsaUnion u) {
   }
 }
 
-// QsaUnionBuildKernel: one mask byte per block plus cnt, total and base.
-constexpr int kUnionStaticLds = (16 * 256 + 2 * 16) * (int)sizeof(int), kUnionMaxLds = 65536;
-inline bool QsaUnionFits(int pos0, int R) {
-  return (pos0 + R - 1) / 4 + 1 + kUnionStaticLds <= kUnionMaxLds;
+// QsaUnionStageKernel: the arithmetic of QsaUnionHalfQKernel (same steps,
+// chains, softmax, P V and gate), with the key and value loads off the
+// critical path. Waves 6 and 7 load the K and V
+// rows of later steps into registers (16 b128 loads per lane in flight, one
+// step ahead) and write them to LDS; waves 0..5 each run one full 16-chunk QK
+// chain (M tile wave / 2, key tile wave % 2) with all of q in VGPRs and K from
+// LDS. The fp32 C operand of a full chain equals the half chains with the LDS
+// round trip. Three barriers a step instead of five. WGP mode: the barriers
+// wait for LDS only (StageBarrier), so the loads stay in flight across them.
+// Map picks the lanes of the loads (StageLoad); 1 is the default, 0 is the
+// plain map (bench only, same bits). Mut (bench only): 1 swaps QK chunks 0
+// and 1, 2 hides key 31 of each step, 3 swaps the two P V key chunks. Each
+// one must change the output bytes. Mut 4 (bench timing only, wrong output)
+// skips QK, softmax and P V: the time of the loads and LDS stores alone.
+constexpr int kStageKPad = 264;  // halves per staged key row: 528 B puts 16 key rows on distinct banks
+constexpr int kStageKBytes = kUnionKeys * kStageKPad * 2;
+constexpr int kStageListBytes = kUnionCap * (int)sizeof(int);
+constexpr int kStageLoopBytes = kUnionLoopBytes + kStageKBytes;
+constexpr int kStageWaves = 8, kStageLoaders = 2;
+
+__device__ __forceinline__ void StageBarrier() {
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+  __builtin_amdgcn_s_barrier();
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
 }
+
+// The key of lane `key` in step j of a tile list (QsaUnionHalfQKernel's keypos and keymask).
+__device__ __forceinline__ void StageKey(const int* list, int n, int end, int j, int key, int& pos, int& mask) {
+  const int idx = j * kUnionKeys + key;
+  const int e = idx < n ? list[idx >> 2] : 0;
+  const int p = (e & 0xffffff) * 4 + (idx & 3);
+  pos = idx < n && p < end ? p : -1;
+  mask = idx < n ? (e >> 24) & 0xff : 0;
+}
+
+// One half (128 dims) of the K or V row of position pos for KV group g, through a buffer resource over
+// positions [0, end) (StageRsrc). An absent key (pos < 0) reads out of range, which gives zeros without
+// memory traffic and without a branch, so the waitcnt pass keeps all 16 loads in flight.
+typedef unsigned StageU4 __attribute__((ext_vector_type(4)));
+__device__ __forceinline__ __amdgpu_buffer_rsrc_t StageRsrc(const __half* cache, int end) {
+  return StreamRsrc(reinterpret_cast<const uint32_t*>(cache), (uint32_t)end * 1024);
+}
+// Map 0: load i of a lane reads dims [8 i, 8 i + 8) of the half row of key `lane` (pa). Map 1: load i reads key
+// lo + 16 (i >> 3) (pa for i < 8, pb after) at chunk 2 (i & 7) + hi (lo = lane & 15, hi = lane >> 4), so the
+// two lane halves read neighbouring 16-byte chunks of the same 16 rows: 16 cache lines per load, not 32.
+template <int Map>
+__device__ __forceinline__ void StageLoad(StageU4 (&r)[16], __amdgpu_buffer_rsrc_t rs, int end, int pa, int pb,
+                                          int g, int half, int hi) {
+  const int base = g * 512 + half * 256 + (Map == 1 ? hi * 16 : 0), out = end * 1024;
+  const int va = pa >= 0 ? pa * 1024 + base : out, vb = pb >= 0 ? pb * 1024 + base : out;
+#pragma unroll
+  for (int i = 0; i < 16; ++i)
+    r[i] = __builtin_amdgcn_raw_buffer_load_b128(rs, Map == 0 || i < 8 ? va : vb, Map == 0 ? i * 16 : (i & 7) * 32, 0);
+}
+
+template <bool Gate = true, int Mut = 0, int Map = 1>
+__global__ void __launch_bounds__(256) QsaUnionStageKernel(QsaPrefill a, QsaUnion u) {
+  __shared__ __attribute__((aligned(16))) unsigned char smem[kStageLoopBytes];
+  __shared__ int slist[kUnionCap];
+  __shared__ float maxima[48], sums[48], scale[48];
+  // Key positions and masks of steps s .. s + 2 live at once (slot s & 3).
+  __shared__ int keypos[4][kUnionKeys], keymask[4][kUnionKeys], stepmask[4];
+  auto score = reinterpret_cast<float(*)[kUnionKeys]>(smem);
+  auto phi = reinterpret_cast<_Float16(*)[kUnionPad]>(smem + kUnionScoreBytes);
+  auto vt = reinterpret_cast<_Float16(*)[kUnionPad]>(smem + kUnionScoreBytes + kUnionPhiBytes);
+  auto kst = reinterpret_cast<_Float16(*)[kStageKPad]>(smem + kUnionLoopBytes);
+  const QsaArgs q = a.input;
+  const int tile = blockIdx.y, g = blockIdx.x, r0 = tile * kUnionRows;
+  const int t = threadIdx.x, lane = t & 31, wave = __builtin_amdgcn_readfirstlane(t >> 5);
+  const int rows = min(kUnionRows, q.R - r0);
+  const int n = u.count[tile] * 4, steps = (n + kUnionKeys - 1) / kUnionKeys, end = q.pos0 + q.R;
+  const int* list = u.list + (size_t)tile * kUnionCap;
+  for (int i = t; i < n / 4; i += 256) slist[i] = list[i];
+  if (t < 48) { maxima[t] = -INFINITY; sums[t] = 0.f; }
+  F8 out[3][2] = {};
+  // P V of step s for this wave's 32 value dims (QsaUnionHalfQKernel's code).
+  auto pv = [&](int s) {
+    if constexpr (Mut == 4) return;
+    const int sm = stepmask[s & 3];
+    const bool live0 = sm & 3, live1 = sm & 6, live2 = sm & 12;
+#pragma unroll
+    for (int m3 = 0; m3 < 3; ++m3) {
+      if (!(m3 == 0 ? live0 : m3 == 1 ? live1 : live2)) continue;
+      F8 high[2] = {};
+#pragma unroll
+      for (int kk = 0; kk < kUnionKeys; kk += 16) {
+        const int k = Mut == 3 ? kUnionKeys - 16 - kk : kk;
+        const H16 ah = *reinterpret_cast<const H16*>(&phi[m3 * 16 + (lane & 15)][k]);
+#pragma unroll
+        for (int d2 = 0; d2 < 2; ++d2) {
+          const H16 b = *reinterpret_cast<const H16*>(&vt[wave * 32 + d2 * 16 + (lane & 15)][k]);
+          high[d2] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(ah, b, high[d2]);
+        }
+      }
+#pragma unroll
+      for (int d2 = 0; d2 < 2; ++d2)
+#pragma unroll
+        for (int z = 0; z < 8; ++z)
+          out[m3][d2][z] = out[m3][d2][z] * scale[m3 * 16 + FragmentRow(z)] + high[d2][z];
+    }
+  };
+  if (wave >= kStageWaves - kStageLoaders) {
+    // Loaders: wave 6 + half holds dims [128 half, 128 half + 128) of the 32 keys (StageLoad maps the lanes).
+    const int half = wave - (kStageWaves - kStageLoaders), lo = lane & 15, hi = lane >> 4;
+    const auto krs = StageRsrc(q.c.k, end), vrs = StageRsrc(q.c.v, end);
+    auto key_of = [&](int i) { return Map == 0 ? lane : lo + 16 * (i >> 3); };
+    auto chunk_of = [&](int i) { return Map == 0 ? i : 2 * (i & 7) + hi; };
+    StageU4 kr[16], vr[16];
+    int ka, kb;  // the StageLoad positions of kr
+    auto publish = [&](int j, int pos, int mask) {
+      if (half == 0) {
+        keypos[j & 3][lane] = pos; keymask[j & 3][lane] = mask;
+        int km = mask;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) km |= __shfl_xor(km, o);
+        if (lane == 0) stepmask[j & 3] = km;
+      }
+    };
+    // The StageLoad positions of step j; publishes key `lane` of step j.
+    auto keys = [&](int j, int& pa, int& pb) {
+      int ma, mb;
+      StageKey(slist, n, end, j, Map == 0 ? lane : lo, pa, ma);
+      if (Map == 1) StageKey(slist, n, end, j, 16 + lo, pb, mb);
+      else { pb = pa; mb = ma; }
+      publish(j, Map == 1 && hi ? pb : pa, Map == 1 && hi ? mb : ma);
+    };
+    auto store_k = [&] {
+#pragma unroll
+      for (int i = 0; i < 16; ++i)
+        *reinterpret_cast<StageU4*>(&kst[key_of(i)][half * 128 + chunk_of(i) * 8]) = kr[i];
+    };
+    auto store_v = [&] {
+#pragma unroll
+      for (int i = 0; i < 16; ++i)
+#pragma unroll
+        for (int k = 0; k < 8; ++k)
+          reinterpret_cast<unsigned short(*)[kUnionPad]>(vt)[half * 128 + chunk_of(i) * 8 + k][key_of(i)] =
+              (unsigned short)(vr[i][k >> 1] >> (16 * (k & 1)));
+    };
+    StageBarrier();  // slist
+    int a0, b0, a1, b1;
+    keys(0, a0, b0);
+    keys(1, a1, b1);
+    StageLoad<Map>(kr, krs, end, a0, b0, g, half, hi);
+    store_k();
+    StageLoad<Map>(vr, vrs, end, a0, b0, g, half, hi);
+    StageLoad<Map>(kr, krs, end, ka = a1, kb = b1, g, half, hi);
+    StageBarrier();
+    for (int s = 0; s < steps; ++s) {
+      // QK phase: V(s) to LDS, V(s + 1) loads (the positions of K(s + 1)), keys of step s + 2.
+      store_v();
+      int a2, b2;
+      keys(s + 2, a2, b2);
+      StageLoad<Map>(vr, vrs, end, ka, kb, g, half, hi);
+      StageBarrier();
+      // Softmax phase: K(s + 1) to LDS, K(s + 2) loads.
+      store_k();
+      StageLoad<Map>(kr, krs, end, ka = a2, kb = b2, g, half, hi);
+      StageBarrier();
+      pv(s);
+      StageBarrier();
+    }
+  } else {
+    const int mt = wave >> 1, nt = wave & 1;
+    const int qm = mt * 16 + (lane & 15), qrow = qm / 12, qhead = qm % 12;
+    // Rows past the tile load a clamped row. Their scores are never visible.
+    const size_t qi = ((size_t)(r0 + min(qrow, rows - 1)) * 24 + g * 12 + qhead) * 256;
+    H16 qf[16];
+#pragma unroll
+    for (int c = 0; c < 16; ++c) qf[c] = HalfFragment(a.q_hi + qi + c * 16);
+    unsigned rowpack = 0;
+#pragma unroll
+    for (int z = 0; z < 8; ++z) rowpack |= (unsigned)((mt * 16 + FragmentRow(z)) / 12) << (4 * z);
+    StageBarrier();  // slist
+    StageBarrier();
+    for (int s = 0; s < steps; ++s) {
+      const int slot = s & 3, sm = stepmask[slot];
+      const bool live0 = sm & 3, live1 = sm & 6, live2 = sm & 12;
+      if (Mut != 4 && (mt == 0 ? live0 : mt == 1 ? live1 : live2)) {
+        const int key = nt * 16 + (lane & 15);
+        const _Float16* kp = kst[key];
+        // K chunk c + 4 loads into the slot of chunk c after its WMMA: four chunks in flight from LDS.
+        H16 kb[4];
+#pragma unroll
+        for (int c = 0; c < 4; ++c) kb[c] = *reinterpret_cast<const H16*>(kp + c * 16);
+        F8 high = {};
+#pragma unroll
+        for (int cc = 0; cc < 16; ++cc) {
+          const int c = Mut == 1 && cc < 2 ? 1 - cc : cc;
+          high = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(qf[c], kb[c & 3], high);
+          if (c + 4 < 16) kb[c & 3] = *reinterpret_cast<const H16*>(kp + (c + 4) * 16);
+          __builtin_amdgcn_sched_barrier(0);
+        }
+        const int pos = keypos[slot][key], km = Mut == 2 && key == kUnionKeys - 1 ? 0 : keymask[slot][key];
+        unsigned rz = rowpack;
+        asm volatile("" : "+v"(rz));
+#pragma unroll
+        for (int z = 0; z < 8; ++z) {
+          const int m = mt * 16 + FragmentRow(z), row = rz >> (4 * z) & 15;
+          // QsaUnionHalfQKernel's test, without the short-circuit branches.
+          const bool visible = (pos >= 0) & (row < rows) & ((km >> row & 1) != 0) & (pos <= q.pos0 + r0 + row);
+          score[m][key] = visible ? high[z] * .0625f : -INFINITY;
+        }
+      }
+      StageBarrier();
+      // Online softmax (QsaUnionHalfQKernel's code): four threads per query row, eight keys each.
+      if (Mut != 4 && ((t >> 6) == 0 ? live0 : (t >> 6) == 1 ? live1 : live2)) {
+        const int m = t >> 2, part = t & 3;
+        float maximum = -INFINITY;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) maximum = fmaxf(maximum, score[m][part * 8 + i]);
+        maximum = fmaxf(maximum, __shfl_xor(maximum, 1));
+        maximum = fmaxf(maximum, __shfl_xor(maximum, 2));
+        const float old_max = maxima[m], new_max = fmaxf(old_max, maximum);
+        const float base = new_max == -INFINITY ? 0.f : new_max;
+        float sum = 0.f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          const int col = part * 8 + i;
+          const float p = __expf(score[m][col] - base);
+          phi[m][col] = (_Float16)p;
+          sum += p;
+        }
+        sum += __shfl_xor(sum, 1);
+        sum += __shfl_xor(sum, 2);
+        if (part == 0) {
+          const float s = old_max == -INFINITY ? 0.f : __expf(old_max - base);
+          maxima[m] = new_max; scale[m] = s; sums[m] = sums[m] * s + sum;
+        }
+      }
+      StageBarrier();
+      pv(s);
+      StageBarrier();
+    }
+  }
+  if constexpr (!Gate) {
+#pragma unroll
+    for (int m3 = 0; m3 < 3; ++m3)
+#pragma unroll
+      for (int d2 = 0; d2 < 2; ++d2)
+#pragma unroll
+        for (int z = 0; z < 8; ++z) {
+          const int m = m3 * 16 + FragmentRow(z), row = m / 12, head = m % 12;
+          const int d = wave * 32 + d2 * 16 + (lane & 15);
+          if (row < rows)
+            a.context[((size_t)(r0 + row) * 24 + g * 12 + head) * 256 + d] = out[m3][d2][z] / sums[m];
+        }
+    return;
+  }
+  // The fused gate of QsaUnionHalfQKernel<true>, element by element.
+  auto gated = reinterpret_cast<_Float16(*)[256]>(smem);
+#pragma unroll
+  for (int m3 = 0; m3 < 3; ++m3)
+#pragma unroll
+    for (int d2 = 0; d2 < 2; ++d2)
+#pragma unroll
+      for (int z = 0; z < 8; ++z) {
+        const int m = m3 * 16 + FragmentRow(z), row = m / 12, h = g * 12 + m % 12;
+        const int d = wave * 32 + d2 * 16 + (lane & 15);
+        if (row < rows) {
+          const float context = out[m3][d2][z] / sums[m];
+          const float gate = Sigmoid(q.q[((size_t)(r0 + row) * 24 + h) * 512 + 256 + d]);
+          const float x = context * gate;
+          gated[m][d] = (_Float16)(RoundH(x) * __half2float(q.suh_o[h * 256 + d]));
+        }
+      }
+  StageBarrier();
+  for (int job = wave; job < 96; job += 8) {
+    const int m = job >> 1, half = job & 1, row = m / 12, h = g * 12 + m % 12;
+    if (row >= rows) continue;
+    float v[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) v[i] = (float)gated[m][half * 128 + lane * 4 + i];
+    Wht128(v);
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      q.xh_o[OutProjIndex(r0 + row, h * 256 + half * 128 + lane * 4 + i, q.pack_rows, q.pack_off)] =
+          __float2half(v[i] * kHadNorm);
+  }
+}
+
 
 inline size_t QsaUnionListInts(int rows) {
   return (size_t)((rows + kUnionRows - 1) / kUnionRows) * kUnionCap;
 }
+
+// qsa-attn: QsaUnionStageKernel in place of QsaUnionHalfQKernel (same bits). On since its gate of Oct 31
+// (token gates 4.05 and 3.05 pass, exact-extend load 6 of 6, cold prefill +2.62% at 32K and +3.86% at 130K);
+// a constexpr, so no new CRUCIBLE_* switch. false gives the old kernel.
+constexpr bool kQsaUnionStage = true;
 
 // Same work as LaunchQsaFlash for one part (pos0 + R <= context).
 inline void LaunchQsaUnionFlash(QsaPrefill a, QsaUnion u, hipStream_t stream = nullptr) {
@@ -476,6 +758,7 @@ inline void LaunchQsaUnionFlash(QsaPrefill a, QsaUnion u, hipStream_t stream = n
   const int blocks = (q.pos0 + q.R - 1) / 4 + 1;
   QsaUnionBuildKernel<<<tiles, 256, blocks, stream>>>(q, u);
   if (a.q_lo) QsaUnionFlashKernel<true><<<dim3(tiles, 2), 256, 0, stream>>>(a, u);
+  else if constexpr (kQsaUnionStage) QsaUnionStageKernel<false><<<dim3(2, tiles), 256, 0, stream>>>(a, u);
   else QsaUnionHalfQKernel<false><<<dim3(2, tiles), 256, 0, stream>>>(a, u);
 }
 
@@ -491,7 +774,8 @@ inline void LaunchQsaUnionFlashGate(QsaPrefill a, QsaUnion u, hipStream_t stream
     return;
   }
   QsaUnionBuildKernel<<<tiles, 256, blocks, stream>>>(q, u);
-  QsaUnionHalfQKernel<true><<<dim3(2, tiles), 256, 0, stream>>>(a, u);
+  if constexpr (kQsaUnionStage) QsaUnionStageKernel<true><<<dim3(2, tiles), 256, 0, stream>>>(a, u);
+  else QsaUnionHalfQKernel<true><<<dim3(2, tiles), 256, 0, stream>>>(a, u);
 }
 
 // LaunchQsaPrefill with the row-tile union flash in place of the per-row one.

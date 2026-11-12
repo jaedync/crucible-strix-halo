@@ -1,2 +1,0 @@
-{"event":"ready","load_seconds":39.536605799,"max_rows":8,"draft_head":"full","draft_q":0,"lookup":0}
-{"event":"result","name":"long_16384","repeat":0,"spec":0,"prompt_tokens":16384,"prefill_seconds":12.842655771,"ttft_seconds":12.842655771,"decode_seconds":0.000013956,"forwards":0,"accepted":0,"proposed":0,"output_ids":[27775]}

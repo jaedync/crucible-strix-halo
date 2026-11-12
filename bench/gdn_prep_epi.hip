@@ -7,7 +7,13 @@
 // partial tile) and part edges in the check. Then ABAB event timing.
 // Usage: gdn_prep_epi [--k K] [--pairs N] [rows ...]
 // A build with -DGDN_PREP_EPI_BENCH_MUTANT skips the halo rows: it must FAIL.
+// the "cut" check runs the epilogue path with the engine's lazy-scale anchor (2,048) twice: whole
+// parts, and the part that holds a cut p as two pieces (crucible::PrefillPieces, qk_rows, LaunchGdnPrepQkHalo), with
+// the separate gate (LaunchGdnLanes) and the fused scan gate (LaunchGdnScanGate). The state with its scale floats,
+// the history ring and the gated out-projection input must be equal. A build with -DGDN_CUT_BENCH_MUTANT reads the
+// piece's q and k without qk_rows: it must FAIL.
 #include "prefill_common.h"
+#include "../engine/model/flashnext/prefill_launch.h"
 #include "../engine/exl3/decode_split.h"
 #include "../engine/layers/prefill_hc.h"
 #include "../engine/exl3/prefill_linear.h"
@@ -64,17 +70,24 @@ struct Gemm {
 
 struct Gdn {
   int R;
-  Buffer<float> ab, conv, A_log, dt_bias, gamma, hist, hist0, state, state0;
+  Buffer<float> ab, conv, A_log, dt_bias, gamma, hist, hist0, state, state0, carry;
+  Buffer<unsigned long long> prog;
+  unsigned gen = 0;
   Buffer<__half> suh, xh;
   Buffer<float> q, k, qf, kf, v, y, g, beta;
   explicit Gdn(int rows)
       : R(rows), ab(Random((size_t)rows * 96, 1.f, 3)), conv(Random(kQkvO * 4, .5f, 4)), A_log(Random(48, .5f, 5)),
         dt_bias(Random(48, .5f, 6)), gamma(Random(128, .1f, 7)), hist(16 * kQkvO), hist0(Random(16 * kQkvO, 1.f, 8)),
-        state(48 * 128 * 128), state0(Random(48 * 128 * 128, .01f, 9)), suh(Half(Random(kZO, 1.f, 10))),
+        state(kGdnStateFloats + kGdnScaleFloats), state0(Init()), carry(48), prog(48 * 4), suh(Half(Random(kZO, 1.f, 10))),
         xh((size_t)rows * kZO), q(48 * (size_t)kCore * 128), k(48 * (size_t)kCore * 128),
         qf(Parts() * kGdnPrepPartFloats), kf(Parts() * kGdnPrepPartFloats), v(48 * (size_t)kCore * 128),
         y(48 * (size_t)kCore * 128), g(48 * kCore), beta(48 * kCore) {}
   size_t Parts() const { return (size_t)(R + kCore - 1) / kCore; }
+  static std::vector<float> Init() {
+    auto x = Random(kGdnStateFloats + kGdnScaleFloats, .01f, 9);
+    std::fill(x.begin() + kGdnStateFloats, x.end(), 0.f);  // a zeroed scale means 1
+    return x;
+  }
   void Reset() {
     HIP_OK(hipMemcpy(state.p, state0.p, state.n * 4, hipMemcpyDeviceToDevice));
     HIP_OK(hipMemcpy(hist.p, hist0.p, hist.n * 4, hipMemcpyDeviceToDevice));
@@ -114,7 +127,49 @@ void Parts(GdnPrefill full, Gdn& d, int halo, std::vector<float>* qk = nullptr) 
   }
 }
 
+// b-cut2: the epilogue path as prefill_engine.inc runs it with a cut (0: none) and the lazy-scale anchor.
+void PartsCut(GdnPrefill full, Gdn& d, int halo, int cut, bool fused) {
+  full.anchor = kCore; full.carry = d.carry.p;
+  const auto args = [&](int o, int n) {
+    GdnPrefill a = full;
+    a.input.qkv += (size_t)o * kQkvO; a.input.z += (size_t)o * kZO;
+    if (a.input.pack_rows) a.input.pack_off = o; else a.input.xh_out += (size_t)o * kZO;
+    a.input.pos0 += o; a.input.R = a.input.commit = n;
+    a.ab_logits += (size_t)o * 96; a.chunks = (n + 63) / 64;
+    return a;
+  };
+  for (const auto& piece : crucible::PrefillPieces(full.input.R, cut)) {
+    const int o = piece.offset, n = piece.rows;
+    GdnPrefill a = args(o, n);
+    const size_t part = (size_t)(piece.part / kCore) * kGdnPrepPartFloats;
+    a.q = d.qf.p + part + (size_t)(o - piece.part) * 128; a.k = d.kf.p + part + (size_t)(o - piece.part) * 128;
+    if (n != piece.part_rows) {
+#ifndef GDN_CUT_BENCH_MUTANT
+      a.qk_rows = (piece.part_rows + 63) & ~63;
+#else
+      a.qk_rows = a.chunks * 64;
+#endif
+      if (o == piece.part) {
+        GdnPrefill w = args(o, piece.part_rows);
+        w.q = d.qf.p + part; w.k = d.kf.p + part;
+        LaunchGdnPrepQkHalo(w, nullptr, halo);
+      }
+    }
+    if (fused) LaunchGdnScanGate(a, d.prog.p, ++d.gen ? d.gen : ++d.gen, nullptr, halo);
+    else LaunchGdnLanes(a, nullptr, true, halo);
+  }
+}
+
 struct Result { std::vector<float> qk, state, hist, y; std::vector<__half> xh; };
+Result RunCut(const Gemm& m, Gdn& d, bool packed, int pos0, int cut, bool fused) {
+  d.Reset();
+  m.Run(GdnPrepEpi{m.qkv.p, d.qf.p, d.kf.p, d.conv.p, d.R});
+  PartsCut(d.Full(m, packed, pos0), d, 16 * kRm, cut, fused);
+  CheckLaunch();
+  Result out;
+  out.state = d.state.Get(); out.hist = d.hist.Get(); out.xh = d.xh.Get();
+  return out;
+}
 Result Run(const Gemm& m, Gdn& d, bool packed, int pos0, bool epi) {
   d.Reset();
   GdnPrefill full = d.Full(m, packed, pos0);
@@ -144,9 +199,11 @@ template <class T> bool Same(const std::vector<T>& a, const std::vector<T>& b) {
 int main(int argc, char** argv) {
   int pairs = 7;
   std::vector<int> ks, sizes;
+  bool cut_only = false;
   for (int i = 1; i < argc; ++i) {
     const std::string s = argv[i];
-    if (s == "--pairs" && i + 1 < argc) pairs = std::stoi(argv[++i]);
+    if (s == "--cut") cut_only = true;
+    else if (s == "--pairs" && i + 1 < argc) pairs = std::stoi(argv[++i]);
     else if (s == "--k" && i + 1 < argc) ks.push_back(std::stoi(argv[++i]));
     else sizes.push_back(std::stoi(s));
   }
@@ -159,6 +216,25 @@ int main(int argc, char** argv) {
       if (R < 1 || R > 16384) return 2;
       Gemm m(R, K);
       Gdn d(R);
+      // b-cut2: a cut inside a part against whole parts, both scan paths, on the 4-row grid from a launch start
+      // on that grid (PrefillPreCutValid); pos0 2,000 puts an anchor inside the first part.
+      bool cut_same = true;
+      int cuts = 0;
+      for (int cut : {4, 60, 1000, 2044, 2052, 4096 + 1000})
+        for (int pos0 : {0, 100, 2000})
+          for (int fused = 0; fused < 2; ++fused) {
+            if (cut >= R || (fused && !GdnScanGateFits())) continue;
+            const int packed = (cut / 4 + pos0) % 2;
+            const Result a = RunCut(m, d, packed, pos0, 0, fused), b = RunCut(m, d, packed, pos0, cut, fused);
+            const bool eq = Same(a.state, b.state) && Same(a.hist, b.hist) && Same(a.xh, b.xh);
+            if (!eq) std::printf("K=%d R=%d cut=%d pos0=%d fused=%d DIFFER\n", K, R, cut, pos0, fused);
+            cut_same = cut_same && eq;
+            ++cuts;
+          }
+      ok = ok && cut_same;
+      std::printf("K=%d R=%d cut=%s (%d cases)", K, R, cut_same ? "EQUAL" : "DIFFER", cuts);
+      if (cut_only) { std::printf("\n"); std::fflush(stdout); continue; }
+      std::printf("  ");
       bool same = true;
       for (int packed = 0; packed < 2; ++packed)
         for (int pos0 : {0, 2, 5, 100}) {

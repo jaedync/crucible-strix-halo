@@ -11,6 +11,7 @@ Rank 2 (layer operators).
 - Prefill operators: `prefill_hc.h`, `prefill_ple.h`, `prefill_moe.h`,
   `prefill_moe_pair.h` (M1: gate/up and the mid step in one kernel)
   with its K-set allowlist `prefill_moe_kset.h` (host only).
+  `prefill_moe_tile.h` (192-row gate/up and down items: one decode per weight tile serves 12 row tiles).
 - Long-context QSA: `qsa_long.h`; capture tool `qsa_capture.h` with its
   policy `qsa_capture_policy.h`.
 - MoE helpers: `moe_window_policy.h` (the MoE window compile switch),
@@ -46,7 +47,7 @@ Names have the prefix `CRUCIBLE_`, left out here.
 
 - Numerics: `HC_WMMA`, `PERSISTENT_GDN`, `PF_EXACT_SPLIT`, `PF_GDN_EAGER`, `PF_GDN_MICRO`, `PF_HC_FUSED`, `PF_QSA_ROWS`.
 - Diagnostic: `QSA_CAPTURE_AT`, `QSA_CAPTURE_DIR`, `QSA_CAPTURE_INDEX_ONLY`.
-- Build macro: `GDN_VSCAN_MUTANT`, `PERSISTENT_GDN_DEPENDENT_LDS`, `PERSISTENT_GDN_LIMIT_LOADS`, `PERSISTENT_GDN_PREFETCH`, `PERSISTENT_GDN_SERIAL`, `PERSISTENT_GDN_WAVES`, `PERSISTENT_HC_PIPE`, `PF_QSA_SCORE_MODE`, `QSA_POOL_TILED`, `QSA_PREFETCH`, `QSA_SPLITS`, `QSA_TRACE`.
+- Build macro: `GDN_VSCAN_MUTANT`, `PERSISTENT_GDN_PREFETCH`, `PERSISTENT_GDN_SERIAL`, `PERSISTENT_HC_PIPE`, `PF_QSA_SCORE_MODE`, `QSA_POOL_TILED`, `QSA_PREFETCH`, `QSA_SPLITS`, `QSA_TRACE`.
 
 ## Lever ledger (closed)
 

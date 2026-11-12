@@ -7,7 +7,7 @@
 #include "geometry.h"
 
 namespace crucible {
-constexpr size_t kGdnStateBytes = sizeof(float) * 48 * 128 * 128;
+constexpr size_t kGdnStateBytes = sizeof(float) * (kGdnStateFloats + kGdnScaleFloats);
 constexpr size_t kGdnHistBytes = sizeof(float) * 16 * kGdnQkvWidth;
 constexpr size_t kPleRingBytes = sizeof(float) * 16 * kWide;
 

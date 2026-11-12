@@ -51,6 +51,12 @@ def scheduled_body(source, name):
         if reference.count(binding) != 1:
             raise ValueError('the GDN state binding changed; review the persistent adapter')
         reference = reference.replace(binding, '', 1)
+        # The pending-row stride of the argument type: the persistent caller holds one trunk GdnArgs (kMaxRows; it
+        # never runs with a verify span, CRUCIBLE_SPEC_SPAN).
+        stride = '\n  constexpr int PEND = kGdnPendRows<Args>;  // pending rows per head in a.pend'
+        if reference.count(stride) != 1:
+            raise ValueError('the GDN pending stride changed; review the persistent adapter')
+        reference = reference.replace(stride, '\n  constexpr int PEND = kMaxRows;  // pending rows per head in a.pend', 1)
     result = adapt(reference)
     # Lookahead progress belongs to the per-op kernels; the persistent side
     # requires the lookahead off, so it publishes nothing.
@@ -66,11 +72,6 @@ def scheduled_body(source, name):
                                 'S[i] += PersistentCoefficient(kq + i, y) * delta;')
         result = result.replace('y += S[i] * qq[i];',
                                 'y += S[i] * PersistentCoefficient(qq + i, y);')
-        fence = '\n#if CRUCIBLE_PERSISTENT_GDN_LIMIT_LOADS\n      asm volatile("" ::: "memory");\n#endif\n'
-        for line in ('      mem += S[ii] * PersistentCoefficient(kq + ii, mem);',
-                     '      mem += S[i] * PersistentCoefficient(kq + i, mem);',
-                     '      S[i] += PersistentCoefficient(kq + i, y) * delta;'):
-            result = result.replace(line, fence + line)
     return result
 
 

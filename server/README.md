@@ -4,7 +4,8 @@ This server provides a small OpenAI-compatible API.
 It supports text chat and text completions with greedy or exact sampled decoding.
 It binds to `127.0.0.1` by default, on port 8790 unless `--port` selects another port.
 `--host ADDRESS` selects another bind address (see [Bind address](#bind-address)).
-It has no authentication and must remain local.
+It needs no key on loopback. An address that is not loopback needs an API key (see [API key](#api-key)).
+It has no TLS: use a reverse proxy for other machines (see [Remote access](../docs/REMOTE_ACCESS.md)).
 It is not a persistent service.
 
 ## Agent clients
@@ -44,6 +45,10 @@ curl -sS -N http://127.0.0.1:8790/v1/chat/completions \
 
 Set `stream` to `false` for one JSON response.
 Use `GET /v1/models` to get the loaded model ID.
+An engine started in request mode (`CRUCIBLE_ABLATE=<file> CRUCIBLE_ABLATE_MODE=request`) serves the stock and
+the ablated model in one process. Select the ablated mode with the model name `<served id>-abliterated` (or the
+same form of `--model-name`) or with the body field `"crucible_ablate": true`. `/v1/models` lists the ablated
+names only then. On a stock engine both forms get HTTP 400, never a stock answer.
 Use `GET /v1/crucible/version` to get the Crucible version and the git commit. `GET /v1/models` also has
 `crucible_version`.
 The server tells you at start when a newer release exists (one request a day to GitHub). Turn it off with
@@ -61,7 +66,7 @@ Batches are not supported.
 The server accepts any `Host` header. A reverse proxy such as llama-swap, nginx or LiteLLM sends the `Host` header of
 its own client, for example `myserver:8080`. The server answers it with no extra setting.
 The server binds `127.0.0.1` by default, so the proxy must run on the same machine.
-To reach it from another machine, use `--host` (see [Bind address](#bind-address)).
+To reach it from another machine, use `--host` with an API key (see [Bind address](#bind-address) and [API key](#api-key)).
 
 A llama-swap config (keys checked against llama-swap's `config-schema.json`):
 
@@ -108,11 +113,30 @@ export CRUCIBLE_ALLOWED_HOSTS='127.0.0.1,localhost,[::1],myserver'
 - `--host ADDRESS` sets the bind address. The default is `127.0.0.1`, so nothing changes without the flag.
 - `ADDRESS` is an IPv4 or IPv6 literal, for example `0.0.0.0`, `::`, or `::1`. A host name or a scope id (`%eth0`) stops the start (exit 2).
 - The start line `Crucible is ready at ...` shows the real address.
-- An address that is not loopback prints one `WARNING` line at start.
-  The server has no authentication, so every machine that can reach the address can use it.
+- Loopback is 127.0.0.0/8 and `::1`. Every other address needs `--api-key-file`, also `0.0.0.0`, `::` and an
+  IPv4-mapped address such as `::ffff:127.0.0.1`. Without the flag the server exits with code 2 before it loads the model.
+  The one exception is the Docker image: there `0.0.0.0` and `::` start with no key (see [Docker](../docs/DOCKER.md)).
+- An address that is not loopback prints one `WARNING` line at start. With a key, the key is then the only protection.
+  In the Docker image with no key, the line says that a published port on all addresses is an open server.
 - Turn on strict Host mode (`--allowed-host`, above) and use a firewall that limits the port to the clients you trust.
 - `::` accepts IPv4 clients too: the server sets `IPV6_V6ONLY` to 0 on every host.
 - `--host` does not change the Host check rules.
+
+### API key
+
+- `--api-key-file PATH` names a file that holds the key. `PATH` must be absolute. `./crucible setup --bind ADDRESS`
+  (or `--api-key`) makes the file `~/.config/crucible/api-key`. The key is never in an argument, a variable, `config.json` or a log.
+- The file must be a regular file (not a link) of the user that runs the server, with mode 0600 or stricter, at most
+  1024 bytes, and one key of 32 to 256 characters from `A-Z a-z 0-9 . _ ~ + / = -`. Otherwise the server exits with code 78
+  and names the file and the rule, never the content. The server reads the file once at start and keeps only a sha256 digest.
+  To change the key, replace the file and restart.
+- With a key, every route needs it except `GET /health`: send `Authorization: Bearer KEY` or `x-api-key: KEY`.
+  If a request has both headers, both must be right. A repeated header gives 400. A missing or wrong key gives 401
+  with the same text, the header `WWW-Authenticate: Bearer` and an error body that OpenAI and Anthropic clients both read
+  (error type `authentication_error`).
+- The check runs after the Host check and before the server reads the body. The key is never logged. The 401 is one
+  `crucible_error` line with the reason `auth`.
+- The key also works on loopback (`--api-key-file` with the default host). Use it behind a reverse proxy.
 
 ### Tokenize and apply the template (`POST /tokenize`, `POST /v1/tokenize`, `POST /apply-template`)
 
@@ -166,7 +190,8 @@ The server protects itself against a bad client:
 
 - It accepts at most 256 connections at one time. Above that, a new connection gets HTTP 503.
 - A client must send the request head and body in 60 s. Then the server closes the connection.
-- A request that does not fit the engine line limit (2 MiB) gets HTTP 413.
+- A request that does not fit the engine line limit gets HTTP 413. The engine reports the limit in its `ready` event
+  (`line_bytes`: 8 bytes for each context token + 1 MiB, at least 2 MiB). An engine without the field has 2 MiB.
 - With `--serial`, a stream that does not read its output for 30 s stops with an error.
 - `--max-requests-per-client N` limits the open requests of one client address (HTTP 429). It is off by default,
   because all clients on the loopback address share one address.
@@ -201,7 +226,8 @@ The server protects itself against a bad client:
   A field in the request always wins over the server default. See [Server defaults](#server-defaults).
 - `seed`: an unsigned 64-bit integer. An omitted or null seed uses fresh system entropy.
   Every response and stream chunk reports the selected value as `seed`.
-- `presence_penalty`, `frequency_penalty`: the server accepts these fields only when they are `0` or null. They have
+- `presence_penalty`, `frequency_penalty`, `repetition_penalty`: the server accepts `presence_penalty` and
+  `frequency_penalty` only when they are `0` or null, and `repetition_penalty` only when it is `1` or null. They have
   no effect, because the engine has no penalty sampler. Any other value gets HTTP 400.
 - `max_tokens` or `max_completion_tokens`: a positive integer. The default is 128 when the request has neither field.
   The flag `--default-max-tokens N|max` changes the default (see [Server defaults](#server-defaults)).
@@ -305,10 +331,18 @@ reasoning again (about 1 s for each 1,300 tokens). Only turns that reach the clo
 The continuation depends only on the request. It is not bit-identical to one job that decodes the forced tokens,
 because the second job computes the reasoning with prefill arithmetic.
 That turn writes one `crucible_turn` line with the counts that the client sees and the first job's times,
-so a log collector can join it to its own request record. `think_closed_at`, `think_closed_by`, and `cont_*` fields describe the
+so a gateway joins it to its own row for the request. `think_closed_at`, `think_closed_by`, and `cont_*` fields describe the
 second job. `crucible_metrics` in the reply describes the second job.
 Every `crucible_turn` line also carries numbers about the engine, the decode passes, the stall and the token
 classes.
+
+A request may send a gateway's id for it in the header `X-Client-Request-Id`. The flag `--client-request-id-header NAME`
+(or the variable `CRUCIBLE_CLIENT_REQUEST_ID_HEADER`; the flag wins) sets another header name: 1 to 64 letters, digits
+or hyphens, matched without regard to case. An invalid name stops the start. When the value matches
+`^[A-Za-z0-9_.:-]{1,64}$`, the server writes it as the field `client_request_id` in every `crucible_prefill`,
+`crucible_decode`, `crucible_turn`, `crucible_error` and `crucible_cancel` line of that request, on both workers and
+on both jobs of a closed think turn. So a gateway can pair a request with its lines when requests overlap. A missing or
+invalid header adds no field and changes nothing else. The value is never part of a reply.
 
 Two stderr lines show a turn while it runs. They hold counts only, never token IDs or text.
 
@@ -334,7 +368,7 @@ The template replays assistant `reasoning_content` inside `<think>` for every tu
 
 The server renders the checkpoint's real chat template.
 It accepts system, user, assistant, and tool messages.
-It also accepts text content blocks, assistant `reasoning_content`, and assistant `tool_calls`.
+It also accepts text content blocks, assistant `reasoning_content` (or `reasoning`, its alias), and assistant `tool_calls`.
 With `--vision`, it also accepts image content parts. See [Image input](#image-input).
 It rejects video, unsupported sampling controls, and unknown fields.
 
@@ -344,8 +378,16 @@ Usage counts include the generated stop token.
 The prompt and requested output must fit the configured context.
 Otherwise the server returns HTTP 400 with a message that contains "exceeds the context window".
 Start the server with `--clamp-max-tokens` to lower `max_tokens` to the remaining context instead.
-Request bodies are limited to 1 MiB (HTTP 413). `--max-body-mib N` raises the limit to N MiB (at most 64, or 1024 with `--vision`).
-A 256K-token conversation of code can need more than 1 MiB.
+
+A YaRN server (`--ctx` above 262144, or `CRUCIBLE_ROPE_MODE=auto:2|auto:4`) has a reply reserve R
+(`--yarn-reply-reserve N`, default 32768):
+
+- A request is plain when its prompt plus `min(max_tokens, R) - 1` is 262144 tokens or fewer. Else it runs YaRN.
+- The server lowers the `max_tokens` of a plain request to the plain limit (prompt + `max_tokens` - 1 = 262144).
+- A reply that reaches that limit ends with `finish_reason` `length`. The next request of the conversation runs YaRN.
+- A `crucible_rope` stderr line counts each clamp, each cut (a clamped reply that reached its limit) and each crossing.
+The default body limit holds 16 bytes for each `--ctx` token, at least 1 MiB (HTTP 413 above it): 1 MiB at 32768,
+4 MiB at 262144 and 8 MiB at 524288. `--max-body-mib N` sets N MiB (at most 64, or 1024 with `--vision`).
 
 Without `--streams`, the server uses the batch worker with one stream (`--streams 1`).
 It processes one request at a time. The remaining requests wait in a queue.
@@ -421,7 +463,7 @@ A request that sends a `seed` still gives the same tokens each time.
 
 Start the server with `--vision` to load the vision tower (about 0.3 GB).
 Without `--vision`, a request with an image part gets HTTP 400 with a message that names the flag.
-`--vision` also raises the default body limit to 256 MiB (`--max-body-mib` allows up to 1024 with `--vision`).
+`--vision` also raises the default body limit to at least 256 MiB (`--max-body-mib` allows up to 1024 with `--vision`).
 
 Send each image as an OpenAI `image_url` part with a base64 `data:` URL:
 
@@ -481,6 +523,18 @@ code in `usage.tool_call_invalid` (for example `incomplete_call`, `parameter_tag
 If deltas of a call already went out, the stream ends with `finish_reason` `length`, not `stop`.
 Clients such as Pi then do not run the partial call. Pi sends the model an error result and asks it to issue the call again.
 
+The end-of-turn guard (`--end-of-turn-guard on`, the default) handles a model that writes an end-of-turn token
+(`<|im_end|>` or `<|endoftext|>`) inside its reasoning or inside an open tool call, for example when it quotes a chat
+template. The server keeps that token as plain text and the model goes on. This happens at most 16 times in the
+reasoning and 4 times in a tool call for each reply. After that limit the token ends the reply as before. An
+end-of-turn token in the answer itself always ends the reply. The guard acts on chat requests only, not on
+`/v1/completions`. It does not act when the kept text would pass the thinking cap or leave no room for the reply
+(`max_tokens`); the token then ends the reply as before. The kept tokens are counted in
+`usage.completion_tokens_details.end_of_turn_kept` and each one writes a `crucible_end_of_turn_kept` line to stderr,
+with no model text. A client `stop` string that the kept text matches ends the reply. Each kept token starts a new
+engine job, so on a busy server a kept token can add a short delay (not measured). Use `--end-of-turn-guard off` for
+the old behavior: the token ends the reply.
+
 The client must execute each function and send one tool result for each call ID.
 Include the assistant message and its `tool_calls` before these results.
 Use `{"role":"tool","tool_call_id":"call_...","content":"42"}` for a result.
@@ -525,7 +579,8 @@ The engine writes accepted token IDs immediately:
 
 A `done` event gives prompt usage, completion usage, timing, and the finish reason.
 A malformed request produces an `error` event without stopping the resident engine.
-The input limit is 2 MiB per line.
+The input limit per line follows the context: 8 bytes for each context token + 1 MiB, at least 2 MiB
+(`engine/serve/serve_line.h`). The `ready` event reports it as `line_bytes`. A longer line gets an `error` event.
 With `--vision 1`, a request can add `"images"` (at most 256): a list of objects with `offset` (first image token),
 `height`, `width`, `digest` (64 hex characters), and `path` (an absolute path to a regular file of
 height x width x 3 RGB bytes, not a symbolic link). The digest is the SHA-256 of the little-endian `uint32` pair

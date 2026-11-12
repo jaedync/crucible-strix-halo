@@ -23,7 +23,7 @@ class EquivalenceTest(unittest.TestCase):
         for module in (g, lg):
             p = patch.object(module, 'VOCAB', 4); p.start(); self.addCleanup(p.stop)
         self.out = self.root/'nonce'; self.out.mkdir()
-        self.start = time.time_ns()
+        self.start = time.time_ns(); time.sleep(0.05)  # a file's mtime comes from the coarse kernel clock, up to one tick behind time_ns()
         self.plan = {'nonce': 'nonce', 'root': str(self.out), 'tokens': 8,
                      'commands': [['resident'], ['cli0'], ['cli1'], ['cli2']],
                      'prompts': []}
@@ -269,7 +269,7 @@ class EquivalenceTest(unittest.TestCase):
                     frozen = json.loads(kwargs['input'])
                     self.assertEqual(frozen['tokens'], 8)
                     if mutation != 'noop':
-                        self.start = time.time_ns(); self.emit()
+                        self.start = time.time_ns(); time.sleep(0.05); self.emit()  # see setUp: coarse mtime vs time_ns()
                         receipt_path = self.out/'worker.json'; receipt = json.loads(receipt_path.read_text())
                         receipt['nonce'] = self.out.name
                         for child in receipt['children']: child['nonce'] = self.out.name

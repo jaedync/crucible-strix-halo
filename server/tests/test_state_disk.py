@@ -307,11 +307,11 @@ class StateDiskTest(unittest.TestCase):
             items = iter(list(events) + [dict(event="batch_end", op="stage")])
             backend._next = lambda: next(items)
         replies(dict(event="staged", state="ready", tokens=40, reason="start", tag=7))
-        self.assertEqual(backend._stage(dict(ids=[1, 2]), 2, read=False), ("ready", "start", 40, 7))
+        self.assertEqual(backend._stage(dict(ids=[1, 2]), 2, read=False)[:4], ("ready", "start", 40, 7))
         self.assertEqual(json.loads(sent[-1])["position"], 2)
         self.assertEqual(json.loads(sent[-1])["read"], 0)
         replies(dict(event="staged", state="none", tokens=0))
-        self.assertEqual(backend._stage(dict(ids=[1, 2])), ("none", "-", 0, 0))
+        self.assertEqual(backend._stage(dict(ids=[1, 2]))[:4], ("none", "-", 0, 0))
         # Review HIGH-2: the default command (next turn, may read) is the 7b3106e8 one, byte for byte, so this server
         # also drives the train 23 engine, which refuses unknown fields.
         self.assertEqual(sent[-1], json.dumps(dict(op="stage", request=dict(ids=[1, 2])), separators=(",", ":"),
@@ -323,6 +323,35 @@ class StateDiskTest(unittest.TestCase):
         self.assertEqual(backend._stage(dict(ids=[1, 2])).reason, "other")
         replies(dict(event="staged", state="none", tokens=0, tag=-1))
         with self.assertRaises(ProtocolError): backend._stage(dict(ids=[1, 2]))
+
+    def test_the_stage_reply_carries_the_ledger_words(self):
+        """Start plan B1a: the engine names the length of the best disk state (also for a refused read: today such a
+        reply says tokens 0) and what the read waits for. An older engine sends neither; a word outside the closed set
+        is dropped, a bad length is a protocol error."""
+        backend = object.__new__(BatchedEngineBackend)
+        backend.process = SimpleNamespace(stdin=SimpleNamespace(write=lambda text: None, flush=lambda: None))
+        def replies(*events):
+            items = iter(list(events) + [dict(event="batch_end", op="stage")])
+            backend._next = lambda: next(items)
+        replies(dict(event="staged", state="none", tokens=0, reason="room", tag=0, best=171777, wait="room"))
+        reply = backend._stage(dict(ids=[1, 2]))
+        self.assertEqual((reply.state, reply.tokens, reply.best, reply.wait), ("none", 0, 171777, "room"))
+        replies(dict(event="staged", state="none", tokens=0))
+        reply = backend._stage(dict(ids=[1, 2]))
+        self.assertEqual((reply.best, reply.wait), (None, None))
+        replies(dict(event="staged", state="reading", tokens=40, wait="Bad Word", best=40))
+        self.assertEqual(backend._stage(dict(ids=[1, 2])).wait, None)
+        replies(dict(event="staged", state="none", tokens=0, best=-1))
+        with self.assertRaises(ProtocolError): backend._stage(dict(ids=[1, 2]))
+
+    def test_a_refused_read_names_its_state_on_the_turn_line(self):
+        """The turn's record keeps the ledger words of its last stage reply (load_fields passes them)."""
+        ids = list(range(1, STAGE_MIN_TOKENS + 100))
+        self.disk.write_text(json.dumps([ids]))
+        backend = self.start()
+        job = self.run_job(backend, ids + [7, 8, 9])
+        self.assertEqual(job.turn.get("stage_best_tokens"), len(ids))
+        self.assertIn(job.turn.get("stage_wait_cause"), ("none", "reader"))
 
     def test_the_stage_job_tag_goes_only_to_an_engine_that_takes_it(self):
         """Fix 2 (cause.md item 10): each long turn has one tag on the engine's stage and host_evict lines and on its
@@ -342,7 +371,7 @@ class StateDiskTest(unittest.TestCase):
         self.assertEqual((backend._job_tag(job), backend._job_tag(job), backend._job_tag(other)), (1, 1, 2))
         self.assertEqual(job.turn["state_disk_job"], 1)
         replies()
-        self.assertEqual(backend._stage(dict(ids=[1, 2]), 0, True, 1), ("reading", "writing", 40, 0))
+        self.assertEqual(backend._stage(dict(ids=[1, 2]), 0, True, 1)[:4], ("reading", "writing", 40, 0))
         self.assertEqual(json.loads(sent[-1]), dict(op="stage", request=dict(ids=[1, 2]), job=1))
         # The ready event decides it.
         backend = object.__new__(BatchedEngineBackend)
@@ -425,6 +454,79 @@ class StateDiskTest(unittest.TestCase):
             self.assertEqual(job.turn["state_disk_wait_s"], 0)
             clock[0] += 1
             self.assertTrue(backend._staged(job))
+
+    def test_a_slot_wait_does_not_use_up_the_time_of_a_read_that_starts_late(self):
+        """a long turn waited about 90 s for a slot while the engine said
+        "reading" ("freeing": the read had no host room yet). The read started when the slot freed, but _staged counted
+        the 90 s against STAGE_WAIT_SECONDS and let the turn open in the same poll. The open then found no ready state
+        (Lookup miss, not_saved), the read ended 0.5 s later and expired unused, and the turn prefilled cold. The wait for
+        a read that is in flight must start when the turn has a free slot (and when the read starts), not at the first
+        "reading" reply."""
+        clock = [0.0]
+        started = []
+
+        def state(payload=None):
+            if clock[0] < 100: return batch_backend.StageReply("reading", "freeing", 100000)  # no room for the read yet
+            if not started: started.append(clock[0])
+            return batch_backend.StageReply("ready" if clock[0] - started[0] >= 0.5 else "reading",
+                                            "start" if clock[0] == started[0] else "-", 100000)
+
+        clock[0] = 0.0
+        backend, job, opened = self.waiting_backend(state, clock)
+        backend._stage = lambda payload, *args: state(payload)
+        with patch.object(batch_backend.time, "monotonic", side_effect=lambda: clock[0]):
+            while clock[0] < 100:  # no free slot: only _stage_ahead polls
+                self.assertFalse(backend._admit())
+                clock[0] += 0.5
+            backend.free_contexts.append(40000)
+            while not opened and clock[0] < 200:
+                backend._admit()
+                clock[0] += 0.05
+        self.assertTrue(opened)
+        self.assertEqual(job.turn["state_disk"], "ready")  # the turn opened on the finished read, not beside it
+        self.assertLess(opened[0] - 100, 2)
+
+    def test_a_none_reply_wait_does_not_use_up_the_time_of_a_read_that_starts_late(self):
+        """The journal of req 1468 (Nov 2, 15:21:34 to 15:22:37): the stage replies were "none" with reason
+        "protected" every 5.5 s for 62 s (the host cache refused room for the read), then "reading" with reason
+        "start" at the moment the slot freed. `since` was the time of the first reply, so the same poll opened the turn
+        (91.5 s after its first poll). The read ended 0.47 s later and expired unused; the turn prefilled cold."""
+        clock = [0.0]
+        started = []
+
+        def state(payload=None):
+            if clock[0] < 100: return batch_backend.StageReply("none", "protected", 100000)
+            if not started: started.append(clock[0])
+            return batch_backend.StageReply("ready" if clock[0] - started[0] >= 0.5 else "reading",
+                                            "start" if clock[0] == started[0] else "-", 100000)
+
+        backend, job, opened = self.waiting_backend(state, clock)
+        backend._stage = lambda payload, *args: state(payload)
+        with patch.object(batch_backend.time, "monotonic", side_effect=lambda: clock[0]):
+            while clock[0] < 100:
+                self.assertFalse(backend._admit())
+                clock[0] += 0.5
+            backend.free_contexts.append(40000)
+            while not opened and clock[0] < 200:
+                backend._admit()
+                clock[0] += 0.05
+        self.assertTrue(opened)
+        self.assertEqual(job.turn["state_disk"], "ready")
+        self.assertLess(opened[0] - 100, 2)
+
+    def test_a_read_that_never_starts_still_ends_the_wait(self):
+        """The bound stays: a turn with a free slot waits at most 2 * STAGE_WAIT_SECONDS for a read that never ends,
+        so one stuck read cannot hold the FIFO (batch_backend._admit) for good."""
+        clock = [0.0]
+        backend, job, opened = self.waiting_backend(lambda payload=None: "reading", clock)
+        backend.free_contexts.append(40000)
+        with patch.object(batch_backend.time, "monotonic", side_effect=lambda: clock[0]):
+            while not opened and clock[0] < 500:
+                backend._admit()
+                clock[0] += 0.05
+        self.assertTrue(opened)
+        self.assertLessEqual(opened[0], 2 * batch_backend.STAGE_WAIT_SECONDS + 1)
+        self.assertGreater(opened[0], batch_backend.STAGE_WAIT_SECONDS - 1)
 
     def test_stop_fits_the_service_stop_time(self):
         """A service unit stops with TimeoutStopSec=120. The engine flushes for at most 75 s, the server

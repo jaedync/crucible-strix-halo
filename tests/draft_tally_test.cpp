@@ -59,13 +59,57 @@ int main() {
     assert(t.passes == 2);
     assert(t.Fields() == ",\"draft_pos_proposed\":[1,1,0,0,0,0,0],\"draft_pos_tested\":[1,1,0,0,0,0,0],"
                          "\"draft_pos_accepted\":[1,0,0,0,0,0,0],\"draft_len_hist\":[0,0,1,0,0,0,0,0],"
-                         "\"draft_passes\":2,\"draft_ms\":1.750");
+                         "\"draft_passes\":2,\"draft_ms\":1.750,\"draft_run_hist\":[0,0,0,0,0,0,0,0,0],"
+                         "\"draft_lookup_rounds\":0,\"draft_lookup_pos_proposed\":[0,0,0,0,0,0,0],"
+                         "\"draft_lookup_pos_accepted\":[0,0,0,0,0,0,0]");
+  }
+  {  // runs of full-accept rounds (plan wide C): 3 full, 1 miss, 2 full; the open run counts in Fields
+    DraftTally t;
+    for (int i = 0; i < 3; ++i) Run(t, {1, 2}, 2);
+    Run(t, {1, 2}, 1, 9);
+    Run(t, {1}, 1);
+    Run(t, {}, 0);                        // no drafts: neither extends nor ends a run
+    Run(t, {1, 2, 3}, 3);
+    assert((t.run == std::array<long, 9>{0, 0, 1, 0, 0, 0, 0, 0, 0}) && t.open_run == 2);
+    assert(t.Fields().find("\"draft_run_hist\":[0,1,1,0,0,0,0,0,0]") != std::string::npos);
+    assert(t.open_run == 2);              // Fields does not close the run
+    Run(t, {4}, 0, 5);                    // a miss closes it
+    assert((t.run == std::array<long, 9>{0, 1, 1, 0, 0, 0, 0, 0, 0}) && t.open_run == 0);
+    Run(t, {4}, 0, 5);                    // a miss after a miss adds no run
+    assert((t.run == std::array<long, 9>{0, 1, 1, 0, 0, 0, 0, 0, 0}));
+  }
+  {  // the last bin holds runs of 9 or more
+    DraftTally t;
+    for (int i = 0; i < 12; ++i) Run(t, {1}, 1);
+    Run(t, {1}, 0, 2);
+    for (int i = 0; i < 8; ++i) Run(t, {1}, 1);
+    Run(t, {1}, 0, 2);
+    assert((t.run == std::array<long, 9>{0, 0, 0, 0, 0, 0, 0, 1, 1}));
+  }
+  {  // lookup rounds by position, always written, detail off
+    DraftTally t;
+    Run(t, {5, 6, 7}, 2, 9, true);
+    Run(t, {5, 6}, 2, -1, true);
+    Run(t, {5, 6, 7, 8}, 1, 4);           // a head round: not a lookup position
+    assert((t.lookup_proposed == std::array<long, 7>{2, 2, 1, 0, 0, 0, 0}));
+    assert((t.lookup_accepted == std::array<long, 7>{2, 2, 0, 0, 0, 0, 0}));
+    const std::string f = t.Fields();
+    assert(f.find("\"draft_lookup_rounds\":2,\"draft_lookup_pos_proposed\":[2,2,1,0,0,0,0],"
+                  "\"draft_lookup_pos_accepted\":[2,2,0,0,0,0,0]") != std::string::npos);
+  }
+  {  // with detail on, draft_lookup_rounds is written once
+    DraftTally t;
+    t.detail = true;
+    Run(t, {5}, 1, -1, true);
+    const std::string f = t.Fields();
+    const auto at = f.find("\"draft_lookup_rounds\"");
+    assert(at != std::string::npos && f.find("\"draft_lookup_rounds\"", at + 1) == std::string::npos);
   }
   {  // a bad call is ignored, never thrown
     DraftTally t;
     t.Round(std::vector<int>{1}, 5, 0, false);
     t.Round(std::vector<int>{1}, -1, 0, false);
-    assert(t.length == std::array<long, 8>{});
+    assert((t.length == std::array<long, 8>{}));
   }
   return 0;
 }

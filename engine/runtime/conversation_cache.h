@@ -81,8 +81,10 @@ class PrefixCache {
     for (const auto& entry : entries_)
       if (entry.policy == policy) visit(entry);
   }
+  // `reserve` false: the caller made the room already (BatchConversationCache::Admit). Its evicted entries that went to
+  // the disk writer now count in Outside(), and a second reserve here would evict more entries for them.
   bool Insert(std::span<const int> ids, const Policy& policy, size_t bytes,
-              std::shared_ptr<const Snapshot> snapshot) {
+              std::shared_ptr<const Snapshot> snapshot, bool reserve = true) {
     if (ids.empty() || !snapshot || !bytes || bytes > budget_) return false;
     for (auto it = entries_.begin(); it != entries_.end(); ++it) {
       if (it->policy == policy && it->ids.size() == ids.size() &&
@@ -92,7 +94,7 @@ class PrefixCache {
         break;
       }
     }
-    Reserve(bytes);
+    if (reserve) Reserve(bytes);
     entries_.push_front({std::vector<int>(ids.begin(), ids.end()), policy, bytes, std::move(snapshot)});
     bytes_ += bytes;
     return true;

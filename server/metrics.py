@@ -23,6 +23,24 @@ CHUNK_LIMIT = 1024
 now = time.monotonic
 
 
+# The gateway's id for a request (the header that --client-request-id-header names) reaches the log lines of its jobs
+# as client_request_id, so the gateway pairs a request with its lines when requests overlap. The id is checked here,
+# before any line holds it; a value that fails the check is dropped, and the lines keep today's keys. It is never part
+# of a response.
+CLIENT_REQUEST_ID = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+
+
+def client_request_id(value):
+    """value when it is a valid gateway request id, else None."""
+    return value if isinstance(value, str) and CLIENT_REQUEST_ID.fullmatch(value) else None
+
+
+def _client(value):
+    """The field for a log line, or nothing."""
+    value = client_request_id(value)
+    return {} if value is None else dict(client_request_id=value)
+
+
 def new_turn(request_id=None):
     return dict(enabled=False, request_id=request_id, queued=None, t_submit=now(), t_admit=None, t_first_gpu=None,
                 t_prefill_end=None, t_first_token=None, t_done=None, prefill_chunks=[], chunk_count=0, prefill_sum=0.0)
@@ -104,13 +122,26 @@ CACHE_INT_FIELDS = ("cache_saved_tokens", "cache_tail_tokens", "cache_entries", 
                     # An earlier change: per-tier lookups, hits and reused tokens (slot, host, disk), cumulative.
                     "cache_slot_lookups", "cache_slot_hits", "cache_slot_tokens",
                     "cache_host_lookups", "cache_host_hits", "cache_host_tokens",
-                    "cache_disk_lookups", "cache_disk_hits", "cache_disk_tokens")
+                    "cache_disk_lookups", "cache_disk_hits", "cache_disk_tokens",
+                    # Y2: YaRN opens and Way A crossings, cumulative.
+                    "rope_yarn_opens", "rope_crossings", "rope_crossing_tokens")
+ROPE_WORDS = frozenset(("plain", "yarn2", "yarn4"))
 # The engine's fixed miss causes (engine/serve/cache_status.h) plus ssd_read_failed, which the server adds for
-# a failed disk read. A log reader can map a word it does not know to "other", so a new reason never costs the turn's metrics.
+# a failed disk read. the gateway maps a word it does not know to "other", so a new reason never costs the turn's metrics.
 MISS_REASONS = frozenset(("none", "bypass", "too_short", "new", "diverged", "evicted", "not_saved",
                           "above_limit", "above_prompt", "off_grid", "schedule", "rows", "tail", "empty",
                           "unknown", "ssd_read_failed"))
 CLOSEST_OUTCOMES = frozenset(("all", "prompt_differs", "reply_differs"))
+# The miss ledger (start plan B1a, engine/serve/miss_ledger.h): where the best state for the prompt was and why the turn
+# did not use it. Closed word sets and numbers only. The engine's own sets; a word outside them is dropped.
+LEDGER_INT_FIELDS = ("best_shared_tokens", "disk_shared_tokens", "resume_gap_tokens", "slots_durable")
+LEDGER_WORDS = dict(
+    best_tier=frozenset(("slot", "point", "host", "disk", "lost", "none")),
+    lost_cause=frozenset(("none", "new", "handover", "evict", "idle", "budget", "spill", "stop", "switch", "undo",
+                          "unknown")),
+    resume_tier=frozenset(("slot", "point", "host", "disk", "block", "none")),
+    resume_point=frozenset(("frontier", "pre", "start", "end", "grid", "header", "tail", "none")))
+STAGE_WAIT_CAUSES = frozenset(("none", "room", "reader", "writer"))  # what a disk read waited for (stage_wait_cause)
 
 
 def _cache_fields(event):
@@ -120,8 +151,20 @@ def _cache_fields(event):
     # The miss diagnosis: a closed set of words, so no request text can reach the line.
     if event.get("miss_reason") in MISS_REASONS:
         fields["miss_reason"] = event["miss_reason"]
+    if event.get("rope") in ROPE_WORDS:
+        fields["rope"] = event["rope"]
     if event.get("closest_outcome") in CLOSEST_OUTCOMES:
         fields["closest_outcome"] = event["closest_outcome"]
+    for key in LEDGER_INT_FIELDS:
+        if type(event.get(key)) is int and event[key] >= 0: fields[key] = event[key]
+    for key, words in LEDGER_WORDS.items():
+        if event.get(key) in words: fields[key] = event[key]
+    restore = event.get("restore_seconds")  # the time from the open to the state in the slot (copy, host or SSD read)
+    if type(restore) in (int, float) and not isinstance(restore, bool) and restore >= 0:
+        fields["restore_s"] = float(restore)
+    drain = event.get("handover_drain_s")  # the time that the open waited for the disk writer
+    if type(drain) in (int, float) and not isinstance(drain, bool) and drain >= 0:
+        fields["handover_drain_s"] = float(drain)
     age = event.get("closest_age_s")
     if type(age) in (int, float) and not isinstance(age, bool) and age >= 0:
         fields["closest_age_s"] = float(age)
@@ -145,6 +188,10 @@ ENGINE_DRAFT_FIELDS = ("draft_proposed", "draft_accepted", "spec_steps")
 DRAFT_POSITIONS = 7
 DRAFT_LIST_FIELDS = (("draft_pos_proposed", DRAFT_POSITIONS), ("draft_pos_tested", DRAFT_POSITIONS),
                      ("draft_pos_accepted", DRAFT_POSITIONS), ("draft_len_hist", DRAFT_POSITIONS + 1))
+# Optional lists (engine/serve/draft_tally.h kDraftRunBins): an older engine does not write them.
+DRAFT_RUN_BINS = 9
+DRAFT_WIDE_LISTS = (("draft_run_hist", DRAFT_RUN_BINS), ("draft_lookup_pos_proposed", DRAFT_POSITIONS),
+                    ("draft_lookup_pos_accepted", DRAFT_POSITIONS))
 
 
 def _count_list(value, size):
@@ -163,6 +210,14 @@ def draft_position_fields(events):
             return {}
         fields = {name: [sum(column) for column in zip(*(event[name] for event in events))]
                   for name, _ in DRAFT_LIST_FIELDS}
+        # The rounds whose drafts were lookup copies of the history (the done event has it with --draft-stats): only
+        # when every event reports a count, so a sum never mixes reported and missing jobs.
+        if all(type(event.get("draft_lookup_rounds")) is int and event["draft_lookup_rounds"] >= 0 for event in events):
+            fields["draft_lookup_rounds"] = sum(event["draft_lookup_rounds"] for event in events)
+        # Plan wide C: runs of full-accept rounds, and the lookup rounds by position. Each list on its own terms.
+        for name, size in DRAFT_WIDE_LISTS:
+            if all(_count_list(event.get(name), size) for event in events):
+                fields[name] = [sum(column) for column in zip(*(event[name] for event in events))]
         return fields | dict(draft_passes=sum(event["draft_passes"] for event in events),
                              draft_ms=float(sum(event["draft_ms"] for event in events)))
     except (AttributeError, TypeError, ValueError):  # A counter must never fail a request.
@@ -192,7 +247,7 @@ def draft_fields(*parts):
     return dict(spec_rounds=rounds, draft_accepted=sum(turn.get("round_tokens", 0) for turn in counted) - rounds)
 
 
-# crucible_decode (live drafts for a log reader): at most one line a second for each decoding
+# crucible_decode (the gateway's live drafts): at most one line a second for each decoding
 # speculative turn, and one final line with its crucible_turn values. Counts only, never token IDs or text.
 DECODE_LINE_SECONDS = 1.0
 DECODE_DRAFT_KEYS = ("spec_rounds", "draft_proposed", "draft_accepted")
@@ -239,13 +294,14 @@ def decode_line(job, t):
             done = owner.get("closed_count", owner.get("decode_tokens", 0)) + turn.get("decode_tokens", 0)
         if getattr(job, "think_cap", None) is not None:
             done = min(done, job.think_cap)  # tokens past an armed cap are discarded, so the count stays monotonic
-        # a log parser needs draft_proposed: without the engine's step counters (an older engine, or packed_op step
+        # A log parser needs draft_proposed: without the engine's step counters (an older engine, or packed_op step
         # before the first speculative step) the turn writes no line.
         if not draft or not draft.get("spec_rounds") or "draft_proposed" not in draft or type(done) is not int:
             return None
         owner["decode_line_t"] = t
         return _decode_text(dict(request_id=owner.get("request_id"), completion_tokens=done,
-                                 **{key: draft[key] for key in DECODE_DRAFT_KEYS if key in draft}, elapsed_s=t - start))
+                                 **{key: draft[key] for key in DECODE_DRAFT_KEYS if key in draft}, elapsed_s=t - start) |
+                            _client(owner.get("client_request_id")))
     except (AttributeError, TypeError, ValueError):  # A counter must never fail a request.
         return None
 
@@ -260,7 +316,7 @@ def final_decode_line(turn_text, owner):
             return None
         return _decode_text(dict(request_id=fields.get("request_id"), completion_tokens=fields.get("completion_tokens"),
                                  **{key: fields[key] for key in DECODE_DRAFT_KEYS if key in fields},
-                                 elapsed_s=fields.get("decode_s")))
+                                 elapsed_s=fields.get("decode_s")) | _client(fields.get("client_request_id")))
     except (AttributeError, TypeError, ValueError):
         return None
 
@@ -336,7 +392,8 @@ def load_fields(turns):
 
 
 def _load_fields(turns):
-    fields = {}
+    # A closed think turn's jobs share the id; the first job's turn is first in turns.
+    fields = _client(next((turn["client_request_id"] for turn in turns if "client_request_id" in turn), None))
     engine = next((turn["engine_id"] for turn in turns if isinstance(turn.get("engine_id"), str)), None)
     if engine is not None and re.fullmatch("[0-9a-f]{%d}" % ENGINE_ID_DIGITS, engine):
         fields["engine_id"] = engine
@@ -356,6 +413,22 @@ def _load_fields(turns):
         if isinstance(reason, str) and re.fullmatch(r"[a-z0-9_]{1,24}|-", reason): fields["state_disk_reason"] = reason
         for key in ("state_disk_polls", "state_disk_tokens", "state_disk_tag", "state_disk_job"):
             if type(staged.get(key)) is int: fields[key] = staged[key]
+        # Start plan B1a: the best disk state for the prompt, also when its read was refused, and what the read waited for.
+        if type(staged.get("stage_best_tokens")) is int and staged["stage_best_tokens"] >= 0:
+            fields["stage_best_tokens"] = staged["stage_best_tokens"]
+        if staged.get("stage_wait_cause") in STAGE_WAIT_CAUSES: fields["stage_wait_cause"] = staged["stage_wait_cause"]
+    # The block length that the server gave the turn's first job (server/backend.py submit).
+    shared = next((turn["shared_prefix_tokens"] for turn in turns if type(turn.get("shared_prefix_tokens")) is int), None)
+    if shared is not None and shared >= 0: fields["shared_prefix_tokens"] = shared
+    # The prompt rows that a cancelled prefill of this turn had computed (server/batch_backend.py _cancelled).
+    cancelled = [turn["cancel_prefill_tokens"] for turn in turns if type(turn.get("cancel_prefill_tokens")) is int]
+    if cancelled: fields["cancel_prefill_tokens"] = sum(cancelled)
+    # The request's max_tokens and whether it samples (temperature above 0), from the first job (plan wide B1: the slot
+    # need of a turn is prompt plus max_tokens; the share of sampled turns). Numbers only.
+    first = turns[0] if turns else {}
+    if type(first.get("max_tokens")) is int and first["max_tokens"] >= 0 and first.get("sampled") in (0, 1) and \
+            type(first.get("sampled")) is int:
+        fields.update(max_tokens=first["max_tokens"], sampled=first["sampled"])
     keys = ("think_tokens", "tool_tokens", "answer_tokens")
     if any(key in turn for turn in turns for key in keys):
         fields.update({key: sum(turn.get(key, 0) for turn in turns) for key in keys})
@@ -404,28 +477,31 @@ def turn_line(summary, event, draft=None, load=None):
     try:
         return "crucible_turn " + json.dumps({key: _round(value) for key, value in fields.items()}, allow_nan=False)
     except (TypeError, ValueError):  # A log line must never stop the worker.
-        return "crucible_turn " + json.dumps(dict(request_id=fields["request_id"], error="unloggable metrics"))
+        return "crucible_turn " + json.dumps(dict(request_id=fields["request_id"], error="unloggable metrics") |
+                                             _client(fields.get("client_request_id")))
 
 
-def error_line(request_id, status, message, streamed):
+def error_line(request_id, status, message, streamed, client_request_id=None):
     """A failed request, for log collectors. The messages are the server's own fixed texts, never content."""
     try:
         return "crucible_error " + json.dumps(dict(request_id=request_id, status=status, streamed=streamed,
-                                                    error=str(message)[:300]), allow_nan=False)
+                                                    error=str(message)[:300]) | _client(client_request_id),
+                                               allow_nan=False)
     except (TypeError, ValueError):
-        return "crucible_error " + json.dumps(dict(request_id=None, status=status, streamed=streamed))
+        return "crucible_error " + json.dumps(dict(request_id=None, status=status, streamed=streamed) |
+                                               _client(client_request_id))
 
 
 # The reasons of a 4xx in the server log: a closed set, so no request text can reach the log.
 CLIENT_ERROR_REASONS = frozenset(("bad_request", "context_length", "invalid_tool_call_history", "line_too_large",
                                   "body_too_large", "length_required", "unsupported_media_type", "forbidden_host",
-                                  "not_found", "too_many_requests"))
-_STATUS_REASONS = {403: "forbidden_host", 404: "not_found", 411: "length_required", 413: "body_too_large",
+                                  "not_found", "too_many_requests", "auth"))
+_STATUS_REASONS = {401: "auth", 403: "forbidden_host", 404: "not_found", 411: "length_required", 413: "body_too_large",
                    415: "unsupported_media_type", 429: "too_many_requests"}
 _COUNT_KEYS = ("prompt_tokens", "max_tokens", "context")
 
 
-def client_error_line(request_id, status, error, streamed=False):
+def client_error_line(request_id, status, error, streamed=False, client_request_id=None):
     """A refused request (4xx): a fixed reason code and counts, never the message (it can name request values)."""
     code = getattr(error, "code", None)
     reason = code if code in CLIENT_ERROR_REASONS else _STATUS_REASONS.get(status, "bad_request")
@@ -433,7 +509,7 @@ def client_error_line(request_id, status, error, streamed=False):
     fields = dict(request_id=request_id if type(request_id) is int else None, status=status, streamed=streamed,
                   reason=reason)
     fields |= {key: counts[key] for key in _COUNT_KEYS if type(counts.get(key)) is int}
-    return "crucible_error " + json.dumps(fields)
+    return "crucible_error " + json.dumps(fields | _client(client_request_id))
 
 
 def engine_error_line(request_id, op, error, recoverable):
@@ -467,17 +543,17 @@ def worker_error_line(error):
                                                        at=code_frames(error)))
 
 
-def cancel_line(request_id, completion_tokens, streamed):
+def cancel_line(request_id, completion_tokens, streamed, client_request_id=None):
     """The client went away; the server cancelled its job (between prefill chunks in the batch worker)."""
     return "crucible_cancel " + json.dumps(dict(request_id=request_id, streamed=streamed,
-                                                 completion_tokens=completion_tokens))
+                                                 completion_tokens=completion_tokens) | _client(client_request_id))
 
 
-def fallback_line(request_id, completion_tokens, streamed, invalid=None):
+def fallback_line(request_id, completion_tokens, streamed, invalid=None, client_request_id=None):
     """Output that did not parse as valid tool calls went back as content (counts and a fixed reason code only)."""
     return "crucible_error " + json.dumps(dict(request_id=request_id, status=200, streamed=streamed,
                                                 error="tool_call_fallback", completion_tokens=completion_tokens) |
-                                           (dict(invalid=invalid) if invalid else {}))
+                                           (dict(invalid=invalid) if invalid else {}) | _client(client_request_id))
 
 
 def tool_pass_line(request_id, streamed, calls, reasons):
@@ -487,10 +563,17 @@ def tool_pass_line(request_id, streamed, calls, reasons):
                                                     reasons=sorted(set(reasons))))
 
 
+def end_of_turn_kept_line(request_id, where, completion_tokens, kept):
+    """The end-of-turn guard wrote an end-of-turn token as text (http.keep_end_of_turn): where it was ("reasoning"
+    or "tool_call"), the reply's output count after the text, and the count kept there so far. No model text."""
+    return "crucible_end_of_turn_kept " + json.dumps(dict(request_id=request_id, where=where,
+                                                           completion_tokens=completion_tokens, kept=kept))
+
+
 def request_line(first_turn, event, closed=None, cont_turn=None, cont_event=None):
     """The crucible_turn line of a request whose think block the server closed, or that the server logs itself.
 
-    Counts and finish are what the client sees, so a log collector can join the line to its own request record. The first job's times
+    Counts and finish are what the client sees, so the gateway joins the line to its row. The first job's times
     give queue, prefill and TTFT. The continuation's own figures go in cont_* fields.
     """
     summary = finalize(first_turn, event if cont_turn is None else {})
@@ -557,15 +640,16 @@ def _closed_classes(first_turn, cont_turn, closed_at, forced, total):
 
 
 def prefill_line(turn, done, total, end, turn_request_id=None):
-    # A closed think turn's continuation job has its own request_id; turn_request_id (the first job's id) lets a log reader
-    # pair its prefill lines with the turn. Other lines keep their keys.
+    # A closed think turn's continuation job has its own request_id; turn_request_id (the first job's id) lets the
+    # gateway pair its prefill lines with the turn. Other lines keep their keys.
     try:
         fields = dict(request_id=turn.get("request_id"), done=done, total=total,
                       elapsed_s=_round(_span(end, turn.get("t_first_gpu"))))
         if turn_request_id is not None: fields["turn_request_id"] = turn_request_id
-        return "crucible_prefill " + json.dumps(fields, allow_nan=False)
+        return "crucible_prefill " + json.dumps(fields | _client(turn.get("client_request_id")), allow_nan=False)
     except (TypeError, ValueError):
-        return "crucible_prefill " + json.dumps(dict(request_id=turn.get("request_id"), error="unloggable metrics"))
+        return "crucible_prefill " + json.dumps(dict(request_id=turn.get("request_id"), error="unloggable metrics") |
+                                                _client(turn.get("client_request_id")))
 
 
 def emit(line):

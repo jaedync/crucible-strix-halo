@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from server import draft_capture as dc
+from server.leak_canary import CANARY
 
 DAY = 1_760_400_000.0          # 2025-10-14 00:00 UTC
 SECRET = [248045, 77, 88, 99, 123456, 248046]
@@ -22,7 +23,7 @@ def doc_numbers_only(value, key=None):
     if isinstance(value, list):
         return all(isinstance(v, int) and not isinstance(v, bool) for v in value)
     if isinstance(value, str):
-        return key in ("day", "granularity")
+        return key in ("day", "granularity") or (key == "canary" and value == CANARY)   # the leak-guard marker
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
@@ -34,14 +35,14 @@ class CountsTest(unittest.TestCase):
             cap.record(tools=True, thinking=False, prompt_ids=SECRET, output_ids=[248058, 1, 129, 248059])
             cap.record(tools=False, thinking=True, prompt_ids=SECRET, output_ids=[5, 6])
             cap.close()
-            files = [f for f in root.iterdir() if f.name != ".lock"]
+            files = [f for f in root.iterdir() if f.name not in (".lock", ".gitignore")]
             self.assertEqual([f.name for f in files], ["draft-counts-2025-10-14.json"])
             self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o700)
             self.assertEqual(stat.S_IMODE(files[0].stat().st_mode), 0o600)
             text = files[0].read_text()
             doc = json.loads(text)
         self.assertTrue(doc_numbers_only(doc))
-        self.assertEqual(sorted(doc), ["block", "categories", "day", "granularity", "vocab"])
+        self.assertEqual(sorted(doc), ["block", "canary", "categories", "day", "granularity", "vocab"])
         tool = doc["categories"]["tool"]
         self.assertEqual((tool["sequences"], tool["tokens"]), (1, 4))
         self.assertEqual(len(tool["counts"]), 1940)
@@ -62,7 +63,7 @@ class CountsTest(unittest.TestCase):
             cap = dc.DraftCapture(Path(tmp), mode="counts", clock=lambda: now[0])
             cap.record(tools=False, thinking=False, prompt_ids=[], output_ids=[1])
             cap.close()
-            days = {f.name: json.loads(f.read_text()) for f in Path(tmp).iterdir() if f.name != ".lock"}
+            days = {f.name: json.loads(f.read_text()) for f in Path(tmp).iterdir() if f.name not in (".lock", ".gitignore")}
         self.assertEqual(days["draft-counts-2025-10-14.json"]["categories"]["chat"]["tokens"], 6)
         self.assertEqual(days["draft-counts-2025-10-15.json"]["categories"]["chat"]["tokens"], 1)
 
@@ -94,7 +95,31 @@ class ReviewDcTest(unittest.TestCase):
                 cap.close()
                 doc = json.loads(Path(tmp, "draft-counts-2025-10-14.json").read_text())
                 self.assertEqual(doc["categories"]["chat"]["tokens"], 1)
-                self.assertEqual(Path(tmp, "draft-counts-2025-10-14.json.bad").read_text(), bad)
+                aside = Path(tmp, "draft-counts-2025-10-14.json.bad").read_text()
+                self.assertIn(CANARY, aside)      # H16: the start of the server marks every old file, a .bad file too
+                try:
+                    kept = json.loads(aside)
+                    kept.pop("canary")
+                    self.assertEqual(kept, json.loads(bad))
+                except ValueError:
+                    self.assertTrue(aside.startswith(bad))
+
+    def test_without_canary_drops_only_the_canary_key(self):
+        """The reader and the daily-switch rehearsal both read a day file through without_canary, then _valid_counts."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cap = dc.DraftCapture(Path(tmp, "cap"), mode="counts", clock=lambda: DAY + 60)
+            cap.record(tools=False, thinking=False, prompt_ids=[], output_ids=[1])
+            cap.close()
+            doc = json.loads(Path(tmp, "cap", "draft-counts-2025-10-14.json").read_text())
+        self.assertIn("canary", doc)
+        self.assertFalse(dc._valid_counts(doc, "2025-10-14"))        # the strict shape check does not take the key
+        body = dc.without_canary(doc)
+        self.assertIn("canary", doc)                                 # the input is not changed
+        self.assertNotIn("canary", body)
+        self.assertTrue(dc._valid_counts(body, "2025-10-14"))
+        self.assertFalse(dc._valid_counts(dc.without_canary(dict(doc, extra=1)), "2025-10-14"))
+        self.assertEqual(dc.without_canary([1]), [1])
+        self.assertIsNone(dc.without_canary(None))
 
     def test_one_writer_per_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -208,8 +233,8 @@ class TokensModeGuardTest(unittest.TestCase):
             self.assertEqual(capture.mode, "counts")
             capture.record(tools=True, thinking=True, prompt_ids=prompt, output_ids=output)
             capture.close()
-            files = sorted(p.name for p in Path(tmp).iterdir() if p.name != ".lock")
-            data = b"".join(p.read_bytes() for p in Path(tmp).iterdir())
+            files = sorted(p.name for p in Path(tmp).iterdir() if p.name not in (".lock", ".gitignore"))
+            data = b"".join(p.read_bytes() for p in Path(tmp).iterdir() if p.name != ".gitignore")
         self.assertEqual(len(files), 1)
         self.assertTrue(files[0].startswith("draft-counts-") and files[0].endswith(".json"))
         for token in prompt[:2] + output[:2]:
@@ -226,13 +251,13 @@ class TokensTest(unittest.TestCase):
             cap.record(tools=True, thinking=True, prompt_ids=SECRET, output_ids=[1, 2])
             cap.record(tools=False, thinking=False, prompt_ids=[3] * 60, output_ids=[4])  # over the cap: dropped
             cap.close()
-            files = [f for f in root.iterdir() if f.name != ".lock"]
+            files = [f for f in root.iterdir() if f.name not in (".lock", ".gitignore")]
             self.assertEqual([f.name for f in files], ["draft-tokens-2025-10-14.bin"])
             self.assertEqual(stat.S_IMODE(files[0].stat().st_mode), 0o600)
             data = files[0].read_bytes()
             records = list(dc.read_spool(files[0]))
         # Header, one record header and 8 uint32 IDs: nothing else is in the file.
-        self.assertEqual(len(data), len(dc.SPOOL_MAGIC) + dc.RECORD.size + 4 * 8)
+        self.assertEqual(len(data), len(dc.SPOOL_HEADER) + dc.RECORD.size + 4 * 8)
         self.assertEqual(records, [("tool+think", SECRET, [1, 2])])
         self.assertEqual(cap.dropped, 1)
 

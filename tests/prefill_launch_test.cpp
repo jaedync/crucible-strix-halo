@@ -50,8 +50,8 @@ int main() {
   assert(PrefillLaunchRows(0, 32768, 4096, 0, kNone) == 4096);
   assert(PrefillLaunchRows(0, 32768, 4096, -1, kNone) == 4096);
   // Launch row settings.
-  assert(PrefillLaunchSetting(nullptr, 4096) == kDefaultPrefillLaunchRows);  // unset merges two grid chunks
-  assert(kDefaultPrefillLaunchRows == 8192);
+  assert(PrefillLaunchSetting(nullptr, 4096) == kDefaultPrefillLaunchRows);  // prefill-rows: unset merges four grid chunks
+  assert(kDefaultPrefillLaunchRows == 16384);
   assert(PrefillLaunchSetting("16384", 4096) == 16384);
   assert(PrefillLaunchSetting("32768", 4096) == 32768);
   assert(PrefillLaunchSetting("4096", 4096) == 4096);  // the off value: one grid chunk a launch

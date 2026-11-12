@@ -1,0 +1,252 @@
+# The measured values behind the README, the charts and docs/HISTORY.md. One row = one value. Add rows; do not change old rows.
+# Seeded from the public tables of v0.37.0 (the source column names the line). The README blocks, its charts and HISTORY.md are made from it.
+metric	pack	config	context_k	value	unit	release	date	profile	runs	note	source
+cold32_ttft	4.05	default		17.1	s	v0.34.0	2026-11-07	balanced	2		v0.37.0:README.md:25
+cold32_ttft	4.05	default		16.9	s	v0.33.0	2026-11-03	balanced	2		v0.37.0:README.md:25
+cold32_ttft	4.05	default		17.0	s	v0.32.0	2026-11-03	balanced	2		v0.37.0:README.md:25
+cold32_ttft	4.05	default		17.7	s	v0.31.0	2026-11-01	balanced	2		v0.37.0:README.md:25
+cold32_ttft	4.05	default		17.9	s	v0.30.0	2026-10-31	balanced	2		v0.37.0:README.md:25
+cold32_ttft	4.05	default		19.4	s	v0.26.0	2026-10-27..2026-10-28	balanced	2		v0.37.0:README.md:25
+cold32_ttft	4.05	default		19.7	s	v0.22.0	2026-10-27..2026-10-28	balanced	2		v0.37.0:README.md:25
+cold32_prefill	4.05	default		1831	tok/s	v0.34.0	2026-11-07	balanced	2		v0.37.0:README.md:26
+cold32_prefill	4.05	default		1851	tok/s	v0.33.0	2026-11-03	balanced	2		v0.37.0:README.md:26
+cold32_prefill	4.05	default		1841	tok/s	v0.32.0	2026-11-03	balanced	2		v0.37.0:README.md:26
+cold32_prefill	4.05	default		1763	tok/s	v0.31.0	2026-11-01	balanced	2		v0.37.0:README.md:26
+cold32_prefill	4.05	default		1741	tok/s	v0.30.0	2026-10-31	balanced	2		v0.37.0:README.md:26
+cold32_prefill	4.05	default		1613	tok/s	v0.26.0	2026-10-27..2026-10-28	balanced	2		v0.37.0:README.md:26
+cold32_prefill	4.05	default		1585	tok/s	v0.22.0	2026-10-27..2026-10-28	balanced	2		v0.37.0:README.md:26
+cold130_ttft	4.05	default		72.4	s	v0.34.0	2026-11-07	balanced	2		v0.37.0:README.md:27
+cold130_ttft	4.05	default		72.1	s	v0.33.0	2026-11-03	balanced	2		v0.37.0:README.md:27
+cold130_ttft	4.05	default		74.3	s	v0.32.0	2026-11-03	balanced	2		v0.37.0:README.md:27
+cold130_ttft	4.05	default		75.6	s	v0.31.0	2026-11-01	balanced	2		v0.37.0:README.md:27
+cold130_ttft	4.05	default		77.3	s	v0.30.0	2026-10-31	balanced	2		v0.37.0:README.md:27
+cold130_ttft	4.05	default		82.0	s	v0.26.0	2026-10-27..2026-10-28	balanced	2		v0.37.0:README.md:27
+cold130_ttft	4.05	default		84.5	s	v0.22.0	2026-10-27..2026-10-28	balanced	2		v0.37.0:README.md:27
+cold130_prefill	4.05	default		1782	tok/s	v0.34.0	2026-11-07	balanced	2		v0.37.0:README.md:28
+cold130_prefill	4.05	default		1789	tok/s	v0.33.0	2026-11-03	balanced	2		v0.37.0:README.md:28
+cold130_prefill	4.05	default		1736	tok/s	v0.32.0	2026-11-03	balanced	2		v0.37.0:README.md:28
+cold130_prefill	4.05	default		1707	tok/s	v0.31.0	2026-11-01	balanced	2		v0.37.0:README.md:28
+cold130_prefill	4.05	default		1669	tok/s	v0.30.0	2026-10-31	balanced	2		v0.37.0:README.md:28
+cold130_prefill	4.05	default		1574	tok/s	v0.26.0	2026-10-27..2026-10-28	balanced	2		v0.37.0:README.md:28
+cold130_prefill	4.05	default		1527	tok/s	v0.22.0	2026-10-27..2026-10-28	balanced	2		v0.37.0:README.md:28
+resend32	4.05	default		0.019	s	v0.34.0	2026-11-07	balanced	2		v0.37.0:README.md:29
+resend32	4.05	default		0.020	s	v0.33.0	2026-11-03	balanced	2		v0.37.0:README.md:29
+resend32	4.05	default		0.021	s	v0.32.0	2026-11-03	balanced	2		v0.37.0:README.md:29
+resend32	4.05	default		0.021	s	v0.31.0	2026-11-01	balanced	2		v0.37.0:README.md:29
+resend32	4.05	default		0.023	s	v0.30.0	2026-10-31	balanced	2		v0.37.0:README.md:29
+resend32	4.05	default		0.014	s	v0.26.0	2026-10-27..2026-10-28	balanced	2		v0.37.0:README.md:29
+resend32	4.05	default		1.870	s	v0.22.0	2026-10-27..2026-10-28	balanced	2		v0.37.0:README.md:29
+dec32_code	4.05	default		71.2	tok/s	v0.34.0	2026-11-07	balanced	2		v0.37.0:README.md:30
+dec32_code	4.05	default		71.7	tok/s	v0.33.0	2026-11-03	balanced	2	from the run by context length, not from the ladder run	v0.37.0:README.md:30
+dec32_code	4.05	default		71.8	tok/s	v0.32.0	2026-11-03	balanced	2	from the run by context length, not from the ladder run	v0.37.0:README.md:30
+dec32_code	4.05	default		69.0	tok/s	v0.31.0	2026-11-01	balanced	2	from the run by context length, not from the ladder run	v0.37.0:README.md:30
+dec32_code	4.05	default		68.4	tok/s	v0.30.0	2026-10-31	balanced	2	from the run by context length, not from the ladder run	v0.37.0:README.md:30
+dec32_code	4.05	default		58.4	tok/s	v0.26.0	2026-10-29	balanced	2	2 low samples; from the run by context length, not from the ladder run	v0.37.0:README.md:30
+dec32_code	4.05	default		64.6	tok/s	v0.22.0	2026-10-29	balanced	2	from the run by context length, not from the ladder run	v0.37.0:README.md:30
+dec32_prose	4.05	default		58.4	tok/s	v0.34.0	2026-11-07	balanced	2		v0.37.0:README.md:31
+dec32_prose	4.05	default		56.3	tok/s	v0.33.0	2026-11-03	balanced	2		v0.37.0:README.md:31
+dec32_prose	4.05	default		57.6	tok/s	v0.32.0	2026-11-03	balanced	2		v0.37.0:README.md:31
+dec32_prose	4.05	default		55.2	tok/s	v0.31.0	2026-11-01	balanced	2		v0.37.0:README.md:31
+dec32_prose	4.05	default		53.3	tok/s	v0.30.0	2026-10-31	balanced	2		v0.37.0:README.md:31
+dec32_prose	4.05	default		50.5	tok/s	v0.26.0	2026-10-27..2026-10-28	balanced	2		v0.37.0:README.md:31
+dec32_prose	4.05	default		50.4	tok/s	v0.22.0	2026-10-27..2026-10-28	balanced	2		v0.37.0:README.md:31
+dec4	4.05	default		118.3	tok/s	v0.34.0	2026-11-07	balanced	2		v0.37.0:README.md:32
+dec4	4.05	default		113.8	tok/s	v0.33.0	2026-11-03	balanced	2		v0.37.0:README.md:32
+dec4	4.05	default			tok/s	v0.32.0	2026-11-03	balanced	2	no value: one session of each run stopped after 13 tokens	v0.37.0:README.md:32
+dec4	4.05	default		117.6	tok/s	v0.31.0	2026-11-01	balanced	2		v0.37.0:README.md:32
+dec4	4.05	default		102.4	tok/s	v0.30.0	2026-10-31	balanced	2		v0.37.0:README.md:32
+dec4	4.05	default		106.9	tok/s	v0.26.0	2026-10-27..2026-10-28	balanced	2		v0.37.0:README.md:32
+dec4	4.05	default		106.7	tok/s	v0.22.0	2026-10-27..2026-10-28	balanced	2		v0.37.0:README.md:32
+d3	4.05	default		34.2	tok/s	v0.34.0	2026-11-07	balanced	2		v0.37.0:README.md:33
+d3	4.05	default		34.1	tok/s	v0.33.0	2026-11-03	balanced	2		v0.37.0:README.md:33
+d3	4.05	default		34.2	tok/s	v0.32.0	2026-11-03	balanced	2		v0.37.0:README.md:33
+d3	4.05	default		34.1	tok/s	v0.31.0	2026-11-01	balanced	2		v0.37.0:README.md:33
+d3	4.05	default		34.3	tok/s	v0.30.0	2026-10-31	balanced	2		v0.37.0:README.md:33
+d3	4.05	default		32.1	tok/s	v0.26.0	2026-10-27..2026-10-28	balanced	2		v0.37.0:README.md:33
+d3	4.05	default		31.0	tok/s	v0.22.0	2026-10-27..2026-10-28	balanced	2		v0.37.0:README.md:33
+cold32_ttft	3.05	default		16.6	s	v0.34.0	2026-11-07	balanced	2		v0.37.0:README.md:39
+cold32_ttft	3.05	default		16.7	s	v0.33.0	2026-11-03	balanced	2		v0.37.0:README.md:39
+cold32_ttft	3.05	default		16.7	s	v0.32.0	2026-11-03	balanced	2		v0.37.0:README.md:39
+cold32_ttft	3.05	default		16.8	s	v0.31.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:39
+cold32_ttft	3.05	default		16.9	s	v0.30.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:39
+cold32_ttft	3.05	default		19.2	s	v0.26.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:39
+cold32_ttft	3.05	default		18.9	s	v0.22.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:39
+cold32_prefill	3.05	default		1877	tok/s	v0.34.0	2026-11-07	balanced	2		v0.37.0:README.md:40
+cold32_prefill	3.05	default		1870	tok/s	v0.33.0	2026-11-03	balanced	2		v0.37.0:README.md:40
+cold32_prefill	3.05	default		1867	tok/s	v0.32.0	2026-11-03	balanced	2		v0.37.0:README.md:40
+cold32_prefill	3.05	default		1858	tok/s	v0.31.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:40
+cold32_prefill	3.05	default		1843	tok/s	v0.30.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:40
+cold32_prefill	3.05	default		1628	tok/s	v0.26.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:40
+cold32_prefill	3.05	default		1656	tok/s	v0.22.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:40
+cold130_ttft	3.05	default		71.1	s	v0.34.0	2026-11-07	balanced	2		v0.37.0:README.md:41
+cold130_ttft	3.05	default		71.3	s	v0.33.0	2026-11-03	balanced	2		v0.37.0:README.md:41
+cold130_ttft	3.05	default		72.4	s	v0.32.0	2026-11-03	balanced	2		v0.37.0:README.md:41
+cold130_ttft	3.05	default		72.8	s	v0.31.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:41
+cold130_ttft	3.05	default		74.2	s	v0.30.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:41
+cold130_ttft	3.05	default		81.5	s	v0.26.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:41
+cold130_ttft	3.05	default		81.0	s	v0.22.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:41
+cold130_prefill	3.05	default		1814	tok/s	v0.34.0	2026-11-07	balanced	2		v0.37.0:README.md:42
+cold130_prefill	3.05	default		1809	tok/s	v0.33.0	2026-11-03	balanced	2		v0.37.0:README.md:42
+cold130_prefill	3.05	default		1783	tok/s	v0.32.0	2026-11-03	balanced	2		v0.37.0:README.md:42
+cold130_prefill	3.05	default		1771	tok/s	v0.31.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:42
+cold130_prefill	3.05	default		1739	tok/s	v0.30.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:42
+cold130_prefill	3.05	default		1583	tok/s	v0.26.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:42
+cold130_prefill	3.05	default		1594	tok/s	v0.22.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:42
+resend32	3.05	default		0.015	s	v0.34.0	2026-11-07	balanced	2		v0.37.0:README.md:43
+resend32	3.05	default		0.020	s	v0.33.0	2026-11-03	balanced	2		v0.37.0:README.md:43
+resend32	3.05	default		0.023	s	v0.32.0	2026-11-03	balanced	2		v0.37.0:README.md:43
+resend32	3.05	default		0.017	s	v0.31.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:43
+resend32	3.05	default		0.017	s	v0.30.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:43
+resend32	3.05	default		0.025	s	v0.26.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:43
+resend32	3.05	default		1.736	s	v0.22.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:43
+dec32_code	3.05	default		76.8	tok/s	v0.34.0	2026-11-07	balanced	2		v0.37.0:README.md:44
+dec32_code	3.05	default		73.9	tok/s	v0.33.0	2026-11-03	balanced	2		v0.37.0:README.md:44
+dec32_code	3.05	default		74.0	tok/s	v0.32.0	2026-11-03	balanced	2		v0.37.0:README.md:44
+dec32_code	3.05	default		75.4	tok/s	v0.31.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:44
+dec32_code	3.05	default		76.7	tok/s	v0.30.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:44
+dec32_code	3.05	default		70.8	tok/s	v0.26.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:44
+dec32_code	3.05	default		71.5	tok/s	v0.22.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:44
+dec32_prose	3.05	default		60.7	tok/s	v0.34.0	2026-11-07	balanced	2		v0.37.0:README.md:45
+dec32_prose	3.05	default		60.3	tok/s	v0.33.0	2026-11-03	balanced	2		v0.37.0:README.md:45
+dec32_prose	3.05	default		58.9	tok/s	v0.32.0	2026-11-03	balanced	2		v0.37.0:README.md:45
+dec32_prose	3.05	default		57.2	tok/s	v0.31.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:45
+dec32_prose	3.05	default		59.4	tok/s	v0.30.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:45
+dec32_prose	3.05	default		58.4	tok/s	v0.26.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:45
+dec32_prose	3.05	default		56.3	tok/s	v0.22.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:45
+dec4	3.05	default		129.0	tok/s	v0.34.0	2026-11-07	balanced	2		v0.37.0:README.md:46
+dec4	3.05	default		118.3	tok/s	v0.33.0	2026-11-03	balanced	2		v0.37.0:README.md:46
+dec4	3.05	default		130.2	tok/s	v0.32.0	2026-11-03	balanced	1	1 run	v0.37.0:README.md:46
+dec4	3.05	default		128.1	tok/s	v0.31.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:46
+dec4	3.05	default		127.2	tok/s	v0.30.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:46
+dec4	3.05	default		125.8	tok/s	v0.26.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:46
+dec4	3.05	default		128.3	tok/s	v0.22.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:46
+d3	3.05	default		39.1	tok/s	v0.34.0	2026-11-07	balanced	2		v0.37.0:README.md:47
+d3	3.05	default		39.3	tok/s	v0.33.0	2026-11-03	balanced	2		v0.37.0:README.md:47
+d3	3.05	default		39.3	tok/s	v0.32.0	2026-11-03	balanced	2		v0.37.0:README.md:47
+d3	3.05	default		39.2	tok/s	v0.31.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:47
+d3	3.05	default		39.5	tok/s	v0.30.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:47
+d3	3.05	default		36.5	tok/s	v0.26.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:47
+d3	3.05	default		35.4	tok/s	v0.22.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:README.md:47
+cold_ttft	4.05	long	250	149.0	s	v0.37.0	2026-11-11	balanced	1	plain positions	v0.37.0:README.md:114
+cold_ttft	4.05	long	490	340.4	s	v0.37.0	2026-11-11	balanced	1	YaRN	v0.37.0:README.md:114
+cold_prefill	4.05	long	250	1677.6	tok/s	v0.37.0	2026-11-11	balanced	1	plain positions	v0.37.0:README.md:115
+cold_prefill	4.05	long	490	1436.2	tok/s	v0.37.0	2026-11-11	balanced	1	YaRN	v0.37.0:README.md:115
+dec_code	4.05	long	250	67.7	tok/s	v0.37.0	2026-11-11	balanced	1	plain positions	v0.37.0:README.md:116
+dec_code	4.05	long	490	59.8	tok/s	v0.37.0	2026-11-11	balanced	1	YaRN	v0.37.0:README.md:116
+dec_tool	4.05	long	250	97.0	tok/s	v0.37.0	2026-11-11	balanced	1	plain positions	v0.37.0:README.md:117
+dec_tool	4.05	long	490	100.2	tok/s	v0.37.0	2026-11-11	balanced	1	YaRN	v0.37.0:README.md:117
+ctx_prefill	4.05	default	32	1578	tok/s	v0.22.0	2026-10-28..2026-10-29	balanced	4		v0.37.0:docs/RESULTS.md:129
+ctx_prefill	4.05	default	64	1564	tok/s	v0.22.0	2026-10-28..2026-10-29	balanced	4		v0.37.0:docs/RESULTS.md:129
+ctx_prefill	4.05	default	128	1526	tok/s	v0.22.0	2026-10-28..2026-10-29	balanced	4		v0.37.0:docs/RESULTS.md:129
+ctx_prefill	4.05	default	192	1490	tok/s	v0.22.0	2026-10-28..2026-10-29	balanced	4		v0.37.0:docs/RESULTS.md:129
+ctx_prefill	4.05	default	250	1416	tok/s	v0.22.0	2026-10-28..2026-10-29	balanced	4		v0.37.0:docs/RESULTS.md:129
+ctx_prefill	4.05	default	32	1626	tok/s	v0.26.0	2026-10-28..2026-10-29	balanced	4		v0.37.0:docs/RESULTS.md:130
+ctx_prefill	4.05	default	64	1604	tok/s	v0.26.0	2026-10-28..2026-10-29	balanced	4		v0.37.0:docs/RESULTS.md:130
+ctx_prefill	4.05	default	128	1567	tok/s	v0.26.0	2026-10-28..2026-10-29	balanced	4		v0.37.0:docs/RESULTS.md:130
+ctx_prefill	4.05	default	192	1526	tok/s	v0.26.0	2026-10-28..2026-10-29	balanced	4		v0.37.0:docs/RESULTS.md:130
+ctx_prefill	4.05	default	250	1448	tok/s	v0.26.0	2026-10-28..2026-10-29	balanced	4		v0.37.0:docs/RESULTS.md:130
+ctx_prefill	4.05	default	32	1700	tok/s	v0.30.0	2026-10-31	balanced	2		v0.37.0:docs/RESULTS.md:131
+ctx_prefill	4.05	default	64	1701	tok/s	v0.30.0	2026-10-31	balanced	2		v0.37.0:docs/RESULTS.md:131
+ctx_prefill	4.05	default	128	1664	tok/s	v0.30.0	2026-10-31	balanced	2		v0.37.0:docs/RESULTS.md:131
+ctx_prefill	4.05	default	192	1624	tok/s	v0.30.0	2026-10-31	balanced	2		v0.37.0:docs/RESULTS.md:131
+ctx_prefill	4.05	default	250	1536	tok/s	v0.30.0	2026-10-31	balanced	2		v0.37.0:docs/RESULTS.md:131
+ctx_prefill	4.05	default	32	1749	tok/s	v0.31.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:docs/RESULTS.md:132
+ctx_prefill	4.05	default	64	1754	tok/s	v0.31.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:docs/RESULTS.md:132
+ctx_prefill	4.05	default	128	1723	tok/s	v0.31.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:docs/RESULTS.md:132
+ctx_prefill	4.05	default	192	1683	tok/s	v0.31.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:docs/RESULTS.md:132
+ctx_prefill	4.05	default	250	1576	tok/s	v0.31.0	2026-11-01..2026-11-02	balanced	2		v0.37.0:docs/RESULTS.md:132
+ctx_prefill	4.05	default	32	1808	tok/s	v0.32.0	2026-11-03	balanced	2		v0.37.0:docs/RESULTS.md:133
+ctx_prefill	4.05	default	64	1801	tok/s	v0.32.0	2026-11-03	balanced	2		v0.37.0:docs/RESULTS.md:133
+ctx_prefill	4.05	default	128	1760	tok/s	v0.32.0	2026-11-03	balanced	2		v0.37.0:docs/RESULTS.md:133
+ctx_prefill	4.05	default	192	1723	tok/s	v0.32.0	2026-11-03	balanced	2		v0.37.0:docs/RESULTS.md:133
+ctx_prefill	4.05	default	250	1592	tok/s	v0.32.0	2026-11-03	balanced	2		v0.37.0:docs/RESULTS.md:133
+ctx_prefill	4.05	default	32	1830	tok/s	v0.33.0	2026-11-03	balanced	2		v0.37.0:docs/RESULTS.md:134
+ctx_prefill	4.05	default	64	1814	tok/s	v0.33.0	2026-11-03	balanced	2		v0.37.0:docs/RESULTS.md:134
+ctx_prefill	4.05	default	128	1752	tok/s	v0.33.0	2026-11-03	balanced	2		v0.37.0:docs/RESULTS.md:134
+ctx_prefill	4.05	default	192	1692	tok/s	v0.33.0	2026-11-03	balanced	2		v0.37.0:docs/RESULTS.md:134
+ctx_prefill	4.05	default	250	1622	tok/s	v0.33.0	2026-11-03	balanced	2		v0.37.0:docs/RESULTS.md:134
+ctx_prefill	3.05	default	32	1661	tok/s	v0.22.0	2026-10-28..2026-10-29	balanced	4		v0.37.0:docs/RESULTS.md:135
+ctx_prefill	3.05	default	64	1640	tok/s	v0.22.0	2026-10-28..2026-10-29	balanced	4		v0.37.0:docs/RESULTS.md:135
+ctx_prefill	3.05	default	128	1607	tok/s	v0.22.0	2026-10-28..2026-10-29	balanced	4		v0.37.0:docs/RESULTS.md:135
+ctx_prefill	3.05	default	192	1580	tok/s	v0.22.0	2026-10-28..2026-10-29	balanced	4		v0.37.0:docs/RESULTS.md:135
+ctx_prefill	3.05	default	250	1494	tok/s	v0.22.0	2026-10-28..2026-10-29	balanced	4		v0.37.0:docs/RESULTS.md:135
+ctx_prefill	3.05	default	32	1598	tok/s	v0.26.0	2026-11-01..2026-11-02	balanced		the number of runs is not stated for this line	v0.37.0:docs/RESULTS.md:136
+ctx_prefill	3.05	default	64	1601	tok/s	v0.26.0	2026-11-01..2026-11-02	balanced		the number of runs is not stated for this line	v0.37.0:docs/RESULTS.md:136
+ctx_prefill	3.05	default	128	1567	tok/s	v0.26.0	2026-11-01..2026-11-02	balanced		the number of runs is not stated for this line	v0.37.0:docs/RESULTS.md:136
+ctx_prefill	3.05	default	192	1530	tok/s	v0.26.0	2026-11-01..2026-11-02	balanced		the number of runs is not stated for this line	v0.37.0:docs/RESULTS.md:136
+ctx_prefill	3.05	default	250	1448	tok/s	v0.26.0	2026-11-01..2026-11-02	balanced		the number of runs is not stated for this line	v0.37.0:docs/RESULTS.md:136
+ctx_prefill	3.05	default	32	1799	tok/s	v0.30.0	2026-11-01	balanced	2		v0.37.0:docs/RESULTS.md:137
+ctx_prefill	3.05	default	64	1767	tok/s	v0.30.0	2026-11-01	balanced	2		v0.37.0:docs/RESULTS.md:137
+ctx_prefill	3.05	default	128	1722	tok/s	v0.30.0	2026-11-01	balanced	2		v0.37.0:docs/RESULTS.md:137
+ctx_prefill	3.05	default	192	1677	tok/s	v0.30.0	2026-11-01	balanced	2		v0.37.0:docs/RESULTS.md:137
+ctx_prefill	3.05	default	250	1589	tok/s	v0.30.0	2026-11-01	balanced	2		v0.37.0:docs/RESULTS.md:137
+ctx_prefill	3.05	default	32	1846	tok/s	v0.31.0	2026-11-02	balanced	2		v0.37.0:docs/RESULTS.md:138
+ctx_prefill	3.05	default	64	1824	tok/s	v0.31.0	2026-11-02	balanced	2		v0.37.0:docs/RESULTS.md:138
+ctx_prefill	3.05	default	128	1795	tok/s	v0.31.0	2026-11-02	balanced	2		v0.37.0:docs/RESULTS.md:138
+ctx_prefill	3.05	default	192	1755	tok/s	v0.31.0	2026-11-02	balanced	2		v0.37.0:docs/RESULTS.md:138
+ctx_prefill	3.05	default	250	1644	tok/s	v0.31.0	2026-11-02	balanced	2		v0.37.0:docs/RESULTS.md:138
+ctx_prefill	3.05	default	32	1828	tok/s	v0.32.0	2026-11-03	balanced	2		v0.37.0:docs/RESULTS.md:139
+ctx_prefill	3.05	default	64	1802	tok/s	v0.32.0	2026-11-03	balanced	2		v0.37.0:docs/RESULTS.md:139
+ctx_prefill	3.05	default	128	1761	tok/s	v0.32.0	2026-11-03	balanced	2		v0.37.0:docs/RESULTS.md:139
+ctx_prefill	3.05	default	192	1731	tok/s	v0.32.0	2026-11-03	balanced	2		v0.37.0:docs/RESULTS.md:139
+ctx_prefill	3.05	default	250	1620	tok/s	v0.32.0	2026-11-03	balanced	2		v0.37.0:docs/RESULTS.md:139
+ctx_prefill	3.05	default	32	1855	tok/s	v0.33.0	2026-11-03	balanced	2		v0.37.0:docs/RESULTS.md:140
+ctx_prefill	3.05	default	64	1840	tok/s	v0.33.0	2026-11-03	balanced	2		v0.37.0:docs/RESULTS.md:140
+ctx_prefill	3.05	default	128	1807	tok/s	v0.33.0	2026-11-03	balanced	2		v0.37.0:docs/RESULTS.md:140
+ctx_prefill	3.05	default	192	1767	tok/s	v0.33.0	2026-11-03	balanced	2		v0.37.0:docs/RESULTS.md:140
+ctx_prefill	3.05	default	250	1648	tok/s	v0.33.0	2026-11-03	balanced	2		v0.37.0:docs/RESULTS.md:140
+ctx_decode	4.05	default	32	64.6	tok/s	v0.22.0	2026-10-29	balanced	2	4 samples	v0.37.0:docs/RESULTS.md:197
+ctx_decode	4.05	default	64	56.1	tok/s	v0.22.0	2026-10-29	balanced	2	3 samples	v0.37.0:docs/RESULTS.md:197
+ctx_decode	4.05	default	128	57.3	tok/s	v0.22.0	2026-10-29	balanced	2	4 samples	v0.37.0:docs/RESULTS.md:197
+ctx_decode	4.05	default	192	54.0	tok/s	v0.22.0	2026-10-29	balanced	2	3 samples	v0.37.0:docs/RESULTS.md:197
+ctx_decode	4.05	default	250	58.1	tok/s	v0.22.0	2026-10-29	balanced	2	4 samples	v0.37.0:docs/RESULTS.md:197
+ctx_decode	4.05	default	32	58.4	tok/s	v0.26.0	2026-10-29	balanced	2	4 samples	v0.37.0:docs/RESULTS.md:198
+ctx_decode	4.05	default	64	55.4	tok/s	v0.26.0	2026-10-29	balanced	2	3 samples	v0.37.0:docs/RESULTS.md:198
+ctx_decode	4.05	default	128	53.8	tok/s	v0.26.0	2026-10-29	balanced	2	4 samples	v0.37.0:docs/RESULTS.md:198
+ctx_decode	4.05	default	192	53.9	tok/s	v0.26.0	2026-10-29	balanced	2	3 samples	v0.37.0:docs/RESULTS.md:198
+ctx_decode	4.05	default	250	57.9	tok/s	v0.26.0	2026-10-29	balanced	2	4 samples	v0.37.0:docs/RESULTS.md:198
+ctx_decode	4.05	default	32	68.4	tok/s	v0.30.0	2026-10-31	balanced	2	6 samples	v0.37.0:docs/RESULTS.md:199
+ctx_decode	4.05	default	64	66.1	tok/s	v0.30.0	2026-10-31	balanced	2	5 samples	v0.37.0:docs/RESULTS.md:199
+ctx_decode	4.05	default	128	63.3	tok/s	v0.30.0	2026-10-31	balanced	2	6 samples	v0.37.0:docs/RESULTS.md:199
+ctx_decode	4.05	default	192	61.9	tok/s	v0.30.0	2026-10-31	balanced	2	5 samples	v0.37.0:docs/RESULTS.md:199
+ctx_decode	4.05	default	250	61.2	tok/s	v0.30.0	2026-10-31	balanced	2	6 samples	v0.37.0:docs/RESULTS.md:199
+ctx_decode	4.05	default	32	69.0	tok/s	v0.31.0	2026-11-01	balanced	2	6 samples	v0.37.0:docs/RESULTS.md:200
+ctx_decode	4.05	default	64	66.6	tok/s	v0.31.0	2026-11-01	balanced	2	5 samples	v0.37.0:docs/RESULTS.md:200
+ctx_decode	4.05	default	128	63.9	tok/s	v0.31.0	2026-11-01	balanced	2	6 samples	v0.37.0:docs/RESULTS.md:200
+ctx_decode	4.05	default	192	62.9	tok/s	v0.31.0	2026-11-01	balanced	2	5 samples	v0.37.0:docs/RESULTS.md:200
+ctx_decode	4.05	default	250	61.9	tok/s	v0.31.0	2026-11-01	balanced	2	6 samples	v0.37.0:docs/RESULTS.md:200
+ctx_decode	4.05	default	32	71.8	tok/s	v0.32.0	2026-11-03	balanced	2	6 samples	v0.37.0:docs/RESULTS.md:201
+ctx_decode	4.05	default	64	68.6	tok/s	v0.32.0	2026-11-03	balanced	2	5 samples	v0.37.0:docs/RESULTS.md:201
+ctx_decode	4.05	default	128	66.8	tok/s	v0.32.0	2026-11-03	balanced	2	6 samples	v0.37.0:docs/RESULTS.md:201
+ctx_decode	4.05	default	192	64.7	tok/s	v0.32.0	2026-11-03	balanced	2	5 samples	v0.37.0:docs/RESULTS.md:201
+ctx_decode	4.05	default	250	64.3	tok/s	v0.32.0	2026-11-03	balanced	2	6 samples	v0.37.0:docs/RESULTS.md:201
+ctx_decode	4.05	default	32	71.7	tok/s	v0.33.0	2026-11-03	balanced	2	6 samples	v0.37.0:docs/RESULTS.md:202
+ctx_decode	4.05	default	64	68.8	tok/s	v0.33.0	2026-11-03	balanced	2	5 samples	v0.37.0:docs/RESULTS.md:202
+ctx_decode	4.05	default	128	66.9	tok/s	v0.33.0	2026-11-03	balanced	2	6 samples	v0.37.0:docs/RESULTS.md:202
+ctx_decode	4.05	default	192	64.7	tok/s	v0.33.0	2026-11-03	balanced	2	5 samples	v0.37.0:docs/RESULTS.md:202
+ctx_decode	4.05	default	250	62.2	tok/s	v0.33.0	2026-11-03	balanced	2	6 samples	v0.37.0:docs/RESULTS.md:202
+ctx_decode	3.05	default	32	73.2	tok/s	v0.26.0	2026-11-01..2026-11-02	balanced	2	4 samples	v0.37.0:docs/RESULTS.md:203
+ctx_decode	3.05	default	64	70.3	tok/s	v0.26.0	2026-11-01..2026-11-02	balanced	2	4 samples	v0.37.0:docs/RESULTS.md:203
+ctx_decode	3.05	default	128	71.0	tok/s	v0.26.0	2026-11-01..2026-11-02	balanced	2	6 samples	v0.37.0:docs/RESULTS.md:203
+ctx_decode	3.05	default	192	67.4	tok/s	v0.26.0	2026-11-01..2026-11-02	balanced	2	5 samples	v0.37.0:docs/RESULTS.md:203
+ctx_decode	3.05	default	250	66.4	tok/s	v0.26.0	2026-11-01..2026-11-02	balanced	2	5 samples	v0.37.0:docs/RESULTS.md:203
+ctx_decode	3.05	default	32	74.0	tok/s	v0.30.0	2026-11-01	balanced	2	4 samples	v0.37.0:docs/RESULTS.md:204
+ctx_decode	3.05	default	64	71.2	tok/s	v0.30.0	2026-11-01	balanced	2	4 samples	v0.37.0:docs/RESULTS.md:204
+ctx_decode	3.05	default	128	71.0	tok/s	v0.30.0	2026-11-01	balanced	2	6 samples	v0.37.0:docs/RESULTS.md:204
+ctx_decode	3.05	default	192	68.8	tok/s	v0.30.0	2026-11-01	balanced	2	5 samples	v0.37.0:docs/RESULTS.md:204
+ctx_decode	3.05	default	250	66.5	tok/s	v0.30.0	2026-11-01	balanced	2	5 samples	v0.37.0:docs/RESULTS.md:204
+ctx_decode	3.05	default	32	73.8	tok/s	v0.31.0	2026-11-02	balanced	2	4 samples	v0.37.0:docs/RESULTS.md:205
+ctx_decode	3.05	default	64	71.0	tok/s	v0.31.0	2026-11-02	balanced	2	4 samples	v0.37.0:docs/RESULTS.md:205
+ctx_decode	3.05	default	128	70.9	tok/s	v0.31.0	2026-11-02	balanced	2	6 samples	v0.37.0:docs/RESULTS.md:205
+ctx_decode	3.05	default	192	68.8	tok/s	v0.31.0	2026-11-02	balanced	2	5 samples	v0.37.0:docs/RESULTS.md:205
+ctx_decode	3.05	default	250	66.7	tok/s	v0.31.0	2026-11-02	balanced	2	5 samples	v0.37.0:docs/RESULTS.md:205
+ctx_decode	3.05	default	32	75.7	tok/s	v0.32.0	2026-11-03	balanced	2	4 samples	v0.37.0:docs/RESULTS.md:206
+ctx_decode	3.05	default	64	72.5	tok/s	v0.32.0	2026-11-03	balanced	2	4 samples	v0.37.0:docs/RESULTS.md:206
+ctx_decode	3.05	default	128	71.8	tok/s	v0.32.0	2026-11-03	balanced	2	6 samples	v0.37.0:docs/RESULTS.md:206
+ctx_decode	3.05	default	192	69.6	tok/s	v0.32.0	2026-11-03	balanced	2	5 samples	v0.37.0:docs/RESULTS.md:206
+ctx_decode	3.05	default	250	67.3	tok/s	v0.32.0	2026-11-03	balanced	2	5 samples	v0.37.0:docs/RESULTS.md:206
+ctx_decode	3.05	default	32	77.0	tok/s	v0.33.0	2026-11-03	balanced	2	4 samples	v0.37.0:docs/RESULTS.md:207
+ctx_decode	3.05	default	64	74.0	tok/s	v0.33.0	2026-11-03	balanced	2	4 samples	v0.37.0:docs/RESULTS.md:207
+ctx_decode	3.05	default	128	73.9	tok/s	v0.33.0	2026-11-03	balanced	2	6 samples	v0.37.0:docs/RESULTS.md:207
+ctx_decode	3.05	default	192	71.2	tok/s	v0.33.0	2026-11-03	balanced	2	5 samples	v0.37.0:docs/RESULTS.md:207
+ctx_decode	3.05	default	250	69.1	tok/s	v0.33.0	2026-11-03	balanced	2	5 samples	v0.37.0:docs/RESULTS.md:207

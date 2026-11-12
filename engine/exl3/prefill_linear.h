@@ -3,6 +3,7 @@
 #include "exl3.h"
 #include "front_order.h"
 #include "prefill_items.h"
+#include "prefill_half.h"
 #include "kernels/exl3_gemm.h"
 #include "../switches.h"
 #include <algorithm>
@@ -74,6 +75,35 @@ __global__ void __launch_bounds__(256) PrefillLinInHalfKernel(const LinJob* __re
   __half* dst=j.xh+(PACKED ? PackedIndex(it.r,c,j.R) : (size_t)it.r*j.I+c);
 #pragma unroll
   for (int i=0;i<4;++i) dst[i]=__float2half(v[i]*kHadNorm);
+}
+
+// PrefillLinInHalfKernel<true> for a group whose jobs share R, I and the
+// source (no item list): one wave per row and 128-column block reads the
+// fp16 source once and writes the transform of every job. The job-major
+// kernel reads the source once per job (the whole source does not stay in
+// the MALL between the passes). Same arithmetic per element: bitwise equal
+// (bench/dense_next.hip R8192: 2 jobs 924 -> 773 us, 4 jobs 1,749 -> 1,610 us).
+__global__ void __launch_bounds__(256) PrefillLinInHalfJobsKernel(const LinJob* __restrict__ jobs,
+    int njobs,int n,const __half* __restrict__ source) {
+  const int w=blockIdx.x*8+(threadIdx.x>>5);
+  if (w>=n) return;
+  const LinJob& j0=jobs[0];
+  const int blocks=j0.I/128, r=w/blocks, blk=w-r*blocks;
+  const int c=blk*128+(threadIdx.x&31)*4;
+  const __half* src=source+(size_t)r*j0.lds+c;
+  float s[4];
+#pragma unroll
+  for (int i=0;i<4;++i) s[i]=__half2float(src[i]);
+  for (int jj=0;jj<njobs;++jj) {
+    const LinJob& j=jobs[jj];
+    float v[4];
+#pragma unroll
+    for (int i=0;i<4;++i) v[i]=RoundH(s[i]*__half2float(j.suh[c+i]));
+    Wht128(v);
+    __half* dst=j.xh+PackedIndex(r,c,j.R);
+#pragma unroll
+    for (int i=0;i<4;++i) dst[i]=__float2half(v[i]*kHadNorm);
+  }
 }
 
 // Repacks a row-major [R][I] fp16 input that another kernel wrote (I % 128
@@ -470,12 +500,16 @@ inline void LaunchPrefillGemmOutWide(int kw, int rm, const LinJob* lin, const Ex
 struct PrefillTiles {
   bool fixed = false;
   PrefillGemmShape moe{2, true}, in{8, true}, out{4, true};
-  // MoE row tiles for 4096-row chunks: 6 (96 rows) fits the about 80 rows per
-  // expert, and RM8 with two column tiles per wave spills in the queue
-  // kernel. CRUCIBLE_PF_MOE_RM (2, 4, 6, 7 or 8) overrides it for tests.
+  // MoE row tiles for chunks of kPrefillMoeRm6Rows rows or more: 6 (96 rows) fits the about 80 rows per
+  // expert at 4096, and RM8 with two column tiles per wave spills in the queue
+  // kernel. RM6 is also the fastest at 1024 to 3072 rows (about 20 to 60 rows per expert; verify-moe trace,
+  // Pair + Gemm ms per layer, RM 2/4/6: 1024 8.52/7.94/7.42, 2048 14.10/12.17/11.46, 3072 -/16.69/15.49;
+  // probably the experts with the most rows, which need several RM2 or RM4 row tiles, cause not measured).
+  // CRUCIBLE_PF_MOE_RM (2, 4, 6, 7 or 8) overrides it for tests.
+  static constexpr int kPrefillMoeRm6Rows = 1024;
   PrefillGemmShape Moe(int R) const {
     static const int big=crucible::SwitchText("CRUCIBLE_PF_MOE_RM") ? std::atoi(crucible::SwitchText("CRUCIBLE_PF_MOE_RM")) : 6;
-    return fixed ? moe : PrefillGemmShape{R >= 4096 ? big : R >= 2048 ? 4 : 2, true};
+    return fixed ? moe : PrefillGemmShape{R >= kPrefillMoeRm6Rows ? big : 2, true};
   }
   // With the fused output transform, RM16 items run about 2x slower than RM8
   // in the engine at 4K (8-wave blocks; cause not found yet), so dense groups
@@ -507,25 +541,37 @@ struct PrefillLinear {
   bool k6 = false;           // every job has K6 (fused output kernels take one width class)
   bool split = false;        // K6 and K3..5 jobs: one fused launch per width class
   int wide = 0;              // 7 or 8: every job has that width (PrefillGemmOutWideKernel)
+  // Half path (prefill_half.h): each Run decodes the group's tiles once into `wcopy`, then one
+  // fp16 GEMM launch covers every job. Same bytes as the fused EXL3 kernels.
+  bool half = false;
+  __half* wcopy = nullptr;
+  HalfGemmJob* hjobs = nullptr;
+  Exl3GemmItem* hitems = nullptr;
+  int hcount = 0;
+  std::vector<int> hfront;   // per job: the front split of its tiles (0: engine order)
 
   size_t DeviceBytes() const {
     return jobs.size() * (sizeof(LinJob) + sizeof(Exl3GemmJob)) +
-           (size_t)count * sizeof(Exl3GemmItem) + (size_t)((input ? nin : 0) + nout) * sizeof(XfItem);
+           (size_t)(count + hcount) * sizeof(Exl3GemmItem) + (size_t)((input ? nin : 0) + nout) * sizeof(XfItem) +
+           (hjobs ? jobs.size() * sizeof(HalfGemmJob) : 0);
   }
 
   // Releases the device plan arrays (the engine's plan cache evicts with it).
   void Free() {
-    for (void* p : {(void*)linear, (void*)gemm, (void*)items, (void*)input, (void*)output})
+    for (void* p : {(void*)linear, (void*)gemm, (void*)items, (void*)input, (void*)output, (void*)hjobs, (void*)hitems})
       if (p) HIP_OK(hipFree(p));
     linear = nullptr; gemm = nullptr; items = nullptr; input = nullptr; output = nullptr;
+    hjobs = nullptr; hitems = nullptr;
   }
   __half* repack = nullptr;  // packed copy of an input written row-major elsewhere
 
   // With a packed shape and no input transform, `repack` receives the
   // packed copy of jobs[0].xh before the GEMM.
   // front_s: per job, 0 for engine order or the front-order split (Lin::front_s).
+  // wcopy (wcopy_cap halves): the half path's decode copy; nullptr keeps the EXL3 kernels.
   void Build(std::vector<LinJob> source, PrefillGemmShape g, __half* repack_dst, float* partial,
-             size_t partial_cap, __half* xh, size_t xh_cap, const std::vector<int>& front_s = {}) {
+             size_t partial_cap, __half* xh, size_t xh_cap, const std::vector<int>& front_s = {},
+             __half* wcopy_dst = nullptr, size_t wcopy_cap = 0) {
     size_t po = 0, xo = 0;
     nin = 0;
     shape = g; repack = g.packed ? repack_dst : nullptr; front = false;
@@ -555,7 +601,10 @@ struct PrefillLinear {
         std::fprintf(stderr,"prefill GEMM supports EXL3 K3..8 only\n");std::abort();
       }
       job.S = 1; job.partial = partial+po; job.xh = xh+xo;
-      po += (size_t)job.R*job.O; xo += (size_t)job.R*job.I;
+      // A fused group never writes the fp32 partial (PrefillGemmOutKernel keeps the tile in registers and LDS), so
+      // only an unfused group takes workspace; the fused jobs point at its start.
+      if (!fused) po += (size_t)job.R*job.O;
+      xo += (size_t)job.R*job.I;
       jobs.push_back(job);
       const int fs = j < front_s.size() ? front_s[j] : 0;
       if (j > 0 && (fs > 0) != front) {
@@ -586,6 +635,34 @@ struct PrefillLinear {
     linear=PrefillUpload(jobs); gemm=PrefillUpload(gj); items=PrefillUpload(gi);
     input=PrefillUpload(in); output=PrefillUpload(out);
     count=gi.size(); nout=out.size();
+    BuildHalf(gj, front_s, wcopy_dst, wcopy_cap);
+  }
+  // The half path takes fused K3..6 groups of at least kHalfMinRows rows whose decode copy fits.
+  void BuildHalf(const std::vector<Exl3GemmJob>& gj, const std::vector<int>& front_s, __half* dst, size_t cap) {
+    half = false;
+    if (!dst || !fused || wide) return;
+    size_t need = 0;
+    std::vector<HalfGemmJob> hj;
+    for (size_t j = 0; j < gj.size(); ++j) {
+      const Exl3GemmJob& e = gj[j];
+      if (e.M < kHalfMinRows || (e.I / 16) % kHalfKC) return;
+      hj.push_back({e.x, dst + need, e.I, e.O, e.M, e.Xrows});
+      need += (size_t)e.I * e.O;
+    }
+    if (need > cap) return;
+    int columns = 0;
+    for (const auto& e : gj) columns += e.O;
+    const std::vector<Exl3GemmItem> hi = HalfItems(hj, HalfGroupFor(columns));
+    half = true; wcopy = dst; hcount = (int)hi.size();
+    hfront.assign(gj.size(), 0);
+    for (size_t j = 0; j < gj.size() && j < front_s.size(); ++j) hfront[j] = front_s[j];
+    hjobs = PrefillUpload(hj); hitems = PrefillUpload(hi);
+  }
+  // Every job reads the fp16 source with one stride and has the same R and I.
+  bool SharedSource() const {
+    return std::all_of(jobs.begin(), jobs.end(), [&](const LinJob& j) {
+      return j.R == jobs[0].R && j.I == jobs[0].I && j.lds == jobs[0].lds;
+    });
   }
   // mark(stage) runs after the input transform and after the GEMM.
   // input_packed: the producer already wrote `repack` (no repack kernel).
@@ -604,7 +681,10 @@ struct PrefillLinear {
     }
     if (transform_input) {
       if (input_half) {
-        if (shape.packed) PrefillLinInHalfKernel<true><<<(nin+7)/8,256>>>(linear,input,nin,input_half);
+        if (shape.packed && !input && SharedSource()) {
+          const int per = jobs[0].R * (jobs[0].I / 128);
+          PrefillLinInHalfJobsKernel<<<(per+7)/8,256>>>(linear,(int)jobs.size(),per,input_half);
+        } else if (shape.packed) PrefillLinInHalfKernel<true><<<(nin+7)/8,256>>>(linear,input,nin,input_half);
         else PrefillLinInHalfKernel<false><<<(nin+7)/8,256>>>(linear,input,nin,input_half);
       } else if (shape.packed) PrefillLinInPackedKernel<<<(nin+7)/8,256>>>(linear,input,nin);
       else LinInKernel<<<(nin+7)/8,256>>>(linear,input,nin);
@@ -616,7 +696,13 @@ struct PrefillLinear {
     if (fused && transform_output) {
       // A split group (4.05 QSA input) ran unfused with LinOutKernel before
       // same values, 27 ms more per 4,096 rows.
-      if (wide) {
+      if (half) {
+        for (size_t j = 0; j < jobs.size(); ++j) {
+          const LinJob& J = jobs[j];
+          LaunchHalfCopy(J.K, hfront[j], J.tiles, HalfCopyOf(j), J.I, J.O);
+        }
+        HalfGemmOutKernel<kHalfKC, EPI...><<<hcount, 128>>>(linear, hjobs, hitems, hcount, epi...);
+      } else if (wide) {
         LaunchPrefillGemmOutWide(wide,shape.rm,linear,gemm,items,count,epi...);
       } else if (split) {
         LaunchPrefillGemmOut(shape.rm,linear,gemm,items,count6,true,front,epi...);
@@ -629,6 +715,12 @@ struct PrefillLinear {
     LaunchPrefillGemm(shape,gemm,items,count);
     mark("lin_gemm");
     if (transform_output) LinOutKernel<<<(nout+7)/8,256>>>(linear,output,nout);
+  }
+  // Job j's slice of the decode copy (the jobs in order, I * O halves each).
+  __half* HalfCopyOf(size_t j) const {
+    size_t o = 0;
+    for (size_t i = 0; i < j; ++i) o += (size_t)jobs[i].I * jobs[i].O;
+    return wcopy + o;
   }
   void Run(bool transform_input = true, bool transform_output = true) const {
     Run(transform_input, transform_output, [](const char*) {});

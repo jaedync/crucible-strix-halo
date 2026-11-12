@@ -80,7 +80,16 @@ void Engine::InitPrefill() {
   pf_gdn_.ut=Scratch<float>(48*core*128); pf_gdn_.u=Scratch<float>(vectors);
   pf_y_=Scratch<float>(48*core*128); pf_gdn_.y=pf_y_; pf_gdn_.wk=Scratch<float>(vectors);
   pf_gdn_.g=Scratch<float>(48*core); pf_gdn_.beta=Scratch<float>(48*core);
+  // the lazy scale resets only where a cold prefill cuts a core part (positions that are multiples of
+  // kPrefillCoreRows, or of the chunk rows when those divide it), so a resume at any row gives the cold bits. Another
+  // chunk size keeps the reset at each part start (anchor 0).
+  pf_gdn_.carry=Zeros<float>(kGdnHeads);
+  pf_gdn_.anchor=prefill_rows_>0 && (prefill_rows_%kPrefillCoreRows==0 || kPrefillCoreRows%prefill_rows_==0)
+                     ? std::min(prefill_rows_,kPrefillCoreRows) : 0;
   pf_gdn_micro_=NumericsOn("CRUCIBLE_PF_GDN_MICRO");
+  // The fused scan and gate needs all 192 blocks resident; otherwise the engine keeps the separate gate.
+  if (!prefill::GdnEager() && prefill::GdnScanGateFits()) pf_gdn_prog_=Zeros<unsigned long long>(48*4);
+  else std::fprintf(stderr,"prefill GDN: separate scan and gate (the fused kernel does not fit)\n");
   pf_gdn_.lower=Scratch<float>(matrices); pf_gdn_.qk=Scratch<float>(matrices);
   pf_ab_=Scratch<float>(pf_room_rows_*96);
   pf_prompt_stacks_=Scratch<float>((size_t)prefill_rows_*kWide);
@@ -88,10 +97,11 @@ void Engine::InitPrefill() {
     pf_hstride_=kWide+64;
     pf_H_=Scratch<float>((size_t)pf_room_rows_*pf_hstride_);
   }
-  // Fragment-order copies of the trunk HC fn and up (1.29 GB, one buffer)
-  // for the bulk dots and mix: 4K -44 ms, same bits.
-  // Decode keeps the row-major weights; the MTP layer's HC keeps them too (fnf and upf stay null).
-  {
+  // Fragment-order copies of the trunk HC fn and up (1.29 GB) for the bulk dots and mix: 4K -44 ms, same bits
+  // The fp16 loader makes them for every site in the static arena, where decode reads them
+  // too (model.h HcW, hc_wmma2.h). Only the int8 HC load (CRUCIBLE_HC_WMMA=2) still needs this buffer of W' copies.
+  if (m_.L[0].hca.fnf) std::fprintf(stderr,"prefill HC: fragment-order fn and up from the loader\n");
+  else {
     const size_t fnh=(size_t)(kRank+kStreams+15)/16*16*kWide,uph=(size_t)kWide*kRank;
     __half* p=Zeros<__half>((fnh+uph)*kLayers*2);
     for (Layer& L : m_.L)
@@ -169,13 +179,26 @@ const Engine::PrefillPlans& Engine::PrefillPlansFor(int R) {
         Job(w.gdn.z,x_,kHidden,z_,kGdnValueWidth,kEpiStore,nullptr,R)};
       front={w.gdn.qkv.front_s,w.gdn.z.front_s};
     }
-    g.input.Build(input,pf_tiles_.In(R),nullptr,partial_,partial_capacity_,xh_,xh_capacity_,front);
+    g.input.Build(input,pf_tiles_.In(R),nullptr,partial_,partial_capacity_,xh_,xh_capacity_,front,
+                  pf_wcopy_,pf_wcopy_cap_);
     const Lin& out=w.attn ? w.qsa.o : w.gdn.out;
-    // An ablated output projection stores y; AblateWrite does the write-back.
-    const LinJob oj=abl_attn_[l] ? Job(out,nullptr,0,abl_y_,kHidden,kEpiStore,nullptr,R)
+    // An ablated output projection stores y; AblateWrite does the write-back. Request mode builds both: output is
+    // the stock plan and output_abl the ablated one; each prefill pass picks (PrefillBlock).
+    const LinJob ablated=Job(out,nullptr,0,abl_y_,kHidden,kEpiStore,nullptr,R);
+    const bool split=abl_attn_[l] && abl_request_;
+    const LinJob oj=abl_attn_[l] && !split ? ablated
                                  : Job(out,nullptr,0,PrefillH(R),PrefillHStride(R),kEpiResidual,post_,R);
     g.output.Build({oj},pf_tiles_.Out(R),pf_xpack_,partial_,partial_capacity_,xh_,xh_capacity_,
-                   {out.front_s});
+                   {out.front_s},pf_wcopy_,pf_wcopy_cap_);
+    if (split) {
+      g.output_abl.Build({ablated},pf_tiles_.Out(R),pf_xpack_,partial_,partial_capacity_,xh_,xh_capacity_,
+                         {out.front_s},pf_wcopy_,pf_wcopy_cap_);
+      // The attention core writes the stock plan's input (xh or repack); the ablated plan must read the same.
+      if (g.output_abl.jobs[0].xh!=g.output.jobs[0].xh || g.output_abl.repack!=g.output.repack) {
+        std::fprintf(stderr,"ablated prefill output plan does not share the stock plan's input\n");
+        std::exit(2);
+      }
+    }
   }
   const size_t bytes=p->DeviceBytes();
   if (bytes>kPrefillPlanBytes)
@@ -206,7 +229,7 @@ void Engine::FreePrefillPlans(bool oldest_only) {
     prefill_plan_bytes_-=bytes;
     if (oldest_only)
       std::fprintf(stderr,"prefill plan for %d rows evicted (%.1f MiB)\n",i->first,bytes/1048576.0);
-    for (auto& layer : i->second.second->layers) { layer.input.Free(); layer.output.Free(); }
+    for (auto& layer : i->second.second->layers) { layer.input.Free(); layer.output.Free(); layer.output_abl.Free(); }
     i=prefill_plans_.erase(i);
     if (oldest_only) break;  // The erased LRU iterator is no longer comparable.
   }
@@ -231,6 +254,8 @@ int Engine::PrefillFirstRow(int R, bool predict, int keep, const std::string& du
 
 void Engine::PrefillBlock(int li, const Layer& L, const PrefillLayer& P, int R, int pos0, bool cache_only,
                           int first) {
+  abl_now_=li<kLayers ? AblPass(R) : AblPassRows{};
+  const float* const abl_attn=AblAttn(li);
   // Above 8 rows the bulk inputs are fp16 (x_ is fp16-exact); the fp32 opt-in was deleted in train 18.
   const bool half_x=R>8;
   HcRead(L.hca,R,true,half_x ? pf_x_ : nullptr,half_x,PrefillH(R),PrefillHStride(R)); Mark("hc_mix");
@@ -243,13 +268,16 @@ void Engine::PrefillBlock(int li, const Layer& L, const PrefillLayer& P, int R, 
                 prefill::GdnPrepEpi{qkv_,pf_gdn_.q,pf_gdn_.k,L.gdn.conv,R});
   else P.input.Run(true,true,lin,false,half_x ? pf_x_ : nullptr);
   Mark(L.attn ? "qsa_proj" : "gdn_proj");
+  // a Pre cut inside a core part runs that part as two pieces (crucible::PrefillPieces).
+  const auto pieces=crucible::PrefillPieces(R,pf_cut_.cut);
   if (cache_only) {
     // The same cache kernels as LaunchQsaPrefill on the same parts; the layer's output rows are dead.
-    for (int o=0; o<R; o+=kPrefillCoreRows) {
-      auto a=QArgs(L.qsa,sequence_->qc.at(li),nullptr,std::min(kPrefillCoreRows,R-o),pos0+o,sequence_->Mrope());
+    for (const auto& piece : pieces) {
+      const int o=piece.offset, n=piece.rows;
+      auto a=QArgs(L.qsa,sequence_->qc.at(li),nullptr,n,pos0+o,*sequence_);
       a.q+=(size_t)o*kQsaQWidth; a.k+=(size_t)o*kQsaKvWidth; a.v+=(size_t)o*kQsaKvWidth; a.idx+=(size_t)o*kQsaIdxWidth;
       prefill::LaunchQsaPrefillCache(a);
-      PrefillCutAfter(o+std::min(kPrefillCoreRows,R-o),{sequence_->qc.at(li).ik_raw});
+      PrefillCutAfter(o+n,{sequence_->qc.at(li).ik_raw,PrefillCutPool(li,pos0)});
     }
     Mark("qsa_prep");
     return;
@@ -261,18 +289,19 @@ void Engine::PrefillBlock(int li, const Layer& L, const PrefillLayer& P, int R, 
   if (L.attn) {
     // The QSA and GDN prefill kernels take at most kPrefillCoreRows rows; later
     // parts see earlier parts through the cache or state, as chunks do.
-    for (int o=0; o<R; o+=kPrefillCoreRows) {
-      const int n=std::min(kPrefillCoreRows,R-o), skip=std::clamp(first-o,0,n);
+    for (const auto& piece : pieces) {
+      // The skip is the rows below `first` rounded down to the 16-row QSA skip: a Pre cut starts the second piece at a
+      // row that is a multiple of 4, not of 16, and the QSA prefill launches take only a 16-aligned skip.
+      const int o=piece.offset, n=piece.rows, skip=PrunePieceSkip(first,o,n);
       if (skip==n) {
         // No output row of this part is read: cache rows only.
-        auto c=QArgs(L.qsa,sequence_->qc.at(li),nullptr,n,pos0+o,sequence_->Mrope());
+        auto c=QArgs(L.qsa,sequence_->qc.at(li),nullptr,n,pos0+o,*sequence_);
         c.q+=(size_t)o*kQsaQWidth; c.k+=(size_t)o*kQsaKvWidth; c.v+=(size_t)o*kQsaKvWidth; c.idx+=(size_t)o*kQsaIdxWidth;
         prefill::LaunchQsaPrefillCache(c);
-        PrefillCutAfter(o+n,{sequence_->qc.at(li).ik_raw});
+        PrefillCutAfter(o+n,{sequence_->qc.at(li).ik_raw,PrefillCutPool(li,pos0)});
         continue;
       }
-      auto a=QArgs(L.qsa,sequence_->qc.at(li),direct ? out : out+(size_t)o*kQsaOutWidth,std::min(kPrefillCoreRows,R-o),pos0+o,
-                   sequence_->Mrope());
+      auto a=QArgs(L.qsa,sequence_->qc.at(li),direct ? out : out+(size_t)o*kQsaOutWidth,n,pos0+o,*sequence_);
       if (direct) { a.pack_rows=R; a.pack_off=o; }
       a.q+=(size_t)o*kQsaQWidth; a.k+=(size_t)o*kQsaKvWidth; a.v+=(size_t)o*kQsaKvWidth; a.idx+=(size_t)o*kQsaIdxWidth;
       const auto mark=[&](const char* n) { Mark(n); };
@@ -280,7 +309,7 @@ void Engine::PrefillBlock(int li, const Layer& L, const PrefillLayer& P, int R, 
       if (pf_qsa_union_.list) prefill::LaunchQsaPrefillUnion(qp,pf_qsa_union_,mark,nullptr,skip);
       else prefill::LaunchQsaPrefill(qp,mark,nullptr,skip);
       if (!warming_) CaptureQsa(a,li,false);
-      PrefillCutAfter(o+n,{sequence_->qc.at(li).ik_raw});
+      PrefillCutAfter(o+n,{sequence_->qc.at(li).ik_raw,PrefillCutPool(li,pos0)});
     }
     Mark("qsa_gate");
   } else {
@@ -288,26 +317,50 @@ void Engine::PrefillBlock(int li, const Layer& L, const PrefillLayer& P, int R, 
     if (half_x) LaunchDenseHalf(L.gdn.ab,96,pf_x_,pf_ab_,96,R);
     else LaunchDense(L.gdn.ab,96,kHidden,x_,kHidden,pf_ab_,96,R);
     Mark("gdn_ab");
-    for (int o=0; o<R; o+=kPrefillCoreRows) {
-      const int n=std::min(kPrefillCoreRows,R-o);
+    // The micro and eager scans read and write S_true only.
+    const bool lazy=!pf_gdn_micro_ && !prefill::GdnEager() && pf_gdn_.anchor>0;
+    if (!lazy && sequence_->gdn_lazy) prefill::LaunchGdnMaterialize({sequence_->gstate.at(li)});
+    if (lazy && (pos0+R)%pf_gdn_.anchor) sequence_->gdn_lazy=true;
+    const auto args=[&](int o,int n) {
       auto a=pf_gdn_;
       a.input={qkv_+(size_t)o*kGdnQkvWidth,z_+(size_t)o*kGdnValueWidth,half_x ? nullptr : x_+(size_t)o*kHidden,L.gdn.ab,L.gdn.conv,
                L.gdn.A_log,L.gdn.dt_bias,L.gdn.gamma,sequence_->ghist.at(li),sequence_->gstate.at(li),L.gdn.out.suh,
                direct ? out : out+(size_t)o*kGdnValueWidth,sequence_->gpend.at(li),pos0+o,n,0,n};
       if (direct) { a.input.pack_rows=R; a.input.pack_off=o; }
       a.ab_logits=pf_ab_+(size_t)o*96; a.chunks=(n+63)/64;
+      return a;
+    };
+    const int halo=gdn_epi ? (P.input.half ? 128 : P.input.shape.rm*16) : 0;
+    for (const auto& piece : pieces) {
+      const int o=piece.offset, n=piece.rows;
+      auto a=args(o,n);
       if (gdn_epi) {
-        a.q=pf_gdn_.q+(size_t)(o/kPrefillCoreRows)*prefill::kGdnPrepPartFloats;
-        a.k=pf_gdn_.k+(size_t)(o/kPrefillCoreRows)*prefill::kGdnPrepPartFloats;
+        // GdnPrepEpi wrote q and k per whole part: a piece reads them from its row in the part (qk_rows).
+        const size_t part=(size_t)(piece.part/kPrefillCoreRows)*prefill::kGdnPrepPartFloats;
+        a.q=pf_gdn_.q+part+(size_t)(o-piece.part)*128;
+        a.k=pf_gdn_.k+part+(size_t)(o-piece.part)*128;
+        if (n!=piece.part_rows) {
+          a.qk_rows=(piece.part_rows+63)&~63;
+          // The halo rows of the whole part, from the history at the part start (before its first piece's scan).
+          if (o==piece.part) {
+            auto w=args(o,piece.part_rows);
+            w.q=pf_gdn_.q+part; w.k=pf_gdn_.k+part;
+            prefill::LaunchGdnPrepQkHalo(w,nullptr,halo);
+          }
+        }
       }
       if (pf_gdn_micro_) prefill::LaunchGdnMicro(a,pf_y_);
-      else prefill::LaunchGdnLanes(a,nullptr,true,gdn_epi ? P.input.shape.rm*16 : 0);
+      else {
+        // A new tag for each launch, never 0 (the counters start at 0).
+        if (pf_gdn_prog_) prefill::LaunchGdnScanGate(a,pf_gdn_prog_,++pf_gdn_gen_ ? pf_gdn_gen_ : ++pf_gdn_gen_,nullptr,halo);
+        else prefill::LaunchGdnLanes(a,nullptr,true,halo);
+      }
       PrefillCutAfter(o+n,{sequence_->gstate.at(li),sequence_->ghist.at(li),sequence_->gpend.at(li)});
     }
     Mark("gdn_core");
   }
-  P.output.Run(false,true,lin,direct);
-  if (abl_attn_[li]) AblateWrite(abl_attn_[li],PrefillH(R),PrefillHStride(R),R);
+  (abl_attn && abl_request_ ? P.output_abl : P.output).Run(false,true,lin,direct);
+  if (abl_attn) AblateWrite(abl_attn,PrefillH(R),PrefillHStride(R),R);
   Mark(L.attn ? "qsa_oproj" : "gdn_oproj");
   // The MoE half keeps the shapes and numerics of all R rows; it runs on rows [first, R) only.
   const PrefillGemmShape moe=pf_tiles_.Moe(R);
@@ -319,14 +372,21 @@ void Engine::PrefillBlock(int li, const Layer& L, const PrefillLayer& P, int R, 
   HcRead(L.hcm,R,true,xh_,half_x && moe.packed,H,ldh,shape_rows); Mark("hc_mix");
   LaunchDense(L.moe.router,kExperts+1,kHidden,x_,kHidden,rlog_,kExperts+1,R,true);
   PrefillMoeRouteWaveKernel<<<(R+7)/8,256>>>(rlog_,sel_moe_,wts_,R); Mark("moe_router");
+  // prefill-rows: CRUCIBLE_ROUTE_DUMP also records the bulk launches (the MoE bench replays them).
+  if (route_dump_ && li<kLayers) DumpRoutes(li,R);
   // K6 projections (4.05 shared expert) select the K6 kernel instantiations, K7 and K8 (h6_ng8
   // shared experts) the wide ones, K3.5 experts with K7 the kPrefillMoeK7Half ones, K2 and K2.5 experts
   // with K6 the kPrefillMoeK6Low ones (PrefillWidthIssue rejects any other set before the GEMM path runs).
   const int kmax=PrefillMoeKmax(MoeLayerWidths(L));
   const bool k6=kmax==6;
+  // prefill-moe: packed RM6 shapes with the fp16 pd run 192-row items on the
+  // tile kernels (gate/up with the mid step, then down), bitwise equal to the pair or FX + Mid path and the RM6
+  // down kernel. The plan then makes 192-row units and items for both.
+  // prefill-rows: only launches of at least kPrefillMoeTileRows (8,192) rows take them (PrefillMoeTileLaunch).
+  const bool tile=PrefillMoeTileLaunch(R) && PrefillMoeTileShape(moe,half_pd,kmax);
   // Above 8 rows HcRead(hcm) leaves the fp16 copy of x_ in xh_ for the router
   // and the packed input transform.
-  auto a=pf_moe_; a.dispatch.rows=R; a.tile_rows=16*moe.rm; a.packed=moe.packed; a.xh=xh_;
+  auto a=pf_moe_; a.dispatch.rows=R; a.tile_rows=tile ? kTileRows : 16*moe.rm; a.packed=moe.packed; a.xh=xh_;
   if (R<=8) PrefillPackKernel<<<(R*kHidden+255)/256,256>>>(x_,xh_,nullptr,R*kHidden);
   prefill::LaunchMoeDispatch(a.dispatch);
   HIP_OK(hipMemsetAsync(a.item_counts,0,2*sizeof(int),0));
@@ -341,8 +401,16 @@ void Engine::PrefillBlock(int li, const Layer& L, const PrefillLayer& P, int R, 
   // section 11); merge only after its night pair passes the kill line.
   // Only the byte-tested K sets take the pair path (prefill_moe_kset.h).
   const bool tested=PrefillMoePairKSet(k6,L.moe.sg.K,L.moe.su.K,L.moe.sd.K,L.moe.experts);
-  const bool pair=fused && tested && PrefillMoePairShape(moe);
-  if (pair) {
+  const bool pair=!tile && fused && tested && PrefillMoePairShape(moe);
+  // The producer/consumer kernels, bitwise equal to the tile kernels, for the KMAX
+  // codes 5 and 6. kPrefillMoePc (prefill_moe_tile.h) is a compile-time switch, on: the fat gate/up kernel with the tile
+  // down kernel (kPcFatDown false). Off, pc is false and the pc launches instantiate no kernel.
+  const bool pc=tile && PrefillMoePcOn(kmax);
+  if (pc) {
+    LaunchPrefillMoePcEngine(kmax,a,PrefillTileFxLead()); Mark("moe_gateup");
+  } else if (tile) {
+    LaunchPrefillMoeTilePair(kmax,a,PrefillTileFxLead()); Mark("moe_gateup");
+  } else if (pair) {
     LaunchPrefillMoePair(moe.rm,a,k6); Mark("moe_gateup");
   } else if (fused) {
     LaunchPrefillMoeFxK(moe.rm,a,kmax); Mark("moe_gateup");
@@ -352,8 +420,11 @@ void Engine::PrefillBlock(int li, const Layer& L, const PrefillLayer& P, int R, 
     Mark("moe_xform");
     LaunchPrefillMoeGemmK(moe,a.g_gu,a.i_gu,a.item_counts,kmax); Mark("moe_gateup");
   }
-  if (!pair) { PrefillMoeMidKernel<<<(R*kSlots*5+7)/8,256>>>(a); Mark("moe_mid"); }
-  LaunchPrefillMoeGemmK(moe,a.g_down,a.i_down,a.item_counts+1,kmax,half_pd); Mark("moe_down");
+  if (!pair && !tile) { PrefillMoeMidKernel<<<(R*kSlots*5+7)/8,256>>>(a); Mark("moe_mid"); }
+  if (pc) LaunchPrefillMoePcDownEngine(kmax,a.g_down,a.i_down,a.item_counts+1);
+  else if (tile) LaunchPrefillMoeTileDown(kmax,a.g_down,a.i_down,a.item_counts+1);
+  else LaunchPrefillMoeGemmK(moe,a.g_down,a.i_down,a.item_counts+1,kmax,half_pd);
+  Mark("moe_down");
   if (const float* ab=AblMlp(li)) {
     if (half_pd) PrefillMoeCombineKernel<true,true><<<(R*20+7)/8,256>>>(a,wts_,nullptr,abl_y_,kHidden);
     else PrefillMoeCombineKernel<false,true><<<(R*20+7)/8,256>>>(a,wts_,nullptr,abl_y_,kHidden);
@@ -375,7 +446,14 @@ void Engine::BeginPrefillJoin(int R, int pos0) {
   for (const auto& [layer,cache] : sequence_->qc)
     if (layer!=kLayers && cache.raw_slots)
       spans.emplace_back(cache.ik_raw,size_t(cache.raw_slots)*kQsaRawDim*sizeof(float));
-  if (!crucible::PrefillJoinValid(join,R,prefill_rows_,spans)) {
+  // a cut off the 128-position pool grid copies the pool block that holds it
+  // (SlotCheckpointIO::Spans, PrefillCutPool).
+  const size_t at=size_t(pos0)+size_t(std::max(join.cut,0));
+  if (join.cut && at%128)
+    for (const auto& [layer,cache] : sequence_->qc)
+      if (layer!=kLayers)
+        spans.emplace_back(cache.ik_pool+at/128*QsaPoolFloats(128),QsaPoolFloats(128)*sizeof(float));
+  if (!crucible::PrefillJoinValid(join,R,prefill_rows_,spans) || (join.pre && join.start!=size_t(pos0))) {
     std::fprintf(stderr,"prefill join plan fault (x4-tail): rows %d, ledger %d, cut %d, %zu copies\n",R,join.ledger,
                  join.cut,join.copies.size());
     std::abort();
@@ -403,6 +481,17 @@ void Engine::PrefillCutAfter(int end, std::initializer_list<const void*> sources
     }
 }
 
+// the QSA pool block that holds the cut, when the cut is off the 128-position grid (else nullptr).
+// The part or piece that ends at the cut leaves it as a slot checkpoint at the cut holds it; later rows write it.
+const void* Engine::PrefillCutPool(int li, int pos0) const {
+  static_assert(crucible::kQsaSelectBlockSteps[0]==kSelBlocks && crucible::kQsaSelectBlockSteps[1]==kQsaCandidates &&
+                crucible::kQsaSelectBlockSteps[2]==1024*32 && crucible::kQsaSelectBlockSteps[3]==kQsaTopMaxBlocks,
+                "PrefillPreCutValid keeps the QSA top-k steps of qsa_long.h");
+  const size_t at=size_t(pos0)+size_t(pf_cut_.cut);
+  if (!pf_cut_.cut || at%128==0) return nullptr;
+  return sequence_->qc.at(li).ik_pool+at/128*QsaPoolFloats(128);
+}
+
 // x4-tail: the PLE ring at the cut holds rows cut-16..cut-1 of this launch (the cut is at least one core part in).
 // The ring kernel of LaunchPrefillPle runs again with the cut buffer as its ring and the cut as its rows, while
 // pf_plenv_ still holds the launch's fp16 values.
@@ -423,7 +512,9 @@ void Engine::PrefillCutPle(int pos0) {
 
 std::vector<int> Engine::Prefill(const int* tokens, int R, const std::string& dump, bool predict,
                                  const PrefillBetween* between, int keep) {
+  SettlePleSide();
   if (!ContextRowsFit((int)Length(),R,sequence_->capacity,pf_room_rows_)) std::abort();
+  CheckRopeRows(sequence_->hist.size(),R,sequence_->rope_mode);
   if (!ValidTokenIds(std::span<const int>(tokens,R),kVocab)) std::abort();
   // Prefill commits every row, so the retained ledger advances like Forward(R,0,R).
   const std::string state_error=sequence_->retained.Forward(R,0,R);
@@ -513,7 +604,7 @@ const Engine::MtpPrefillPlan* Engine::MtpPrefillPlanFor(int R) {
     front.push_back(mtp.fh.front_s);
   }
   for (size_t j=0; j<jobs.size(); ++j) jobs[j].S=front[j];  // carried through PackJobs, reset by Build
-  const auto groups=crucible::PackJobs(jobs,xh_capacity_,partial_capacity_,
+  const auto groups=crucible::PackJobs(jobs,xh_capacity_,partial_plan_floats_,
                                        [](const LinJob& a,const LinJob& b) { return (a.S>0)==(b.S>0); });
   if (groups.empty()) return nullptr;
   auto p=std::make_unique<MtpPrefillPlan>();

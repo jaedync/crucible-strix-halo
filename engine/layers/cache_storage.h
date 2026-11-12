@@ -38,7 +38,8 @@ inline bool EngineCompactState(const char* value) {
   return CompactStateFlag(value);
 }
 inline std::array<size_t, 4> QsaCacheBytes(int context, bool bounded) {
-  if (context < 1 || context > 262144) throw std::invalid_argument("QSA cache context is out of range");
+  // 1,048,576 = kRopeMaxPositions (engine/runtime/rope_mode.h): the RoPE mode sets the real cap (CheckRopeContext).
+  if (context < 1 || context > 1048576) throw std::invalid_argument("QSA cache context is out of range");
   return {size_t(context) * 1024, size_t(context) * 1024,
           size_t(bounded ? kQsaRawSlots : context) * kQsaRawDim * sizeof(float),
           size_t((context + 127) / 128) * 4096 * sizeof(float)};

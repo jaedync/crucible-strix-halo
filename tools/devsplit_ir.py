@@ -1,6 +1,7 @@
 """IR text work of tools/devsplit.py: the call graph of the front-end module, the grouping of kernels, and the
 repair of the parts that llvm-extract cuts out of it. All of it reads and writes the textual IR of `llvm-dis`."""
 from collections import defaultdict
+from pathlib import Path
 import re
 
 HEAD_WORDS = frozenset(
@@ -32,6 +33,7 @@ class Module:
         self.kernels, self.size, self.refs = set(), {}, {}
         self.order = {}  # global variable name -> position in the module
         self.lds = {}  # shared-memory (addrspace 3) variable name -> its definition line as the front end wrote it
+        self.reached = {}  # memo of reach()
         for line in chunks[0].split("\n"):
             if line.startswith("@") and " = " in line:
                 name, rest = line[1:].split(" = ", 1)
@@ -60,6 +62,8 @@ class Module:
 
     def reach(self, kernel):
         """Every function and global that `kernel` uses, directly or through calls."""
+        if kernel in self.reached:
+            return self.reached[kernel]
         seen, todo = set(), [kernel]
         while todo:
             node = todo.pop()
@@ -67,7 +71,16 @@ class Module:
                 continue
             seen.add(node)
             todo.extend(r for r in self.refs.get(node, ()) if r in self.head and r not in seen)
+        self.reached[kernel] = seen
         return seen
+
+    def users(self):
+        """{function or global: kernels that reach it}."""
+        out = defaultdict(set)
+        for k in self.kernels:
+            for n in self.reach(k):
+                out[n].add(k)
+        return out
 
 
 def read_groups(path):
@@ -210,6 +223,199 @@ def restore(lines, head, strong, owned, order, lds):
     first = next((i for i, line in enumerate(out) if line[:1] in "@$"), len(out))
     out[first:first] = [f"${n} = comdat any" for n in sorted(comdats) if f"${n}" not in have]
     return "\n".join(flatten_srcloc(out))
+
+
+# Argument facts (tools/devsplit_facts.tsv). IPSCCP gives an argument of an internal function a range (or a
+# constant) when every call site in the module passes a value in it. A part holds only some of the call sites, so
+# it can find a narrower fact than the one-module build, and the inlined body then compiles to other code
+# (LaneWindow<5>::LaneWindow(int) on trunk 27e0f62b: range(i32 0, 32) in a part, none in the module, because
+# the TileBody call sites of the prefill MoE tile kernels pass a lane that IPSCCP cannot bound).
+# A part therefore gets a stub kernel that calls each such function with the module's fact: the stub's value
+# widens the lattice to exactly that fact, because the part's own call sites are a subset of the module's.
+RANGE_ATTR = re.compile(r"\brange\(i(\d+) (-?\d+), (-?\d+)\)")
+DEFINE_NAME = re.compile(r"@((?:[\w.$-]+|\"[^\"]*\"))\(")
+NO_FACT = "@"
+STUB_PREFIX = "__devsplit_facts_"  # tools/isa_diff.py does not compare these kernels
+UNSUPPORTED_PARAM = ("byval(", "sret(", "inalloca(", "preallocated(", "byref(", "...")
+
+
+def split_params(text):
+    """The parameters of a parameter list text, split at the commas outside brackets."""
+    out, depth, cur = [], 0, []
+    for ch in text:
+        if ch in "({[<":
+            depth += 1
+        elif ch in ")}]>":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    if "".join(cur).strip():
+        out.append("".join(cur).strip())
+    return out
+
+
+def param_type(param):
+    """The type at the start of one parameter text."""
+    if param[:1] in "{<[":
+        close = {"{": "}", "<": ">", "[": "]"}[param[0]]
+        depth = 0
+        for i, ch in enumerate(param):
+            depth += ch == param[0]
+            depth -= ch == close
+            if depth == 0:
+                return param[:i + 1]
+    m = re.match(r"ptr addrspace\(\d+\)|\S+", param)
+    return m.group(0)
+
+
+def define_params(line):
+    """(name, prefix before @name, parameter texts) of a `define` line."""
+    m = DEFINE_NAME.search(line)
+    depth, i = 0, m.end() - 1
+    for j in range(i, len(line)):
+        depth += line[j] == "("
+        depth -= line[j] == ")"
+        if depth == 0:
+            return m.group(1), line[:m.start()], split_params(line[i + 1:j])
+    raise ValueError(f"no parameter list in {line[:120]}")
+
+
+def argument_ranges(line):
+    """Per argument of a `define` line: 'BITS:LO:HI' of its range attribute, or NO_FACT."""
+    out = []
+    for p in define_params(line)[2]:
+        m = RANGE_ATTR.search(p)
+        out.append(f"{m.group(1)}:{m.group(2)}:{m.group(3)}" if m else NO_FACT)
+    return out
+
+
+def define_lines(text):
+    """{function: its define line} of an IR text (only the define lines matter)."""
+    out = {}
+    for line in text.split("\n"):
+        if line.startswith("define "):
+            out[define_params(line)[0]] = line
+    return out
+
+
+def derive_facts(module_defs, part_defs):
+    """{function: {argument index: module fact}} where a part's IPSCCP result differs from the module's.
+
+    Inputs are the define lines after IPSCCP of the one-module build and of each part. A fact is the module's
+    range ('BITS:LO:HI') or 'any' (the module knows nothing). A part that has no range where the module has one
+    holds a constant (fewer call sites); a part with a range where the module has none is narrower.
+    """
+    mono = {n: argument_ranges(l) for n, l in define_lines(module_defs).items()}
+    facts = {}
+    for text in part_defs:
+        for name, line in define_lines(text).items():
+            if name not in mono:
+                continue
+            part = argument_ranges(line)
+            if len(part) != len(mono[name]):
+                continue
+            if mono[name] != part:
+                # The other arguments keep the module's range: the stub passes a value in it, because poison
+                # would make the range "may be undef", and IPSCCP then drops the attribute.
+                row = facts.setdefault(name, {})
+                for i, (m, p) in enumerate(zip(mono[name], part)):
+                    if m != p:
+                        row[i] = "any" if m == NO_FACT else m
+                    elif m != NO_FACT:
+                        row[i] = m
+    return facts
+
+
+def read_facts(path):
+    """{function: {argument index: fact}} from a three-column file (function, argument, fact). Missing: none."""
+    facts = {}
+    if path and Path(path).exists():
+        for line in Path(path).read_text().splitlines():
+            if line and not line.startswith("#"):
+                name, arg, fact = line.split("\t")
+                facts.setdefault(name, {})[int(arg)] = fact
+    return facts
+
+
+def write_facts(path, facts):
+    rows = "".join(f"{n}\t{a}\t{facts[n][a]}\n" for n in sorted(facts) for a in sorted(facts[n]))
+    Path(path).write_text("# function\targument\tfact of the one-module build after IPSCCP (tools/devsplit.py --derive)\n" + rows)
+
+
+def range_width(bits, lo, hi):
+    """Number of values in the range [lo, hi) of a `bits` wide integer (wrapping); 0 for the full set."""
+    return (hi - lo) % (1 << bits)
+
+
+def signed(value, bits):
+    value %= 1 << bits
+    return value - (1 << bits) if value >= 1 << (bits - 1) else value
+
+
+def fact_stub(name, lines, facts, wanted):
+    """A kernel `name` that calls each function of `wanted` (defined in `lines`, with facts) with the module's facts.
+
+    -> (the stub's lines or [], the functions it calls). An argument with a fact gets a volatile load (any value)
+    or a load folded into [lo, hi) by urem and add; one without gets poison, which adds nothing to a constant or
+    an unknown value. A result goes to a volatile store, or the early passes delete the call of a function without
+    side effects before IPSCCP runs. Each call has its own block behind a switch on a loaded value, so a call that
+    the optimizer finds undefined (poison for a noundef argument) cannot remove the others.
+    A function with an aggregate-in-memory or variadic parameter, or a calling convention, gets no call.
+    """
+    body, used, attrs = [], [], ""
+    for line in lines:
+        if not line.startswith("define "):
+            continue
+        if not attrs and " amdgpu_kernel " in line:
+            # The stub takes the attributes of a kernel of the part. Without the target attributes the inliner
+            # keeps the callees as functions of their own, and they would be added to the code object.
+            group = re.findall(r" (#\d+)", line.rsplit(")", 1)[1])
+            attrs = f" {group[-1]}" if group else ""
+        fn, prefix, params = define_params(line)
+        if fn not in wanted or fn not in facts:
+            continue
+        if any(u in p for p in params for u in UNSUPPORTED_PARAM):
+            continue
+        words, rest = split_head(prefix[len("define "):].strip())
+        rest = re.sub(r"\b(range|nofpclass|dereferenceable|dereferenceable_or_null)\([^)]*\)|\balign \d+", "", rest)
+        rtype = " ".join(w for w in rest.split() if w not in ("noundef", "zeroext", "signext", "inreg", "noalias", "nonnull"))
+        if not rtype or rtype.split()[0].endswith("cc") or rtype.split()[0].startswith("amdgpu_"):
+            continue
+        k = len(used)
+        body.append(f"k{k}:")
+        args = []
+        for i, p in enumerate(params):
+            t = param_type(p)
+            fact = facts[fn].get(i)
+            if fact is None:
+                args.append(f"{t} poison")
+                continue
+            body.append(f"  %a{k}.{i} = load volatile {t}, ptr addrspace(1) %p, align 1")
+            value = f"%a{k}.{i}"
+            if fact != "any":
+                bits, lo, hi = (int(x) for x in fact.split(":"))
+                width = range_width(bits, lo, hi)
+                if width:
+                    body.append(f"  %r{k}.{i} = urem {t} %a{k}.{i}, {signed(width, bits)}")
+                    body.append(f"  %a{k}.{i}.r = add {t} %r{k}.{i}, {signed(lo, bits)}")
+                    value = f"%a{k}.{i}.r"
+            args.append(f"{t} {value}")
+        if rtype == "void":
+            body.append(f"  call void @{fn}({', '.join(args)}) alwaysinline")
+        else:
+            body.append(f"  %c{k} = call {rtype} @{fn}({', '.join(args)}) alwaysinline")
+            body.append(f"  store volatile {rtype} %c{k}, ptr addrspace(1) %p, align 1")
+        body.append("  br label %done")
+        used.append(fn)
+    if not used:
+        return [], []
+    cases = " ".join(f"i32 {k}, label %k{k}" for k in range(len(used)))
+    return [f"define amdgpu_kernel void @{name}(ptr addrspace(1) noundef %p){attrs} {{",
+            "  %sel = load volatile i32, ptr addrspace(1) %p, align 4",
+            f"  switch i32 %sel, label %done [ {cases} ]", *body, "done:", "  ret void", "}"], used
 
 
 SRCLOC_USE = re.compile(r"!srcloc !(\d+)")

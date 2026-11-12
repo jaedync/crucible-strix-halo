@@ -1,5 +1,6 @@
 // Bulk prefill launches that merge grid chunks (prefill-moe lesson 1).
 #pragma once
+#include "../../layers/kernels/qsa_union_lds.h"
 #include <algorithm>
 #include <cerrno>
 #include <cstddef>
@@ -16,28 +17,40 @@ constexpr int kMaxPrefillLaunchRows = 32768;
 // Rows of one GDN or QSA core part inside a launch (engine.hip kPrefillCoreRows). A merge needs a grid of whole
 // parts: the core scratch holds min(grid, parts) rows, and a launch cuts its parts from its own start.
 constexpr int kPrefillLaunchCoreRows = 2048;
-// Rows of a launch when CRUCIBLE_PF_LAUNCH_ROWS is unset: two chunks of the 4,096-row grid. Bitwise equal to one
-// chunk a launch (1K to 128K prompts), and 55 ms (32K) to 78 ms (128K) less wall per 4,096 rows for 1,677 MiB of
-// stage arena. CRUCIBLE_PF_LAUNCH_ROWS=4096 turns it off. Only the 4,096-row grid merges by default: no other grid was
-// measured (a 2048-row grid keeps one chunk a launch unless the variable merges it).
-constexpr int kDefaultPrefillLaunchRows = 8192;
+// Rows of one QSA union flash tile (prefill_qsa_union.h kUnionRows). Tiles start at the part start, and a row's key
+// order depends on its tile, so a resume keeps the cold QSA bits only at a multiple of these rows.
+constexpr int kQsaUnionTileRows = 4;
+// Rows of a launch when CRUCIBLE_PF_LAUNCH_ROWS is unset: four chunks of the 4,096-row grid. Bitwise equal
+// to one chunk a launch (1K to 128K prompts). prefill-rows (with the MoE tile
+// kernels): 16384+128 against 8192+128 gives P1 +3.1% and P2 +3.0% for 3.3 GB more device memory (stage arena 4,656
+// instead of 2,346 MiB); 32768 gives +4.7% for 9.8 GB and stays an env value until a memory soak on the daily
+// profile. CRUCIBLE_PF_LAUNCH_ROWS=4096 turns the merge off. Only the 4,096-row grid merges by default: no other grid
+// was measured (a 2048-row grid keeps one chunk a launch unless the variable merges it).
+constexpr int kDefaultPrefillLaunchRows = 16384;
 // Join rows when CRUCIBLE_PF_LAUNCH_ROWS is unset (x4-tail): a cold prompt's last partial chunk
-// of up to this many rows joins the last launch, so the default path is the daily path ("8192+128"). A set value
+// of up to this many rows joins the last launch ("16384+128"; the daily env pins its own value). A set value
 // without "+T" ("8192") has no join; "4096" turns the merge and the join off.
 constexpr int kDefaultPrefillJoinRows = 128;
 constexpr int kDefaultPrefillLaunchGrid = 4096;
+
+// A tail of at most this many rows runs the small-row kernels alone (Engine::Prefill: fp32 x, PleMixKernel), and in
+// a launch it would run the bulk kernels. The two are not bitwise equal (engine kMaxRows), so such a tail never joins
+// a launch, whatever the load (F3): it is its own small-row launch on an idle server and
+// with a ready decoder, as it is for a request that resumes from a cached 4,096 k point.
+constexpr int kPrefillJoinSmallRows = 8;
 
 // Rows of the bulk launch at prompt position `at` (prompt end `end`). The grid
 // schedule takes min(step, end - at) rows a chunk. A launch merges whole grid
 // chunks while it stays within `launch` rows and its end stays at or before
 // `stop` (the first position that must end a chunk: a snapshot frontier or
 // the MTP warm-up start). A partial chunk is always the last one of a
-// launch, so a launch ends only on grid chunk ends and the GDN and QSA core
-// cuts stay where the grid schedule puts them.
+// launch (a partial chunk of 8 rows or fewer is not merged at all, F3), so a launch ends only on grid chunk ends and
+// the GDN and QSA core cuts stay where the grid schedule puts them.
 inline int PrefillLaunchRows(size_t at, size_t end, int step, int launch, size_t stop) {
   int rows = int(std::min<size_t>(size_t(step), end - at));
   while (rows % step == 0 && at + size_t(rows) < end) {
     const int next = int(std::min<size_t>(size_t(step), end - at - size_t(rows)));
+    if (next < step && next <= kPrefillJoinSmallRows) break;  // F3: a partial chunk of 8 rows or fewer stays a small-row launch
     if (rows + next > launch || at + size_t(rows + next) > stop) break;
     rows += next;
   }
@@ -85,7 +98,7 @@ inline int PrefillLaunchSetting(const char* value, int grid) {
 }
 
 // x4-tail: the join rows of CRUCIBLE_PF_LAUNCH_ROWS="L+T": T, or 0 when the value has no "+T". Unset gives
-// kDefaultPrefillJoinRows for the grid kDefaultPrefillLaunchGrid, so the default launch is "8192+128". Only a valid
+// kDefaultPrefillJoinRows for the grid kDefaultPrefillLaunchGrid, so the default launch is "16384+128". Only a valid
 // setting has join rows (PrefillLaunchSetting).
 inline int PrefillJoinSetting(const char* value, int grid) {
   if (!value) return grid == kDefaultPrefillLaunchGrid ? kDefaultPrefillJoinRows : 0;
@@ -99,9 +112,6 @@ inline int PrefillJoinSetting(const char* value, int grid) {
 // the launch rows (the bytes before x4-tail; CRUCIBLE_PF_LAUNCH_ROWS=8192 gives them back).
 inline int PrefillRoomRows(int launch, int join) { return join > 0 ? launch + join : launch; }
 
-// A tail of at most this many rows runs the small-row kernels alone (Engine::Prefill: fp32 x, PleMixKernel), and in
-// a launch it would run the bulk kernels. That is not proved bitwise, so such a tail never joins (engine kMaxRows).
-constexpr int kPrefillJoinSmallRows = 8;
 
 // x4-tail: the plan of one bulk launch with joins. The grid schedule, the core
 // cuts and every row's arithmetic stay; only the launch boundaries move.
@@ -169,16 +179,66 @@ struct PrefillJoinSpec {
   int ledger = 0;  // rows from the launch start to the start of the plain plan's last launch (0: the launch start)
   int cut = 0;     // rows from the launch start to the cut (0: no cut)
   std::vector<PrefillCutCopy> copies;
+  // the cut is an exact-resume Pre point, which may be inside a core part
+  // (PrefillPreCutValid); `start` is the launch's first position.
+  bool pre = false;
+  size_t start = 0;
 };
 
+// QSA picks its top-k kernels by the block count (pos0 + rows) / 4 of a core part
+// (qsa_long.h LaunchQsaTop, prefill_qsa_select.h): kSelBlocks, kQsaCandidates, the register-kernel width step and
+// kQsaTopMaxBlocks (the engine checks these values), and by rows above 8 (kPrefillJoinSmallRows).
+inline constexpr size_t kQsaSelectBlockSteps[] = {512, 8192, 32768, 65536};
+// A Pre cut `cut` rows into a launch of `rows` rows from position `start`. A cut at a core part end splits nothing.
+// A cut inside a part runs the part's QSA and GDN calls as two pieces; that keeps the bits of the whole part when
+// both pieces start on the 4-row QSA tile grid, have more than 8 rows, pick the top-k kernels of the whole part, and
+// run the same QSA flash kernel.
+inline bool PrefillPreCutValid(size_t start, int rows, int cut) {
+  if (cut < 16 || cut >= rows || cut % kQsaUnionTileRows || start % kQsaUnionTileRows) return false;
+  const int part = cut / kPrefillLaunchCoreRows * kPrefillLaunchCoreRows;
+  if (cut == part) return true;
+  const int end = std::min(rows, part + kPrefillLaunchCoreRows);
+  if (cut - part <= kPrefillJoinSmallRows || end - cut <= kPrefillJoinSmallRows) return false;
+  for (const size_t blocks : kQsaSelectBlockSteps)
+    if ((start + size_t(cut)) / 4 <= blocks && (start + size_t(end)) / 4 > blocks) return false;
+  // The flash kernel is the union one while the part fits the union LDS budget, else the per-row one, which is
+  // another arithmetic. The choice depends on the part's end only, so the first piece can land below the budget while
+  // the whole part lands above it: then the piece would run the union flash and the cold run the per-row flash. Piece 2
+  // ends at the part end, so it always agrees with the cold run.
+  if (prefill::QsaUnionFits(int(start) + part, cut - part) && !prefill::QsaUnionFits(int(start) + part, end - part))
+    return false;
+  return true;
+}
+
+// the GDN and QSA calls of a launch: its core parts from the launch start, and the part that holds
+// `cut` (rows from the launch start, 0: none) as two pieces split there. `part` and `part_rows` name the whole part.
+struct PrefillPiece {
+  int offset = 0, rows = 0, part = 0, part_rows = 0;
+};
+inline std::vector<PrefillPiece> PrefillPieces(int rows, int cut) {
+  std::vector<PrefillPiece> pieces;
+  for (int o = 0; o < rows; o += kPrefillLaunchCoreRows) {
+    const int n = std::min(kPrefillLaunchCoreRows, rows - o);
+    if (cut > o && cut < o + n) {
+      pieces.push_back({o, cut - o, o, n});
+      pieces.push_back({cut, o + n - cut, o, n});
+    } else {
+      pieces.push_back({o, n, o, n});
+    }
+  }
+  return pieces;
+}
+
 // The checks of Engine::BeginPrefillJoin. The ledger is a grid point of the launch. A cut is a core part end inside the
-// launch, at least 16 rows in (the PLE ring at the cut holds the launch's own rows), with copies; no cut, no copies.
+// launch, or a Pre cut (PrefillPreCutValid), at least 16 rows in (the PLE ring at the cut holds the launch's own rows),
+// with copies; no cut, no copies.
 // Each copy names a distinct span of `spans` (the sequence's state spans) with its size, and has a target.
 inline bool PrefillJoinValid(const PrefillJoinSpec& spec, int rows, int grid,
                              const std::vector<std::pair<const void*, size_t>>& spans) {
   if (grid <= 0 || rows <= 0 || spec.ledger < 0 || spec.ledger >= rows || spec.ledger % grid) return false;
   if (!spec.cut) return spec.copies.empty();
-  if (spec.cut < 16 || spec.cut >= rows || spec.cut % kPrefillLaunchCoreRows || spec.copies.empty()) return false;
+  if (spec.cut < 16 || spec.cut >= rows || spec.copies.empty()) return false;
+  if (spec.pre ? !PrefillPreCutValid(spec.start, rows, spec.cut) : spec.cut % kPrefillLaunchCoreRows != 0) return false;
   for (size_t i = 0; i < spec.copies.size(); ++i) {
     const auto& copy = spec.copies[i];
     if (!copy.target || !copy.source) return false;

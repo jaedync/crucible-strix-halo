@@ -110,6 +110,84 @@ __device__ __forceinline__ void LinOutLane(const float* p, const __half svh[4], 
   for (int i = 0; i < 4; ++i) v[i] *= kHadNorm * __half2float(svh[i]);
 }
 
+// LinOutLane and LinInLane with Wht128Lane (the same values) and the lane as an
+// argument (the producer/consumer kernels, layers/prefill_moe_tile.h).
+__device__ __forceinline__ void LinOutLaneAt(const float* p, const __half svh[4], float v[4], int lane) {
+#pragma unroll
+  for (int i = 0; i < 4; ++i) v[i] = 0.f + p[i];
+  Wht128Lane(v, lane);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) v[i] *= kHadNorm * __half2float(svh[i]);
+}
+// LinOutLaneAt of the gate (pa, sa) and up (pb, sb) rows of the MoE epilogue
+// through Wht128Fold2, with the fold's sign in the scale. A nonzero value is
+// LinOutLaneAt's; a zero can have the other sign. The epilogues use the values
+// only through RoundH(Silu(g) * u), which ROCm 7.2.4 compiles to one v_fma_mix
+// with a +0 addend: a zero product gives +0 with either sign, so the bytes
+// from there on are LinOutLaneAt's.
+__device__ __forceinline__ void LinOutPairLaneAt(const float* pa, const float* pb, const __half sa[4],
+                                                 const __half sb[4], float a[4], float b[4], int lane) {
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    a[i] = 0.f + pa[i];
+    b[i] = 0.f + pb[i];
+  }
+  const float sg = Wht128Fold2(a, b, lane);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    a[i] *= sg * (kHadNorm * __half2float(sa[i]));
+    b[i] *= sg * (kHadNorm * __half2float(sb[i]));
+  }
+}
+template <bool NO_SUH = false>
+__device__ __forceinline__ void LinInLaneAt(const float s[4], const __half suh[4], float v[4], int lane) {
+#pragma unroll
+  for (int i = 0; i < 4; ++i) v[i] = NO_SUH ? RoundH(s[i]) : RoundH(RoundH(s[i]) * __half2float(suh[i]));
+  Wht128Lane(v, lane);
+}
+// The X input transform of a prefill MoE expert (PrefillFxTransform's
+// arithmetic, layers/prefill_moe.h) on the lane's 4 fp16 inputs x and its 4
+// suh values s, each packed as 2 half2: __hmul2, Wht128Lane, * nm,
+// __floats2half2_rn. nm is kHadNorm (1 only in a bench mutant). Returns the 4
+// fp16 outputs packed as 2 half2.
+__device__ __forceinline__ uint2 LinInHalfLane(const uint2& x, const uint2& s, float nm, int lane) {
+  const __half2 s01 = *reinterpret_cast<const __half2*>(&s.x), s23 = *reinterpret_cast<const __half2*>(&s.y);
+  const float2 p01 = __half22float2(__hmul2(*reinterpret_cast<const __half2*>(&x.x), s01));
+  const float2 p23 = __half22float2(__hmul2(*reinterpret_cast<const __half2*>(&x.y), s23));
+  float v[4] = {p01.x, p01.y, p23.x, p23.y};
+  Wht128Lane(v, lane);
+  __half2 h[2] = {__floats2half2_rn(v[0] * nm, v[1] * nm), __floats2half2_rn(v[2] * nm, v[3] * nm)};
+  return *reinterpret_cast<const uint2*>(h);
+}
+// LinInHalfLane of the same x with two suh vectors sa and sb (the gate and up
+// sides of a MoE X item pair), through Wht128Fold2: the values of two
+// LinInHalfLane calls. The fold's sign goes into nm, and the product and the
+// fp16 rounding are one v_fma_mix with a +0 addend (ROCm 7.2.4, as for
+// LinInHalfLane), so a zero is +0 whatever its sign and a nonzero value is
+// LinInHalfLane's: the same bytes.
+__device__ __forceinline__ void LinInHalfPairLane(const uint2& x, const uint2& sa, const uint2& sb, float nm, int lane,
+                                                  uint2& ha, uint2& hb) {
+  auto in = [&](const uint2& s, float v[4]) {
+    const __half2 s01 = *reinterpret_cast<const __half2*>(&s.x), s23 = *reinterpret_cast<const __half2*>(&s.y);
+    const float2 p01 = __half22float2(__hmul2(*reinterpret_cast<const __half2*>(&x.x), s01));
+    const float2 p23 = __half22float2(__hmul2(*reinterpret_cast<const __half2*>(&x.y), s23));
+    v[0] = p01.x;
+    v[1] = p01.y;
+    v[2] = p23.x;
+    v[3] = p23.y;
+  };
+  float a[4], b[4];
+  in(sa, a);
+  in(sb, b);
+  const float sn = Wht128Fold2(a, b, lane) * nm;
+  auto out = [&](const float v[4]) {
+    __half2 h[2] = {__floats2half2_rn(v[0] * sn, v[1] * sn), __floats2half2_rn(v[2] * sn, v[3] * sn)};
+    return *reinterpret_cast<const uint2*>(h);
+  };
+  ha = out(a);
+  hb = out(b);
+}
+
 __device__ __forceinline__ void LinWriteBlock(const LinJob& j, int r, int blk) {
   const int lane = threadIdx.x & 31;
   float v[4];

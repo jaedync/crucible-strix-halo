@@ -270,11 +270,33 @@ def test_worker_error_line_logs_only_server_messages():
 def test_engine_error_text_keeps_known_messages_and_short_keys():
     from server.engine_messages import loggable
     assert loggable("prompt token IDs must be in [0,248320)") == "prompt token IDs must be in [0,248320)"
+    # The header point copy of batch_session.h (CRUCIBLE_EXACT_RESUME=1) throws this fixed text; the worker log keeps
+    # it, so a reader sees the cause instead of the "other" fallback.
+    assert loggable("a header copy must restore the donor point") == "a header copy must restore the donor point"
     assert loggable("duplicate request field: max_tokens") == "duplicate request field: max_tokens"
     assert loggable("duplicate request field: " + CANARY + " x") == "other"
     # A suffix that is a number could be a token ID.
     assert loggable("duplicate request field: 248044") == "other"
     assert loggable(None) == "other" and loggable("x" * 100000) == "other"
+
+
+def test_start_time_memory_refusal_is_not_logged():
+    # The refusal carries measured sizes, so the log rule keeps it out: the engine prints it to stderr before any
+    # request. A text that starts with the same words but carries other content must not pass either.
+    from server.engine_messages import loggable
+    text = ("batch memory does not fit: 1 stream at 256,000 context needs 7.9 GiB (8,498,762,752 bytes) of state. "
+            "All of that state is already allocated.\n  free host memory: 8.9 GiB (9,555,148,800 bytes)"
+            "\n  free device memory: 8.0 GiB (8,544,751,616 bytes)"
+            "\n  start-time reserve: 9.0 GiB (9,663,676,416 bytes): system 8.0 GiB, plans 512.0 MiB, host 512.0 MiB"
+            "\n  conversation cache budget: 0.0 GiB (0 bytes)"
+            "\nFree memory is at or below the reserve before any new state, so no stream count fits."
+            "\nThe check needs more than 9.0 GiB (9,663,676,416 bytes) free now, 1.0 GiB more than now."
+            "\nStop other memory-heavy programs, if any, or start with a lower --ctx."
+            "\nLargest --ctx at --streams 1: 221,184."
+            "\nThese numbers are text only: Crucible did not change your settings.")
+    assert loggable(text) == "other"
+    assert loggable("batch memory does not fit: canary-serve-api-5519") == "other"
+    assert loggable("batch memory does not fit: " + CANARY) == "other"
 
 
 def test_engine_messages_cover_the_serve_path():
@@ -348,11 +370,14 @@ def test_a_request_above_the_engine_line_limit_fails_alone(start_backend, batch)
 
 def test_the_engine_line_limit_matches_the_engine_source():
     # One limit for text and image lines: image pixels go in private files, not in the line.
+    # the limit follows the context (serve_line.h ServeLineBytes) and the engine reports it; an engine that
+    # does not report it has the 2 MiB floor, which is ENGINE_LINE_BYTES.
     from pathlib import Path
     from server.backend import ENGINE_LINE_BYTES
-    source = (Path(__file__).parents[2] / "engine/serve/serve.h").read_text()
-    assert "constexpr size_t kMaxLine = 2 * 1024 * 1024;" in source and ENGINE_LINE_BYTES == 2 * 1024 * 1024
-    assert "kServeVisionLine" not in source
+    root = Path(__file__).parents[2] / "engine/serve"
+    source = (root / "serve_line.h").read_text()
+    assert "inline constexpr size_t kServeLineFloorBytes = size_t(2) << 20;" in source and ENGINE_LINE_BYTES == 2 * 1024 * 1024
+    assert "kServeVisionLine" not in source + (root / "serve.h").read_text()
 
 
 @pytest.mark.parametrize("batch", [False, True])

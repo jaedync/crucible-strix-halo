@@ -2,6 +2,8 @@
 
 The engine's own messages are fixed English texts. A text outside this list could quote request content in the future,
 so the server never logs it. test_engine_messages_cover_the_serve_path keeps the list in step with engine/.
+A start-time memory refusal carries measured sizes, so it is not in this list: the engine prints it to stderr before any
+request, and the server logs it as "other". Do not add a prefix for a text with numbers.
 
 Rule for engine authors: a message that can contain a token ID (or any other request value) must be a fixed KNOWN text,
 or a PREFIX whose suffix is never request data. An unknown text is logged as a 16-hex sha256 prefix, and the hash of a
@@ -14,17 +16,33 @@ PREFIXES = ("duplicate request field: ", "MTP cache allocation failed: ", "MTP c
 _SUFFIX = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,39}")  # a name, never a number such as a token ID
 
 KNOWN = frozenset((
+    # Per-request ablation (engine/serve/serve_protocol.h, engine/serve/batch_session.h).
+    'ablate must be 0 or 1',
+    'ablate needs an engine started with CRUCIBLE_ABLATE_MODE=request',
+    'this engine serves no ablated requests',
+    # YaRN (engine/runtime/rope_mode.h, engine/serve/serve_protocol.h, engine/serve/batch_session.h).
+    'CRUCIBLE_ROPE_MODE=yarn:F or auto:F keeps states out of the disk tier: remove --state-dir',
+    'SetStreamRope: no such stream',
+    'StreamRope: no such stream',
+    'a RoPE mode change needs an empty sequence',
+    'prompt and max_tokens exceed the RoPE mode limit of this engine',
+    "the request's RoPE mode does not match its state tenant",
+    'this engine serves no YaRN requests',
+    'rope must be plain, yarn2 or yarn4 and hold the request in a mode of this engine',
     'CRUCIBLE_COMPACT_STATE must be 0 or 1',
     'CRUCIBLE_STATE_CACHE needs 0, 4, or 6',
     'CRUCIBLE_STATIC_CACHE needs 0 or 4',
     'MTP cache is absent; restart prompt warmup before a nonzero MTP position',
+    'MtpLeadWait: the lead is not the latest',
     'QSA cache allocation failed; reduce context or stream count',
     'QSA cache context is out of range',
     'Truncate cannot cross committed recurrent state',
     'Truncate cannot grow token history',
     'a frontier copy must restore the donor point',
+    'a header copy must restore the donor point',
     'a pre-end cut needs core parts of more than 8 rows',
     'all sequence slots are in use',
+    'an MTP lead needs CRUCIBLE_DRAFT_CHAIN lead, a scored call and the q block head',
     'an image above 4096 tokens is not supported',
     'a prefill cut needs device copies',
     'a request can contain at most 256 images',
@@ -40,6 +58,7 @@ KNOWN = frozenset((
     'vision slice out of range',
     'vision scratch accounting',
     'batch cache budget must fit 0..131072 MiB',
+    'core parts need more than 8 rows',
     'draft-blocks file could not be read',
     'draft-blocks file is empty',
     'draft-blocks file is larger than 64 KiB',
@@ -55,17 +74,17 @@ KNOWN = frozenset((
     'batch list has too many streams',
     'batch list is empty',
     'batch needs one token per stream and a supported row count',
-    'batch op must be open, prefill, step, verify_step, spec_step, stage, or close',
+    'batch op must be open, prefill, step, verify_step, spec_step, stage, ping, or close',
     'batch options need a value after each switch',
     'batch options need values',
     'batch prefill rows exceed the supported range',
     'batch slots must be in [1,8]',
     'packed verify rows must be 8 to 16',
+    'ping takes no fields',
     'this engine runs packed verify passes of at most 8 rows',
     'CRUCIBLE_PACKED_ROWS must be 8 to 16',
     'batch speculation is not supported yet; use --spec 0',
     'batch speculation needs draft_head 64k, draft_adapt 0, and draft_q > 0',
-    'batch states exceed the shared memory budget; reduce streams, context, or cache budget',
     'batch step contains a duplicate or inactive request',
     'batch step must contain one to eight active requests',
     'batch stream ID is out of range',
@@ -140,20 +159,20 @@ KNOWN = frozenset((
     'not enough device memory for the MTP cache; reduce the context, or use --spec 0 in gen',
     'open requires a positive request ID and an explicit spec request',
     'prefill cut buffer is too small',
-    'prefill cut needs a grid point after its window start',
+    'prefill cut needs a position after its window start',
     'prefill interval must be 1 to 47 layers',
     'prefix cache restored the whole prompt',
     'prompt token IDs must be in [0,248320)',
     'proposal has no draft probability',
     'replay must equal the retained pending prefix from the previous forward',
     'request ID must be unique and positive',
-    'request exceeds the 2 MiB JSON-line limit',
+    'request exceeds the serve JSON-line limit',
     'request integer exceeds the supported range',
     'request is not active',
     'request is not waiting for prefill',
     'sequence slot generation limit reached; restart the worker',
     'serve cache and prefill settings exceed their supported ranges',
-    'serve context must be an integer in [1,262144]',
+    # 'serve context must be an integer in [1,N]' is built from the RoPE word's cap: see BUILT below.
     'serve options must contain complete numeric values',
     'serve options need a value after each switch',
     'session replay needs --conversation-cache-mib',
@@ -241,10 +260,18 @@ class ProtocolError(RuntimeError):
     """A server-side failure with a fixed text that the server wrote; the worker log may show it."""
 
 
+# Texts that the engine builds from a closed set of values, so each one is still a fixed text: the context start errors
+# of rope_mode.h CheckRopeContext (the cap of the RoPE word, and the hint for a context above 262,144).
+BUILT = frozenset(
+    f"{what} must be an integer in [1,{cap}]{hint}" for what in ("serve context", "context")
+    for cap, hints in ((262144, 2), (524288, 2), (1048576, 1))
+    for hint in ("", " (a context above 262144 needs CRUCIBLE_ROPE_MODE=yarn:F or auto:F with 262144*F >= ctx)")[:hints])
+
+
 def loggable(text):
     if not isinstance(text, str):
         return "other"
-    if text in KNOWN:
+    if text in KNOWN or text in BUILT:
         return text
     for prefix in PREFIXES:
         if text.startswith(prefix) and _SUFFIX.fullmatch(text[len(prefix):]):

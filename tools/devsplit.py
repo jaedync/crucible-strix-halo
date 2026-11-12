@@ -21,6 +21,7 @@ No kernel source moves. Kernels go to the lightest part, heaviest first; the ker
 Exit codes: 0 built, 1 a step failed, 2 the tool could not plan the build.
 """
 import argparse
+import collections
 import concurrent.futures
 import hashlib
 import json
@@ -37,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import devsplit_ir as ir  # noqa: E402  (-I drops the script directory from sys.path)
 
 GROUPS = Path(__file__).with_name("devsplit_groups.tsv")
+FACTS = Path(__file__).with_name("devsplit_facts.tsv")
 
 
 def log(msg):
@@ -47,13 +49,23 @@ class StepFailed(Exception):
     pass
 
 
-def run(cmd, what, stdin=None):
-    """Run one step; returns (seconds, stdout). A failure prints the tool output and raises StepFailed."""
+def run(cmd, what, stdin=None, out=None):
+    """Run one step; returns (seconds, stdout). A failure prints the tool output and raises StepFailed.
+
+    `out` is the file that the step writes. It is removed before the step, and the step fails when it exits 0 and leaves
+    no output (a killed compiler child does that under hipcc, and a wrapper can hide the signal)."""
+    if out is not None:
+        Path(out).unlink(missing_ok=True)
     t0 = time.monotonic()
     r = subprocess.run([str(c) for c in cmd], capture_output=True, text=True, input=stdin)
     dt = time.monotonic() - t0
     if r.returncode:
         sys.stderr.write(f"devsplit: {what} failed (rc {r.returncode}):\n{r.stdout[-3000:]}{r.stderr[-6000:]}")
+        raise StepFailed(what)
+    if out is not None and (not Path(out).is_file() or Path(out).stat().st_size == 0):
+        Path(out).unlink(missing_ok=True)
+        sys.stderr.write(f"devsplit: {what} exited 0 but wrote no output ({out}); the compiler may have been killed (out of memory?):\n"
+                         f"{r.stdout[-3000:]}{r.stderr[-6000:]}")
         raise StepFailed(what)
     return dt, r.stdout
 
@@ -160,8 +172,12 @@ def nm_defined(llvm_nm, bc):
     return [tuple(line.split()[-2:]) for line in out.splitlines() if len(line.split()) >= 2]
 
 
-def extract_parts(llvm, bc, mod, groups, globs, outs, pool):
-    """llvm-extract each group, then restore the linkage and make every strong global live in one part only."""
+def extract_parts(llvm, bc, mod, groups, globs, outs, pool, facts=None):
+    """llvm-extract each group, then restore the linkage and make every strong global live in one part only.
+
+    With `facts` (devsplit_ir.read_facts), each part also gets a stub kernel that passes the one-module build's
+    argument facts to the functions that kernels of other parts call too (see devsplit_ir.fact_stub).
+    -> (number of strong globals, number of stub calls)."""
     ext = [str(llvm / "llvm-extract"), "--recursive", "--keep-const-init"]
     raw = [o.with_suffix(".raw.bc") for o in outs]
     futures = [pool.submit(run, [*ext, *[f"--func={k}" for k in g], *[f"--glob={x}" for x in (globs if i == 0 else [])],
@@ -176,12 +192,81 @@ def extract_parts(llvm, bc, mod, groups, globs, outs, pool):
         for n in names:
             owner.setdefault(n, i)
 
+    users = mod.users() if facts else {}
+    lds = set(mod.lds)
+
     def finish(i):
         owned = {n for n, o in owner.items() if o == i}
-        run([llvm / "llvm-as", "-o", outs[i]], f"llvm-as {outs[i].name}", stdin=ir.restore(texts[i], head, strong, owned, mod.order, mod.lds))
+        text = ir.restore(texts[i], head, strong, owned, mod.order, mod.lds)
+        calls = 0
+        if facts:
+            mine = set(groups[i])
+            # A stub kernel that reaches shared memory would change the LDS layout of the part: no stub call.
+            wanted = {f for f in facts if users.get(f, set()) - mine and not mod.reach(f) & lds}
+            stub, used = ir.fact_stub(f"{ir.STUB_PREFIX}{i}", texts[i], facts, wanted)
+            text += "\n" + "\n".join(stub)
+            calls = len(used)
+        run([llvm / "llvm-as", "-o", outs[i]], f"llvm-as {outs[i].name}", stdin=text)
         raw[i].unlink()
-    list(pool.map(finish, range(len(groups))))
-    return len(strong)
+        return calls
+    calls = sum(pool.map(finish, range(len(groups))))
+    return len(strong), calls
+
+
+def ipsccp_defines(back_end):
+    """The define lines of the module after IPSCCP: the back-end command runs until that pass, then it is stopped.
+
+    The argument ranges in these lines are the facts that tools/devsplit_facts.tsv pins (devsplit_ir.derive_facts).
+    """
+    cmd = ["-emit-llvm-bc" if str(t) == "-emit-obj" else str(t) for t in back_end]
+    cmd = cmd[:2] + ["-mllvm", "-print-after=ipsccp", "-mllvm", "-print-module-scope"] + cmd[2:]
+    out, started, complete, tail = [], False, False, collections.deque(maxlen=20)
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, errors="replace")
+    try:
+        for line in proc.stderr:
+            if not started:
+                tail.append(line)
+            if line.startswith("; *** IR Dump After"):
+                if started:
+                    complete = True
+                    break
+                started = True
+            elif started and line.startswith("define "):
+                out.append(line.rstrip("\n"))
+            elif started and line.startswith("attributes #"):
+                complete = True
+                break
+    finally:
+        proc.kill()
+        proc.wait()
+    if not started:
+        sys.stderr.write(f"devsplit: IPSCCP dump failed (rc {proc.returncode}):\n{''.join(tail)}")
+        raise StepFailed("IPSCCP dump")
+    if not complete:
+        sys.stderr.write("devsplit: IPSCCP dump cut off before its last line (the compiler was killed?); the facts would be partial.\n")
+        raise StepFailed("IPSCCP dump")
+    return "\n".join(out)
+
+
+def check_facts(module_defs, part_defs, facts):
+    """Raise RuntimeError when a part's argument facts after IPSCCP differ from the one-module build's.
+
+    module_defs and part_defs are define lines after IPSCCP (ipsccp_defines); facts is the --facts value."""
+    drift = ir.derive_facts(module_defs, part_defs)
+    if drift:
+        table = FACTS.relative_to(FACTS.parents[1]) if facts == "none" else facts
+        names = ", ".join(sorted(drift)[:8])
+        raise RuntimeError(f"argument facts drift: {len(drift)} functions see other IPSCCP facts in a part than in "
+                           f"one module ({names}); the ISA would differ from plain hipcc. Run `make split-facts` "
+                           f"and commit {table}. If the drift remains after make split-facts, set SPLIT_CHECK=0, "
+                           f"run make isa-check, and report it")
+
+
+def facts_of(plan, bcs, work, pool):
+    """[define lines after IPSCCP] of each bitcode file, in parallel."""
+    def one(i):
+        return ipsccp_defines(device_back_end(plan["device"], bcs[i], work / f"ipsccp{i}.bc", False))
+    return list(pool.map(one, range(len(bcs))))
 
 
 def shared_symbols(llvm_nm, bcs):
@@ -204,17 +289,22 @@ def main(argv=None):
     ap.add_argument("--trace", action="store_true", help="write -ftime-trace JSON of each part back end")
     ap.add_argument("--groups", default=str(GROUPS), help="kernels that are compiled in one part (group, kernel); 'none' for no groups")
     ap.add_argument("--derive", metavar="CHANGED", help="write --groups from a list of kernels whose ISA changed in a build with no groups, then stop")
+    ap.add_argument("--facts", default=str(FACTS), help="argument facts of the one-module build (function, argument, fact); 'none' for no stubs")
+    ap.add_argument("--derive-facts", action="store_true", help="write --facts from every kernel in a part of its own, then stop")
+    ap.add_argument("--check", action="store_true", help="fail when a part's argument facts after IPSCCP differ from the one-module build's (adds one whole-module IPSCCP run)")
     ap.add_argument("--only", help="experiment: build only the kernels whose names contain one of these (comma list)")
     ap.add_argument("--device-only", action="store_true", help="stop after the device link (for timing)")
     ap.add_argument("flags", nargs=argparse.REMAINDER, help="after --: the hipcc command line without -o")
     args = ap.parse_args(argv)
-    args.device_only = args.device_only or bool(args.derive)
+    args.device_only = args.device_only or bool(args.derive) or args.derive_facts
     flags = args.flags[1:] if args.flags[:1] == ["--"] else args.flags
     work = args.work
     t_all = time.monotonic()
     work.mkdir(parents=True, exist_ok=True)
     (work / "cache").mkdir(exist_ok=True)
     args.out.parent.mkdir(parents=True, exist_ok=True)
+    if not (args.derive or args.derive_facts or args.device_only):
+        args.out.unlink(missing_ok=True)  # an old engine must not stay in place when this build fails
     try:
         plan = driver_plan(args.hipcc, flags, args.out, Path.cwd())
     except (RuntimeError, OSError) as error:
@@ -244,9 +334,9 @@ def build(args, plan, llvm, work, t_all):
         host_opts = strip_opts(host_opts, ("-o", "-fcuda-include-gpubinary"))
         host_cmd = [*host_opts, "-fcuda-include-gpubinary", placeholder, "-o", host_o, "-x", "hip", host_src]
         if not serial:
-            host_future = pool.submit(run, host_cmd, "host compile")
+            host_future = pool.submit(run, host_cmd, "host compile", out=host_o)
     bc = work / "dev0.bc"
-    dt, _ = run(device_front_end(plan["device"], bc), "device front end")
+    dt, _ = run(device_front_end(plan["device"], bc), "device front end", out=bc)
     log(f"device front end {dt:.1f}s")
     t_parse = time.monotonic()
     nm = llvm / "llvm-nm"
@@ -262,6 +352,13 @@ def build(args, plan, llvm, work, t_all):
                                      + "".join(f"{g}\t{k}\n" for k, g in sorted(derived.items(), key=lambda kv: (kv[1], kv[0]))))
         log(f"{len(derived)} kernels in {len(set(derived.values()))} groups -> {args.groups}")
         return 0
+    if args.derive_facts:
+        return derive_facts(args, plan, llvm, mod, bc, cuid, work, pool)
+    if args.facts != "none" and not Path(args.facts).exists():
+        log(f"warning: no facts file {args.facts}: no fact stubs, the ISA can differ from plain hipcc "
+            f"(run `make split-facts`)")
+    facts = {} if args.facts == "none" else ir.read_facts(Path(args.facts))
+    mono_facts = pool.submit(ipsccp_defines, device_back_end(plan["device"], bc, work / "ipsccp-module.bc", False)) if args.check else None
     kgroups = ir.groups_of(mod, {} if args.groups == "none" else ir.read_groups(Path(args.groups)))
     if args.only:
         kgroups = [(ks, w) for ks, w in kgroups if any(w_ in k for k in ks for w_ in args.only.split(","))]
@@ -273,11 +370,15 @@ def build(args, plan, llvm, work, t_all):
     parts_dir.mkdir()
     bcs = [parts_dir / f"p{i}.bc" for i in range(len(groups))]
     t0 = time.monotonic()
-    nstrong = extract_parts(llvm, bc, mod, groups, cuid, bcs, pool)
+    nstrong, ncalls = extract_parts(llvm, bc, mod, groups, cuid, bcs, pool, facts)
     dup = shared_symbols(nm, bcs)
     if dup:
         raise RuntimeError(f"parts define the same strong symbol twice: {dup}")
-    log(f"{len(kernels)} kernels in {len(groups)} parts ({nstrong} strong globals), extract {time.monotonic() - t0:.1f}s")
+    log(f"{len(kernels)} kernels in {len(groups)} parts ({nstrong} strong globals, {ncalls} fact stub calls), extract {time.monotonic() - t0:.1f}s")
+    if mono_facts:
+        t_check = time.monotonic()
+        check_facts(mono_facts.result(), facts_of(plan, bcs, work, pool), args.facts)
+        log(f"argument facts of every part equal the module's, check {time.monotonic() - t_check:.1f}s")
     jobs = []
     for i, part in enumerate(bcs):
         obj = parts_dir / f"p{i}.o"
@@ -288,7 +389,7 @@ def build(args, plan, llvm, work, t_all):
 
     def compile_part(job):
         part, obj, cmd, cached = job
-        dt, _ = run(cmd, f"back end of {part.name}")
+        dt, _ = run(cmd, f"back end of {part.name}", out=obj)
         os.replace(obj, cached)
         return part.name, dt
 
@@ -301,15 +402,15 @@ def build(args, plan, llvm, work, t_all):
     first = next(i for i, t in enumerate(lld) if t.endswith(".o"))
     lld[first:first + 1] = objs
     t_link = time.monotonic()
-    run([*lld, "-o", hsaco], "lld")
+    run([*lld, "-o", hsaco], "lld", out=hsaco)
     if args.device_only:
         log(f"device only: {time.monotonic() - t_all:.1f}s -> {hsaco}")
         return 0
     hipfb = work / "dev.hipfb"
     bundler = [t for t in plan["bundler"] if not t.startswith("-output=") and t.startswith("-input=") <= (t == "-input=/dev/null")]
-    run([*bundler, f"-input={hsaco}", f"-output={hipfb}"], "bundler")
+    run([*bundler, f"-input={hsaco}", f"-output={hipfb}"], "bundler", out=hipfb)
     log(f"lld and bundler {time.monotonic() - t_link:.1f}s")
-    dt, _ = host_future.result() if host_future else run(host_cmd, "host compile")
+    dt, _ = host_future.result() if host_future else run(host_cmd, "host compile", out=host_o)
     log(f"host compile {dt:.1f}s")
     run([llvm / "llvm-objcopy", "--update-section", f".hip_fatbin={hipfb}", host_o], "objcopy")
     link = strip_opts(plan["link"], ("-o",))
@@ -318,9 +419,28 @@ def build(args, plan, llvm, work, t_all):
     if len(objs_in_link) != 1:
         raise RuntimeError(f"expected one host object in the link command, found {len(objs_in_link)}")
     link[objs_in_link[0]] = str(host_o)
-    run([*link, "-o", args.out], "link")
+    run([*link, "-o", args.out], "link", out=args.out)
     prune_cache(work / "cache", objs, len(objs))
     log(f"done {time.monotonic() - t_all:.1f}s -> {args.out}")
+    return 0
+
+
+def derive_facts(args, plan, llvm, mod, bc, cuid, work, pool):
+    """--derive-facts: every kernel alone in a part (the fewest call sites, so the narrowest facts), IPSCCP on each
+    part and on the whole module; every argument whose fact differs gets the module's fact in --facts."""
+    t0 = time.monotonic()
+    mono = pool.submit(ipsccp_defines, device_back_end(plan["device"], bc, work / "ipsccp-module.bc", False))
+    alone = sorted(mod.kernels)
+    fdir = work / "facts"
+    shutil.rmtree(fdir, ignore_errors=True)
+    fdir.mkdir()
+    bcs = [fdir / f"k{i}.bc" for i in range(len(alone))]
+    extract_parts(llvm, bc, mod, [[k] for k in alone], cuid, bcs, pool)
+    log(f"{len(alone)} one-kernel parts, extract {time.monotonic() - t0:.1f}s")
+    facts = ir.derive_facts(mono.result(), facts_of(plan, bcs, fdir, pool))
+    ir.write_facts(Path(args.facts), facts)
+    log(f"{sum(len(v) for v in facts.values())} argument facts of {len(facts)} functions -> {args.facts} ({time.monotonic() - t0:.1f}s)")
+    shutil.rmtree(fdir, ignore_errors=True)
     return 0
 
 

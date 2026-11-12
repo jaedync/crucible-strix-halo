@@ -14,10 +14,12 @@ import json
 import os
 import random
 import time
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 
+from . import taint
 from .data import Seqs
 from .mtp_model import Ckpt, Mtp, load_blocks
 
@@ -96,10 +98,11 @@ def evaluate(m, seqs, D, length, limit):
     return res
 
 
-def save(path, m, opt, step, rng, scope):
+def save(path, m, opt, step, rng, scope, tainted=False):
     tmp = path + ".tmp"
-    torch.save({"params": {n: p.detach().cpu() for n, p in m.trainable(scope)},
-                "opt": opt.state_dict(), "step": step, "rng": rng.getstate(), "scope": scope}, tmp)
+    state = {"params": {n: p.detach().cpu() for n, p in m.trainable(scope)},
+             "opt": opt.state_dict(), "step": step, "rng": rng.getstate(), "scope": scope}
+    torch.save(taint.tag_checkpoint(state, tainted), tmp)   # leak guard: capture data in, canary in the checkpoint
     os.replace(tmp, path)
 
 
@@ -138,7 +141,11 @@ def main():
     if a.sidecar:
         a.stock = True
     t_start = time.time()
-    os.makedirs(a.run, exist_ok=True)
+    # Leak guard (training/mtp_tune/taint.py): the run is tainted when any data folder or any earlier state is.
+    # Fail closed: a folder without the public marker counts as tainted (taint.run_tainted).
+    tainted = taint.run_tainted(a.data + a.onpolicy + a.heldout, sidecar=a.sidecar)
+    taint.guard_output(a.run, tainted)          # H13: a tainted run never writes into a git work tree
+    Path(a.run).mkdir(parents=True, exist_ok=True)
     m = Mtp(Ckpt(a.ckpt, a.sidecar), load_blocks(a.blocks).cuda())
     named = m.trainable(a.scope)
     plain = {n for n, _ in m.trainable("plain")}
@@ -161,13 +168,17 @@ def main():
             by_name[n].data.copy_(v.cuda())
         opt.load_state_dict(s["opt"])
         step, _ = s["step"], rng.setstate(s["rng"])
+        tainted = tainted or taint.state_tainted(s)
     elif a.init and not a.stock:
         by_name = dict(named)
-        for n, v in torch.load(a.init, weights_only=False)["params"].items():
+        init = torch.load(a.init, weights_only=False)
+        tainted = tainted or taint.state_tainted(init)
+        for n, v in init["params"].items():
             by_name[n].data.copy_(v.cuda())
-        print(f"init from {a.init}", flush=True)
+        print(f"init from {taint.redact(a.init)}", flush=True)
     print(f"load {time.time() - t_start:.1f} s, step {step}, trainable {sum(p.numel() for p in params)}",
           flush=True)
+    taint.guard_output(a.run, tainted)          # H13: the init and resume states may have made the run tainted
     log = open(f"{a.run}/train.jsonl", "a")
     if not a.eval_only:
         sets = [Seqs(a.data)] + ([Seqs(a.onpolicy)] if a.onpolicy else [])
@@ -201,11 +212,11 @@ def main():
             step += 1
             rec = {"step": step, "loss": [round(x.item(), 4) for x in losses_sum], "gn": round(gn.item(), 3),
                    "s": round(time.time() - t0, 2)}
-            log.write(json.dumps(rec) + "\n")
+            log.write(json.dumps(taint.tag_doc(rec, tainted)) + "\n")
             if step % 10 == 0:
                 print(rec, flush=True)
                 log.flush()
-        save(state_path, m, opt, step, rng, a.scope)
+        save(state_path, m, opt, step, rng, a.scope, tainted)
         print(f"saved step {step}", flush=True)
     if (a.eval or a.eval_only) and a.heldout:
         held = Seqs(a.heldout)
@@ -214,7 +225,7 @@ def main():
         rec = {"step": 0 if a.stock else step, "stock": a.stock and not a.sidecar, "sidecar": a.sidecar,
                "eval": res, "s": round(time.time() - t0, 1)}
         with open(f"{a.run}/eval.jsonl", "a") as f:
-            f.write(json.dumps(rec) + "\n")
+            f.write(json.dumps(taint.tag_doc(rec, tainted)) + "\n")
         for k, r in res.items():
             print(k, r["rows"], r["cond"], flush=True)
 

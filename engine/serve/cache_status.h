@@ -2,6 +2,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include "miss_ledger.h"
 #include <optional>
 #include <string>
 

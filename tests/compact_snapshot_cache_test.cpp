@@ -67,6 +67,7 @@ struct SequenceState {
   std::vector<int> hist;
   RetainedPrefix retained;
   std::map<int, float*> gstate, ghist, gpend;
+  bool gdn_lazy = false;  // as engine/runtime/sequence_state.h
   std::map<int, QsaCache> qc;
   // As engine/runtime/sequence_state.h: the one list of the fixed-size buffers.
   std::vector<DeviceSpan> FixedSpans() const {

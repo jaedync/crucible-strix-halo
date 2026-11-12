@@ -29,7 +29,7 @@ def gates_source_digest():
 class BuildTests(unittest.TestCase):
     def make_dry_run(self, target, env=None, extra=()):
         return subprocess.run(
-            ["make", "-n", "-B", target, *extra], cwd=ROOT, text=True, env=env,
+            ["make", "-n", "-B", "--no-print-directory", target, *extra], cwd=ROOT, text=True, env=env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
         )
 

@@ -8,6 +8,11 @@
 //   OUTDIR/NAME.stk   [n][10240] fp16 (raw IEEE half bits)
 //   OUTDIR/NAME.ids   the token IDs, one line, comma-separated
 // A stack value outside the fp16 range stops the run (exit 3).
+//
+// Leak guard (bench/mtp_taint.h, tests/test_mtp_dump_taint.py): the run stops (exit 2) when a diagnostic switch is set in
+// the environment. A list is public only with its first line `#CRUCIBLE-PUBLIC-SOURCE-v1`; any other list is tainted.
+// A tainted run ends every .stk with the canary and starts every .ids with `#<canary>`; a public run writes
+// PROVENANCE.json at the end. --check output cannot carry the canary, so a tainted list refuses --check.
 // --check 1 also runs the engine MTP over every pair (H_p, ids[p+1]) at
 // predictor position p, in 8-row catch-up chunks with the full head, and
 // after each chunk a chain of D-1 more drafts from the last row (as decode
@@ -16,6 +21,7 @@
 //   "c P D1 D2 ..."             chain from pair P: depth-1..D draft IDs
 #define ENGINE_LIBRARY
 #include "../engine/engine.hip"
+#include "mtp_taint.h"
 
 #include <cmath>
 #include <cstdio>
@@ -23,10 +29,13 @@
 
 namespace {
 
+// Messages name a file, never its folder (leak guard, M5).
+std::string FileName(const std::string& path) { return path.substr(path.find_last_of('/') + 1); }
+
 void WriteAll(const std::string& path, const void* data, size_t bytes) {
   FILE* f = std::fopen(path.c_str(), "wb");
   if (!f || std::fwrite(data, 1, bytes, f) != bytes || std::fclose(f) != 0) {
-    std::fprintf(stderr, "cannot write %s\n", path.c_str());
+    std::fprintf(stderr, "cannot write %s\n", FileName(path).c_str());
     std::exit(1);
   }
 }
@@ -48,6 +57,11 @@ Top2 RowTop2(const float* x, int n) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  // Before anything else: a switch that writes tensors or records to files must not reach a run on private data.
+  if (const char* bad = mtp_taint::DiagnosticSwitchInEnvironment()) {
+    std::fprintf(stderr, "mtp_dump: %s is a diagnostic switch that writes files; unset it\n", bad);
+    return 2;
+  }
   if (argc < 4 || (argc - 4) % 2) {
     std::fprintf(stderr, "usage: mtp_dump CKPT LIST OUTDIR [--ctx N] [--check 1] [--chain D]\n");
     return 2;
@@ -61,15 +75,20 @@ int main(int argc, char** argv) {
     else if (k == "--chain") chain = v;
     else { std::fprintf(stderr, "unknown option %s\n", k.c_str()); return 2; }
   }
+  const mtp_taint::Provenance provenance = mtp_taint::ListProvenance(argv[2]);
+  if (!mtp_taint::CheckOutputAllowed(provenance, check != 0)) {
+    std::fprintf(stderr, "mtp_dump: --check writes files that cannot carry the canary; the list is not marked public\n");
+    return 2;
+  }
   if (chain < 1 || chain > kMaxRows - 1) { std::fprintf(stderr, "--chain must be 1..7\n"); return 2; }
   if (!SetRuntimeMemoryDefaults()) return 1;
   std::vector<std::pair<std::string, std::vector<int>>> seqs;
   {
     std::ifstream f(argv[2]);
-    if (!f) { std::fprintf(stderr, "cannot open %s\n", argv[2]); return 2; }
+    if (!f) { std::fprintf(stderr, "cannot open %s\n", FileName(argv[2]).c_str()); return 2; }
     for (std::string line; std::getline(f, line);) {
       const size_t sp = line.find(' ');
-      if (line.empty() || sp == std::string::npos) continue;
+      if (line.empty() || line[0] == '#' || sp == std::string::npos) continue;   // the public line has a space
       std::vector<int> ids = ParseIds(line.substr(sp + 1));
       if (ids.size() < 2 || (int)ids.size() > ctx) {
         std::fprintf(stderr, "sequence %s: need 2..%d IDs\n", line.substr(0, sp).c_str(), ctx);
@@ -91,6 +110,7 @@ int main(int argc, char** argv) {
   std::vector<__half> half(maxn * kWide);
   std::vector<float> logits((size_t)kMaxRows * kVocab);
   double total_tokens = 0, prefill_s = 0;
+  std::vector<std::pair<std::string, std::vector<int>>> names;   // the sequences of this run, for the provenance marker
   for (auto& [name, ids] : seqs) {
     const int n = (int)ids.size();
     eng.Reset();
@@ -118,12 +138,12 @@ int main(int argc, char** argv) {
       amax = std::max(amax, a);
       half[j] = __float2half(host[j]);
     }
-    WriteAll(out + "/" + name + ".stk", half.data(), (size_t)n * kWide * sizeof(__half));
-    {
-      std::ofstream f(out + "/" + name + ".ids");
-      for (int j = 0; j < n; ++j) f << (j ? "," : "") << ids[j];
-      f << "\n";
+    if (!mtp_taint::WriteStk(out + "/" + name + ".stk", half.data(), (size_t)n * kWide * sizeof(__half), provenance) ||
+        !mtp_taint::WriteIds(out + "/" + name + ".ids", ids, provenance)) {
+      std::fprintf(stderr, "cannot write the outputs of %s\n", name.c_str());
+      return 1;
     }
+    names.emplace_back(name, ids);
     std::fprintf(stderr, "%s: %d tokens, max |stack| %.1f\n", name.c_str(), n, amax);
     if (!check) continue;
     WriteAll(out + "/" + name + ".f32", host.data(), (size_t)n * kWide * sizeof(float));
@@ -148,6 +168,10 @@ int main(int argc, char** argv) {
       for (int d : drafts) mf << " " << d;
       mf << "\n";
     }
+  }
+  if (!mtp_taint::FinishFolder(out, provenance, names)) {
+    std::fprintf(stderr, "the output folder holds files that this list did not make: no provenance marker written; use an empty folder\n");
+    return 1;
   }
   std::fprintf(stderr, "dumped %.0f tokens, prefill %.1f s (%.0f tok/s)\n", total_tokens, prefill_s,
                total_tokens / std::max(prefill_s, 1e-9));

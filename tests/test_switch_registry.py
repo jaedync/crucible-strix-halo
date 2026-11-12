@@ -82,14 +82,14 @@ class RegistryTests(unittest.TestCase):
         self.assertGreater(checked, 5)
 
     def test_launch_rows_default_is_the_code_default(self):
-        # 8192-row launches are the default; CRUCIBLE_PF_LAUNCH_ROWS=4096 turns them off.
+        # prefill-rows: 16384-row launches are the default; CRUCIBLE_PF_LAUNCH_ROWS=4096 turns them off.
         code = (ROOT / 'engine/model/flashnext/prefill_launch.h').read_text()
         value = re.search(r'kDefaultPrefillLaunchRows\s*=\s*(\d+)', code)
         self.assertIsNotNone(value)
         row = self.by_name['CRUCIBLE_PF_LAUNCH_ROWS']
         join = re.search(r'kDefaultPrefillJoinRows\s*=\s*(\d+)', code)
         self.assertIsNotNone(join)
-        # X4 (x4-tail): the default is the daily value "8192+128".
+        # X4 (x4-tail) join rows on the prefill-rows default: "16384+128" (the daily env pins its own value).
         self.assertEqual((row.kind, row.default, row.issue, row.decide_by), ('exact-speed', f'{value[1]}+{join[1]}', 24, 20))
 
     def test_counts(self):

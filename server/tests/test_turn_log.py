@@ -138,6 +138,51 @@ class TurnLogTest(unittest.TestCase):
         for key in ("closest_age_s", "cache_host_hits", "closest_shared_tokens"):
             self.assertNotIn(key, typed)
 
+    def test_miss_ledger_fields(self):
+        """Start plan B1a: each turn line says where the best state for its prompt was and why the turn did not use
+        it. Closed word sets and numbers only: a word outside its set, or a value of the wrong type, never reaches the
+        line."""
+        def line_of(done, load=None):
+            return json.loads(metrics.turn_line(dict(request_id=1), done, load=load).split(" ", 1)[1])
+
+        done = dict(prompt_tokens=128742, cached_tokens=0, best_shared_tokens=126976, best_tier="lost",
+                    lost_cause="handover", disk_shared_tokens=9984, resume_tier="none", resume_point="none",
+                    resume_gap_tokens=126976, handover_drain_s=0.25, slots_durable=2)
+        line = line_of(done)
+        for key, value in done.items():
+            self.assertEqual(line[key], value, key)
+        for word in ("none", "new", "handover", "evict", "idle", "budget", "spill", "stop", "switch", "undo", "unknown"):
+            self.assertEqual(line_of(dict(lost_cause=word))["lost_cause"], word)
+        for word in ("slot", "point", "host", "disk", "lost", "none"):
+            self.assertEqual(line_of(dict(best_tier=word))["best_tier"], word)
+        for word in ("slot", "point", "host", "disk", "block", "none"):
+            self.assertEqual(line_of(dict(resume_tier=word))["resume_tier"], word)
+        for word in ("frontier", "pre", "start", "end", "grid", "header", "tail", "none"):
+            self.assertEqual(line_of(dict(resume_point=word))["resume_point"], word)
+        canary = "CANARY the user wrote this"
+        bad = line_of(dict(best_tier=canary, lost_cause="lost", resume_tier="lost", resume_point=canary,
+                           best_shared_tokens="9", disk_shared_tokens=1.5, resume_gap_tokens=True, handover_drain_s=-1.0,
+                           slots_durable="2"))
+        for key in ("best_tier", "lost_cause", "resume_tier", "resume_point", "best_shared_tokens", "disk_shared_tokens",
+                    "resume_gap_tokens", "handover_drain_s", "slots_durable"):
+            self.assertNotIn(key, bad)
+        self.assertNotIn("CANARY", json.dumps(bad))
+        self.assertEqual(line_of(dict(restore_seconds=1.25))["restore_s"], 1.25)
+        self.assertNotIn("restore_s", line_of(dict(restore_seconds="1")))
+        self.assertEqual(metrics.load_fields([dict(shared_prefix_tokens=12288), dict(shared_prefix_tokens=0)])
+                         ["shared_prefix_tokens"], 12288)
+        self.assertNotIn("shared_prefix_tokens", metrics.load_fields([dict(shared_prefix_tokens="9")]))
+        # The stage reply of the turn's disk read: the length of the best disk state, also when the read was refused,
+        # and what the read waited for.
+        staged = metrics.load_fields([dict(state_disk="none", state_disk_reason="room", state_disk_tokens=0,
+                                           stage_best_tokens=171777, stage_wait_cause="room")])
+        self.assertEqual((staged["stage_best_tokens"], staged["stage_wait_cause"]), (171777, "room"))
+        for word in ("none", "room", "reader", "writer"):
+            self.assertEqual(metrics.load_fields([dict(state_disk="reading", stage_wait_cause=word)])["stage_wait_cause"], word)
+        wrong = metrics.load_fields([dict(state_disk="none", stage_best_tokens="9", stage_wait_cause=canary)])
+        self.assertNotIn("stage_best_tokens", wrong)
+        self.assertNotIn("stage_wait_cause", wrong)
+
     def test_line_survives_missing_metrics(self):
         self.assertTrue(metrics.turn_line(None, dict(prompt_tokens=1)).startswith("crucible_turn {"))
 

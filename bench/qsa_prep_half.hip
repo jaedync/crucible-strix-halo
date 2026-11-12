@@ -19,7 +19,7 @@ int main(int argc, char** argv) {
   Buffer<float> q(Random((size_t)R * 24 * 512, 2.f, 51)), w(norm);
   Buffer<__half> hi((size_t)R * 6144);
   QsaArgs a{};
-  a.q = q.p; a.q_norm1 = w.p; a.pos0 = pos0; a.R = R;
+  a.q = q.p; a.q_norm1 = w.p; a.pos0 = pos0; a.R = R; a.rope = PlainRopeTable();
   const QsaPrefill f{a, nullptr, hi.p, nullptr};
   const auto base = [&] {
     QsaPrepKernel<<<dim3(24, R), 256>>>(a);

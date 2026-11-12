@@ -95,7 +95,7 @@ def test_template_invalid_configuration_and_explicit_error(checkpoint):
 
 
 @pytest.mark.parametrize("options", [
-    ["--ctx", "0"], ["--ctx", "262145"], ["--conversation-cache-mib", "-1"],
+    ["--ctx", "0"], ["--ctx", "524289"], ["--conversation-cache-mib", "-1"],
     ["--conversation-cache-mib", "131073"], ["--prefill", "-1"], ["--prefill", "4097"],
     ["--model-id", ""], ["--model-id", "x" * 201], ["--streams", "0"], ["--streams", "9"],
 ])

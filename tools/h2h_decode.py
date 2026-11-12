@@ -85,6 +85,21 @@ WORKLOADS = {
     "think": (True, None, 768),
     "prose": (False, None, 512),
 }
+# Opt-in workloads (--workloads), not in the default turn order. copy: the reply copies a file of the history with one
+# small edit, so most of its rounds are lookup copies (real use: 13.5% of the decoder rounds; plan wide R.1).
+OPTIONAL_WORKLOADS = {"copy": (False, None, 768)}
+ALL_WORKLOADS = {**WORKLOADS, **OPTIONAL_WORKLOADS}
+
+
+def workload_list(text):
+    """--workloads: a comma list in run order; None or empty gives the five default workloads in their order."""
+    if not text:
+        return list(WORKLOADS)
+    names = [w.strip() for w in text.split(",") if w.strip()]
+    unknown = [w for w in names if w not in ALL_WORKLOADS]
+    if unknown or not names:
+        raise ValueError(f"unknown workload(s) {unknown}: use {', '.join(ALL_WORKLOADS)}")
+    return names
 TOOL_RESULT = "Applied 1 edit."
 MIN_WINDOW_S = 2.0  # a shorter all-decoding window gives no stable total
 
@@ -121,6 +136,10 @@ def user_request(workload, target):
     if workload == "code_sampled":
         return (f"Now write src/test_{Path(path).stem}.py with pytest tests for every public function of {path}. "
                 "Do not call tools: answer with the complete file in one code block.")
+    if workload == "copy":
+        return (f"Write out the complete file {path} again exactly as it is, with one change only: rename the function "
+                f"`{fn}` to `{fn}_v2` (also where it is called). Answer with the whole file in one code block. "
+                "Do not call tools.")
     if workload == "think":
         return (f"Find a real bug or edge case in {path} (for example in `{fn}`). Explain it and give the fixed "
                 "function in a code block. Do not call tools.")
@@ -165,7 +184,7 @@ class Session:
         self.messages, self.target, self.model, self.extra = list(base["messages"]), target, model, extra
 
     def body(self, workload, max_tokens=0):
-        thinking, sampling, default_max = WORKLOADS[workload]
+        thinking, sampling, default_max = ALL_WORKLOADS[workload]
         msgs = self.messages + [{"role": "user", "content": user_request(workload, self.target)}]
         body = {"model": self.model, "messages": msgs, "tools": TOOLS, "stream": True,
                 "stream_options": {"include_usage": True}, "max_tokens": max_tokens or default_max,
@@ -317,8 +336,9 @@ def window_total(results):
     return total / (hi - lo), hi - lo
 
 
-def turn(url, sessions, workload, max_tokens, arrival=None):
-    """Run one turn of every session at the same time and append the replies.
+def turn(url, sessions, workload, max_tokens, arrival=None, stagger=0.0):
+    """Run one turn of every session at the same time and append the replies. With stagger S, session k starts k * S
+    seconds after the first.
 
     arrival: (delay_s, body) of a fresh request (a new session's first prompt, no cache) that starts while the
     sessions decode. Its result is returned last and is not appended to any session."""
@@ -326,6 +346,8 @@ def turn(url, sessions, workload, max_tokens, arrival=None):
     results = [None] * (len(sessions) + (arrival is not None))
 
     def go(k):
+        if stagger and k:
+            time.sleep(k * stagger)
         results[k] = stream(url, bodies[k])
 
     def arrive():
@@ -375,7 +397,9 @@ def run(args):
     deadline = time.time() + args.budget_s
     extras = json.loads(args.extra)
     extras = extras if isinstance(extras, list) else [extras]
-    workloads = list(WORKLOADS)
+    workloads = workload_list(getattr(args, "workloads", None))
+    turns = len(workloads) if getattr(args, "turns", None) is None else args.turns
+    stagger = float(getattr(args, "stagger", 0.0) or 0.0)
     salt0 = args.prefix_salt or str(time.time_ns())
     rows = [(c, int(n), e) for c in args.contexts.split(",") for n in args.sessions.split(",") for e in extras]
     for row_no, (ctx, n, extra) in enumerate(rows):
@@ -391,7 +415,7 @@ def run(args):
                   f"{r['error'] or ''}", flush=True)
         since = 0.0
         _, since = command_trace(url, since)
-        for workload in workloads[:args.turns]:
+        for workload in workloads[:turns]:
             if time.time() > deadline:
                 print("budget reached; stopping", flush=True)
                 return
@@ -401,7 +425,7 @@ def run(args):
                                                             f"{args.arrival_salt}-{workload}" if args.arrival_salt
                                                             else f"{time.time_ns()}"))
             with Clocks() as clocks:
-                results = turn(url, sessions, workload, args.max_tokens, arrival)
+                results = turn(url, sessions, workload, args.max_tokens, arrival, stagger if n > 1 else 0.0)
             if arrival is not None:
                 new = results.pop()
                 ends = [r["chunks"][-1][0] for r in results if r["chunks"]]
@@ -424,6 +448,8 @@ def run(args):
                    "finish": [r["finish"] for r in results], "calls": [len(r["calls"]) for r in results],
                    "errors": [r["error"] for r in results if r["error"]],
                    "content_sha": [hashlib.sha256(r["content"].encode()).hexdigest()[:12] for r in results]}
+            if stagger and n > 1:
+                row["stagger_s"] = stagger
             row["trace"], since = command_trace(url, since)
             out.write(json.dumps(row) + "\n")
             out.flush()
@@ -472,7 +498,9 @@ def main():
     r.add_argument("--out", required=True)
     r.add_argument("--model", default="crucible")
     r.add_argument("--contexts", default="4096,32768,102400")
-    r.add_argument("--workloads", default=",".join(WORKLOADS))
+    r.add_argument("--workloads", default=",".join(WORKLOADS),
+                   help=f"comma list in run order (default the five; opt-in: {', '.join(OPTIONAL_WORKLOADS)})")
+    r.add_argument("--stagger", type=float, default=0.0, help="with several sessions: session k of a turn starts k * S s later")
     r.add_argument("--sessions", default="1,4")
     r.add_argument("--max-tokens", type=int, default=0)
     r.add_argument("--budget-s", type=float, default=1e9)
@@ -485,7 +513,7 @@ def main():
                    help="prompt start of the rows with several sessions: none = the same history in every session, "
                    "distinct = a unique first line per session, shared = one new first line for all sessions of a row")
     r.add_argument("--prefix-salt", default="", help="fixed salt of the first lines, for tests and reruns; empty uses the clock")
-    r.add_argument("--turns", type=int, default=len(WORKLOADS), help="run only the first N turns of each session")
+    r.add_argument("--turns", type=int, default=None, help="run only the first N turns of each session (default all)")
     r.add_argument("--extra", default="{}", help="JSON merged into every measured request, or a list of them "
                    "(each runs its own sessions, in order)")
     t = sub.add_parser("table")

@@ -29,7 +29,8 @@ template <class T> T* Device(const std::vector<T>& h) {
   return d;
 }
 
-void Check(int R, int ldh) {
+// stock: bit r marks a stock row (CRUCIBLE_ABLATE_MODE=request); it must equal AblateWriteStockRef.
+void Check(int R, int ldh, uint32_t stock = 0) {
   std::vector<float> a = Values(kHidden, 1.f, 1);
   double n = 0;
   for (float v : a) n += double(v) * v;
@@ -40,16 +41,20 @@ void Check(int R, int ldh) {
   const std::vector<float> post = Values((size_t)R * kStreams, 3.f, 3 + R);
   std::vector<float> H = Values((size_t)R * ldh, 50.f, 4 + R);
   std::vector<float> want(H);
-  for (int r = 0; r < R; ++r)
-    AblateWriteRef(y.data() + (size_t)r * kHidden, ab.data(), ab.data() + kHidden, post.data() + r * kStreams,
-                   want.data() + (size_t)r * ldh);
+  for (int r = 0; r < R; ++r) {
+    if (r < 32 && (stock >> r & 1u))
+      AblateWriteStockRef(y.data() + (size_t)r * kHidden, post.data() + r * kStreams, want.data() + (size_t)r * ldh);
+    else
+      AblateWriteRef(y.data() + (size_t)r * kHidden, ab.data(), ab.data() + kHidden, post.data() + r * kStreams,
+                     want.data() + (size_t)r * ldh);
+  }
   float *dy = Device(y), *dab = Device(ab), *dpost = Device(post), *dH = Device(H);
-  AblateWriteKernel<<<R, kAblateThreads>>>(dy, dab, dpost, dH, ldh);
+  AblateWriteKernel<<<R, kAblateThreads>>>(dy, dab, dpost, dH, ldh, stock);
   HIP_OK(hipGetLastError());
   std::vector<float> got(H.size());
   HIP_OK(hipMemcpy(got.data(), dH, got.size() * sizeof(float), hipMemcpyDeviceToHost));
   if (std::memcmp(got.data(), want.data(), got.size() * sizeof(float))) {
-    std::fprintf(stderr, "FAIL: R=%d ldh=%d differs from AblateWriteRef\n", R, ldh);
+    std::fprintf(stderr, "FAIL: R=%d ldh=%d stock=%x differs from the reference\n", R, ldh, stock);
     std::exit(1);
   }
   for (float* p : {dy, dab, dpost, dH}) HIP_OK(hipFree(p));
@@ -61,6 +66,13 @@ int main() {
   for (int R : {1, 3, 8, 37}) {
     Check(R, kWide);
     Check(R, kWide + 64);  // padded prefill stride; the padding must stay unchanged
+  }
+  // Mixed passes of per-request mode: stock rows first, last, alternating, and all but one.
+  for (int R : {2, 4, 8, 16}) {
+    Check(R, kWide, 1u);
+    Check(R, kWide, 1u << (R - 1));
+    Check(R, kWide, 0x5555u & ((1u << R) - 1));
+    Check(R, kWide, ((1u << R) - 1) & ~2u);
   }
   std::puts("ablation_kernel_test: ok");
 }

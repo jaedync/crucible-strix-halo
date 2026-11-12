@@ -126,6 +126,14 @@ class StreamTest(unittest.TestCase):
             self.assertEqual(json.loads(out.read_text())["scenario"], "agents6")
         self.assertEqual(sorted(seen), [(f"agent-{i}", "agent", "on", "drop", 768, "m") for i in range(6)])
 
+    def test_overbooked_scenarios_run_more_sessions_than_slots_on_the_default_layout(self):
+        # t34 memsoak: 6 and 8 sessions on the 4 slots of the daily layout (slot handovers).
+        for name, count in (("agents6x4", 6), ("agents8x4", 8)):
+            got, layout = soak.AGENT_SCENARIOS[name]
+            self.assertEqual(got, count)
+            self.assertEqual(layout, soak.AGENT_SCENARIOS["agents"][1])  # the layout keeps --streams 4
+            self.assertIn("--streams 4 ", layout)
+
     def test_parse_stream(self):
         chunks = [dict(choices=[dict(delta=dict(reasoning_content="think "))]),
                   dict(choices=[dict(delta=dict(reasoning_content="more"))]),

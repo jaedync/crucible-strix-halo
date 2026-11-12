@@ -346,10 +346,10 @@ int main() {
     while ((done = session.Prefill(90)).empty()) {}
     assert(done.back().done && engine.histories[0] == request.ids);
     const std::vector<int> expected = mode == 1 ? std::vector<int>{-4, -4, -4, -4, -4, -1}
-                                     : mode == 2 ? std::vector<int>{-12, -9} : std::vector<int>{-16, -5};
+                                     : mode == 2 ? std::vector<int>{-12, -8, -1} : std::vector<int>{-16, -4, -1};  // F3: the 1-row tail is its own launch
     assert(engine.chunks == expected);
-    assert(saved == (mode == 1 ? std::vector<size_t>{4, 8, 12, 16, 20} : mode == 2 ? std::vector<size_t>{12}
-                     : mode == 3 ? std::vector<size_t>{16} : std::vector<size_t>{}));
+    assert(saved == (mode == 1 ? std::vector<size_t>{4, 8, 12, 16, 20} : mode == 2 ? std::vector<size_t>{12, 20}
+                     : mode == 3 ? std::vector<size_t>{16, 20} : std::vector<size_t>{}));
   }
 
   // A turn restored from a session-replay tail keeps the grid after its small-row head chunk (it saves slot
@@ -626,6 +626,11 @@ int main() {
           assert(slot == engine.selected && held != host.rend() && engine.histories[slot] == held->stream);
           log.push_back("release slot=" + std::to_string(slot) + " resumed=" + std::to_string(resumed));
         };
+        // an open that resets the slot and writes it from row 0 (no resume) ends the disk reads of its old rows.
+        hooks.overwrite = [&](int slot) {
+          assert(slot == engine.selected);
+          log.push_back("overwrite slot=" + std::to_string(slot));
+        };
       }
       session.SetCacheHooks(hooks);
       const auto finish = [&](uint64_t id, const crucible::ServeRequest& r) {
@@ -666,10 +671,11 @@ int main() {
     assert(slot == host);
     assert(slot[3] == std::vector<int>{0});  // a's next turn returned to slot 0
     assert((slot_log == std::vector<std::string>{
-        "restore", "tail slot=0 replayed=0 guarded=0", "done slot_resume=0 cached=0",
-        "restore", "tail slot=1 replayed=0 guarded=0", "done slot_resume=0 cached=0",
+        "overwrite slot=0", "restore", "tail slot=0 replayed=0 guarded=0", "done slot_resume=0 cached=0",
+        "overwrite slot=1", "restore", "tail slot=1 replayed=0 guarded=0", "done slot_resume=0 cached=0",
         "release slot=0 resumed=1", "resume slot=0", "tail slot=0 replayed=1 guarded=1", "done slot_resume=1 cached=8",
-        "release slot=0 resumed=0", "restore", "tail slot=0 replayed=0 guarded=0", "done slot_resume=0 cached=0"}));
+        "release slot=0 resumed=0", "overwrite slot=0", "restore", "tail slot=0 replayed=0 guarded=0",
+        "done slot_resume=0 cached=0"}));
     // The host path reports the same source: the restored tail was guarded. It has no release hook.
     assert(host_log[7] == "tail slot=0 replayed=1 guarded=1");
     assert(host_log[6] == "restore" && host_log[8] == "done slot_resume=0 cached=8");
@@ -1764,7 +1770,9 @@ int main() {
     for (const uint64_t id : {1, 2, 3})
       assert(merged.tokens.at(id) == std::vector<int>(serial[id].begin(), serial[id].begin() + merged.tokens.at(id).size()));
     const auto early = run(2, 3, 24);
-    assert(early.parts == 2 && std::count(early.chunks.begin(), early.chunks.end(), -18) == 1);
+    // F3: the 6-row tail is its own launch (before: it joined the chunk before it, one launch of 18 rows).
+    assert(early.parts == 2 && std::count(early.chunks.begin(), early.chunks.end(), -18) == 0 &&
+           std::count(early.chunks.begin(), early.chunks.end(), -12) == 2 && std::count(early.chunks.begin(), early.chunks.end(), -6) == 1);
     assert(early.tokens.at(3).size() == 1 && early.tokens.at(3)[0] == serial[3][0]);
   }
   // Train 13 audit: a decoder that finishes inside a pass saves its tail

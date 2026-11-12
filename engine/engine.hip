@@ -17,6 +17,7 @@
 #include "switches.h"
 #include "runtime/bounds.h"
 #include "runtime/sampling.h"
+#include "runtime/draft_accept.h"
 #include "runtime/retained_prefix.h"
 #include "runtime/layer_loop.h"
 #include "runtime/conversation_cache.h"
@@ -38,10 +39,15 @@
 #include "runtime/draft_ops.h"
 #include "runtime/draft_dense.h"
 #include "runtime/draft_adapt.h"
+#include "runtime/draft_quant.h"
+#include "model/flashnext/draft_chain_switch.h"
 #include "runtime/draft_policy.h"
 #include "layers/expert_count.h"
 #include "runtime/prefill_prune.h"
 #include "layers/moe_rows.h"
+#include "layers/moe_b128.h"
+#include "layers/moe_b128_switch.h"
+#include "layers/moe_sg.h"
 #include "layers/moe_stage.h"
 #include "layers/moe_shared_first.h"
 #include "layers/dense_rows.h"
@@ -54,16 +60,18 @@
 #include "layers/ablation_device.h"
 #include "layers/prefill_moe.h"
 #include "layers/prefill_moe_pair.h"
+#include "layers/prefill_moe_tile.h"
 #include "runtime/prefill_front_check.h"
 #include "layers/prefill_ple.h"
 #include "runtime/prefill_plan_budget.h"
 #include "model/flashnext/prefill_launch.h"
 #include "runtime/mtp_bulk.h"
 #include "runtime/stage_arena.h"
+#include "runtime/stage_plan.h"
 #include "layers/kernels/prefill_qsa_union.h"
 #include "layers/prefill_hc.h"
 #include "runtime/prefill_interleave.h"
-#include "layers/hc_wmma.h"
+#include "layers/hc_wmma2.h"
 #include "layers/kernels/prefill_gdn.h"
 #include "layers/numerics.h"
 #include "layers/kernels/prefill_qsa.h"
@@ -81,6 +89,7 @@ namespace {
 __global__ void FlipLowBitKernel(float* p) { *p = __uint_as_float(__float_as_uint(*p) ^ 1u); }
 #endif
 static_assert(kPrefillCoreRows == kPrefillLaunchCoreRows, "merged launches cut GDN/QSA parts on the grid");
+static_assert(prefill::kUnionRows == kQsaUnionTileRows, "resume points keep the QSA union tiles");
 
 class Engine {
   friend struct EngineStateIO;  // long-context benchmark checkpoints, not a serving API
@@ -102,8 +111,23 @@ class Engine {
       std::fprintf(stderr, "%s\n", error.what());
       std::exit(2);
     }
+    try {
+      rope_ = RopeSettingFromEnv();
+      CheckRopeContext(ctx_, rope_, "context");
+    } catch (const std::exception& error) {
+      std::fprintf(stderr, "%s\n", error.what());
+      std::exit(2);
+    }
     const bool streaming = explicit_policy.blocks != 0 || RowPolicyInt("CRUCIBLE_TUNE_ROWS", 1, 0, 1) != 0;
     Loader(dir).Load(m_, streaming);
+    rope_tables_ = Scratch<float>((size_t)kRopeModes * kRopeTableFloats);
+    FillRopeTables(rope_tables_);
+    if (rope_.start != RopeMode::Plain || rope_.allow != RopeMode::Plain) {
+      float m = 1.f;
+      if (rope_.start != RopeMode::Plain) m = kYarnTable[static_cast<int>(rope_.start) - 1][kRopeMul];
+      std::fprintf(stderr, "rope: mode=%s allow=%s m=%.7f max_ctx=%d%s\n", RopeModeName(rope_.start),
+                   RopeModeName(rope_.allow), m, rope_.ContextCap(), rope_.Forced() ? " forced (test only)" : " auto");
+    }
     // Decide the prefill path before the row-sized buffers.
     prefill_rows_ = ChoosePrefillRows(prefill_rows);
     const char* launch_value = crucible::SwitchText("CRUCIBLE_PF_LAUNCH_ROWS");
@@ -119,7 +143,9 @@ class Engine {
     // x4-tail: join rows only with "L+T"; else 0, and the row buffers hold the launch rows as before.
     pf_join_rows_ = PrefillJoinSetting(launch_value, prefill_rows_);
     pf_room_rows_ = PrefillRoomRows(pf_launch_rows_, pf_join_rows_);
-    lookahead_.Init(m_.static_base, m_.static_bytes, streaming);
+    lookahead_.Init(m_.static_base, m_.static_bytes, streaming, MoeSgHoldsLookahead(moe_b128_));
+    if (!draft_chain_.Default())
+      std::fprintf(stderr, "draft chain: %s (CRUCIBLE_DRAFT_CHAIN)\n", DraftChainLabel(draft_chain_).c_str());
     // Row buffers hold a packed verify pass (kPackedRows) or one bulk launch with its join rows (PrefillRoomRows).
     const int capacity = std::max(kPackedRows, pf_room_rows_);
     // Padding avoids cache conflicts. CRUCIBLE_PF_PAD_H=0 keeps tight storage for A/B checks.
@@ -147,8 +173,13 @@ class Engine {
     }
     ids_ = Zeros<int>(kPackedRows);
     choice_ = Zeros<DraftChoice>(kMaxRows);
+    if (draft_chain_.lead) {
+      HIP_OK(hipHostMalloc(reinterpret_cast<void**>(&choice_lead_), sizeof(DraftChoice)));
+      *choice_lead_ = DraftChoice{-1, 0.f};
+      HIP_OK(hipEventCreateWithFlags(&lead_ready_, hipEventDisableTiming));
+    }
     mtp_stacks_ = Scratch<float>((size_t)kMaxRows * kWide);
-    xh_capacity_ = std::max({kXh, (size_t)capacity * 10240, MoeGateUpHalves(kPackedRows)});
+    xh_capacity_ = std::max({kXh, (size_t)capacity * 10240, MoeDownXhOffset() + MoeDownHalves(kPackedRows)});
     xh_ = Scratch<__half>(xh_capacity_);
     mE_ = Scratch<float>(kMaxRows * kHidden);
     mN_ = Scratch<float>(kMaxRows * kWide);
@@ -168,16 +199,20 @@ class Engine {
     mapj_ = Zeros<int>(kPackedRows * kTopK);
     rowl_ = Zeros<int>(MoeExpertJobs(kPackedRows) * kMaxRows);
     moe_done_ = Zeros<unsigned>(MoeExpertJobs(kPackedRows));
+    if (MoeSgCtlNeeded(moe_b128_)) {
+      moe_sg_ctl_ = Zeros<unsigned>(kSgCtlWords);
+      MoeSgCheckGrids(moe_b128_);  // every instance of the active mode now: a device with no room for the kernel stops at start-up, not at a first verify
+    }
     moe_sync_ = Zeros<unsigned>(kMoeStageWords);
     qsa_sync_ = Zeros<unsigned>(4);
-    hcw_ = HcWAlloc();
+    hcw_ = HcW2Alloc();
     LoadAblation(capacity);
     if (prefill_rows_) InitPrefill();
     std::fprintf(stderr, "weights %.2f GB, context %d, prefill rows %d\n", m_.bytes / 1e9, ctx_, prefill_rows_);
     std::fprintf(stderr, "prefill: %s\n", prefill_path_.c_str());
     if (compact_state_)
-      std::fprintf(stderr, "sequence storage: CRUCIBLE_COMPACT_STATE=1 raw_slots=%d mtp=lazy logical_state_bytes=%zu\n",
-                   kQsaRawSlots, SequenceState::Bytes(ctx_, true, false, mtp_rows_));
+      std::fprintf(stderr, "sequence storage: CRUCIBLE_COMPACT_STATE=1 raw_slots=%d mtp=lazy logical_state_bytes=%zu fixed_state_bytes=%zu\n",
+                   kQsaRawSlots, SequenceState::Bytes(ctx_, true, false, mtp_rows_), SequenceState::FixedBytes());
     if (mtp_rows_ > 0 && mtp_rows_ < ctx_) std::fprintf(stderr, "sequence storage: mtp_rows=%d of context %d\n", mtp_rows_, ctx_);
     const char* warmup = crucible::SwitchText("CRUCIBLE_WARMUP");
     if (!warmup || std::string(warmup) != "0") WarmUp();
@@ -193,6 +228,7 @@ class Engine {
       HIP_OK(hipFree(draft_dense_));
       if (draft_blocks_) HIP_OK(hipFree(draft_blocks_));
     }
+    draft_q_.reset();  // it reads the block head's tiles
     block_head_.reset();
     draft_blocks_ = nullptr;
     draft_dense_ = nullptr;
@@ -216,6 +252,13 @@ class Engine {
     RebuildDraftHead();
     std::fprintf(stderr, "draft head %d tokens, %.2f MB, original EXL3 blocks\n",
                  draft_head_.O, (double)draft_head_.O * (m_.head.I * m_.head.K / 8 + 2) / 1e6);
+    // CRUCIBLE_DRAFT_HEAD=q4|q2 (draft_quant.h): a fixed head gets the low-bit copy; an adaptive head grows, so not.
+    if (draft_q_bits_ && !adapt) {
+      draft_q_ = std::make_unique<DraftQuantHead>(m_.head, block_head_->Weights(), blocks, draft_q_bits_);
+      HIP_OK(hipDeviceSynchronize());
+      std::fprintf(stderr, "draft head q%d (CRUCIBLE_DRAFT_HEAD): %d tokens, %.2f MB coarse copy, %d blocks rescored\n",
+                   draft_q_bits_, draft_q_->Vocabulary(), draft_q_->Bytes() / 1e6, kDraftQBlocks);
+    }
   }
 
   void ObserveDraft(const int* tokens, int count) {
@@ -324,16 +367,28 @@ class Engine {
     return s;
   }
 
+  // S_true in every GDN state of `s` before a small-row forward reads it (a bulk prefill or a restore may
+  // have left the lazy form, prefill_gdn.h). Once per request; a no-op kernel for heads whose scale is 1.
+  void MaterializeGdn(SequenceState& s) {
+    if (!s.gdn_lazy) return;
+    std::vector<float*> states;
+    for (const auto& [layer, state] : s.gstate) states.push_back(state);
+    prefill::LaunchGdnMaterialize(states);
+    s.gdn_lazy = false;
+  }
+
   // Runs rows tokens[0..R) at positions pos0..pos0+R-1; returns greedy ids.
   // replay: accepted draft rows of the previous forward to fold into GDN state;
   // commit: rows of this forward whose GDN updates are certain (R unless verifying).
   std::vector<int> Forward(const int* tokens, int R, int replay, int commit,
                            const std::string& dump = "", int mtp_pos = -1) {
+    SettlePleSide();
     const int pos0 = (int)sequence_->hist.size();
     if (!ContextRowsFit(pos0, R, sequence_->capacity, kMaxRows)) {
       std::fprintf(stderr, "context full or invalid forward row count\n");
       std::exit(1);
     }
+    CheckRopeRows(sequence_->hist.size(), R, sequence_->rope_mode);
     if (!ValidTokenIds(std::span(tokens, R), kVocab)) {
       std::fprintf(stderr, "token IDs must be in [0, %d)\n", kVocab);
       std::exit(2);
@@ -348,6 +403,7 @@ class Engine {
       std::exit(1);
     }
     sequence_->hist.insert(sequence_->hist.end(), tokens, tokens + R);
+    MaterializeGdn(*sequence_);
     const Plans& P = PlansFor(R);
     lookahead_.Start(P.policy);
     host_tokens_.CopyTo(tok_, tokens, R);
@@ -380,8 +436,13 @@ class Engine {
   // trunk (or draft) stacks [R][10240] on the device and the next tokens.
   // Leaves each row's stack in H(). By default only the last ID is scored;
   // earlier IDs are -1. score=false skips the head and returns no IDs.
+  // A scored call with the last-row head leaves only the last row's stack in H() (row R - 1): the earlier rows
+  // skip the MoE half (see MtpLastRowMoe).
+  // CRUCIBLE_DRAFT_CHAIN lead (lead_keep set; DraftLead(), scored, the q block head): no host wait. The choice goes
+  // to its own pinned slot (MtpLeadWait), the last row's stack to lead_keep (H() is scratch for every later pass),
+  // and the call returns no IDs.
   std::vector<int> Mtp(const float* stacks, const int* tokens, int R, int mpos,
-                       bool score = true, bool full_head = false) {
+                       bool score = true, bool full_head = false, float* lead_keep = nullptr) {
     if (!ContextRowsFit(mpos, R, sequence_->mtp_capacity, kMaxRows)) {
       std::fprintf(stderr, "MTP context full or invalid row count\n");
       std::exit(1);
@@ -390,6 +451,8 @@ class Engine {
       std::fprintf(stderr, "token IDs must be in [0, %d)\n", kVocab);
       std::exit(2);
     }
+    if (lead_keep && (!DraftLead() || !score || full_head))
+      throw std::logic_error("an MTP lead needs CRUCIBLE_DRAFT_CHAIN lead, a scored call and the q block head");
     EnsureMtpCache(*sequence_, mpos);
     const Plans& P = PlansFor(R);
     lookahead_.Start(P.policy);
@@ -400,7 +463,16 @@ class Engine {
     RunGroup(P.mtp_in, true, true);
     MtpFuseKernel<<<dim3(kWide / 256, R), 256>>>(mhp_, mep_, H_);
     Mark("mtp_in");
-    Block(kLayers, m_.mtp.L, P.L[kLayers], R, mpos, 0, R);
+    if (MtpLastRowMoe(R, score)) {
+      BlockAttention(kLayers, m_.mtp.L, P.L[kLayers], R, mpos, 0, R);
+      // The last row's MoE half runs as a one-row pass on row 0, then its stack goes back to row R - 1.
+      float* const last_row = H_ + (size_t)(R - 1) * kWide;
+      HIP_OK(hipMemcpyAsync(H_, last_row, sizeof(float) * kWide, hipMemcpyDeviceToDevice, 0));
+      BlockMoe(kLayers, m_.mtp.L, PlansFor(1).L[kLayers], 1);
+      HIP_OK(hipMemcpyAsync(last_row, H_, sizeof(float) * kWide, hipMemcpyDeviceToDevice, 0));
+    } else {
+      Block(kLayers, m_.mtp.L, P.L[kLayers], R, mpos, 0, R);
+    }
     if (!score) {
       lookahead_.Stop();
       Collect();
@@ -410,7 +482,7 @@ class Engine {
     const Hc& hc = m_.mtp.mixer;
     const float* last = H_ + (size_t)(R - 1) * kWide;
     if (hc_wmma_) {
-      HcWLaunch(hc.fn, hc.M, hc.up, hc.w1, last, 1, x_, nullptr, hcw_, ++hcw_epoch_);
+      HcW2Launch(hc.fn, hc.fnf, hc.M, hc.up, hc.upf, hc.w1, last, 1, x_, nullptr, hcw_, ++hcw_epoch_, hc.q8);
     } else {
       HcDotsKernel<1><<<((hc.M + 1) * kStreams + 7) / 8, 256>>>(hc.fn, hc.M, last, dots_, ss_);
       Mark("hc_dots");
@@ -420,12 +492,27 @@ class Engine {
     const bool dense_head = draft_dense_ && !full_head;
     const bool block_head = draft_blocks_ && !draft_dense_ && !full_head;
     const Group& head = block_head ? draft_group_ : PlansFor(1).head;
+    const bool q_head = block_head && draft_q_;
+    DraftChoice* const out_choice = lead_keep ? choice_lead_ : choice_;
     if (dense_head) {
       LinInKernel<<<(head.nin + 7) / 8, 256>>>(head.d_jobs, head.d_in, head.nin);
       DraftDenseGemvKernel<<<(draft_size_ + 7) / 8, 256>>>(draft_dense_, head.jobs[0].xh, logits_, draft_size_);
+    } else if (q_head) {
+      LinInKernel<<<(head.nin + 7) / 8, 256>>>(head.d_jobs, head.d_in, head.nin);
+      draft_q_->Score(head.jobs[0].xh, 1, logits_, draft_blocks_, out_choice);
     } else RunGroup(head, true, true);
-    DraftChoiceKernel<<<1, 1024>>>(logits_, dense_head ? draft_size_ : block_head ? draft_head_.O : kVocab,
-                                  full_head ? nullptr : draft_blocks_, choice_, dense_head);
+    if (!q_head)
+      DraftChoiceKernel<<<1, 1024>>>(logits_, dense_head ? draft_size_ : block_head ? draft_head_.O : kVocab,
+                                    full_head ? nullptr : draft_blocks_, out_choice, dense_head);
+    if (lead_keep) {
+      HIP_OK(hipMemcpyAsync(lead_keep, last, sizeof(float) * kWide, hipMemcpyDeviceToDevice, 0));
+      Mark("draft_head");
+      lookahead_.StopAsync();
+      HIP_OK(hipEventRecord(lead_ready_, 0));
+      Collect();  // profile runs only: waits for the marks
+      ++lead_epoch_;
+      return {};
+    }
     Mark("draft_head");
     lookahead_.Stop();
     Collect();
@@ -437,13 +524,42 @@ class Engine {
     return out;
   }
 
+  // A scored call with the last-row head reads only the last row after the MTP layer: the HC mixer and the draft head
+  // take row R - 1, and every caller chains from that row's stack. So the MoE half of the earlier (catch-up) rows is
+  // dead work; their attention half still runs, because it writes their MTP cache rows. The expert counter keeps
+  // the R-row pass, so its MTP counts stay those of every row. The draft choice may differ in the last bits (another
+  // MoE kernel); verification commits the target's tokens, so the output does not change.
+  bool MtpLastRowMoe(int R, bool score) const {
+    return score && draft_last_only_ && R > 1 && !ecount_ && batch_streams_.empty() && !VerificationSpansActive();
+  }
+
+  // CRUCIBLE_DRAFT_CHAIN lead: the first MTP pass of the next round, launched at the end of a solo step (after the
+  // accept), so it runs while the server handles the step's tokens: Mtp with `lead_keep` (see there). LeadEpoch()
+  // names the latest such pass; MtpLeadWait(epoch) gives its choice.
+  bool DraftLead() const { return draft_chain_.lead && draft_last_only_ && draft_blocks_ && !draft_dense_ && draft_q_; }
+  uint64_t LeadEpoch() const { return lead_epoch_; }
+  // The choice of the lead `epoch` (the host spins on its event); sets DraftMargin() as Mtp does.
+  DraftChoice MtpLeadWait(uint64_t epoch) {
+    if (epoch == 0 || epoch != lead_epoch_) throw std::logic_error("MtpLeadWait: the lead is not the latest");
+    for (hipError_t e; (e = hipEventQuery(lead_ready_)) != hipSuccess;)
+      if (e != hipErrorNotReady) HIP_OK(e);
+    const DraftChoice choice = *choice_lead_;
+    draft_margin_ = choice.margin;
+    return choice;
+  }
+
   // Builds the plans before the ready report, so the first packed step does
   // not allocate and the startup memory report holds the 9..16-row plans.
   void WarmPlans() {
     for (int r = 1; r <= kMaxRows; ++r) PlansFor(r);
     if (sequences_.size() > 1 && MaxPassRows() > kMaxRows)
       for (int r = kMaxRows + 1; r <= kPackedRows; ++r) PlansFor(r);
+    else if (span_rows_ > kMaxRows && MaxPassRows() > kMaxRows)
+      for (int r = kMaxRows + 1; r <= span_rows_; ++r) PlansFor(r);
   }
+  // Rows of one lone verify span (CRUCIBLE_SPEC_SPAN): span_rows_ where the engine runs passes of that many rows
+  // (MaxPassRows), else kMaxRows. The first call with a span builds the 16-row plans.
+  int SpanRows() { return span_rows_ > kMaxRows && MaxPassRows() >= span_rows_ ? span_rows_ : kMaxRows; }
 
   // Rows one packed verify pass may hold (pass_rows.h): kMaxRows when a static
   // group has neither front order nor chunk-aligned spans. The first call
@@ -500,6 +616,7 @@ class Engine {
       std::exit(1);
     }
     sequence_->hist.resize(n);
+    SettlePleSide();
   }
   size_t Length() const { return sequence_->hist.size(); }
   int Context() const { return ctx_; }
@@ -678,7 +795,7 @@ class Engine {
   // Rows per Engine::Prefill chunk; 0 means the prompt uses Forward (8 rows).
   int PrefillRows() const { return prefill_rows_; }
   // Most rows of one Prefill call: whole PrefillRows() chunks that a caller merges
-  // (PrefillLaunchRows in prefill_launch.h); CRUCIBLE_PF_LAUNCH_ROWS, default 8192 for the 4,096-row grid
+  // (PrefillLaunchRows in prefill_launch.h); CRUCIBLE_PF_LAUNCH_ROWS, default 16384 for the 4,096-row grid
   // (kDefaultPrefillLaunchRows, with kDefaultPrefillJoinRows join rows), else PrefillRows().
   int PrefillLaunchRows() const { return pf_launch_rows_; }
   // x4-tail: rows that the prompt's last partial chunk may add to a launch; 0 without
@@ -769,6 +886,7 @@ class Engine {
 
   void AddSequence(int capacity = 0) {
     auto state = std::make_unique<SequenceState>(m_, capacity ? capacity : ctx_, compact_state_, mtp_rows_);
+    state->rope_mode = rope_.start;
     const auto spans = state->Spans();
     buffers_.insert(buffers_.end(), spans.begin(), spans.end());
     sequences_.push_back(std::move(state));
@@ -788,42 +906,56 @@ class Engine {
 
   // The attention-stage row buffers (projections, GDN and QSA inputs, PLE, split-K partials) and the prefill MoE
   // scratch share one allocation: a layer writes its MoE scratch only after its attention outputs are consumed,
-  // and the scratch is dead before the next layer or an interleaved decode pass starts. About 281 KB a prefill row
-  // (1.15 GB at 4096 rows). CRUCIBLE_PF_STAGE_SHARE=0 keeps two separate regions.
+  // and the scratch is dead before the next layer or an interleaved decode pass starts. Inside each view, buffers
+  // whose live ranges never meet share bytes (stage_plan.h, tests/stage_plan_test.cpp): about 117 KB of attention
+  // buffers and 127 KB of MoE buffers a prefill row (the plan before arena-trim: 281 KB and 296 KB).
+  // CRUCIBLE_PF_STAGE_SHARE=0 keeps two separate regions.
+  // The prefill GEMM groups are all fused packed groups (O % 128 == 0), which never write the fp32 split-K
+  // partial. A run with CRUCIBLE_PF_TILES may use an unfused group, which keeps the full workspace.
+  // The MoE plain path (fp32 pg and pu) runs only on launches of fewer than kPrefillMoeTileRows rows when every
+  // layer takes the tile path on larger ones (MoeAllTile); a pack with a layer that does not keeps pg and pu whole.
+  bool MoeAllTile() const {
+    if (!prefill_rows_ || NumericsOn("CRUCIBLE_PF_EXACT_SPLIT")) return false;
+    const PrefillGemmShape moe = PrefillTilesFromEnv(PrefillTiles{}).Moe(kPrefillMoeTileRows);
+    if (!PrefillMoeHalfOut(moe)) return false;
+    return m_.AllLayers([&](const Layer& L) { return PrefillMoeTileShape(moe, true, PrefillMoeKmax(MoeLayerWidths(L))); });
+  }
   void AllocateStageArena(int capacity) {
-    const size_t launch = (size_t)pf_room_rows_, rows = launch * kSlots;
-    auto attention = [&](StageView& v) {
-      qkv_ = v.Take<float>((size_t)capacity * kGdnQkvWidth);
-      z_ = v.Take<float>((size_t)capacity * kGdnValueWidth);
-      q_ = v.Take<float>((size_t)capacity * kQsaQWidth);
-      k_ = v.Take<float>((size_t)capacity * kQsaKvWidth);
-      v_ = v.Take<float>((size_t)capacity * kQsaKvWidth);
-      idx_ = v.Take<float>((size_t)capacity * kQsaIdxWidth);
-      eple_ = v.Take<float>((size_t)capacity * kHidden);
-      kv_ = v.Take<float>((size_t)capacity * 12800);
-      partial_capacity_ = std::max(kPartial, (size_t)capacity * 16384);
-      partial_ = v.Take<float>(partial_capacity_);
-      if (prefill_rows_) {
-        pf_xpack_ = v.Take<__half>(launch * kMixerOutWidth);
-        pf_plenv_ = v.Take<__half>(launch * kWide);
-      }
-    };
-    auto moe = [&](StageView& v) {
-      if (!prefill_rows_) return;
-      auto& a = pf_moe_;
-      a.pg = v.Take<float>(rows * kMoeInter); a.pu = v.Take<float>(rows * kMoeInter);
-      a.pd = v.Take<float>(rows * kHidden);
-      a.xg = v.Take<__half>(rows * kHidden); a.xu = v.Take<__half>(rows * kHidden);
-      a.xd = v.Take<__half>(rows * kMoeInter);
-    };
+    crucible::StageInputs in;
+    in.capacity = (size_t)capacity;
+    in.launch = (size_t)pf_room_rows_;
+    in.bulk = prefill_rows_ > 0;
+    // The half path's decode copy (prefill_half.h): the largest dense group, GDN in, 80 MiB.
+    if (prefill_rows_ >= kHalfMinRows) {
+      pf_wcopy_cap_ = std::max({(size_t)kHidden * (kGdnQkvWidth + kGdnValueWidth),
+                                (size_t)kHidden * (kQsaQWidth + 2 * kQsaKvWidth + kQsaIdxWidth),
+                                (size_t)kMixerOutWidth * kHidden, (size_t)kQsaOutWidth * kHidden});
+      in.wcopy_halves = pf_wcopy_cap_;
+    }
+    in.decode_partial = kPartial;
+    in.unfused = crucible::SwitchText("CRUCIBLE_PF_TILES") != nullptr;
+    in.moe_all_tile = MoeAllTile();
+    partial_capacity_ = crucible::StagePartialFloats(in);
+    partial_plan_floats_ = crucible::StagePlanFloats(in);
+    const crucible::AttentionPlan ap = crucible::PlanAttention(in);
+    const crucible::MoePlan mp = crucible::PlanMoe(in);
     const char* share = crucible::SwitchText("CRUCIBLE_PF_STAGE_SHARE");
     const bool shared = !(share && std::string(share) == "0");
-    const StageLayout layout = StageArenaLayout(StageBytes(attention), StageBytes(moe), shared);
+    const StageLayout layout = StageArenaLayout(ap.bytes, mp.bytes, shared);
     char* arena = Scratch<char>(layout.bytes);
-    StageView first{arena, layout.first};
-    attention(first);
-    StageView second{arena + layout.second_offset, layout.second};
-    moe(second);
+    char* at = arena;
+    qkv_ = (float*)(at + ap.qkv); z_ = (float*)(at + ap.z);
+    q_ = (float*)(at + ap.q); k_ = (float*)(at + ap.k); v_ = (float*)(at + ap.v); idx_ = (float*)(at + ap.idx);
+    eple_ = (float*)(at + ap.eple); kv_ = (float*)(at + ap.kv);
+    partial_ = (float*)(at + ap.partial);
+    if (in.bulk) { pf_xpack_ = (__half*)(at + ap.xpack); pf_plenv_ = (__half*)(at + ap.plenv); }
+    if (in.wcopy_halves) pf_wcopy_ = (__half*)(at + ap.wcopy);
+    if (in.bulk) {
+      char* mo = arena + layout.second_offset;
+      auto& a = pf_moe_;
+      a.pg = (float*)(mo + mp.pg); a.pu = (float*)(mo + mp.pu); a.pd = (float*)(mo + mp.pd);
+      a.xg = (__half*)(mo + mp.xg); a.xu = (__half*)(mo + mp.xu); a.xd = (__half*)(mo + mp.xd);
+    }
     std::fprintf(stderr, "stage arena: %.1f MiB (%s; attention %.1f MiB, MoE %.1f MiB)\n", layout.bytes / 1048576.0,
                  shared ? "shared" : "separate", layout.first / 1048576.0, layout.second / 1048576.0);
   }
@@ -854,6 +986,8 @@ class Engine {
 
   struct LayerGroups {
     Group a_in, a_out, gu, dn;
+    // CRUCIBLE_ABLATE_MODE=request: the ablated output projection of an ablated layer (a_out is then the stock one).
+    Group a_out_abl;
     int kr = 3;  // routed expert K; the shared expert has kr + 2
     // The shared expert's width: kr + 2 on the K3..6 packs, 7 or 8 on the h6_ng8 packs.
     int ks = 5;
@@ -861,9 +995,11 @@ class Engine {
     GemvItem* d_gu8 = nullptr;
     int n_gu8 = 0;
     bool moe_chunk_fits = false;  // every expert split span is whole kMoeChunk stages
+    int moe_ib = 16;  // column blocks per expert item: 16, or 20 for the Q4 body (CRUCIBLE_MOE_B128=2, R > 1)
     int state_cache = 0;
   };
-  struct PrefillLayer { PrefillLinear input, output; };
+  // output_abl: CRUCIBLE_ABLATE_MODE=request only, the ablated output projection (output is then the stock one).
+  struct PrefillLayer { PrefillLinear input, output, output_abl; };
   // The bulk MTP warm-up of one row count: fc_embedding and fc_hidden groups, and the MTP layer's input projections.
   struct MtpPrefillPlan {
     std::vector<PrefillLinear> fuse;
@@ -873,7 +1009,8 @@ class Engine {
     PrefillLayer layers[kLayers];
     size_t DeviceBytes() const {
       size_t bytes = 0;
-      for (const auto& layer : layers) bytes += layer.input.DeviceBytes() + layer.output.DeviceBytes();
+      for (const auto& layer : layers)
+        bytes += layer.input.DeviceBytes() + layer.output.DeviceBytes() + layer.output_abl.DeviceBytes();
       return bytes;
     }
   };
@@ -905,8 +1042,9 @@ class Engine {
   // front_s: one entry per job for dense decode groups that may use the front
   // tile order; entries > 0 mean the loader already stored that order.
   // item_blocks: column blocks per item (MoeFusedKernel<..., C> needs 8 * C).
+  // poff0, xoff0: the group's first partial float and first xh half.
   void Build(Group& g, std::vector<LinJob> jobs, int R, bool fixedS, size_t poff0 = 0,
-             const std::vector<int>& front_s = {}, int item_blocks = 8, int shared_job = -1) {
+             const std::vector<int>& front_s = {}, int item_blocks = 8, int shared_job = -1, size_t xoff0 = 0) {
     std::vector<std::pair<int, int>> io;
     for (const LinJob& j : jobs) io.push_back({j.I, j.O});
     const std::vector<int> splits = fixedS ? std::vector<int>(jobs.size(), 1) : DecodeSplits(io);
@@ -914,7 +1052,7 @@ class Engine {
     const RowPolicy policy = ResolveRowPolicy(R, m_.head.K, m_.L[0].moe.experts[0].K[0]);
     g.fuse = fixedS ? 0 : policy.fuse;
     g.cache = policy.cache;
-    size_t poff = poff0, xoff = 0;
+    size_t poff = poff0, xoff = xoff0;
     int maxspan = 0;
     std::vector<GemvItem> items;
     std::vector<XfItem> in, out;
@@ -1005,6 +1143,17 @@ class Engine {
   // is not a reviewed sidecar for this checkpoint's geometry.
   void LoadAblation(int rows) {
     const char* path = crucible::SwitchText("CRUCIBLE_ABLATE");
+    if (const char* mode = crucible::SwitchText("CRUCIBLE_ABLATE_MODE")) {
+      if (std::string(mode) != "request") {
+        std::fprintf(stderr, "CRUCIBLE_ABLATE_MODE must be request (or unset for the process-wide ablation)\n");
+        std::exit(2);
+      }
+      if (!path || !*path) {
+        std::fprintf(stderr, "CRUCIBLE_ABLATE_MODE=request needs CRUCIBLE_ABLATE=FILE\n");
+        std::exit(2);
+      }
+      abl_request_ = true;
+    }
     if (!path || !*path) return;
     AblationSet set;
     try {
@@ -1024,11 +1173,74 @@ class Engine {
     }
     abl_rows_ = rows;
     abl_y_ = Scratch<float>((size_t)rows * kHidden);
-    std::fprintf(stderr, "ablation: %zu sublayers from %s (sha256 %s, %s)\n", set.sites.size(), path,
-                 set.sha256.c_str(), set.pin->source);
+    std::fprintf(stderr, "ablation: %zu sublayers from %s (sha256 %s, %s)%s\n", set.sites.size(), path,
+                 set.sha256.c_str(), set.pin->source, abl_request_ ? ", per request" : "");
   }
 
-  const float* AblMlp(int li) const { return li < kLayers ? abl_mlp_[li] : nullptr; }
+ public:
+  // CRUCIBLE_ABLATE_MODE=request: each request chooses.
+  bool AblateRequests() const { return abl_request_; }
+  // The mode of the request on `stream`; BatchSession::Open and serial serve set it before the request's forwards.
+  // The RoPE mode of the sequence on `stream` (rope_mode.h). The same mode does
+  // nothing. A different mode needs an empty sequence (a full prefill from token 0) and a mode that the process allows;
+  // a forced process (CRUCIBLE_ROPE_MODE=yarn:F) keeps its mode.
+  void SetStreamRope(int stream, RopeMode mode) {
+    if (stream < 0 || size_t(stream) >= sequences_.size()) throw std::out_of_range("SetStreamRope: no such stream");
+    SequenceState& s = *sequences_[size_t(stream)];
+    if (s.rope_mode == mode) return;
+    if (!s.hist.empty()) throw std::logic_error("a RoPE mode change needs an empty sequence");
+    if (rope_.Forced() || RopeFactor(mode) > RopeFactor(rope_.allow))
+      throw std::logic_error(std::string("CRUCIBLE_ROPE_MODE does not allow ") + RopeModeName(mode));
+    s.rope_mode = mode;
+  }
+  RopeMode StreamRope(int stream) const {
+    if (stream < 0 || size_t(stream) >= sequences_.size()) throw std::out_of_range("StreamRope: no such stream");
+    return sequences_[size_t(stream)]->rope_mode;
+  }
+  const RopeSetting& Rope() const { return rope_; }
+
+  void SetStreamAblate(int stream, bool on) {
+    if (on && !abl_request_) {
+      std::fprintf(stderr, "an ablated request needs CRUCIBLE_ABLATE_MODE=request\n");
+      std::exit(2);
+    }
+    if (stream < 0) std::abort();
+    if (size_t(stream) >= stream_ablate_.size()) stream_ablate_.resize(size_t(stream) + 1, 0);
+    stream_ablate_[size_t(stream)] = on;
+  }
+
+ private:
+  bool StreamAblated(int stream) const {
+    return stream >= 0 && size_t(stream) < stream_ablate_.size() && stream_ablate_[size_t(stream)];
+  }
+  // The ablation of the current pass: `on` when some row is ablated; `stock` marks the stock rows of a mixed pass.
+  // Process-wide mode: every row. Request mode: each row's stream. A pass with no ablated row takes the stock path.
+  struct AblPassRows { bool on = false; uint32_t stock = 0; };
+  AblPassRows AblPass(int R) const {
+    if (!abl_y_) return {};
+    if (!abl_request_) return {true, 0};
+    AblPassRows pass;
+    const auto row = [&](int r, int stream) {
+      if (StreamAblated(stream)) pass.on = true;
+      else {
+        if (r >= 32) std::abort();  // the kernel's mask holds 32 rows; a batch or verify pass has at most 16
+        pass.stock |= 1u << r;
+      }
+    };
+    if (!batch_streams_.empty()) {
+      for (int r = 0; r < R; ++r) row(r, batch_streams_[size_t(r)]);
+    } else if (VerificationSpansActive()) {
+      for (const auto& span : verify_spans_)
+        for (int r = span.row; r < span.row + span.rows; ++r) row(r, span.stream);
+    } else {
+      return {StreamAblated(ActiveStream()), 0};
+    }
+    if (!pass.on) pass.stock = 0;
+    return pass;
+  }
+
+  const float* AblMlp(int li) const { return li < kLayers && abl_now_.on ? abl_mlp_[li] : nullptr; }
+  const float* AblAttn(int li) const { return li < kLayers && abl_now_.on ? abl_attn_[li] : nullptr; }
 
   // y is in abl_y_; post_ holds the inject gates of the current HC read.
   void AblateWrite(const float* ab, float* H, int ldh, int R) {
@@ -1036,7 +1248,7 @@ class Engine {
       std::fprintf(stderr, "ablation scratch holds %d rows, not %d\n", abl_rows_, R);
       std::abort();
     }
-    AblateWriteKernel<<<R, kAblateThreads>>>(abl_y_, ab, post_, H, ldh);
+    AblateWriteKernel<<<R, kAblateThreads>>>(abl_y_, ab, post_, H, ldh, abl_now_.stock);
   }
 
   // Opt-in (CRUCIBLE_PERSISTENT_GDN=1): one persistent kernel runs the R=1
@@ -1078,13 +1290,23 @@ class Engine {
 
   void Block(int li, const Layer& L, const LayerGroups& G, int R, int pos0, int replay,
              int commit) {
+    abl_now_ = li < kLayers ? AblPass(R) : AblPassRows{};
+    const float* const abl_attn = AblAttn(li);
     if (li < kLayers && !L.attn && R == 1 && replay == 0 && commit == 1 && batch_streams_.empty() && !VerificationSpansActive() &&
-        PersistentGdnOn() && !abl_attn_[li]) {
+        PersistentGdnOn() && !abl_attn) {
       PersistentGdnSide(li, L, G, pos0);
       Mark("gdn_side");
       BlockMoe(li, L, G, R);
       return;
     }
+    BlockAttention(li, L, G, R, pos0, replay, commit);
+    BlockMoe(li, L, G, R);
+  }
+
+  // The attention half of Block: HC read, projections, attention core and output projection into H().
+  // Block sets abl_now_ for layer li < kLayers; the scored MTP catch-up (li == kLayers) has no ablation: AblAttn is null there.
+  void BlockAttention(int li, const Layer& L, const LayerGroups& G, int R, int pos0, int replay, int commit) {
+    const float* const abl_attn = AblAttn(li);
     HcRead(L.hca, R, true);
     Mark("hc_mix");
     RunGroup(G.a_in, true, true);
@@ -1097,10 +1319,9 @@ class Engine {
       BatchAttentionCore(li, L, G, R);
     }
     Mark(L.attn ? "qsa_core" : "gdn_core");
-    RunGroup(G.a_out, false, true);
-    if (li < kLayers && abl_attn_[li]) AblateWrite(abl_attn_[li], H_, kWide, R);
+    RunGroup(abl_attn && abl_request_ ? G.a_out_abl : G.a_out, false, true);
+    if (abl_attn) AblateWrite(abl_attn, H_, kWide, R);
     Mark(L.attn ? "qsa_oproj" : "gdn_oproj");
-    BlockMoe(li, L, G, R);
   }
 
   void BlockMoe(int li, const Layer& L, const LayerGroups& G, int R) {
@@ -1131,8 +1352,7 @@ class Engine {
     MoeRowsInSlotsKernel<<<MoeInSlotsBlocks(R), 256>>>(G.gu.d_jobs, map_, mapj_, R);
     // Gate/up, mid and down in one launch (moe_rows.h); the profile reports
     // the three as moe_gateup.
-    // Expert jobs hold at most kMaxRows compact rows (moe_chunk_map.h).
-    MoeFused(G, std::min(R, kMaxRows));
+    MoeFused(G, R);
     Mark("moe_gateup");
     if (const float* ab = AblMlp(li)) {
       MoeRowsCombineKernel<true><<<(R * 20 + 7) / 8, 256>>>(G.dn.d_jobs, map_, mapj_, wts_, nullptr, abl_y_, R);
@@ -1162,11 +1382,12 @@ class Engine {
     hipLaunchKernelGGL(kernel, dim3(grid), dim3(256), MoeFusedLds(1, 0, G.gu.lds, G.dn.lds), 0, a);
   }
 
+  // pass_rows: rows of the forward (up to kPackedRows); R = min(pass_rows, kMaxRows).
   template <int R>
-  void MoeFusedR(const LayerGroups& G) {
+  void MoeFusedR(const LayerGroups& G, int pass_rows) {
     if (NarrowMoeWidths({G.kr, G.ks})) {
-      if (G.kr == 4) MoeFusedLaunch<R, 4>(G);
-      else MoeFusedLaunch<R, 3>(G);
+      if (G.kr == 4) MoeFusedLaunch<R, 4>(G, pass_rows);
+      else MoeFusedLaunch<R, 3>(G, pass_rows);
     } else {
       MoeFusedWideR<R>(G);
     }
@@ -1203,8 +1424,39 @@ class Engine {
         G.gu.d_jobs, G.gu.d_items, G.gu.nitems, G.dn.d_jobs, G.dn.d_items, G.dn.nitems, moe_done_);
   }
 
+  // CRUCIBLE_MOE_B128=12 (default) and 3: the stream-grid kernel (moe_sg.h) on the jobs of BuildLayer (it ignores
+  // the items); 12 the grid-capped shape that holds the lookahead helper (moe-r35b, MoeSgModeShape, bitwise equal to 3).
+  template <int R>
+  void MoeSgLaunch(const LayerGroups& G, int pass_rows) {
+    MoeSgModeLaunch<R>(moe_b128_, G.gu.d_jobs, G.dn.d_jobs, moe_sg_ctl_, pass_rows);
+  }
+
   template <int R, int KR>
-  void MoeFusedLaunch(const LayerGroups& G) {
+  void MoeFusedLaunch(const LayerGroups& G, int pass_rows) {
+    // CRUCIBLE_MOE_B128 (moe_b128.h, bitwise equal): K4 routed and K6 shared experts, cache policy 4, full
+    // staging. 1: the B64 body on the engine items; 2: the Q4 body on the 20-block items of BuildLayer.
+    if constexpr (KR == 4) {
+      if (moe_b128_ != 0 && G.ks == 6 && G.gu.cache == 4) {
+        if constexpr (R <= kMaxRows) {
+          if (MoeB128UsesStreamGrid(moe_b128_, pass_rows)) {
+            MoeSgLaunch<R>(G, pass_rows);
+            return;
+          }
+        }
+        if (G.moe_ib == 20) {
+          hipLaunchKernelGGL((MoeQ4Kernel<R, 4, 5, 0>), dim3(G.gu.nitems + G.dn.nitems), dim3(160),
+                             MoeFusedLds(R, 0, G.gu.lds, G.dn.lds), 0, G.gu.d_jobs, G.gu.d_items, G.gu.nitems,
+                             G.dn.d_jobs, G.dn.d_items, G.dn.nitems, moe_done_);
+          return;
+        }
+        if (moe_b128_ == 1) {
+          hipLaunchKernelGGL((MoeQ4Kernel<R, 4, 8, 1>), dim3(G.gu.nitems + G.dn.nitems), dim3(256),
+                             MoeFusedLds(R, 0, G.gu.lds, G.dn.lds), 0, G.gu.d_jobs, G.gu.d_items, G.gu.nitems,
+                             G.dn.d_jobs, G.dn.d_items, G.dn.nitems, moe_done_);
+          return;
+        }
+      }
+    }
     // Chunked x staging pays from R=2 on with K3 experts (3.05); at R=1 the
     // full span is 5 KB. With K4 experts (4.05) it lost 0.2-0.5 ms at R=3..5
     // and was even at R=6..8 (v8-405.txt), so only K3 builds it. It stages gate/up activations in 40-tile
@@ -1222,16 +1474,18 @@ class Engine {
         G.gu.d_jobs, G.gu.d_items, G.gu.nitems, G.dn.d_jobs, G.dn.d_items, G.dn.nitems, moe_done_);
   }
 
+  // R: rows of the forward. Expert jobs hold at most kMaxRows compact rows (moe_chunk_map.h), so the kernels run
+  // at min(R, kMaxRows) rows.
   void MoeFused(const LayerGroups& G, int R) {
-    switch (R) {
-      case 1: MoeFusedR<1>(G); break;
-      case 2: MoeFusedR<2>(G); break;
-      case 3: MoeFusedR<3>(G); break;
-      case 4: MoeFusedR<4>(G); break;
-      case 5: MoeFusedR<5>(G); break;
-      case 6: MoeFusedR<6>(G); break;
-      case 7: MoeFusedR<7>(G); break;
-      default: MoeFusedR<8>(G); break;
+    switch (std::min(R, kMaxRows)) {
+      case 1: MoeFusedR<1>(G, R); break;
+      case 2: MoeFusedR<2>(G, R); break;
+      case 3: MoeFusedR<3>(G, R); break;
+      case 4: MoeFusedR<4>(G, R); break;
+      case 5: MoeFusedR<5>(G, R); break;
+      case 6: MoeFusedR<6>(G, R); break;
+      case 7: MoeFusedR<7>(G, R); break;
+      default: MoeFusedR<8>(G, R); break;
     }
   }
 
@@ -1264,9 +1518,11 @@ class Engine {
       std::fprintf(stderr, "ablation scratch holds %d rows, not %d\n", abl_rows_, StaticRows(R));
       std::exit(2);
     }
-    float* const out_dst = abl ? abl_y_ : H_;
-    const int out_ld = abl ? kHidden : 0, out_epi = abl ? kEpiStore : kEpiResidual;
-    float* const out_aux = abl ? nullptr : post_;
+    // Request mode: a_out is the stock plan and a_out_abl the ablated one; each pass picks (Block).
+    const bool split = abl && abl_request_;
+    float* const out_dst = abl && !split ? abl_y_ : H_;
+    const int out_ld = abl && !split ? kHidden : 0, out_epi = abl && !split ? kEpiStore : kEpiResidual;
+    float* const out_aux = abl && !split ? nullptr : post_;
     G.state_cache = ResolveRowPolicy(R, m_.head.K, m_.L[0].moe.experts[0].K[0]).state;
     // Static projections of a packed pass (R > kMaxRows) run kPackedRows rows;
     // each row's values do not depend on the row count, and rows >= R are
@@ -1281,6 +1537,9 @@ class Engine {
             N, false, 0, {L.qsa.q.front_s, L.qsa.k.front_s, L.qsa.v.front_s, L.qsa.idx.front_s});
       Build(G.a_out, {Job(L.qsa.o, nullptr, 0, out_dst, out_ld, out_epi, out_aux, N)}, N, false, 0,
             {L.qsa.o.front_s});
+      if (split)
+        Build(G.a_out_abl, {Job(L.qsa.o, nullptr, 0, abl_y_, kHidden, kEpiStore, nullptr, N)}, N, false, 0,
+              {L.qsa.o.front_s});
     } else {
       Build(G.a_in,
             {Job(L.gdn.qkv, x_, kHidden, qkv_, kGdnQkvWidth, kEpiStore, nullptr, N),
@@ -1288,6 +1547,14 @@ class Engine {
             N, false, 0, {L.gdn.qkv.front_s, L.gdn.z.front_s});
       Build(G.a_out, {Job(L.gdn.out, nullptr, 0, out_dst, out_ld, out_epi, out_aux, N)}, N, false, 0,
             {L.gdn.out.front_s});
+      if (split)
+        Build(G.a_out_abl, {Job(L.gdn.out, nullptr, 0, abl_y_, kHidden, kEpiStore, nullptr, N)}, N, false, 0,
+              {L.gdn.out.front_s});
+    }
+    // The attention core writes the input of G.a_out (its xh); the ablated plan must read the same rows.
+    if (split && (G.a_out_abl.jobs[0].xh != G.a_out.jobs[0].xh || G.a_out_abl.R != G.a_out.R)) {
+      std::fprintf(stderr, "ablated output plan does not share the stock plan's input\n");
+      std::exit(2);
     }
     // Unique-expert jobs [0, R*kTopK), then the shared expert in chunks of
     // kMaxRows rows (moe_chunk_map.h). Routed slots start on expert 0;
@@ -1311,10 +1578,15 @@ class Engine {
     G.kr = e0.K[0];
     G.ks = L.moe.sg.K;
     // MoeFusedKernel<..., kMoeCols> items span kMoeItemBlocks columns.
-    const int ib = kMoeItemBlocks<kMoeCols>;
+    // CRUCIBLE_MOE_B128=2: the Q4 body takes 20-block items (MoeQ4Kernel W = 5) at R > 1. R = 1 keeps 16-block
+    // items, because MoeStage needs one combine group per down item.
+    const bool q4 = moe_b128_ == 2 && R > 1 && G.kr == 4 && G.ks == 6;
+    const int ib = q4 ? 20 : kMoeItemBlocks<kMoeCols>;
+    G.moe_ib = ib;
+    const int gu_items = q4 ? 2 * ((kMoeInter / 16 + 19) / 20) : kMoeGuItems<kMoeCols>;
     const bool shared_first=R>1;
     Build(G.gu, gu, expert_rows, true, 0, {}, ib, shared_first?2*R*kTopK:-1);
-    if (G.gu.nitems != (int)gu.size() / 2 * kMoeGuItems<kMoeCols>) {
+    if (G.gu.nitems != (int)gu.size() / 2 * gu_items) {
       std::fprintf(stderr, "MoE gate/up items do not match the down-item wait count\n");
       std::exit(1);
     }
@@ -1334,7 +1606,9 @@ class Engine {
     // theirs, so the two groups need disjoint partial scratch.
     size_t gu_partial = 0;
     for (const LinJob& j : G.gu.jobs) gu_partial += (size_t)j.S * j.R * j.O;
-    Build(G.dn, dn, expert_rows, true, gu_partial, {}, ib, shared_first?R*kTopK:-1);
+    // The stream-grid kernel (CRUCIBLE_MOE_B128=3 and 12) writes the mid to the down jobs' xh while gate/up jobs still
+    // read theirs, so the down group's xh starts after the gate/up inputs of the largest pass.
+    Build(G.dn, dn, expert_rows, true, gu_partial, {}, ib, shared_first?R*kTopK:-1, MoeDownXhOffset());
     // The chunked bodies (MoeGemvCoreChunked; the bench MoeGemvChunked in
     // bench/kernels/moe_rows.h) stage whole kMoeChunk-tile chunks; another span runs
     // the full-span stage (bitwise equal).
@@ -1517,8 +1791,8 @@ class Engine {
       // One arithmetic for every R: each row's x and post are bitwise equal
       // for any R and any row offset (Gates 2 and 3).
       for (int o = 0; o < R; o += kHcWRows)
-        HcWLaunch(hc.fn, hc.M, hc.up, hc.w1, H_ + (size_t)o * kWide, std::min(kHcWRows, R - o),
-                  x_ + (size_t)o * kHidden, inject ? post_ + o * kStreams : nullptr, hcw_, ++hcw_epoch_);
+        HcW2Launch(hc.fn, hc.fnf, hc.M, hc.up, hc.upf, hc.w1, H_ + (size_t)o * kWide, std::min(kHcWRows, R - o),
+                  x_ + (size_t)o * kHidden, inject ? post_ + o * kStreams : nullptr, hcw_, ++hcw_epoch_, hc.q8);
       return;
     }
     for (int o=0; o<R; o+=8) {
@@ -1545,11 +1819,13 @@ class Engine {
     else DenseGemvKernel<R><<<(O + 7) / 8, 256>>>(W, O, x, ldx, y, ldy);
   }
 
+  // Supertile grids (bench/dense_next.hip, R8192, cold caches): router O=513 1,930 -> 826 us, a/b O=96
+  // 1,150 -> 561 us, PLE kv O=12800 28.1 -> 17.1 ms. All dense kernels are bitwise equal.
   void LaunchDenseHalf(const __half* W, int O, const __half* x, float* y, int ldy, int R) {
-    const dim3 g((R+127)/128,(O+127)/128);
-    if (O < 256 && R <= 1024) PrefillDenseTileKernel<<<dim3((R+63)/64,(O+127)/128),256>>>(W,O,x,y,ldy,R);
-    else if (O < 256 || O > 1024) PrefillDenseBigKernel<<<g,256>>>(W,O,x,y,ldy,R);
-    else PrefillDenseFastKernel<2><<<g,256>>>(W,O,x,y,ldy,R);
+    const int cbs = (O + 127) / 128;
+    if (O < 256 && R <= 1024) PrefillDenseTileKernel<<<dim3((R+63)/64,cbs),256>>>(W,O,x,y,ldy,R);
+    else if (O > 1024) PrefillDenseSwKernel<4,128><<<(R+127)/128*cbs,256>>>(W,O,x,y,ldy,R,16);
+    else PrefillDenseSwKernel<4,64><<<(R+63)/64*cbs,128>>>(W,O,x,y,ldy,R,8);
   }
 
   // x_in_xh: above 8 rows, xh_ already holds the fp16 copy of x.
@@ -1640,11 +1916,12 @@ class Engine {
       auto& st = m_.ple.host->stats();
       const auto now = std::chrono::steady_clock::now();
       std::fprintf(stderr, "ple host gather: %d rows, %.3f ms since start, %.3f ms waited (sum hint %.3f ms, "
-                   "copy %.3f ms, fresh pages %llu)\n", R,
+                   "copy %.3f ms, fresh pages %llu, fetch %d, major faults %llu)\n", R,
                    std::chrono::duration<double, std::milli>(now - ple_gather_start_).count(),
                    std::chrono::duration<double, std::milli>(now - waited).count(),
                    st.hint_ns.exchange(0) / 1e6, st.copy_ns.exchange(0) / 1e6,
-                   (unsigned long long)st.fresh_pages.exchange(0));
+                   (unsigned long long)st.fresh_pages.exchange(0), m_.ple.host->Fetch(),
+                   (unsigned long long)st.major_faults.exchange(0));
     }
     return ple_packed_;
   }
@@ -1699,9 +1976,13 @@ class Engine {
     }
   }
 
-  QsaArgs QArgs(const Qsa& w, const QsaCache& c, __half* xh_o, int R, int pos0, const int* mrope) {
+  QsaArgs QArgs(const Qsa& w, const QsaCache& c, __half* xh_o, int R, int pos0, const SequenceState& state) {
+    // A row never runs above its mode's positions: plain stays within the native 262,144 (yarn-interface.md). The
+    // entry of each forward checks this before any kernel (CheckRopeRows); this is the last line of defense.
+    CheckRopeRows(size_t(pos0), R, state.rope_mode);
     QsaArgs a{};
-    a.mrope = mrope;
+    a.mrope = state.Mrope();
+    a.rope = rope_tables_ + kRopeTableFloats * static_cast<int>(state.rope_mode);
     a.q = q_;
     a.k = k_;
     a.v = v_;
@@ -1826,17 +2107,42 @@ class Engine {
   unsigned long long *ecount_ = nullptr, *ecbuf_ = nullptr;
   int *mapj_ = nullptr, *rowl_ = nullptr;
   unsigned* moe_done_ = nullptr;
+  unsigned* moe_sg_ctl_ = nullptr;  // MoeSgKernel control words (CRUCIBLE_MOE_B128=3 and 12; zero between launches)
   unsigned* moe_sync_ = nullptr;  // MoeStageKernel's counters (zero between its launches)
   unsigned* qsa_sync_ = nullptr;  // QsaAttnTailKernel's counters (zero between its launches)
   std::unique_ptr<AsyncHead> overlap_;
   std::unique_ptr<BlockDraftHead> block_head_;
   bool draft_last_only_ = true;
   int* draft_blocks_ = nullptr;
+  // CRUCIBLE_DRAFT_HEAD (draft_quant_host.h): 0 the EXL3 block head; 4 or 2 the low-bit copy with rescoring.
+  static int DraftHeadBits() {
+    const int bits = ResolveDraftHeadBits(crucible::SwitchText("CRUCIBLE_DRAFT_HEAD"));
+    if (bits < 0) {
+      std::fprintf(stderr, "CRUCIBLE_DRAFT_HEAD must be exl3, q4 or q2\n");
+      std::exit(2);
+    }
+    return bits;
+  }
+  const int draft_q_bits_ = DraftHeadBits();
+  // CRUCIBLE_DRAFT_CHAIN (draft_chain_switch.h): proposer-only changes to the MTP draft calls.
+  static DraftChain DraftChainFromEnv() {
+    DraftChain d;
+    if (!ResolveDraftChain(crucible::SwitchText("CRUCIBLE_DRAFT_CHAIN"), d)) {
+      std::fprintf(stderr, "CRUCIBLE_DRAFT_CHAIN must be a comma list of hc8, lead and stop=01..99\n");
+      std::exit(2);
+    }
+    return d;
+  }
+  const DraftChain draft_chain_ = DraftChainFromEnv();
+  std::unique_ptr<DraftQuantHead> draft_q_;
   Lin draft_head_;
   __half* draft_dense_ = nullptr;
   int draft_size_ = 0;
   Group draft_group_;
   DraftChoice* choice_ = nullptr;
+  DraftChoice* choice_lead_ = nullptr;  // CRUCIBLE_DRAFT_CHAIN lead only (pinned)
+  hipEvent_t lead_ready_{};
+  uint64_t lead_epoch_ = 0;
   float draft_margin_ = INFINITY;
   std::string profile_scope_;
   std::string PrefillWidthIssue() const;
@@ -1853,6 +2159,7 @@ class Engine {
   void BeginPrefillJoin(int R, int pos0);
   void PrefillCutAfter(int end, std::initializer_list<const void*> sources);
   void PrefillCutPle(int pos0);
+  const void* PrefillCutPool(int li, int pos0) const;
   const MtpPrefillPlan* MtpPrefillPlanFor(int R);
   // Bulk MTP plans by row count (a full chunk and the last partial chunk); null: the 8-row path for that count.
   std::map<int, std::unique_ptr<MtpPrefillPlan>> mtp_prefill_plans_;
@@ -1872,6 +2179,8 @@ class Engine {
   SequenceState* sequence_ = nullptr;
   std::unique_ptr<VisionEncoder> vision_;
   bool compact_state_ = false;
+  RopeSetting rope_;               // CRUCIBLE_ROPE_MODE
+  float* rope_tables_ = nullptr;   // kRopeModes tables of kRopeTableFloats (FillRopeTables)
   std::vector<int> batch_streams_;
   int ctx_, mtp_rows_, prefill_rows_, pf_launch_rows_ = 0;
   int pf_join_rows_ = 0, pf_room_rows_ = 0;  // x4-tail: join rows, and launch rows plus join rows
@@ -1879,7 +2188,7 @@ class Engine {
   crucible::PrefillJoinSpec pf_join_{}, pf_cut_{};
   bool pf_join_set_ = false;
   std::vector<char> pf_cut_done_;
-  size_t xh_capacity_, partial_capacity_;
+  size_t xh_capacity_, partial_capacity_, partial_plan_floats_ = 0;  // floats; the plan size is the old partial size
   // Budget: 1 GiB and 16 entries, or one oversized custom plan. Scratch is separate.
   std::map<int,std::pair<uint64_t,std::unique_ptr<PrefillPlans>>> prefill_plans_;
   size_t prefill_plan_bytes_ = 0;
@@ -1888,6 +2197,9 @@ class Engine {
   uint64_t plan_tick_ = 0;
   std::string prefill_path_;
   prefill::GdnPrefill pf_gdn_{};
+  // The fused GDN scan and gate: 192 progress counters and the tag of the last launch.
+  unsigned long long* pf_gdn_prog_=nullptr;
+  unsigned pf_gdn_gen_=0;
   PrefillMoe pf_moe_{};
   Group pf_head_;
   float *pf_ab_, *pf_y_, *pf_context_;
@@ -1903,6 +2215,8 @@ class Engine {
   float* pf_qsa_select_ = nullptr;
   float* pf_prompt_stacks_ = nullptr;
   __half* pf_xpack_ = nullptr;
+  __half* pf_wcopy_ = nullptr;  // half path decode copy, pf_wcopy_cap_ halves (AllocateStageArena)
+  size_t pf_wcopy_cap_ = 0;
   __half* pf_x_ = nullptr;
   // Keep public H() tight for decode, MTP, batching and retained-prefix readers.
   float* pf_H_ = nullptr;
@@ -1925,6 +2239,31 @@ class Engine {
   // The R=1 ring reads front order at 84% of DRAM against 73% for LinGemv, but
   // engine order at 72% (fwd v3). CRUCIBLE_DECODE_RING=0 or 1 forces it.
   enum RingMode { kRingOff, kRingOn, kRingFront };
+  // CRUCIBLE_MOE_B128 (moe_b128_switch.h): 12 (default) the grid-capped stream-grid kernel that holds the lookahead
+  // helper (moe-r35b, MoeSgModeShape) and 3 the stream-grid kernel of t28 (moe_sg.h), both for passes of 2..16 rows
+  // (R = 1 keeps MoeStageKernel); 0 MoeFusedKernel (rollback), 1 the B64 body, 2 the Q4 body (moe_b128.h).
+  const int moe_b128_ = [] {
+    const int v = ResolveMoeB128(crucible::SwitchText("CRUCIBLE_MOE_B128"));
+    if (v < 0) {
+      std::fprintf(stderr, "CRUCIBLE_MOE_B128 must be 0, 1, 2, 3 or 12\n");
+      std::exit(2);
+    }
+    return v;
+  }();
+  // CRUCIBLE_GDN_VERIFY (gdn_verify_switch.h): resolved here so a bad value stops the engine at start, not at the first
+  // GDN launch. The launch paths read the same value through GdnVerifyOn.
+  [[maybe_unused]] const int gdn_verify_ = GdnVerifyMinRows();
+  // CRUCIBLE_SPEC_SPAN (runtime/spec_span.h): rows of one single-session verify span, and the pending GDN rows per head
+  // of every sequence (16 with a span). GdnVerifyKernel keeps the 8-row stride, so the two switches do not combine.
+  const int span_rows_ = [] {
+    const int n = SpecSpanRows();
+    if (n > kMaxRows && GdnVerifyMinRows() > 0) {
+      std::fprintf(stderr, "CRUCIBLE_SPEC_SPAN above 8 needs CRUCIBLE_GDN_VERIFY=0\n");
+      std::exit(2);
+    }
+    return n;
+  }();
+  const int pend_rows_ = SpecPendRows(span_rows_);
   RingMode ring_mode_ = [] {
     const char* v = crucible::SwitchText("CRUCIBLE_DECODE_RING");
     if (v && std::string(v) == "0") return kRingOff;
@@ -1935,8 +2274,10 @@ class Engine {
   float *mE_, *mN_, *mhp_, *mep_;
   // The WMMA HC read (hc_wmma.h) serves decode, verify, the MTP last row and
   // chunked prefill with one arithmetic for every R. Bulk prefill (R > 8)
-  // keeps its own kernels. CRUCIBLE_HC_WMMA=0 selects the VALU kernels.
-  const bool hc_wmma_ = NumericsInt("CRUCIBLE_HC_WMMA", 1, 0, 1) != 0;
+  // keeps its own kernels. CRUCIBLE_HC_WMMA=0 selects the VALU kernels; 2 also
+  // loads int8 HC weights (hc_int8.h; the loader reads it, and the WMMA read
+  // takes the int8 blocks).
+  const bool hc_wmma_ = NumericsInt("CRUCIBLE_HC_WMMA", 1, 0, 2) != 0;
   HcWScratch hcw_{};
   unsigned hcw_epoch_ = 0;
   float *H_, *x_, *dots_, *ss_, *post_, *qkv_, *z_, *q_, *k_, *v_, *idx_, *rlog_, *wts_;
@@ -1944,6 +2285,10 @@ class Engine {
   std::array<const float*, kLayers> abl_attn_{}, abl_mlp_{};
   float* abl_y_ = nullptr;
   int abl_rows_ = 0;
+  // CRUCIBLE_ABLATE_MODE=request: the mode of each stream's request, and the rows of the current pass.
+  bool abl_request_ = false;
+  std::vector<uint8_t> stream_ablate_;
+  AblPassRows abl_now_;
   float *eple_, *kv_, *logits_, *partial_, *scores_, *qsa_scratch_;
   mutable PinnedVector<float> logit_host_;
   __half* xh_;

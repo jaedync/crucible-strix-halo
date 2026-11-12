@@ -49,7 +49,9 @@ H2H = ("--streams 4 --ctx 131072 --prefill 4096 --conversation-cache-mib 10240 -
        "--default-thinking on --max-body-mib 16")
 # agents6 (train 22): the agents sessions, six at once, on the h2h layout with 6 slots.
 H2H6 = H2H.replace("--streams 4 ", "--streams 6 ")
-AGENT_SCENARIOS = {"agents": (4, H2H), "agents6": (6, H2H6), "served3": (3, SERVED)}
+# agents6x4, agents8x4 (t34 memsoak): six and eight sessions on the 4 slots of the h2h layout. The sessions
+# queue for a slot, so slots are handed over between long conversations (the path of the lazy handover spill).
+AGENT_SCENARIOS = {"agents": (4, H2H), "agents6": (6, H2H6), "agents6x4": (6, H2H), "agents8x4": (8, H2H), "served3": (3, SERVED)}
 # The incident's appended tokens per turn (numbers only): small steps, then about 20K per turn.
 STEPS = (690, 435, 750, 5550, 800, 1700, 4700, 5250, 720, 1500, 560, 1900, 1950, 1600, 600, 700, 1250, 740,
          20450, 19950, 19500, 19150, 21500, 20500, 24400, 4000, 3700, 18750, 2900, 9850)

@@ -12,8 +12,13 @@
     size_t total=0;
     for (const auto& span:spans) total+=span.tokens.size();
     const int cap=total>size_t(kMaxRows)?MaxPassRows():kMaxRows;
-    if (const auto error=SpecSpansError(spans,prefixes,cap,kMaxRows,kVocab); !error.empty())
+    // CRUCIBLE_SPEC_SPAN: a lone span may hold span_rows_ rows; spans of a packed pass keep kMaxRows each.
+    const int span_limit=spans.size()==1?std::min(span_rows_,cap):kMaxRows;
+    if (const auto error=SpecSpansError(spans,prefixes,cap,span_limit,kVocab); !error.empty())
       throw std::invalid_argument(error);
+    for (const auto& span:spans)
+      CheckRopeRows(prefixes[span.stream].length,(int)span.tokens.size(),sequences_[span.stream]->rope_mode);
+    SettlePleSide();
     std::vector<int> tokens;
     for (const auto& span:spans) tokens.insert(tokens.end(),span.tokens.begin(),span.tokens.end());
     const int rows=tokens.size();
@@ -22,6 +27,7 @@
     verify_spans_.reserve(spans.size());
     for (const auto& span:spans) sequences_[span.stream]->hist.reserve(prefixes[span.stream].length+span.tokens.size());
     struct Clear { std::vector<ActiveVerifySpan>& spans; ~Clear() { spans.clear(); } } clear{verify_spans_};
+    for (const auto& span:spans) MaterializeGdn(*sequences_[span.stream]);
     PrepareVerifySpans(spans,ple_rows);
     const BatchHostInputs input(tokens,std::move(ple_rows));
     lookahead_.Start(P.policy);
@@ -42,6 +48,8 @@
   // Each scored span's last row gets its own HC read (as Mtp) and one draft-head pass scores all of them.
   // Leaves span i's rows in H() from row Offset(i). Returns one choice per span ({-1, 0} when not scored).
   struct MtpSpan { int stream; const float* stacks; std::vector<int> tokens; int mpos; bool score; };
+  // The greedy chain's prior for a draft not yet computed (CRUCIBLE_DRAFT_CHAIN stop=NN; default kDraftNextPrior).
+  float DraftPrior() const { return draft_chain_.Prior(kDraftNextPrior); }
   std::vector<DraftChoice> MtpSpans(const std::vector<MtpSpan>& spans) {
     if (!batch_streams_.empty() || VerificationSpansActive()) throw std::invalid_argument("nested MTP pass");
     int rows=0;
@@ -93,7 +101,7 @@
       const auto& span=verify_spans_[size_t(scored[k])];
       const float* last=H_+size_t(span.row+span.rows-1)*kWide;
       float* x=x_+k*kHidden;
-      if (hc_wmma_) HcWLaunch(hc.fn,hc.M,hc.up,hc.w1,last,1,x,nullptr,hcw_,++hcw_epoch_);
+      if (hc_wmma_) HcW2Launch(hc.fn,hc.fnf,hc.M,hc.up,hc.upf,hc.w1,last,1,x,nullptr,hcw_,++hcw_epoch_,hc.q8);
       else {
         HcDotsKernel<1><<<((hc.M+1)*kStreams+7)/8,256>>>(hc.fn,hc.M,last,dots_,ss_);
         HcMixKernel<1><<<kHidden/16,256>>>(hc.up,hc.w1,dots_,hc.M,ss_,last,x,nullptr);
@@ -101,9 +109,17 @@
     }
     Mark("hc_mix");
     const int n=int(scored.size());
-    RunGroup(DraftGroup(n),true,true);
-    for (int k=0;k<n;++k)
-      DraftChoiceKernel<<<1,1024>>>(logits_+size_t(k)*draft_head_.O,draft_head_.O,draft_blocks_,choice_+k,false);
+    if (draft_q_ && n == 1) {
+      // CRUCIBLE_DRAFT_HEAD=q4|q2: the block head's input transform, then the low-bit head (draft_quant.h). One row
+      // only: for 2..8 rows the EXL3 group reads its tiles once for all rows, and the coarse pass spills (draft-cost.md).
+      const Group& head=DraftGroup(n);
+      LinInKernel<<<(head.nin+7)/8,256>>>(head.d_jobs,head.d_in,head.nin);
+      draft_q_->Score(head.jobs[0].xh,n,logits_,draft_blocks_,choice_);
+    } else {
+      RunGroup(DraftGroup(n),true,true);
+      for (int k=0;k<n;++k)
+        DraftChoiceKernel<<<1,1024>>>(logits_+size_t(k)*draft_head_.O,draft_head_.O,draft_blocks_,choice_+k,false);
+    }
     Mark("draft_head");
     lookahead_.Stop();
     Collect();
@@ -150,7 +166,10 @@
         args.rows[i]=GdnRow(li,L,G,span.rows,span.pos,span.replay,span.commit,*sequences_[span.stream],span.row);
       }
       const dim3 grid(48,unsigned(verify_spans_.size()));
-      if (G.state_cache==6) GdnKernel<4,true><<<grid,256>>>(args);
+      const auto& last=verify_spans_.back();
+      if (pend_rows_!=kMaxRows) LaunchGdnSpan(GdnSpanPackedArgs{args},grid,G.state_cache);
+      else if (GdnVerifyOn(last.row+last.rows)) LaunchGdnVerify(args,grid.y,G.state_cache);
+      else if (G.state_cache==6) GdnKernel<4,true><<<grid,256>>>(args);
       else if (G.state_cache==4) GdnKernel<4><<<grid,256>>>(args);
       else GdnKernel<0><<<grid,256>>>(args);
       return;
@@ -238,6 +257,27 @@
     for (const auto& span:verify_spans_) {
       PleArgs args{kv_+size_t(span.row)*12800,m_.ple.nk1,m_.ple.nq1,m_.ple.nc1,m_.ple.conv,
         sequences_[span.stream]->ple_ring,H_+size_t(span.row)*kWide,span.pos,span.rows};
-      PleMixKernel<<<kStreams,512>>>(args);
+      if (span.rows>kMaxRows) {
+        // A lone span past kMaxRows rows (CRUCIBLE_SPEC_SPAN): rows 8.. wait in the side buffer until Truncate.
+        if (!ple_side_) ple_side_=Zeros<float>(size_t(kPleSideRows)*kWide);
+        PleMixSpanKernel<<<kStreams,512>>>(args,ple_side_);
+        side_={span.stream,span.pos,span.rows};
+      } else PleMixKernel<<<kStreams,512>>>(args);
     }
   }
+  // The PLE side rows of the last lone span past kMaxRows rows (VerificationPle): stream, first position, rows.
+  struct PleSide { int stream=-1,pos0=0,rows=0; };
+  PleSide side_;
+  float* ple_side_=nullptr;
+ public:
+  // Copies the side rows that the span's stream keeps (its history length now) into its PLE ring. Truncate calls
+  // it after acceptance; each forward calls it first, so a span whose rows were all kept settles there.
+  void SettlePleSide() {
+    if (side_.stream<0) return;
+    const PleSide side=std::exchange(side_,PleSide{});
+    const SequenceState& s=*sequences_[side.stream];
+    const long kept=long(s.hist.size())-side.pos0;
+    const int count=PleSideKeep(side.rows,int(std::clamp<long>(kept,0,side.rows)));
+    if (count>0) PleSideCommitKernel<<<dim3((kWide+255)/256,count),256>>>(s.ple_ring,ple_side_,side.pos0);
+  }
+ private:

@@ -6,6 +6,7 @@ import random
 import numpy as np
 import torch
 
+from . import taint
 from .mtp_model import W
 
 IM_START, ASSISTANT = 248045, 74455
@@ -26,15 +27,22 @@ def assistant_mask(ids):
     return out
 
 
+def stk_tainted(path):
+    """True when a .stk file ends with the canary trailer (after n * W * 2 bytes of fp16 stacks)."""
+    with open(path, "rb") as handle:
+        handle.seek(-taint.STK_TRAILER_LEN, 2)
+        return handle.read() == taint.STK_TRAILER
+
+
 class Seqs:
     def __init__(self, dirs):
         self.items = []
         for d in dirs:
             for f in sorted(glob.glob(f"{d}/*.stk")):
                 name = f[:-4]
-                ids = [int(v) for v in open(name + ".ids").read().strip().split(",")]
-                if os.path.getsize(f) != len(ids) * W * 2:
-                    raise ValueError(f"{f}: size does not match {len(ids)} IDs")
+                ids = taint.read_ids(name + ".ids")      # skips the canary line of a tainted file
+                if os.path.getsize(f) not in (len(ids) * W * 2, len(ids) * W * 2 + taint.STK_TRAILER_LEN):
+                    raise ValueError(f"{taint.redact(f)}: size does not match {len(ids)} IDs")
                 self.items.append((name, ids))
         self.tokens = sum(len(i) for _, i in self.items)
 

@@ -33,11 +33,16 @@ ready = dict(event="ready", context=context + (mode == "wrong-context"))
 if not os.environ.get("FAKE_NO_CACHE_TAIL"): ready["cache_tail"] = True
 # The model fields as engine/serve/serve_protocol.h ReadyModelJson writes them.
 ready["model"] = dict(arch="qwen4_exp", vocab=248320, eos=248044, layers=48, hidden=2560)
-print(json.dumps(ready), flush=True)
+# FAKE_ABLATE_REQUEST=1: the engine was started in request mode (CRUCIBLE_ABLATE_MODE=request).
+if os.environ.get("FAKE_ABLATE_REQUEST") == "1": ready["ablate_request"] = 1
 line_limit = int(os.environ.get("FAKE_LINE_LIMIT", "0"))
+# As engine/serve/serve_line.h: the engine reports its line limit (ServeLineBytes of its context). FAKE_NO_LINE_BYTES=1
+# copies an older engine, which enforces the limit but does not report it.
+if line_limit and os.environ.get("FAKE_NO_LINE_BYTES") != "1": ready["line_bytes"] = line_limit
+print(json.dumps(ready), flush=True)
 for line in sys.stdin:
     if line_limit and len(line) - 1 > line_limit:
-        print(json.dumps(dict(event="error", error="request exceeds the 2 MiB JSON-line limit")), flush=True)
+        print(json.dumps(dict(event="error", error="request exceeds the serve JSON-line limit")), flush=True)
         continue
     request = json.loads(line)
     if log:

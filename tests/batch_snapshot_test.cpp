@@ -4,6 +4,7 @@
 #include "../engine/runtime/bounds.h"
 #include "../engine/layers/cache_storage.h"
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstring>
 #include <cstdlib>
@@ -48,6 +49,7 @@ struct SequenceState {
   std::vector<int> hist;
   RetainedPrefix retained;
   std::map<int, float*> gstate, ghist, gpend;
+  bool gdn_lazy = false;  // as engine/runtime/sequence_state.h
   std::map<int, QsaCache> qc;
   // As engine/runtime/sequence_state.h: the one list of the fixed-size buffers.
   std::vector<DeviceSpan> FixedSpans() const {
@@ -59,7 +61,7 @@ struct SequenceState {
   float* ple_ring;
   std::vector<float> g, h, p, ple, raw, pool, trunk_raw, trunk_pool;
   std::vector<__half> k, v, trunk_k, trunk_v;
-  explicit SequenceState(int cap, int mtp_rows = 0) : capacity(cap), mtp_capacity(mtp_rows ? mtp_rows : cap), g(48 * 128 * 128), h(16 * 10240),
+  explicit SequenceState(int cap, int mtp_rows = 0) : capacity(cap), mtp_capacity(mtp_rows ? mtp_rows : cap), g(kGdnStateBytes / sizeof(float)), h(16 * 10240),
       p(48 * kMaxRows * kPend), ple(16 * kWide), raw(cap * 128), pool(QsaPoolFloats(cap)),
       trunk_raw(cap * 128), trunk_pool(QsaPoolFloats(cap)), k(cap * 512), v(cap * 512),
       trunk_k(cap * 512), trunk_v(cap * 512) {
@@ -239,4 +241,55 @@ int main() {
   assert(b.qc.at(kLayers).raw_slots == 16 && b.raw.back() == 37);
   assert(ConversationStateIO::Restore(e, b, *absent, peer_stk.data(), peer_carry.data()).mpos == 0);
   assert(b.qc.contains(kLayers));
+  // a lazy save keeps the full blocks below the settled rows on the device. Rows from the
+  // settled rows up change after the save (the resumed request runs on); the snapshot still equals the eager one.
+  {
+    const size_t rows = 3 * kStateBlockRows + 500;
+    e.sequences_.push_back(std::make_unique<SequenceState>(int(rows) + 8));
+    SequenceState& big = *e.sequences_.back();
+    big.hist.assign(rows, 3);
+    for (auto* v : {&big.g, &big.h, &big.p, &big.ple, &big.raw, &big.pool, &big.trunk_raw, &big.trunk_pool})
+      for (size_t i = 0; i < v->size(); ++i) (*v)[i] = float(i % 251) + 1;
+    for (auto* v : {&big.k, &big.v, &big.trunk_k, &big.trunk_v})
+      for (size_t i = 0; i < v->size(); ++i) (*v)[i] = __half(i % 253 + 1);
+    std::vector<float> lstk((kMaxRows + 1) * kWide, 5), lcarry(kWide, 6);
+    ConversationResume lr{rows, 0, 5, 7, true, {7}, std::vector<float>(kVocab, 2)};
+    const auto eager = ConversationStateIO::Save(e, big, lr, lstk.data(), lcarry.data());
+    const auto plan = ConversationStateIO::PlanLazy(big, lr, kStateBlockRows, ConversationStateIO::HeadBytes(big),
+                                                    ConversationStateIO::kTailBytes);
+    assert(plan.rows == 3 * kStateBlockRows && plan.bytes > 0 && plan.bytes < eager->bytes.size());
+    const auto source = std::make_shared<LazySource>(DeviceLazyReader(), plan.rows);
+    const auto lazy = ConversationStateIO::SaveLazy(e, big, lr, lstk.data(), lcarry.data(), plan, source);
+    assert(lazy->bytes.size() == eager->bytes.size());
+    assert(lazy->bytes.LazyBytes() == plan.bytes && lazy->bytes.HostBytes() == eager->bytes.size() - plan.bytes);
+    assert(lazy->hist == eager->hist && lazy->resume.length == eager->resume.length);
+    // Shadow mode: the eager copy of the lazy rows is kept; a walk that reads other bytes is refused and counted.
+    {
+      const auto shadow_source = std::make_shared<LazySource>(DeviceLazyReader(), plan.rows);
+      const auto shadowed = ConversationStateIO::SaveLazy(e, big, lr, lstk.data(), lcarry.data(), plan, shadow_source, true);
+      assert(shadowed->bytes.Copy() == eager->bytes.Copy() && shadow_source->Mismatches() == 0);
+      assert(shadow_source->Compared() == plan.bytes);
+      const auto saved = std::array<__half, 4>{big.k[10], big.v[10], big.trunk_k[10], big.trunk_v[10]};
+      for (auto* v : {&big.k, &big.v, &big.trunk_k, &big.trunk_v}) (*v)[10] = __half(77);  // rows below the settled rows change
+      bool refused = false;
+      try { shadowed->bytes.Copy(); } catch (const SnapshotLost&) { refused = true; }
+      big.k[10] = saved[0], big.v[10] = saved[1], big.trunk_k[10] = saved[2], big.trunk_v[10] = saved[3];
+      assert(refused && shadow_source->Mismatches() == 1);
+    }
+    // The slot keeps writing from the settled rows: K, V, raw keys and the pool of every layer, rows >= 3 blocks.
+    const size_t first = plan.rows;
+    for (auto* v : {&big.k, &big.v, &big.trunk_k, &big.trunk_v})
+      for (size_t i = first * 512; i < v->size(); ++i) (*v)[i] = 9999;
+    for (auto* v : {&big.raw, &big.trunk_raw})
+      for (size_t i = first * 128; i < v->size(); ++i) (*v)[i] = -1;
+    for (auto* v : {&big.pool, &big.trunk_pool})
+      for (size_t i = first / 128 * 4096; i < v->size(); ++i) (*v)[i] = -2;
+    assert(lazy->bytes.Copy() == eager->bytes.Copy());
+    // A write below the plan's rows ends the source: the next walk refuses (SnapshotLost).
+    source->Invalidate();
+    bool lost = false;
+    try { lazy->bytes.Copy(); } catch (const SnapshotLost&) { lost = true; }
+    assert(lost);
+    e.sequences_.pop_back();
+  }
 }

@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <utility>
 #include <cassert>
+#include <functional>
 #include <map>
 #include <set>
 #include <string>
@@ -24,8 +25,14 @@ struct MockEngine {
   void ConfigureServeStreams(int count, uint64_t = 0, int = 0, int = 0) { capacities.assign(size_t(count), Context()); }
   int StreamCapacity(int slot) const { return capacities.at(size_t(slot)); }
   void SelectStream(int slot) { selected = slot; }
-  void Reset() { histories[selected].clear(); }
+  // the lowest row of each slot write (the lazy watermark harness, LazyWatermark* below).
+  std::function<void(int slot, size_t row)> on_write;
+  void Reset() {
+    histories[selected].clear();
+    if (on_write) on_write(selected, 0);
+  }
   std::vector<int> Forward(const int* ids, int rows, int, int) {
+    if (on_write) on_write(selected, histories[selected].size());
     last.clear();
     chunks.push_back(in_prefill ? -rows : rows);
     for (int row = 0; row < rows; ++row) {
@@ -45,6 +52,7 @@ struct MockEngine {
   std::vector<int> ForwardBatch(const std::vector<int>& ids, const std::vector<int>& slots) {
     last.clear();
     for (size_t row = 0; row < ids.size(); ++row) {
+      if (on_write) on_write(slots[row], histories[slots[row]].size());
       histories[slots[row]].push_back(ids[row]);
       last.push_back((ids[row] + 1) % 16);
     }
@@ -95,13 +103,37 @@ struct FakeCache {
         best = key.size();
     return best;
   }
+  // a model of the lazy disk reads of batched_serve.h. `release(slot, true)` leaves
+  // a source on the slot that reads its full blocks below the settled rows (`sources`: the Rows() of each live source).
+  // A write below the full blocks of a live source is an ordering bug (`bad`): the hooks of the real cache end the source
+  // first (LazyLimit: sources with Rows() above `kept` end). `limit_first` false models the order that the lazy disk reads fixed in
+  // checkpoint_load (the restore was enqueued before LazyLimit).
+  bool lazy = false, limit_first = true;
+  std::map<int, std::vector<size_t>> sources;
+  std::vector<std::string> bad;
+  std::vector<std::string> ended;  // "slot=S by NAME rows=R": which hook ended which source
+  static size_t LazyEdge(size_t rows) { return rows / kRows * kRows; }
+  void LazyLimit(int slot, size_t kept, const char* by) {
+    auto& list = sources[slot];
+    for (const size_t rows : list)
+      if (rows > kept) ended.push_back("slot=" + std::to_string(slot) + " by " + by + " rows=" + std::to_string(rows));
+    std::erase_if(list, [&](size_t rows) { return rows > kept; });
+  }
+  void Wrote(int slot, size_t row, const char* by) {
+    for (const size_t rows : sources[slot])
+      if (row < LazyEdge(rows))
+        bad.push_back("slot=" + std::to_string(slot) + " write at " + std::to_string(row) + " by " + by +
+                      " under a live source of " + std::to_string(rows) + " rows");
+  }
   void Write(const crucible::ServeRequest& r, size_t length) {
+    Wrote(engine.selected, 0, "restore");
     engine.histories[engine.selected].assign(r.ids.begin(), r.ids.begin() + std::ptrdiff_t(length));
   }
   crucible::BatchCacheHooks Hooks() {
     crucible::BatchCacheHooks hooks;
     hooks.restore = [this](const crucible::ServeRequest& r) -> crucible::BatchRestore {
       restore_slots.push_back(engine.selected);
+      LazyLimit(engine.selected, 0, "restore");  // BatchPrefixCache::Restore: LazyEnd(Slot()) first
       if (r.cache_control != "auto") return 0;
       if (const size_t tail = Longest(r, true)) {
         Write(r, tail);
@@ -140,6 +172,7 @@ struct FakeCache {
     };
     hooks.resume = [this](const crucible::ServeRequest& r, crucible::BatchResident resident) -> crucible::BatchRestore {
       if (host_tail_first) {
+        LazyLimit(engine.selected, 0, "resume");  // WriteSnapshot: LazyEnd(slot) first
         const size_t tail = Longest(r, true);
         Write(r, tail);
         log.push_back("resume host tail " + std::to_string(tail));
@@ -150,6 +183,8 @@ struct FakeCache {
     };
     hooks.release = [this](int slot, bool resumed) {
       if (held.contains(slot)) host[held[slot]] = true, owner[held[slot]] = held_tenant[slot];
+      // A resumed release whose host save is refused leaves the full blocks on the device.
+      if (lazy && resumed && held.contains(slot)) sources[slot].push_back(held[slot].size());
       held.erase(slot);
       log.push_back("release slot=" + std::to_string(slot) + " resumed=" + std::to_string(resumed));
     };
@@ -157,7 +192,14 @@ struct FakeCache {
       assert(slot == engine.selected);
       buffers[{slot, index}] = engine.histories[slot];
     };
+    hooks.overwrite = [this](int slot) { LazyLimit(slot, 0, "overwrite"); };
     hooks.checkpoint_load = [this](int slot, int index, const crucible::SlotCheckpoint& point) {
+      const size_t settled = point.hist.size() - size_t(std::max(point.replay, 0));
+      // The restore writes the pool block that holds row p: from the block start (a grid point writes none below p).
+      const size_t block = point.hist.size() / kRows * kRows;
+      if (limit_first) LazyLimit(slot, settled, "checkpoint_load");
+      Wrote(slot, std::min(block, settled), "checkpoint_load");
+      if (!limit_first) LazyLimit(slot, settled, "checkpoint_load");
       const auto& stream = engine.histories[slot];
       assert(buffers.at({slot, index}) == point.hist && stream.size() >= point.hist.size() &&
              std::equal(point.hist.begin(), point.hist.end(), stream.begin()));
@@ -201,6 +243,7 @@ struct FakeCache {
     hooks.frontier_copy = [this](const crucible::ServeRequest&, int from, int index,
                                  const crucible::SlotCheckpoint& point) -> crucible::BatchRestore {
       const int target = engine.selected;
+      LazyLimit(target, 0, "frontier_copy");  // FrontierCopy: LazyEnd(target) before the CopyTo
       const auto& stream = engine.histories[from];
       assert(from != target && point.kind == crucible::CheckpointKind::Frontier && buffers.at({from, index}) == point.hist &&
              stream.size() >= point.hist.size() && std::equal(point.hist.begin(), point.hist.end(), stream.begin()));
@@ -212,6 +255,7 @@ struct FakeCache {
         return 0;
       }
       engine.SelectStream(target);
+      Wrote(target, 0, "frontier_copy");  // the donor is read only: its sources stay
       engine.histories[target] = point.hist;
       log.push_back("copy" + names + " at " + std::to_string(point.hist.size()));
       return point.hist.size();
@@ -888,6 +932,147 @@ void TenantsNeverCopyFrontier() {
   }
 }
 
+// The lazy watermark harness. The rig turns on the lazy model of FakeCache and checks every engine write
+// against the live sources of its slot: MockEngine reports the lowest row of each write (Reset: 0, Forward: the rows
+// already in the slot), and a write below the full blocks of a live source is recorded as `bad`.
+struct LazyRig {
+  MockEngine engine;
+  FakeCache cache{engine};
+  crucible::BatchSession<MockEngine> session;
+  explicit LazyRig(int slots) : session(engine, slots) {
+    cache.lazy = true;
+    engine.on_write = [this](int slot, size_t row) { cache.Wrote(slot, row, "engine"); };
+    session.SetCacheHooks(cache.Hooks());
+  }
+  std::vector<size_t> Live(int slot) { return cache.sources[slot]; }
+  bool Ended(const std::string& by, int slot, size_t rows) const {
+    return Has(cache.ended, "slot=" + std::to_string(slot) + " by " + by + " rows=" + std::to_string(rows));
+  }
+};
+// One session of three turns on the same slot. Turn 2 and 3 resume the slot's tail, so each opens with
+// release(slot, true): a source of the previous tail (23 rows after turn 1, 34 after turn 2) stays live on the slot.
+struct LazyChain {
+  std::vector<int> a1, a2, a3, tail1, tail2, tail3;
+  int slot = -1;
+};
+LazyChain RunChain(LazyRig& rig, int shift, uint64_t id, bool last_busy) {
+  LazyChain chain;
+  chain.a1 = Tokens(shift, 21);
+  const auto t1 = Finish(rig.session, rig.engine, id, Request(chain.a1, 13));
+  chain.tail1 = Join(chain.a1, Head(t1.out, t1.out.size() - 1));
+  chain.a2 = Join(chain.tail1, Tokens(5, 9));
+  const auto t2 = Finish(rig.session, rig.engine, id + 1, Request(chain.a2, 24));
+  assert(t2.cached == chain.tail1.size() && !t2.checkpoint);
+  chain.tail2 = Join(chain.a2, Head(t2.out, t2.out.size() - 1));
+  chain.a3 = Join(chain.tail2, Tokens(11, 9));
+  if (last_busy) {
+    chain.slot = Busy(rig.session, rig.engine, id + 2, Request(chain.a3, 30));
+  } else {
+    const auto t3 = Finish(rig.session, rig.engine, id + 2, Request(chain.a3, 30));
+    assert(t3.cached == chain.tail2.size() && !t3.checkpoint);
+    chain.tail3 = Join(chain.a3, Head(t3.out, t3.out.size() - 1));
+    chain.slot = t3.slot;
+  }
+  return chain;
+}
+bool Clean(const LazyRig& rig) {
+  for (const auto& line : rig.cache.bad) std::fprintf(stderr, "lazy watermark: %s\n", line.c_str());
+  return rig.cache.bad.empty();
+}
+
+// A resumed open keeps the rows below the settled ones, so it ends no source and writes only above the full blocks.
+void LazyResumedOpenAgain() {
+  LazyRig rig(1);
+  const auto chain = RunChain(rig, 1, 1, false);
+  assert(chain.tail1.size() == 23 && chain.tail2.size() == 34);
+  assert(rig.Live(0) == std::vector<size_t>({23, 34}) && rig.cache.ended.empty() && Clean(rig));
+  // And a fourth turn that resumes again: still no end, the new source joins the list.
+  const auto a4 = Join(chain.tail3, Tokens(3, 9));
+  assert(Finish(rig.session, rig.engine, 10, Request(a4, 40)).cached == chain.tail3.size());
+  assert(rig.Live(0).size() == 3 && rig.cache.ended.empty() && Clean(rig));
+}
+// A resumed open that finds the tail only on the host writes the slot from row 0 (WriteSnapshot): the sources end first.
+void LazyResumedFromHost() {
+  LazyRig rig(1);
+  const auto chain = RunChain(rig, 1, 1, false);
+  rig.cache.host_tail_first = true;
+  rig.cache.host[chain.tail3] = true;
+  assert(Finish(rig.session, rig.engine, 10, Request(Join(chain.tail3, Tokens(3, 9)), 40)).cached == chain.tail3.size());
+  assert(rig.Ended("resume", 0, 23) && rig.Ended("resume", 0, 34) && Clean(rig));
+}
+// A new session on the slot: the open resets it from row 0, and the overwrite hook ends the sources before the reset.
+void LazyNewSession() {
+  LazyRig rig(1);
+  const auto chain = RunChain(rig, 1, 1, false);
+  assert(rig.Live(0).size() == 2);
+  assert(Finish(rig.session, rig.engine, 10, Request(Tokens(9, 11), 0)).slot == 0);
+  assert(rig.Ended("overwrite", 0, 23) && rig.Ended("overwrite", 0, 34) && rig.Live(0).empty() && Clean(rig));
+}
+// A checkpoint resume below the watermark ends the sources that read past the point, before the restore writes the
+// pool block of the point; the old order (restore first) is the bug that the first review found. The slot keeps the
+// Frontier point of 12 rows from turn 1 (its own buffer). A new prompt that repeats turn 1's first 13 tokens resumes
+// there, below the sources of the tails of 23 and 34 rows (full blocks to 20 and 32).
+void LazyCheckpointBelow() {
+  for (const bool limit_first : {true, false}) {
+    LazyRig rig(1);
+    rig.cache.limit_first = limit_first;
+    const auto chain = RunChain(rig, 1, 1, false);
+    assert(rig.Live(0) == std::vector<size_t>({23, 34}));
+    const auto turn = Finish(rig.session, rig.engine, 10, Request(Join(Head(chain.a1, 13), Tokens(2, 9)), 13));
+    assert(turn.checkpoint && turn.cached == 12);
+    if (limit_first) {
+      assert(rig.Ended("checkpoint_load", 0, 23) && rig.Ended("checkpoint_load", 0, 34));
+      assert(rig.Live(0).empty() && Clean(rig));
+    } else {
+      assert(!rig.cache.bad.empty());  // the harness sees the old order
+      rig.cache.bad.clear();
+    }
+  }
+}
+// A checkpoint resume above the watermark keeps the sources: no row below the point changes. Turn 3's End point (43
+// rows) lies above both sources; a retry that repeats turn 3's prompt whole and then differs resumes there.
+void LazyCheckpointAbove() {
+  LazyRig rig(1);
+  const auto chain = RunChain(rig, 1, 1, false);
+  const auto d = Join(chain.a3, Tokens(2, 9));
+  assert(d[chain.a3.size()] != chain.tail3[chain.a3.size()]);
+  const auto turn = Finish(rig.session, rig.engine, 10, Request(d, 50));
+  assert(turn.checkpoint && turn.cached == chain.a3.size());
+  assert(rig.Live(0) == std::vector<size_t>({23, 34}) && rig.cache.ended.empty() && Clean(rig));
+}
+// A host restore (and a disk restore: BatchPrefixCache::Restore reads the disk tier inside the same hook) writes the
+// slot from row 0. The open resets the slot first (the overwrite hook ends the sources); the restore hook ends again
+// what is live, which here is nothing. A write at row 0 with a live source is `bad` in either place.
+void LazyRestores() {
+  LazyRig rig(1);
+  const auto chain = RunChain(rig, 1, 1, false);
+  // A4 repeats the tail of turn 1 only, so the slot tail does not serve it: the cache restores the host tail.
+  const auto turn = Finish(rig.session, rig.engine, 10, Request(Join(chain.tail1, Tokens(14, 9)), 24));
+  assert(turn.cached == chain.tail1.size() && !turn.checkpoint && Has(rig.cache.log, "restore tail 23"));
+  assert(rig.Ended("overwrite", 0, 23) && rig.Ended("overwrite", 0, 34) && rig.Live(0).empty() && Clean(rig));
+}
+// A frontier copy writes its target from row 0: the open's overwrite hook ends the target's sources before the copy hook
+// runs (the copy hook ends again what is live, here nothing). The copy only reads the donor, so the donor's sources stay.
+void LazyFrontierCopy() {
+  LazyRig rig(2);
+  const auto x = RunChain(rig, 1, 1, false);  // slot 0, idle, with two live sources
+  const auto y = RunChain(rig, 6, 20, true);  // slot 1, busy, with two live sources and its points
+  assert(x.slot == 0 && y.slot == 1 && rig.Live(0).size() == 2 && rig.Live(1).size() == 2);
+  rig.cache.log.clear();
+  const auto z = Finish(rig.session, rig.engine, 30, Request(Join(Head(y.a1, 13), Tokens(2, 9)), 13));
+  assert(rig.Ended("overwrite", 0, 23) && rig.Ended("overwrite", 0, 34) && rig.Live(0).empty());
+  assert(rig.Live(1).size() == 2 && rig.cache.ended.size() == 2 && Clean(rig));
+}
+// A cancelled turn leaves its slot with the sources of the earlier resumes; the next session on the slot ends them.
+void LazyCancelThenReuse() {
+  LazyRig rig(1);
+  const auto chain = RunChain(rig, 1, 1, true);
+  rig.session.Close(3);  // the busy turn 3 ends before its tail is made
+  assert(rig.Live(0) == std::vector<size_t>({23, 34}) && Clean(rig));
+  assert(Finish(rig.session, rig.engine, 30, Request(Tokens(9, 11), 0)).slot == 0);
+  assert(rig.Ended("overwrite", 0, 23) && rig.Ended("overwrite", 0, 34) && rig.Live(0).empty() && Clean(rig));
+}
+
 int main() {
   TenantsNeverShareSlot();
   TenantsNeverCopyFrontier();
@@ -903,6 +1088,14 @@ int main() {
   GuardCases();
   SmallestLoss();
   HooksOff();
+  LazyResumedOpenAgain();
+  LazyResumedFromHost();
+  LazyNewSession();
+  LazyCheckpointBelow();
+  LazyCheckpointAbove();
+  LazyRestores();
+  LazyFrontierCopy();
+  LazyCancelThenReuse();
   std::puts("slot_frontier_test passed");
   return 0;
 }

@@ -18,6 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from server.draft_capture import BLOCK  # noqa: E402
+from server.leak_canary import CANARY  # noqa: E402
 from server.draft_stats import K, read_doc  # noqa: E402
 
 DEFAULT_VOCAB = ROOT / "tests" / "data" / "draft" / "blocks65536.txt"
@@ -153,9 +154,11 @@ def main(argv=None):
         print(f"draft_rank: {error}", file=sys.stderr)
         return 2
     result["days"] = count
+    result["canary"] = CANARY   # leak guard: the numbers come from capture data, so the output carries the canary
     if args.json:
         print(json.dumps(result))
         return 0
+    print("#" + CANARY)
     print(f"days {count}, classes {','.join(result['classes']) or '-'}, generated tokens {result['total_tokens']}")
     for title, rows, cols in (("ADD (not in vocabulary)", result["add"], ("token", "block", "events", "gain", "gain_per_1k")),
                               ("REMOVE (in vocabulary, lowest net first)", result["remove"],

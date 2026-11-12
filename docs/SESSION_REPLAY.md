@@ -37,6 +37,10 @@ On the 4.05 pack, later turns take 1.45 to 1.56 s with replay and 2.1 to 3.9 s w
 - One exception: slot checkpoints (batch serve, `--slot-checkpoints 1`). A turn that resumes from a checkpoint can
   give other tokens than serial serve, and the checkpoint stays only while no other session takes the slot.
   This is the accepted contract A. A think-capped turn is one example.
+- A resume from a position that is not a multiple of 2,048 rows is not bitwise equal to a cold prefill of the same
+  tokens. Top-1 is equal in all measured cases, but a greedy output can change at a near tie.
+  `CRUCIBLE_EXACT_RESUME=1` makes the resume of a longer prompt exact; it costs at
+  most 20 rows of extra prefill for a resume and one small launch for each prompt.
 
 ## Limits
 

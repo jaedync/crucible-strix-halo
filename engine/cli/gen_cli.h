@@ -1,4 +1,5 @@
 #pragma once
+#include <filesystem>
 #include "../runtime/spec_steps.h"
 #include "../switches.h"
 #include "../runtime/sampling_generation.h"
@@ -37,6 +38,7 @@ bool ParseGenOptions(int argc, char** argv, int first, GenOptions& o) {
   for (int i = first; i + 1 < argc; i += 2) {
     const std::string k = argv[i], v = argv[i + 1];
     if (k == "--ids") o.ids = ParseIds(v);
+    else if (k == "--stop-ids") o.stop_ids = ParseIds(v);  // the tree-draft spec_sweep had it; heads_ab.py passes it
     else if (k == "--ids-file") {
       std::ifstream f(v);
       if (!f) return false;
@@ -66,6 +68,10 @@ bool ParseGenOptions(int argc, char** argv, int first, GenOptions& o) {
     else if (k == "--dump") o.dump = v;
     else if (k == "--dump-state") o.state_dump = v;
     else if (k == "--dump-logits") o.logits_dump = v;
+    else if (k == "--debug-schedule") o.debug_schedule = v;
+    else if (k == "--debug-restore-at") o.debug_restore_at = GenNumber<size_t>(v);
+    else if (k == "--debug-state-at") o.debug_state_at = GenNumber<size_t>(v);
+    else if (k == "--dump-step-logits") o.step_logits = v;
 #if CRUCIBLE_DEBUG_NONFINITE & 4
     else if (k == "--inject") o.inject = v;
 #endif
@@ -129,7 +135,7 @@ int CheckGenOptions(const GenOptions& o, std::vector<int>& blocks) {
   if (o.draft_blocks.empty()) return 0;
   std::ifstream f(o.draft_blocks);
   if (!f) {
-    std::fprintf(stderr, "cannot open draft selection: %s\n", o.draft_blocks.c_str());
+    std::fprintf(stderr, "cannot open draft selection: %s\n", std::filesystem::path(o.draft_blocks).filename().string().c_str());
     return 2;
   }
   std::stringstream ss;
@@ -206,6 +212,11 @@ inline GenResult RunSampledGen(Engine& eng, const GenOptions& o, const std::vect
   return result;
 }
 
+// The diagnostic needs the device engine (slot checkpoints); the CPU test of RunGen compiles without it.
+#ifdef __HIPCC__
+#include "gen_debug_schedule.h"
+#endif
+
 // RunPrompt picks the bulk prefill path at compile time; an engine without it would fall back to Forward silently.
 static_assert(crucible::HasGemmPrefill<Engine>, "RunGen needs the GEMM prefill engine interface");
 
@@ -213,6 +224,9 @@ static_assert(crucible::HasGemmPrefill<Engine>, "RunGen needs the GEMM prefill e
 GenResult RunGen(Engine& eng, const GenOptions& o, const std::vector<int>& blocks) {
 #if CRUCIBLE_DEBUG_NONFINITE & 4
   eng.SetInject(o.inject);
+#endif
+#ifdef __HIPCC__
+  if (!o.debug_schedule.empty()) return RunDebugSchedule(eng, o);
 #endif
   const std::vector<int> selected = ResolveDraftBlocks(o, blocks);
   if (o.sampling.temperature > 0) return RunSampledGen(eng, o, selected);
@@ -482,7 +496,7 @@ inline int GenJobsCommand(int argc, char** argv) {
   }
   std::ifstream file(argv[4]);
   if (!file) {
-    std::fprintf(stderr, "cannot open job file: %s\n", argv[4]);
+    std::fprintf(stderr, "cannot open job file: %s\n", std::filesystem::path(argv[4]).filename().string().c_str());
     return 2;
   }
   std::stringstream text;
@@ -558,6 +572,8 @@ int ENGINE_CLI_ENTRY(int argc, char** argv) {
                  "       --spec 0 is serial, --draft-head full uses the full head, --mtp-prefix 0 is full warmup)\n"
                  "       [--prefill R|0] (default: automatic GEMM; --chunk C selects small rows)\n"
                  "       [--dump-state DIR] [--dump-logits FILE]\n"
+                 "       [--debug-schedule 512!,f8,4096 [--debug-restore-at K] [--debug-state-at K] "
+                 "[--dump-step-logits FILE]] (diagnostic, spec 0)\n"
                  "       crucible gen CKPT --jobs FILE   (one load, one job per line: "
                  "{\"args\":[gen options],\"stdout\":F,\"stderr\":F}; every job needs the same --ctx and --prefill)\n"
                  "       crucible serve CKPT [--ctx N] [--spec D] [--draft-q Q] "

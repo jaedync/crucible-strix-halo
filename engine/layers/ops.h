@@ -8,6 +8,7 @@
 #include "packed_state.h"
 #include "nonfinite_probe.h"
 #include "ple_row_codec.h"
+#include "rope_tables.h"
 
 namespace crucible {
 
@@ -237,8 +238,20 @@ __device__ __forceinline__ GdnArgs GdnRowArgs(PackedStateArgs<GdnArgs, kMaxRows>
   return a.rows[row];
 }
 
+// The arguments of GdnKernel for the sequences of an engine with a verify span (CRUCIBLE_SPEC_SPAN,
+// runtime/spec_span.h): the same fields, but a.pend holds kPackedRows pending rows per head. A type of its own keeps
+// the names and the code of the default GdnKernel instances (kMaxRows pending rows) those of trunk.
+struct GdnSpanArgs { GdnArgs a; };
+struct GdnSpanPackedArgs { PackedStateArgs<GdnArgs, kMaxRows> p; };
+__device__ __forceinline__ GdnArgs GdnRowArgs(GdnSpanArgs a, unsigned) { return a.a; }
+__device__ __forceinline__ GdnArgs GdnRowArgs(GdnSpanPackedArgs a, unsigned row) { return a.p.rows[row]; }
+template <class Args> inline constexpr int kGdnPendRows = kMaxRows;
+template <> inline constexpr int kGdnPendRows<GdnSpanArgs> = kPackedRows;
+template <> inline constexpr int kGdnPendRows<GdnSpanPackedArgs> = kPackedRows;
+
 template <int CACHE = 0, bool STREAM_STORE = false, class Args = GdnArgs>
 __global__ void __launch_bounds__(256) GdnKernel(Args args) {
+  constexpr int PEND = kGdnPendRows<Args>;  // pending rows per head in a.pend
   const GdnArgs a = GdnRowArgs(args, blockIdx.y);
   PublishWeights(a.ab);
   __shared__ float qs[128], ks[128], red[8], ob[128], part[2][128];
@@ -260,7 +273,7 @@ __global__ void __launch_bounds__(256) GdnKernel(Args args) {
   // update they computed there, so rollback costs no state traffic and the
   // committed state is bitwise what serial decoding would hold.
   for (int i = 0; i < a.replay; ++i) {
-    const float* pe = a.pend + ((size_t)h * kMaxRows + i) * kPend;
+    const float* pe = a.pend + ((size_t)h * PEND + i) * kPend;
     if (t < 128) ks[t] = pe[t];
     __syncthreads();
     const float decay = pe[256], beta = pe[257], cv = pe[128 + j];
@@ -316,7 +329,7 @@ __global__ void __launch_bounds__(256) GdnKernel(Args args) {
     const float decay = expf(A * softplus);
     const float beta = Sigmoid(pb);
     if (r >= a.commit) {
-      float* pe = a.pend + ((size_t)h * kMaxRows + (r - a.commit)) * kPend;
+      float* pe = a.pend + ((size_t)h * PEND + (r - a.commit)) * kPend;
       if (t < 128) {
         pe[t] = ks[t];
         pe[128 + t] = cv;
@@ -427,6 +440,9 @@ struct QsaArgs {
   int pack_rows = 0, pack_off = 0;  // prefill: xh_o in the packed GEMM layout
   // Multimodal RoPE positions [ctx][4] = (T, H, W, 0) for a request with images; null keeps p.
   const int* mrope = nullptr;
+  // This span's RoPE table (kRopeTableFloats floats, its sequence's RopeMode): Engine::QArgs sets it.
+  // Benches and tests use PlainRopeTable().
+  const float* rope = nullptr;
 };
 
 // Packed verification: one launch serves every span of a verify pass. The span is blockIdx.z (or z / splits);
@@ -443,15 +459,48 @@ __device__ __forceinline__ QsaArgs QsaSpanArgs(const PackedQsaArgs& p, unsigned 
 __device__ __forceinline__ int QsaSpanBase(const QsaArgs&, unsigned) { return 0; }
 __device__ __forceinline__ int QsaSpanBase(const PackedQsaArgs& p, unsigned s) { return p.base[s]; }
 
-// Split-half partial RoPE over channels 0..63 of x (in LDS), position p.
-__device__ __forceinline__ void Rope64(float* x, int p) {
+// RoPE tables. One table per mode (kRopeTableModes; engine/runtime/rope_mode.h RopeMode):
+// [0, 32) the inverse frequency of pair j (channels j and j + 32), [32] the cos/sin multiplier, [33, 64) zero.
+constexpr int kRopeTableFloats = 64;
+constexpr int kRopeMul = kRotDim / 2;
+static_assert(kRopeMul < kRopeTableFloats);
+
+// The plain table on the device, with the expression the kernels used before the table: the same bits.
+__global__ void RopePlainFillKernel(float* table) {
+  const int j = threadIdx.x;
+  if (j < kRotDim / 2) table[j] = powf(kRopeTheta, -2.f * j / kRotDim);
+  else if (j < kRopeTableFloats) table[j] = j == kRopeMul ? 1.f : 0.f;
+}
+// All kRopeTableModes tables: plain on the device, then the YaRN rows of rope_tables.h. Call before a graph capture.
+inline void FillRopeTables(float* tables, hipStream_t stream = nullptr) {
+  RopePlainFillKernel<<<1, kRopeTableFloats, 0, stream>>>(tables);
+  static float yarn[kYarnTables][kRopeTableFloats] = {};
+  for (int m = 0; m < kYarnTables; ++m)
+    for (int i = 0; i < 33; ++i) yarn[m][i] = kYarnTable[m][i];
+  HIP_OK(hipMemcpyAsync(tables + kRopeTableFloats, yarn, sizeof(yarn), hipMemcpyHostToDevice, stream));
+  HIP_OK(hipStreamSynchronize(stream));
+}
+// A lazily filled plain table for benches and tests (the engine owns its own tables).
+inline const float* PlainRopeTable() {
+  static float* table = [] {
+    float* t = nullptr;
+    HIP_OK(hipMalloc(&t, kRopeTableFloats * sizeof(float)));
+    RopePlainFillKernel<<<1, kRopeTableFloats>>>(t);
+    HIP_OK(hipDeviceSynchronize());
+    return t;
+  }();
+  return table;
+}
+
+// Split-half partial RoPE over channels 0..63 of x (in LDS), position p, with the table `rope`.
+__device__ __forceinline__ void Rope64(float* x, const float* rope, int p) {
   const int j = threadIdx.x;
   float c = 0.f, s = 0.f, a = 0.f, b = 0.f;
   if (j < kRotDim / 2) {
-    const float inv = powf(kRopeTheta, -2.f * j / kRotDim);
+    const float inv = rope[j], m = rope[kRopeMul];
     const float ang = (float)p * inv;
-    c = cosf(ang);
-    s = sinf(ang);
+    c = cosf(ang) * m;
+    s = sinf(ang) * m;
     a = x[j];
     b = x[j + 32];
   }
@@ -465,15 +514,15 @@ __device__ __forceinline__ void Rope64(float* x, int p) {
 
 // Interleaved multimodal sections [11, 11, 10]: frequency j uses H if j % 3 == 1 (j < 33), W if
 // j % 3 == 2 (j < 30), else T (HF Qwen4ExpTextRotaryEmbedding). Equal axes give Rope64 exactly.
-__device__ __forceinline__ void Rope64Axes(float* x, int pt, int ph, int pw) {
+__device__ __forceinline__ void Rope64Axes(float* x, const float* rope, int pt, int ph, int pw) {
   const int j = threadIdx.x;
   float c = 0.f, s = 0.f, a = 0.f, b = 0.f;
   if (j < kRotDim / 2) {
     const int p = j % 3 == 1 && j < 33 ? ph : j % 3 == 2 && j < 30 ? pw : pt;
-    const float inv = powf(kRopeTheta, -2.f * j / kRotDim);
+    const float inv = rope[j], m = rope[kRopeMul];
     const float ang = (float)p * inv;
-    c = cosf(ang);
-    s = sinf(ang);
+    c = cosf(ang) * m;
+    s = sinf(ang) * m;
     a = x[j];
     b = x[j + 32];
   }
@@ -486,9 +535,9 @@ __device__ __forceinline__ void Rope64Axes(float* x, int pt, int ph, int pw) {
 }
 
 // RoPE for cache position p: the text path is unchanged unless the request has images.
-__device__ __forceinline__ void RopeAt(float* x, const int* mrope, int p) {
-  if (!mrope) Rope64(x, p);
-  else Rope64Axes(x, mrope[4 * p], mrope[4 * p + 1], mrope[4 * p + 2]);
+__device__ __forceinline__ void RopeAt(float* x, const float* rope, const int* mrope, int p) {
+  if (!mrope) Rope64(x, rope, p);
+  else Rope64Axes(x, rope, mrope[4 * p], mrope[4 * p + 1], mrope[4 * p + 2]);
 }
 
 // Centered RMSNorm of n (<= 256) values in LDS, one per thread.
@@ -521,14 +570,14 @@ __global__ void __launch_bounds__(256) QsaPrepKernel(Args args) {
     x[j] = q[j];
     __syncthreads();
     CNormLds(x, 256, a.q_norm1, red);
-    RopeAt(x, a.mrope, p);
+    RopeAt(x, a.rope, a.mrope, p);
     q[j] = x[j];
   } else if (u < 26) {
     const int g = u - 24;
     x[j] = a.k[(size_t)r * 512 + g * 256 + j];
     __syncthreads();
     CNormLds(x, 256, a.k_norm1, red);
-    RopeAt(x, a.mrope, p);
+    RopeAt(x, a.rope, a.mrope, p);
     a.c.k[((size_t)p * kKvHeads + g) * kHeadDim + j] = __float2half(x[j]);
   } else if (u < 28) {
     const int g = u - 26;
@@ -539,7 +588,7 @@ __global__ void __launch_bounds__(256) QsaPrepKernel(Args args) {
     if (j < kIdxDim) x[j] = iq[j];
     __syncthreads();
     CNormLds(x, kIdxDim, a.iq_norm1, red);
-    RopeAt(x, a.mrope, p);
+    RopeAt(x, a.rope, a.mrope, p);
     if (j < kIdxDim) iq[j] = x[j];
   } else if constexpr (Tail) {
     // QsaRawUsesChunk is false at R = 1 (kQsaRawDecodeRows), so the raw key always goes to the cache.
@@ -589,7 +638,7 @@ __global__ void __launch_bounds__(256) QsaPoolKernel(Args args) {
     }
     __syncthreads();
     CNormLds(x, kIdxDim, a.ik_norm1, red);
-    RopeAt(x, a.mrope, blk * 4);
+    RopeAt(x, a.rope, a.mrope, blk * 4);
     if (j < kIdxDim) a.c.ik_pool[QsaPoolOffset(blk, j)] = x[j];
     __syncthreads();
   }
@@ -615,7 +664,7 @@ __device__ __forceinline__ void QsaPoolTail(const QsaArgs& a, float own, float* 
   }
   __syncthreads();
   CNormLds(x, kIdxDim, a.ik_norm1, red);
-  RopeAt(x, a.mrope, blk * 4);
+  RopeAt(x, a.rope, a.mrope, blk * 4);
   if (j < kIdxDim) a.c.ik_pool[QsaPoolOffset(blk, j)] = x[j];
 }
 
@@ -762,6 +811,75 @@ __global__ void __launch_bounds__(512) PleMixKernel(PleArgs a) {
       hs[j + c * 512] += gv[c] + Silu(cv);
     }
   }
+}
+
+// PleMixKernel for one verify span of more than kMaxRows rows (runtime/spec_span.h): the same arithmetic, but rows
+// from kMaxRows on write `side` ([rows - 8][kWide]) instead of the ring, and read it for their own conv taps. A
+// rejected row then never overwrites one of the nine old ring rows that the next forward reads. Engine::Truncate
+// copies the kept side rows into the ring (PleSideCommitKernel). Rows below kMaxRows are those of PleMixKernel.
+__global__ void __launch_bounds__(512) PleMixSpanKernel(PleArgs a, float* side) {
+  __shared__ float red[16];
+  const int s = blockIdx.x, j = threadIdx.x;
+  constexpr int C = 5;
+  for (int r = 0; r < a.R; ++r) {
+    const int p = a.pos0 + r;
+    const float* key = a.kv + (size_t)r * 12800 + s * kHidden;
+    const float* val = a.kv + (size_t)r * 12800 + kWide;
+    float* hs = a.H + (size_t)r * a.ldh + s * kHidden;
+    float kk[C], qq[C];
+    float sk = 0.f, sq = 0.f;
+#pragma unroll
+    for (int c = 0; c < C; ++c) {
+      const int d = j + c * 512;
+      kk[c] = key[d];
+      qq[c] = hs[d];
+      sk += kk[c] * kk[c];
+      sq += qq[c] * qq[c];
+    }
+    sk = BlockSum<512>(sk, red);
+    sq = BlockSum<512>(sq, red);
+    const float ik = rsqrtf(sk / kHidden + kEps), iqn = rsqrtf(sq / kHidden + kEps);
+    float dot = 0.f;
+#pragma unroll
+    for (int c = 0; c < C; ++c) {
+      const int ch = s * kHidden + j + c * 512;
+      dot += (kk[c] * ik * a.norm_key1[ch]) * (qq[c] * iqn * a.norm_query1[ch]);
+    }
+    dot = BlockSum<512>(dot, red) * 0.019764235376052372f;  // 1/sqrt(2560)
+    const float sg = dot > 0.f ? 1.f : (dot < 0.f ? -1.f : 0.f);
+    const float gate = Sigmoid(sg * sqrtf(fmaxf(fabsf(dot), 1e-6f)));
+    float gv[C], sn = 0.f;
+#pragma unroll
+    for (int c = 0; c < C; ++c) {
+      gv[c] = gate * val[j + c * 512];
+      sn += gv[c] * gv[c];
+    }
+    sn = BlockSum<512>(sn, red);
+    const float in = rsqrtf(sn / kHidden + kEps);
+#pragma unroll
+    for (int c = 0; c < C; ++c) {
+      const int ch = s * kHidden + j + c * 512;
+      const float nv = RoundH(gv[c] * in * a.norm_conv1[ch]);
+      if (r >= kMaxRows) side[(size_t)(r - kMaxRows) * kWide + ch] = nv;
+      else a.ring[(size_t)(p & 15) * kWide + ch] = nv;
+      const float* w = a.conv + (size_t)ch * 4;
+      float cv = 0.f;
+#pragma unroll
+      for (int t = 0; t < 4; ++t) {
+        const int src = p - 9 + 3 * t;
+        if (src >= 0)
+          cv += w[t] * (src >= a.pos0 + kMaxRows ? side[(size_t)(src - a.pos0 - kMaxRows) * kWide + ch]
+                                                 : a.ring[(size_t)(src & 15) * kWide + ch]);
+      }
+      hs[j + c * 512] += gv[c] + Silu(cv);
+    }
+  }
+}
+
+// Copies side rows [0, count) of a verify span that started at pos0 into the PLE ring (rows kMaxRows.. of the span).
+__global__ void __launch_bounds__(256) PleSideCommitKernel(float* ring, const float* side, int pos0) {
+  const int i = blockIdx.x * 256 + threadIdx.x, j = blockIdx.y;
+  if (i < kWide) ring[(size_t)((pos0 + kMaxRows + j) & 15) * kWide + i] = side[(size_t)j * kWide + i];
 }
 
 // ---- MTP input fusion ------------------------------------------------------------

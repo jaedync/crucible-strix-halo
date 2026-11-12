@@ -50,6 +50,7 @@ int main(int argc,char** argv) {
   for (int r=0;r<R;++r) DenseGemvKernel<1><<<(O+7)/8,256>>>(W.p,O,mixed.p+(size_t)r*kHidden,kHidden,y.p+(size_t)r*O,O);
   CheckLaunch();const auto e=Compare(dense,y.Get());
   if (e.rel_l2>2e-5) return 5;
+  EnergyHook("hc", "prefill_hc_tensor", tensor);
   std::printf("hc rows=%d dots=%g post=%g mixed=%g dense=%g tensor_us=%.3f serial_us=%.3f\n",
     R,de.rel_l2,pe.rel_l2,me.rel_l2,e.rel_l2,Time(tensor,3),Time(serial,3));
 }

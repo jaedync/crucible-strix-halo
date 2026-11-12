@@ -29,6 +29,7 @@ int hipMemcpy(void* out, const void* in, size_t n, int) { std::memcpy(out, in, n
 int hipStreamSynchronize(int) { return 0; }
 #define HIP_OK(expr) assert((expr) == 0)
 #include "../engine/runtime/state_disk.h"
+#include "../engine/runtime/lazy_snapshot.h"
 #include "support/disk_test_dir.h"
 #include <atomic>
 #include <chrono>
@@ -89,12 +90,16 @@ StateDiskOptions Options(char id, const std::string& name) {
   options.identity = std::string(64, id);
   options.directory = DirName(id);
   options.min_tokens = 4;
+  options.free_reserve = uint64_t(64) << 20;  // the default 16 GiB would make the tests depend on the free space of the host disk
   options.io_threads = 3;
   options.log = logs.Sink();
   options.block_rows = kRows;
   options.block_head_bytes = kHead;
   options.block_tail_bytes = kTail;
   options.verify_digest = true;
+  // The tier logic is under test, not the host disk: a fixed 1 TiB of free space, whatever the real filesystem holds.
+  // A test of the reserve or the full path sets its own free_space after this.
+  options.free_space = [] { return uint64_t(1) << 40; };
   return options;
 }
 ConversationPolicy Policy(const StateTenant& tenant = kLocalTenant) {
@@ -813,6 +818,176 @@ void WriteDigestChecked() {
   for (const auto& item : fs::directory_iterator(disk.Directory())) assert(item.path().filename() == ".lock");
 }
 
+// a lazy snapshot keeps the full blocks of its tail on the device; the writer reads them in
+// chunks through the staging buffer. Rows that divide the block and rows that do not; the file equals the one of an
+// eager snapshot, and the queue counts the host bytes only.
+struct LazyState {
+  std::shared_ptr<TestSnapshot> snapshot;   // the lazy one
+  std::shared_ptr<LazySource> source;
+  std::vector<uint8_t> device;              // the "device" bytes that the lazy extents read
+  uint64_t lazy_bytes = 0;
+};
+LazyState MakeLazy(const TestSnapshot& eager, size_t settled, LazySource::Reader reader = nullptr) {
+  LazyState state;
+  state.device = eager.bytes.Copy();
+  if (!reader) reader = [](const void* from, void* to, size_t n) { std::memcpy(to, from, n); };
+  state.source = std::make_shared<LazySource>(std::move(reader), settled);
+  const auto lazy = LazyIntervals(Geometry(eager), kRows, settled);
+  state.lazy_bytes = LazyBytesOf(lazy);
+  struct DeviceSpan { const void* pointer; size_t bytes; };
+  const std::vector<DeviceSpan> spans{{state.device.data(), state.device.size()}};
+  const auto parts = SplitLazyParts(spans, lazy, state.source);
+  state.snapshot = std::make_shared<TestSnapshot>(eager);
+  std::vector<SnapshotRange> copies;
+  state.snapshot->bytes = SnapshotBytes::Compose(parts, copies);
+  CopySnapshotRanges(copies, state.snapshot->bytes, true);
+  return state;
+}
+
+void LazySpillRoundTrip() {
+  for (const size_t rows : {3 * kRows, 3 * kRows + 1, 5 * kRows - 1, 5 * kRows + 77}) {
+    const auto s = Make(Tokens(rows, int(rows)), rows - rows / 3, uint8_t(rows));
+    LazyState lazy = MakeLazy(*s, rows - 5);
+    assert(lazy.lazy_bytes > 0 && lazy.snapshot->bytes.HostBytes() == s->bytes.size() - lazy.lazy_bytes);
+    assert(lazy.snapshot->bytes.size() == s->bytes.size());
+    const std::string name = "lazy" + std::to_string(rows);
+    auto options = Options('l', name);
+    std::promise<void> release;
+    std::shared_future<void> gate = release.get_future().share();
+    std::atomic<int> waiting = 0;
+    options.before_write = [&] { ++waiting; gate.wait(); };
+    LazyStaging::Instance().ResetPeak();
+    {
+      Disk disk(options);
+      assert(Spill(disk, lazy.snapshot).empty());
+      while (waiting == 0) std::this_thread::yield();
+      // The queue pins the host bytes only (the old path pinned the whole payload).
+      assert(disk.QueuedBytes() == lazy.snapshot->bytes.HostBytes() && disk.QueuedBytes() < s->bytes.size());
+      release.set_value();
+      assert(disk.Drain(60));
+      assert(disk.Entries() == 1 && disk.QueuedBytes() == 0 && lazy.source->Reads() > 0);
+      Restores(disk, *s);  // byte-identical to the eager snapshot
+      // The restore of a lazily written file is counted and logged (the night summary reads it).
+      assert(disk.Stats().lazy_written == 1 && disk.Stats().lazy_read >= 1);
+      assert(Find("state_disk read").find(" lazy=1") != std::string::npos);
+      assert(Find("result=written").find(" lazy=" + std::to_string(lazy.lazy_bytes)) != std::string::npos);
+      assert(disk.Bytes() == DiskBytes(disk.Directory()));
+    }
+    assert(LazyStaging::Instance().Peak() <= 3);  // io_threads 3: one 8 MiB staging buffer for each reader
+    fs::remove_all(Root() / ".cache" / name);
+  }
+}
+
+// The slot rows change before the writer reads them (the source ends): the write is refused ("lost"), nothing stays on
+// disk, the queue count returns to zero, and the disk takes the next spill.
+void LazySourceLost() {
+  const auto s = Make(Tokens(4 * kRows + 3), 2 * kRows, 61);
+  for (const char* when : {"queued", "blocks"}) {
+    LazyState lazy = MakeLazy(*s, 4 * kRows);
+    auto options = Options('m', std::string("lost-") + when);
+    std::atomic<bool> fired = false;
+    if (when == std::string("queued")) options.before_write = [&] { lazy.source->Invalidate(); };
+    if (when == std::string("blocks")) options.after_blocks = nullptr, options.before_chunk = [&] {
+      if (!fired.exchange(true)) lazy.source->Invalidate();
+    };
+    Disk disk(options);
+    assert(Spill(disk, lazy.snapshot).empty() && disk.Drain(60));
+    assert(disk.Entries() == 0 && disk.Blocks() == 0 && disk.QueuedBytes() == 0 && logs.Has("result=refused reason=lost"));
+    for (const auto& item : fs::directory_iterator(disk.Directory())) assert(item.path().filename() == ".lock");
+    // The same disk takes an eager spill afterwards.
+    SpillOk(disk, s);
+    Restores(disk, *s);
+    fs::remove_all(Root() / ".cache" / (std::string("lost-") + when));
+  }
+}
+
+// Review finding 6 (round 3): the source ends in the middle of pass 1, the digest step that reads every lazy extent once
+// before any file is written. The reader ends the source on its second read (a helper thread calls Invalidate, which waits
+// for the read in progress; the reader leaves once the source shows invalid, so there is no timing luck). The later reads
+// throw SnapshotLost, the write is refused ("lost") before any payload chunk, and nothing stays on disk.
+void LazySourceLostInPass1() {
+  const auto s = Make(Tokens(6 * kRows + 3), 2 * kRows, 62);
+  std::atomic<int> reads = 0, chunks = 0;
+  std::shared_ptr<LazySource> source;
+  std::vector<std::thread> helpers;
+  std::mutex helpers_mutex;
+  LazyState lazy = MakeLazy(*s, 5 * kRows, [&](const void* from, void* to, size_t n) {
+    if (++reads == 2) {
+      std::lock_guard lock(helpers_mutex);
+      helpers.emplace_back([&] { source->Invalidate(); });
+      while (source->Valid()) std::this_thread::yield();  // Invalidate marks the source first, then waits for this read
+    }
+    std::memcpy(to, from, n);
+  });
+  source = lazy.source;
+  auto options = Options('m', "lost-pass1");
+  options.before_chunk = [&] { ++chunks; };
+  Disk disk(options);
+  assert(Spill(disk, lazy.snapshot).empty() && disk.Drain(60));
+  for (auto& helper : helpers) helper.join();
+  assert(reads >= 2 && !source->Valid());  // the source ended while the second read ran
+  assert(chunks == 0);                     // pass 1 failed: no payload chunk was written
+  assert(disk.Entries() == 0 && disk.Blocks() == 0 && disk.QueuedBytes() == 0 && logs.Has("result=refused reason=lost"));
+  for (const auto& item : fs::directory_iterator(disk.Directory())) assert(item.path().filename() == ".lock");
+  SpillOk(disk, s);
+  Restores(disk, *s);
+  fs::remove_all(Root() / ".cache" / "lost-pass1");
+}
+
+// a lazy job whose source ended leaves the queue at once. It does not wait for the
+// writer to find the loss (a slow disk would keep its host bytes and its place in the daily estimate for minutes).
+void LazyLostLeavesQueue() {
+  const auto first = Make(Tokens(2 * kRows + 3, 1), kRows, 71);
+  const auto second = Make(Tokens(3 * kRows + 5, 900), kRows, 72);
+  LazyState lazy = MakeLazy(*second, 3 * kRows);
+  auto options = Options('q', "lazy-lost-queue");
+  std::promise<void> release;
+  std::shared_future<void> gate = release.get_future().share();
+  std::atomic<int> waiting = 0;
+  options.before_write = [&] { ++waiting; gate.wait(); };
+  const auto refused_lost = [&] {
+    std::lock_guard lock(logs.mutex);
+    return std::count_if(logs.lines.begin(), logs.lines.end(), [](const auto& line) { return line.find("result=refused reason=lost") != std::string::npos; });
+  };
+  const auto lost_before = refused_lost();
+  Disk disk(options);
+  assert(Spill(disk, first).empty());
+  while (waiting == 0) std::this_thread::yield();  // the writer holds the first job
+  assert(Spill(disk, lazy.snapshot).empty());
+  const uint64_t both = disk.QueuedBytes();
+  assert(both == first->bytes.size() + lazy.snapshot->bytes.HostBytes());
+  assert(disk.DropLost() == 0);  // the source is still valid
+  lazy.source->Invalidate();
+  assert(disk.DropLost() == 1 && disk.QueuedBytes() == first->bytes.size());
+  assert(disk.DropLost() == 0);
+  assert(Find("queue_drop").find("reason=lost") != std::string::npos);
+  release.set_value();
+  assert(disk.Drain(60));
+  assert(disk.Entries() == 1 && disk.QueuedBytes() == 0 && refused_lost() == lost_before);
+  assert(lazy.source->Reads() == 0);  // the dropped job never read the device
+  fs::remove_all(Root() / ".cache" / "lazy-lost-queue");
+}
+
+// Safety net: device rows that change under a valid source (a missed invalidation) give another digest in the block
+// write, and the write is refused ("digest"), never stored under the wrong name.
+void LazyChangedRowsRefused() {
+  const auto s = Make(Tokens(3 * kRows + 5), kRows, 62);
+  LazyState lazy = MakeLazy(*s, 3 * kRows);
+  auto options = Options('n', "lazy-changed");
+  options.io_threads = 1;  // one block at a time: the first chunk hook runs before every block's gather
+  std::atomic<bool> fired = false;
+  options.after_blocks = nullptr;
+  options.before_chunk = [&] {
+    if (fired.exchange(true)) return;
+    const auto lazy_ranges = LazyIntervals(Geometry(*s), kRows, 3 * kRows);
+    lazy.device[lazy_ranges.front().offset + 5] ^= 0x40;  // the first lazy byte region changes
+  };
+  Disk disk(options);
+  assert(Spill(disk, lazy.snapshot).empty() && disk.Drain(60));
+  assert(disk.Entries() == 0 && disk.Blocks() == 0 && logs.Has("result=refused reason=digest"));
+  for (const auto& item : fs::directory_iterator(disk.Directory())) assert(item.path().filename() == ".lock");
+}
+
 // A and B share a block; a read of A finds it bad while a spill of C pins it: A and B leave, C is refused (damaged),
 // and the block leaves after the last pin.
 void BadBlockWhileShared() {
@@ -959,6 +1134,24 @@ void QueueEstimate() {
   assert(Spill(disk, Make(Tokens(4 * kRows, 300), 0, 54)) == "daily");
 }
 
+// The block writers of one spill charge the ledger at the same time: the day count is the ledger line, and the bytes on
+// disk. The first charge waits after its ledger line until the others are done; a count that adds each file to the
+// count of a later ledger line would show more than the files (flaky under load, Oct 29).
+void ChargeOrder() {
+  const auto s = Make(Tokens(6 * kRows + 3), 2 * kRows + 1, 55);
+  auto options = Options('w', "charge-order");
+  options.io_threads = 6;
+  std::atomic<int> charges = 0;
+  options.after_ledger = [&] {
+    if (charges.fetch_add(1) == 0) std::this_thread::sleep_for(std::chrono::milliseconds(400));
+  };
+  Disk disk(options);
+  SpillOk(disk, s);
+  assert(charges.load() >= 4);
+  assert(disk.DayWritten() == DiskBytes(disk.Directory()) && disk.Stats().written_bytes == disk.DayWritten());
+  fs::remove_all(Root() / ".cache" / "charge-order");
+}
+
 // After spills, reads, evictions, damage and a stop, the directory holds only the names that train 22 removes.
 void OnlyTrain22NamesStay() {
   for (const auto& item : fs::recursive_directory_iterator(Root() / ".cache"))
@@ -967,7 +1160,7 @@ void OnlyTrain22NamesStay() {
 
 // No token, no key byte and no tenant byte in any line: fixed words and numbers only.
 void LogsHoldNoTokens() {
-  const std::regex safe(R"(state_disk [a-z]+( [a-z_]+=[a-z0-9_.\-]+)*)");
+  const std::regex safe(R"(state_disk [a-z_]+( [a-z_]+=[a-z0-9_.\-]+)*)");
   std::lock_guard lock(logs.mutex);
   assert(logs.lines.size() > 50);
   for (const auto& line : logs.lines) {
@@ -1067,6 +1260,11 @@ int main() {
   DamagedBlockAtRead();
   ReadPinsBlocks();
   WriteDigestChecked();
+  LazySpillRoundTrip();
+  LazySourceLost();
+  LazySourceLostInPass1();
+  LazyLostLeavesQueue();
+  LazyChangedRowsRefused();
   BadBlockWhileShared();
   DuplicateBlockInState();
   PruneBranch();
@@ -1074,6 +1272,7 @@ int main() {
   StopFinishesState();
   LedgerPerBlock();
   QueueEstimate();
+  ChargeOrder();
   OnlyTrain22NamesStay();
   TenantNotInLogs();
   LogsHoldNoTokens();

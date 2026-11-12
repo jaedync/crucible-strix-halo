@@ -63,6 +63,28 @@ class BatchBackendTest(unittest.TestCase):
         self.assertEqual(self.collect(peer), list(range(10,18)))
         self.assertEqual(self.collect(self.backend.submit([1], self.request)), list(range(2,10)))
 
+    def test_a_cancelled_prefill_counts_its_rows(self):
+        """Start plan B1a: a turn cancelled in prefill names the prompt rows that it computed and nobody uses
+        (cancel_prefill_tokens: its rows past the restored state). A cancel after the first token names none."""
+        from server.backend import Job
+        from server.batch_backend import LiveRequest
+        backend = object.__new__(BatchedEngineBackend)
+        commands = []
+        backend._command = lambda payload, *args: commands.append(payload)
+        backend.free_contexts, backend.kept, backend.state_disk = [], None, False
+        backend.ownership_lock, backend.owned_jobs = __import__("threading").Lock(), {}
+        in_prefill, decoding = Job(dict(ids=list(range(9000)), max_tokens=4)), Job(dict(ids=[1, 2], max_tokens=4))
+        in_prefill.turn["opened_cached"] = 4096
+        backend.active = {1: LiveRequest(in_prefill, prefilled=8192, slot_context=128),
+                          2: LiveRequest(decoding, ready=True, prefilled=2, slot_context=128)}
+        in_prefill.cancelled.set(), decoding.cancelled.set()
+        self.assertTrue(backend._cancelled())
+        self.assertEqual(in_prefill.turn["cancel_prefill_tokens"], 4096)
+        self.assertNotIn("cancel_prefill_tokens", decoding.turn)
+        self.assertEqual([command["op"] for command in commands], ["close", "close"])
+        from server import metrics
+        self.assertEqual(metrics.load_fields([in_prefill.turn])["cancel_prefill_tokens"], 4096)
+
     def test_ready_and_timeout_types_are_strict(self):
         backend = object.__new__(BatchedEngineBackend)
         backend.context = 1; backend.streams = 1

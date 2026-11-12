@@ -15,6 +15,18 @@ from .batch_scheduler import (ENCODER_SLICE_BAND, ENCODER_SLICE_SECONDS, INTERLE
                               PendingPrefill, choose, encoder_rows, interleave_passes, packed_mode)
 
 SMALL_ROW_CHUNK = 8
+# The most tokens one speculative step may publish: a solo verify span of kSpecSpanMax rows
+# (engine/runtime/spec_span.h, CRUCIBLE_SPEC_SPAN). Packed passes keep kMaxRows rows a span. One place for both checks.
+SPEC_SPAN_MAX = 13
+
+
+def spec_span_rows(setting):
+    """The verify span that the engine runs with. setting is CRUCIBLE_SPEC_SPAN (engine ResolveSpecSpan): unset, empty
+    or 8: 8 (kMaxRows, the trunk limit). A decimal 9 to 13: that span. Else the engine refuses to start; the room then
+    uses SPEC_SPAN_MAX."""
+    if not setting: return PASS_ROWS
+    if setting in tuple(str(n) for n in range(PASS_ROWS, SPEC_SPAN_MAX + 1)): return int(setting)
+    return SPEC_SPAN_MAX
 # Row caps of a decode pass, copied from engine/runtime/packed_rows_option.h for the crucible_turn row counter only.
 PASS_ROWS, PACKED_ROWS, WIDE_DECODERS = 8, 16, 4
 
@@ -53,12 +65,17 @@ STAGE_NONE_POLL_SECONDS = 5.0
 STAGE_STATES = ("none", "reading", "ready", "failed")
 # One stage reply (_stage). `tokens`: the disk state's length; `tag`: a read for a turn ahead took this turn's host
 # state (the engine's host_evict tag), 0 when none. An older engine sends neither reason nor tag.
-StageReply = namedtuple("StageReply", "state reason tokens tag", defaults=("-", 0, 0))
+# `best`: the length of the best disk state, also for a refused read; `wait`: what the read waits for (start plan B1a).
+# None from an older engine.
+StageReply = namedtuple("StageReply", "state reason tokens tag best wait", defaults=("-", 0, 0, None, None))
 # The engine's stage reasons are fixed words (engine/serve/batched_serve.h Stage); anything else is logged as "other".
 STAGE_REASON = re.compile(r"[a-z0-9_]{1,24}")
 # A stopping engine writes its states to disk for up to 75 s (engine/serve/batched_serve.h kStateFlushSeconds). The server
 # waits 85 s, then kills it: the whole stop fits in a systemd TimeoutStopSec=120 with a margin.
 STATE_FLUSH_SECONDS = 85
+# The idle ping (engine op "ping"): when the worker has no work and the engine sent nothing for this long, it asks. The
+# server sets a lower value from --watchdog-stall-seconds (a fifth of the stall time), so that a ping always fits it.
+PING_IDLE_SECONDS = 10.0
 
 
 @dataclass
@@ -85,6 +102,7 @@ class BatchedEngineBackend(EngineBackend):
     counts_stall = True
     bounds_think_cap = False  # the worker stops stepping a job at its think cap and keeps the slot for the continuation
     packed_rows = ""  # CRUCIBLE_PACKED_ROWS as the engine reads it; set in __init__
+    spec_span = PASS_ROWS  # the engine's verify span (CRUCIBLE_SPEC_SPAN); set in __init__
     prefill_interleave = 0
     encoder_slice_seconds = ENCODER_SLICE_SECONDS  # an average of the slice commands run; see encoder_rows
     interleave_min_rows = INTERLEAVE_MIN_ROWS
@@ -92,6 +110,7 @@ class BatchedEngineBackend(EngineBackend):
     state_disk = False  # the disk tier; set from the engine's ready event
     stage_job = False  # the engine takes a stage "job" tag (fix 2); set from the ready event
     stage_jobs = 0  # the last stage job tag (_job_tag)
+    ping_idle_seconds = PING_IDLE_SECONDS
     def __init__(self, executable, checkpoint, context=32768, *, streams=8, output_timeout=30, prefill=None,
                  conversation_cache_mib=0, short_streams=0, short_ctx=0, packed_op="verify_step",
                  session_replay=False, slot_resume=None, slot_checkpoints=None, prefill_interleave=0,
@@ -152,6 +171,8 @@ class BatchedEngineBackend(EngineBackend):
         self.requested_prefill = prefill
         self.streams = streams
         self.packed_rows = os.environ.get("CRUCIBLE_PACKED_ROWS", "")
+        # The engine gets CRUCIBLE_SPEC_SPAN (ENGINE_KEEP_SWITCHES), so its span sets the output room of a spec step.
+        self.spec_span = spec_span_rows(os.environ.get("CRUCIBLE_SPEC_SPAN", ""))
         self.output_timeout = output_timeout
         self.active = {}
         self.next_id = 1
@@ -228,9 +249,22 @@ class BatchedEngineBackend(EngineBackend):
         self.state_disk = bool(getattr(self, "requested_state_dir", None)) and ready.get("state_disk") is True
         if self.state_disk: self.flush_seconds = STATE_FLUSH_SECONDS
         self.stage_job = self.state_disk and ready.get("stage_job") is True
+        # An engine before the ping op does not name it, so it never gets the command (the pattern of stage_job).
+        self.ping_op = ready.get("ping") is True
+
+    def session_counts(self):
+        return len(self.active), self.streams
+
+    def _ping(self):
+        """The idle ping: no fields, no state change. The reply is one batch_end of op ping; anything else is fatal."""
+        self.process.stdin.write('{"op":"ping"}\n')
+        self.process.stdin.flush()
+        reply = self._next()
+        if not (isinstance(reply, dict) and reply.get("event") == "batch_end" and reply.get("op") == "ping"):
+            raise ProtocolError("The engine returned an unexpected ping reply.")
 
     def submit(self, ids, request, cache_prefix_tokens=0, shared_prefix_tokens=0, log_turn=True, image_offsets=(),
-               after=None, think_cap=None):
+               after=None, think_cap=None, client_request_id=None):
         if request.spec and request.max_tokens > 1:
             # G6a: solo speculative steps (greedy and sampled) with one fixed head.
             # Serial serve with the same policy and seed is the reference.
@@ -249,7 +283,7 @@ class BatchedEngineBackend(EngineBackend):
             if self.jobs.full() or len(ids) > self.pending_token_limit - self.pending_tokens:
                 raise ApiError("The batch request queue is full. Try again later.", status=503)
             job = super().submit(ids, request, cache_prefix_tokens, shared_prefix_tokens, log_turn, image_offsets, after,
-                                 think_cap)
+                                 think_cap, client_request_id)
             self.pending_tokens += len(ids)
             return job
 
@@ -274,9 +308,9 @@ class BatchedEngineBackend(EngineBackend):
         elif kind == "token":
             token = event.get("id")
             seen = tokens.setdefault(id, [])
-            # A speculative or verify step publishes up to eight tokens; nothing may follow a stop token.
+            # A speculative or verify step publishes up to SPEC_SPAN_MAX tokens; nothing may follow a stop token.
             if (op not in ("step", "prefill", "spec_step", "verify_step") or
-                    (seen and op not in ("spec_step", "verify_step")) or len(seen) >= 8 or
+                    (seen and op not in ("spec_step", "verify_step")) or len(seen) >= SPEC_SPAN_MAX or
                     type(token) is not int or not 0 <= token < self.model.vocab or
                     entry.count + len(seen) >= entry.job.payload["max_tokens"] or
                     (seen and seen[-1] in entry.job.payload["stop_ids"])):
@@ -559,22 +593,35 @@ class BatchedEngineBackend(EngineBackend):
         if (record is None or (record["state"] == "reading" and now - record["polled"] >= poll_seconds) or
                 (record["state"] == "ready" and now - record["polled"] >= STAGE_REFRESH_SECONDS) or
                 (record["state"] == "none" and now - record["polled"] >= none_poll)):
-            state, reason, tokens, tag = self._stage(job.payload, position, read, self._job_tag(job))
-            if record is None: record = self.staging[id(job)] = dict(state=state, since=now, polled=now)
+            reply = self._stage(job.payload, position, read, self._job_tag(job))
+            state, reason, tokens, tag = reply.state, reply.reason, reply.tokens, reply.tag
+            if reply.best is not None: job.turn["stage_best_tokens"] = reply.best
+            if reply.wait is not None: job.turn["stage_wait_cause"] = reply.wait
+            if record is None: record = self.staging[id(job)] = dict(state=state, since=now, polled=now, wait_from=now,
+                                                                    reason=reason, slot_from=None)
             else:
                 # The engine dropped the ready read and reads it again (a "reading" reply after "ready" or after a
                 # gap in the polls): a new wait.
                 if state == "reading" and (record["state"] == "ready" or
                                            now - record["polled"] >= STAGE_REFRESH_SECONDS):
-                    record["since"] = now
-                record.update(state=state, polled=now)
+                    record["since"] = record["wait_from"] = now
+                # the bound of the wait counts from the start of this read, not from the first "reading"
+                # reply (a turn that waits for a slot polls "reading"/"freeing" for minutes while the read has no
+                # room): a new reply reason is progress (writing, freeing, start), as is the first poll of a turn that
+                # holds a free slot. A turn with a free slot waits at most 2 * STAGE_WAIT_SECONDS.
+                if state != "reading" or record["state"] != "reading" or record["reason"] != reason:
+                    record["wait_from"] = now
+                record.update(state=state, polled=now, reason=reason)
             job.turn["state_disk"] = state
             job.turn["state_disk_wait_s"] = now - record["since"]
             job.turn["state_disk_reason"] = reason
             job.turn["state_disk_polls"] = job.turn.get("state_disk_polls", 0) + 1
             job.turn["state_disk_tokens"] = tokens
             if tag: job.turn["state_disk_tag"] = tag
-        return record["state"] != "reading" or now - record["since"] > STAGE_WAIT_SECONDS
+        if opening and record["slot_from"] is None and record["state"] == "reading":
+            record["slot_from"], record["wait_from"] = now, now
+        return record["state"] != "reading" or (now - record["wait_from"] > STAGE_WAIT_SECONDS or
+                                                (record["slot_from"] is not None and now - record["slot_from"] > 2 * STAGE_WAIT_SECONDS))
 
     def _job_tag(self, job):
         """Fix 2 (cause.md item 10): the turn's tag on the engine's stage and host_evict lines and on its turn line
@@ -613,7 +660,11 @@ class BatchedEngineBackend(EngineBackend):
             reason, tag = event.get("reason", "-"), event.get("tag", 0)
             if not (reason == "-" or isinstance(reason, str) and STAGE_REASON.fullmatch(reason)): reason = "other"
             if type(tag) is not int or tag < 0: raise ProtocolError("The engine returned an invalid stage event.")
-            staged = StageReply(event["state"], reason, event["tokens"], tag)
+            best, wait = event.get("best"), event.get("wait")
+            if best is not None and (type(best) is not int or best < 0):
+                raise ProtocolError("The engine returned an invalid stage event.")
+            staged = StageReply(event["state"], reason, event["tokens"], tag, best,
+                                wait if wait in metrics.STAGE_WAIT_CAUSES else None)
 
     def _open(self, job, slot_context):
         if self.next_id >= (1 << 64): raise ProtocolError("The request ID limit was reached. Restart the worker.")
@@ -631,6 +682,10 @@ class BatchedEngineBackend(EngineBackend):
         progress = False
         for request_id, entry in list(self.active.items()):
             if entry.job.cancelled.is_set():
+                # Start plan B1a: the prompt rows that this prefill computed and nobody uses (it had no first token).
+                if not entry.ready:
+                    entry.job.turn["cancel_prefill_tokens"] = max(
+                        0, entry.prefilled - entry.job.turn.get("opened_cached", 0))
                 self._command(dict(op="close", request_id=request_id))
                 follow = entry.job.successor
                 if follow is not None and not follow.cancelled.is_set() and not self._running(follow):
@@ -677,8 +732,8 @@ class BatchedEngineBackend(EngineBackend):
         now = time.monotonic()
         for id, entry in self.active.items():
             if entry.job.cancelled.is_set(): continue
-            # Room for one step's tokens plus done; a speculative step can publish eight.
-            if entry.job.events.qsize() <= entry.job.events.maxsize - (9 if self._speculative(entry) else 3):
+            # Room for one step's tokens plus done; a speculative step can publish the engine's span (8 by default).
+            if entry.job.events.qsize() <= entry.job.events.maxsize - (self.spec_span + 1 if self._speculative(entry) else 3):
                 entry.paused_since = None
                 if entry.ready: ready.append(id)
             elif entry.paused_since is None: entry.paused_since = now
@@ -812,7 +867,9 @@ class BatchedEngineBackend(EngineBackend):
                 progress = self._cancelled()
                 while self._admit(): progress = True
                 progress = self._schedule() or progress
-                if not progress: self.closed.wait(.005)
+                if not progress:
+                    if self.ping_op and time.monotonic() - self.last_event_at >= self.ping_idle_seconds: self._ping()
+                    else: self.closed.wait(.005)
         except Exception as error:
             if not self.closed.is_set():
                 metrics.emit(metrics.worker_error_line(error))
