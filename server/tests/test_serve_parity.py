@@ -133,6 +133,40 @@ def free_ports(count):
             item.close()
 
 
+def port_base(count, pick=None):
+    """A first port for --port-base: serve_parity uses this port and the count - 1 ports after it, so all must be free."""
+    pick = pick or (lambda: free_ports(1)[0])
+    for _ in range(200):
+        base = pick()
+        if base + count > 65536:
+            continue
+        sockets = [socket.socket() for _ in range(count)]
+        try:
+            for port, item in zip(range(base, base + count), sockets):
+                item.bind(("127.0.0.1", port))
+            return base
+        except OSError:
+            continue
+        finally:
+            for item in sockets:
+                item.close()
+    raise RuntimeError(f"no {count} free ports that follow each other")
+
+
+def test_port_base_gives_ports_that_follow_each_other_and_are_free():
+    # CPU workflow, Nov 12 (container run b3): the heads test took free_ports(2)[0] as the base, but the server of the
+    # second head binds base + 1, which nobody checked. Under pytest -n 8 another worker held it: "the server stopped".
+    with socket.socket() as held:
+        held.bind(("127.0.0.1", 0))
+        held.listen()
+        taken = held.getsockname()[1]
+        picks = iter([taken - 1])
+        base = port_base(2, pick=lambda: next(picks, None) or free_ports(1)[0])
+        for port in range(base, base + 2):
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", port))
+
+
 def serve_in_thread(batch):
     handler = type("H", (fake.Handler,), dict(batch=batch, vision=True, seen=set()))
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -172,7 +206,7 @@ def test_run_reports_a_difference(tmp_path, monkeypatch):
 
 
 def test_launch_starts_each_server_in_turn_and_stops_it(tmp_path):
-    first = free_ports(2)[0]
+    first = port_base(2)
     out = tmp_path / "launch" / "report.json"
     out.parent.mkdir()
     code = parity.main(["launch", "ENGINE", "CKPT", "--out", str(out), "--vision", "--port-base", str(first),
@@ -200,7 +234,7 @@ def test_serve_args_batch_adds_one_stream_only():
 def test_heads_runs_the_default_then_each_block_file(tmp_path):
     # serve --draft-blocks: one batch server per head, in turn; every head must give the IDs of the
     # built-in head.
-    first = free_ports(3)[0]
+    first = port_base(3)
     heads = []
     for name, text in (("full", ",".join(map(str, range(1940)))), ("one", "1937")):
         path = tmp_path / f"{name}.txt"
@@ -228,7 +262,7 @@ def test_heads_fails_when_a_head_changes_an_output(tmp_path, monkeypatch):
     path = tmp_path / "one.txt"
     path.write_text("1937\n")
     out = tmp_path / "heads.json"
-    code = parity.main(["heads", "ENGINE", "CKPT", "--out", str(out), "--port-base", str(free_ports(2)[0]),
+    code = parity.main(["heads", "ENGINE", "CKPT", "--out", str(out), "--port-base", str(port_base(2)),
                         "--server-command", f"{sys.executable} {FAKE}", "--blocks", f"one={path}"])
     report = json.loads(out.read_text())
     assert code == 1 and report["status"] == "FAIL" and report["runs"]["one"]["summary"]["FAIL"] > 0
@@ -266,7 +300,7 @@ def test_heads_with_a_baseline_engine_proves_the_default_path(tmp_path, monkeypa
     path.write_text("1937\n")
     out = tmp_path / "heads.json"
     argv = ["heads", "NEW", "CKPT", "--baseline-engine", "OLD", "--out", str(out), "--port-base",
-            str(free_ports(3)[0]), "--server-command", f"{sys.executable} {FAKE}", "--blocks", f"one={path}"]
+            str(port_base(3)), "--server-command", f"{sys.executable} {FAKE}", "--blocks", f"one={path}"]
     assert parity.main(argv) == 0
     report = json.loads(out.read_text())
     assert set(report["runs"]) == {"default", "one"} and report["status"] == "PASS"
