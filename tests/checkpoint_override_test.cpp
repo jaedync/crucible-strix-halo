@@ -110,7 +110,10 @@ int main() {
       ck.Override(bad, "mtp.");
     }, &err);
     // The message names the sidecar file once, not dir_ + "//" + its absolute path.
-    return code == 1 && err.find(reason) != std::string::npos && err.find("//") == std::string::npos;
+    // Leak guard (M5): the message names the file, never the folder (a sidecar may sit in a private folder).
+    return code == 1 && err.find(reason) != std::string::npos && err.find("//") == std::string::npos &&
+           err.find("checkpoint error: bad.safetensors, tensor ") != std::string::npos &&
+           err.find(root.string()) == std::string::npos && err.find(root.filename().string()) == std::string::npos;
   };
   const std::string shape = "override dtype or shape differs";
   assert(rejects({{"trunk.c", "F16", {4}, 9}}, "outside mtp."));
@@ -141,8 +144,20 @@ int main() {
       ck.Override(side, "mtp.");
       ck.Error("mtp.a", "geometry check");
     }, &err) == 1);
-    assert(err.find(side + ", tensor mtp.a: geometry check") != std::string::npos);
-    assert(err.find("//") == std::string::npos);
+    assert(err.find("side.safetensors, tensor mtp.a: geometry check") != std::string::npos);
+    assert(err.find(root.string()) == std::string::npos && err.find("//") == std::string::npos);
+  }
+  {
+    // Leak guard (M5): no message prints a directory, also when the index or a shard is missing.
+    std::string err;
+    assert(Child([&] { st::Checkpoint ck(root.string()); ck.Override((root / "none").string(), "mtp."); }, &err) == 1);
+    assert(err.find("none") != std::string::npos && err.find(root.string()) == std::string::npos);
+    assert(Child([&] { st::Checkpoint ck(root.string()); ck.Error("not.a.tensor", "reason"); }, &err) == 1);
+    assert(err.find("model.safetensors.index.json") != std::string::npos && err.find(root.string()) == std::string::npos);
+    const std::string empty_dir = (root / "private-run-dir").string();
+    fs::create_directory(empty_dir);
+    assert(Child([&] { st::Checkpoint ck(empty_dir); }, &err) == 1);
+    assert(err.find("private-run-dir") == std::string::npos && err.find(root.string()) == std::string::npos);
   }
   assert(Child([&] { st::Checkpoint ck(root.string()); ck.Override((root / "none").string(), "mtp."); }) == 1);
   fs::remove_all(root);

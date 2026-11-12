@@ -148,6 +148,46 @@ def active(host, unit=UNIT):
     return _ctl(host, "is-active", unit).rc == 0
 
 
+def state(host, unit=UNIT):
+    """(ActiveState, SubState) of the unit. The sub state is asked only for "activating". ("", "") when it is not installed."""
+    if not installed(host, unit) or host.runner is None:
+        return "", ""
+    lines = _ctl(host, "is-active", unit).out.strip().splitlines()
+    active_state = lines[-1].strip() if lines else ""
+    if active_state != "activating":
+        return active_state, ""
+    return active_state, _show(host, unit)[1].get("SubState", "")
+
+
+def up(host, unit=UNIT):
+    """True when the unit runs or loads the model: a restart is needed to change its settings."""
+    return state(host, unit)[0] in ("active", "activating", "reloading")
+
+
+def serving(host, unit=UNIT):
+    """True when the server process of the unit exists: "active", or "activating" while the model loads (ExecStart runs).
+    Not while ExecStartPre runs (that is the start check itself) and not while systemd waits to restart."""
+    active_state, sub = state(host, unit)
+    if active_state == "active":
+        return True
+    return active_state == "activating" and sub not in ("start-pre", "condition") and not sub.startswith("auto-restart")
+
+
+# A setup run that writes new settings sets this flag first and clears it only after the server was restarted with them.
+PENDING_KEY = "restart_pending"
+
+
+def clear_restart_pending(host, s):
+    """Remove the flag from setup-state.json (the file stays when it holds other data)."""
+    path = s.work / "setup-state.json"
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return
+    if isinstance(data, dict) and data.pop(PENDING_KEY, None) is not None:
+        Sandbox([s.work]).write_json(path, data)
+
+
 def manager_ok(host):
     """True when a systemd user manager answers (its state is running, degraded or still starting)."""
     res = _ctl(host, "is-system-running")
@@ -290,6 +330,8 @@ def start(host, s, restart=False):
         host.out(f"The service started, but {s.base_url}/health does not answer 200.")
         _failure_report(host, UNIT)
         return 1
+    if restart:
+        clear_restart_pending(host, s)  # the server runs with the files on the disk now
     return 0
 
 

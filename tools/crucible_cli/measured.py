@@ -27,3 +27,14 @@ SERVER_FLAGS = {
 
 STREAMS = int(SERVER_FLAGS["--streams"])
 CTX = int(SERVER_FLAGS["--ctx"])
+
+# The named session layouts of ./crucible setup --layout: (streams, ctx, short streams, short ctx). The default is the measured
+# one above. A ctx above 262,144 starts the engine with YaRN (factor 2, up to 524,288 positions); each layout needs about
+# the same GPU memory for the session state as the default (about 28 GB).
+LAYOUTS = {
+    "default": (STREAMS, CTX, 0, 0),
+    "long": (3, 524288, 2, 262144),     # 1 session of 524,288 tokens and 2 of 262,144
+    "two-long": (2, 524288, 0, 0),      # 2 sessions of 524,288 tokens
+}
+# Above this context the server runs YaRN and refuses --state-dir (first version): the conversation cache stays in memory.
+PLAIN_CTX = 262144

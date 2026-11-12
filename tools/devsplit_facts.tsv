@@ -4,7 +4,9 @@ _Z10__shfl_xorfii	2	32:32:65
 _Z10__shfl_xoriii	1	any
 _Z10__shfl_xoriii	2	32:32:65
 _Z16__ushort_as_halft	0	any
-_Z6__shfliii	1	32:0:25
+_Z6__shflfii	1	32:-1073741824:32
+_Z6__shflfii	2	32:32:65
+_Z6__shfliii	1	32:-1073741824:32
 _Z6__shfliii	2	32:32:65
 _Z9__shfl_upiji	1	32:-2147483648:32
 _Z9__shfl_upiji	2	32:16:65
@@ -307,6 +309,7 @@ _ZN8crucible7prefill7GdnBaseENS0_10GdnPrefillEii	2	any
 _ZN8crucible8CNormLdsEPfiPKfS0_	1	32:128:257
 _ZN8crucible8MoeSgMidEPKNS_6LinJobERS1_iii	2	any
 _ZN8crucible8MoeSgMidEPKNS_6LinJobERS1_iii	3	32:-134217728:134217728
+_ZN8crucible8TileStepILi0EEEii	0	32:-2147483646:-2147483648
 _ZN8crucible9FrontTileEiiiii	2	any
 _ZN8crucible9FrontTileEiiiii	3	any
 _ZN8crucible9FrontTileEiiiii	4	any

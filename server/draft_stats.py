@@ -78,6 +78,8 @@ def read_doc(text, day):
         doc = json.loads(text)
     except ValueError:
         return None
+    if isinstance(doc, dict):
+        doc.pop("canary", None)      # the writer adds it again at every flush (server/leak_canary.py)
     if not (isinstance(doc, dict) and set(doc) == {"version", "day", "vocab", "block", "k", "classes"} and
             (doc["version"], doc["day"], doc["vocab"], doc["block"], doc["k"]) == (VERSION, day, VOCAB, BLOCK, K) and
             isinstance(doc["classes"], dict) and all(n in CLASSES and _valid_class(e) for n, e in doc["classes"].items())):

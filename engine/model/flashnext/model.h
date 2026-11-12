@@ -219,6 +219,8 @@ class Loader {
     // Fixed-size kernels cannot safely consume arbitrary checkpoint geometry.
     // Validate every source before the first allocation or conversion task.
     ValidateCheckpoint(ck_);
+    // Validation has read every shard header, so the count is complete; a run log shows that a mix loaded.
+    if (ck_.mixed()) std::fprintf(stderr, "mixed pack: the index picks each tensor; %zu copies in other shards skipped\n", ck_.shadowed());
   }
 
   // Dense attention and head tiles load in front order (exact, no extra

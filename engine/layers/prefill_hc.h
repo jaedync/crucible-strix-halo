@@ -428,21 +428,53 @@ __global__ void __launch_bounds__(256) PrefillHcMixWideKernel(const __half* up,c
   float w[4];
 #pragma unroll
   for (int s=0;s<4;++s) w[s]=w1[s*kHidden+d];
+  // The H values of all 8 rows load before the first use. With the row test around each row's loads, every
+  // row waited for its own DRAM round trip (8 in a row per wave). Rows past R load row R-1 and are never
+  // stored. g first, so the two accumulator sets are dead while the loads are in flight. The 64 inv values of
+  // the wave's 16 rows live 2 per lane (value e = 4 row + stream in lane e / 2) and reach their outputs by
+  // ds_bpermute: 32 fewer VGPRs than a copy per output, so the kernel keeps 10 waves per SIMD. Each output gets
+  // the same g, H, inv and w values and the same arithmetic as before.
+  float g[8][4],hv[8][4],il[2];
+#pragma unroll
+  for (int z=0;z<8;++z)
+#pragma unroll
+    for (int s=0;s<4;++s) g[z][s]=hi[s][z]+lo[s][z]*(1.f/prefill::kResidualScale);
+  __builtin_amdgcn_sched_barrier(0);
+  // The wave's own rows (at most 16 from r0, wave-uniform): small offsets, and every load is inside the range.
+  const int rw=__builtin_amdgcn_readfirstlane(r0),live=min(16,R-rw);
+  const auto hrs=StreamRsrc(reinterpret_cast<const uint32_t*>(H+(size_t)rw*ldh),(uint32_t)(live*ldh*sizeof(float)));
+#pragma unroll
+  for (int z=0;z<8;++z) {
+    const uint32_t ho=(uint32_t)((min(prefill::FragmentRow(z),live-1)*ldh+d)*sizeof(float));
+#pragma unroll
+    for (int s=0;s<4;++s)
+      hv[z][s]=__uint_as_float(__builtin_amdgcn_raw_buffer_load_b32(hrs,ho,s*kHidden*(int)sizeof(float),0));
+  }
+#pragma unroll
+  for (int j=0;j<2;++j) {
+    const int e=2*lane+j;
+    il[j]=rsqrtf(ss[min(r0+(e>>2),R-1)*4+(e&3)]/kHidden+kEps);
+  }
 #pragma unroll
   for (int z=0;z<8;++z) {
     const int r=r0+prefill::FragmentRow(z);
-    if (r>=R) continue;
     float v[4];
 #pragma unroll
     for (int s=0;s<4;++s) {
-      const float g=hi[s][z]+lo[s][z]*(1.f/prefill::kResidualScale);
-      const float inv=rsqrtf(ss[r*4+s]/kHidden+kEps);
-      v[s]=Sigmoid(g)*H[(size_t)r*ldh+s*kHidden+d]*inv*w[s];
+      const float inv=__shfl(il[s&1],(prefill::FragmentRow(z)*4+s)>>1);
+      v[s]=Sigmoid(g[z][s])*hv[z][s]*inv*w[s];
     }
     const float x=RoundH(((v[0]+v[1])+(v[2]+v[3]))*.25f);
+    if (r>=R) continue;
     if (mixed) mixed[(size_t)r*kHidden+d]=x;
     if (xh) xh[(size_t)r*kHidden+d]=__float2half(x);
   }
+  // Uses past the row tests, so the compiler keeps every H load ahead of the first row (it sinks a load whose
+  // only use is inside a row test into that test).
+#pragma unroll
+  for (int z=0;z<8;++z)
+#pragma unroll
+    for (int s=0;s<4;++s) asm volatile("" :: "v"(hv[z][s]));
 }
 // Register-blocked fp16 GEMM y[R][O] = x[R][2560] W[O][2560]^T for the
 // router, PLE and GDN a/b weights. A wave owns 32 rows by 32 columns, so each

@@ -15,6 +15,7 @@ import json
 import numpy as np
 import torch
 
+from . import taint
 from .data import Seqs
 from .mtp_model import Ckpt, Mtp, load_blocks
 
@@ -98,15 +99,18 @@ def main():
     ap.add_argument("--asst", action="store_true", help="only chain starts whose first target is assistant text")
     a = ap.parse_args()
     m = Mtp(Ckpt(a.ckpt, a.sidecar), load_blocks(a.blocks).cuda())
+    state = torch.load(a.state, weights_only=False) if a.state else None
+    # Leak guard: the result file is tainted when the held-out folders, the state or the sidecar are (taint.py).
+    tainted = taint.run_tainted(a.heldout, states=[state], sidecar=a.sidecar)
     if a.state:
-        s = torch.load(a.state, weights_only=False)
+        s = state
         named = dict(m.trainable(s["scope"]))
         for n, v in s["params"].items():
             named[n].data.copy_(v.cuda())
     ch = chains(m, Seqs(a.heldout), a.depth, a.len)
     if a.asst:
         ch = {k: v[ch["asst"]] for k, v in ch.items()}
-    res = {"source": a.sidecar or a.state or "stock", "starts": int(len(ch["ok"])),
+    res = {"source": taint.redact(a.sidecar or a.state or "stock"), "starts": int(len(ch["ok"])),
            "cond": [], "grid": {}, "kinds": {}}
     reach = np.ones(len(ch["ok"]), bool)
     for k in range(a.depth):
@@ -124,7 +128,8 @@ def main():
         res["kinds"][kind] = {"c1": round(r1[0] / r1[1] * 1000, 2), "best": round(rb[0] / rb[1] * 1000, 2)}
     print(json.dumps(res))
     if a.out:
-        json.dump(res, open(a.out, "w"), indent=1)
+        taint.guard_output(a.out, tainted, is_dir=False)    # H13: no tainted result inside a git work tree
+        json.dump(taint.tag_doc(res, tainted), open(a.out, "w"), indent=1)
 
 
 if __name__ == "__main__":

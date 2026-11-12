@@ -370,11 +370,14 @@ def test_a_request_above_the_engine_line_limit_fails_alone(start_backend, batch)
 
 def test_the_engine_line_limit_matches_the_engine_source():
     # One limit for text and image lines: image pixels go in private files, not in the line.
+    # the limit follows the context (serve_line.h ServeLineBytes) and the engine reports it; an engine that
+    # does not report it has the 2 MiB floor, which is ENGINE_LINE_BYTES.
     from pathlib import Path
     from server.backend import ENGINE_LINE_BYTES
-    source = (Path(__file__).parents[2] / "engine/serve/serve.h").read_text()
-    assert "constexpr size_t kMaxLine = 2 * 1024 * 1024;" in source and ENGINE_LINE_BYTES == 2 * 1024 * 1024
-    assert "kServeVisionLine" not in source
+    root = Path(__file__).parents[2] / "engine/serve"
+    source = (root / "serve_line.h").read_text()
+    assert "inline constexpr size_t kServeLineFloorBytes = size_t(2) << 20;" in source and ENGINE_LINE_BYTES == 2 * 1024 * 1024
+    assert "kServeVisionLine" not in source + (root / "serve.h").read_text()
 
 
 @pytest.mark.parametrize("batch", [False, True])

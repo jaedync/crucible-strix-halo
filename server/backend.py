@@ -7,7 +7,7 @@ import subprocess
 import sys
 import threading
 import time
-from . import metrics
+from . import ablation, metrics, rope
 from .engine_messages import ENGINE_REJECTED, ProtocolError
 from .api import LEGACY_MODEL, ApiError, ModelInfo, STOP_IDS
 from .hosts import ALLOWED_HOSTS_ENV
@@ -35,14 +35,19 @@ class Job:
 QUEUED_SECONDS = 0.01
 # The host's memory (the test machine: 128 GiB). The engine's startup admission checks the real fit against free memory.
 MAX_CONVERSATION_CACHE_MIB = 131072
-# engine/serve/serve.h kMaxLine. A longer command line is an error before the engine knows its op, so the batch engine
-# cannot recover it (RA-2): the server refuses such a request before it reaches the engine.
+# The line limit of an engine that does not report one (an older engine). A longer command line is an error
+# before the engine knows its op, so the batch engine cannot recover it (RA-2): the server refuses such a request before
+# it reaches the engine. A newer engine reports its limit in the ready event ("line_bytes": engine/serve/serve_line.h
+# ServeLineBytes, which follows the context), and the server uses that value: the engine is the one source.
 ENGINE_LINE_BYTES = 2 * 1024 * 1024
+# The range that the server accepts for a reported limit (a 1 GiB line is far above any context).
+ENGINE_LINE_BYTES_RANGE = (1024, 1 << 30)
 # RA-6: the serial worker waits this long for a full client queue to drain, then stops that client's output, so a
 # client that stops reading cannot hold the engine for the others (the batch backend has output_timeout).
 OUTPUT_TIMEOUT_SECONDS = 30
-# Room for the batch wrapper {"op":"open","request_id":<20 digits>,"request":...} and the newline.
-LINE_WRAPPER_BYTES = 64
+# Room for the batch wrapper {"op":"open","request_id":<20 digits>,"request":...} and the newline, and for the stage
+# wrapper {"op":"stage","request":...,"position":4096,"read":0,"job":<20 digits>} (about 80 bytes).
+LINE_WRAPPER_BYTES = 128
 # Prompt lookup (engine draft_policy.h): copy up to LOOKUP_DEPTH history tokens after a suffix match of at least
 # LOOKUP_MIN tokens. The serve default since train 16: +90% decode on verbatim copy, about 1% elsewhere
 # Verification commits only target tokens, so outputs do not change.
@@ -53,7 +58,7 @@ LOOKUP_DEPTH, LOOKUP_MIN = 7, 8
 # counts). An allow-list fails closed: a capture, dump, analysis or file switch, and any switch added later, stays off under serve until someone classifies it
 # (tests/test_switch_lists.py checks this set).
 ENGINE_KEEP_SWITCHES = frozenset({
-    "CRUCIBLE_ABLATE", "CRUCIBLE_COMPACT_STATE",
+    "CRUCIBLE_ABLATE", "CRUCIBLE_ABLATE_MODE", "CRUCIBLE_COMPACT_STATE",
     "CRUCIBLE_DECODE_RING", "CRUCIBLE_DRAFT_CHAIN", "CRUCIBLE_DRAFT_HEAD", "CRUCIBLE_EXACT", "CRUCIBLE_EXACT_RESUME",
     "CRUCIBLE_FUSE", "CRUCIBLE_GDN_VERIFY", "CRUCIBLE_HC_WMMA",
     "CRUCIBLE_LAZY_SHADOW", "CRUCIBLE_LOOKAHEAD", "CRUCIBLE_LOOKAHEAD_MIB",
@@ -64,8 +69,8 @@ ENGINE_KEEP_SWITCHES = frozenset({
     "CRUCIBLE_PF_MOE_RM",
     "CRUCIBLE_PF_PAD_H", "CRUCIBLE_PF_PRUNE", "CRUCIBLE_PF_QSA_ROWS",
     "CRUCIBLE_PF_STAGE_SHARE", "CRUCIBLE_PF_TILES",
-    "CRUCIBLE_PLE_BF16", "CRUCIBLE_PLE_FETCH", "CRUCIBLE_PLE_HOST", "CRUCIBLE_PLE_TRACE", "CRUCIBLE_PROFILE",
-    "CRUCIBLE_SERVE_PROFILE", "CRUCIBLE_SPEC_STATS", "CRUCIBLE_STATE_CACHE",
+    "CRUCIBLE_PLE_BF16", "CRUCIBLE_PLE_FETCH", "CRUCIBLE_PLE_HOST", "CRUCIBLE_PLE_TRACE", "CRUCIBLE_PROFILE", "CRUCIBLE_ROPE_MODE",
+    "CRUCIBLE_SERVE_PROFILE", "CRUCIBLE_SPEC_SPAN", "CRUCIBLE_SPEC_STATS", "CRUCIBLE_STATE_CACHE",
     "CRUCIBLE_STATIC_CACHE", "CRUCIBLE_TUNE_ROWS",
     "CRUCIBLE_VERIFY_QSA_CHECK", "CRUCIBLE_WARMUP",
 })
@@ -102,10 +107,12 @@ class EngineBackend:
     # Prompt lookup depth for speculative requests; __init__ sets it (the server's --lookup). The library default
     # equals the serve default, so bench, soak and gate tools that build a backend measure what production runs.
     lookup = LOOKUP_DEPTH
-    # The longest engine command line; None reads ENGINE_LINE_BYTES at each submit. Image pixels go in private files
-    # so one limit serves every engine.
+    # The longest engine command line: the ready event's "line_bytes", or None (an older engine), which reads
+    # ENGINE_LINE_BYTES at each submit. Image pixels go in private files, so one limit serves every engine.
     engine_line_bytes = None
     engine_id = None  # set in __init__; None in tests that build the worker without it
+    # True: the engine was started in request mode and serves both modes in one process (ablation.READY_FIELD).
+    ablate_request = False
     # The batch worker times the prefill chunks that hold a decoder back (crucible_turn stall_s); the serial worker does not.
     counts_stall = False
     # The serial protocol has no cancel: a first job that ran past the think cap decoded up to max_tokens for nothing
@@ -187,6 +194,16 @@ class EngineBackend:
             raise ProtocolError("The engine did not return a valid ready event.")
         # Engines before the replay-tail guard reject the field, so it is sent only when the engine names it.
         self.cache_tail = ready.get("cache_tail") is True
+        # the engine's line limit follows its context; an engine without the field keeps ENGINE_LINE_BYTES.
+        if "line_bytes" in ready:
+            low, high = ENGINE_LINE_BYTES_RANGE
+            value = ready["line_bytes"]
+            if type(value) is not int or not low <= value <= high:
+                raise ProtocolError("The engine did not return a valid line limit.")
+            self.engine_line_bytes = value
+        # Per-request ablation: an engine without the request mode refuses "ablate", so the server never sends it there
+        # (validate_request refuses an ablated request first).
+        self.ablate_request = ready.get(ablation.READY_FIELD) == 1
         if "model" in ready:
             self.model = self._ready_model(ready["model"])
 
@@ -269,6 +286,13 @@ class EngineBackend:
             policy = policy | dict(shared_prefix_tokens=shared_prefix_tokens)
         if self.draft_detail and request.spec and request.max_tokens > 1:
             policy = policy | dict(draft_detail=1)  # sent only with the flag, so the default payload stays as before
+        if getattr(request, "rope_mode", None):
+            # Y2: the server's mode of the request, the same for each of its jobs (a server with no auto word sends none).
+            policy = policy | dict(rope=request.rope_mode)
+        if getattr(request, "ablate", False):
+            # The ablated mode is a key of its own: open, stage and the serial line all carry this payload, so the
+            # engine's slot, checkpoint, frontier and disk matches never cross modes. A stock request sends nothing.
+            policy = policy | ablation.engine_fields()
         if getattr(request, "enable_thinking", False) and getattr(self, "cache_tail", False):
             # Clients often send back the answer without the reasoning, and a closed think block continues on a
             # second job. The tail of such a turn must not replace the session's resume point
@@ -295,15 +319,27 @@ class EngineBackend:
             job.turn["enabled"] = request.crucible_metrics
             job.turn["log"] = log_turn
             job.turn["engine_id"] = self.engine_id
+            # crucible_turn numbers (metrics.load_fields): the asked max_tokens and whether the request samples.
+            if type(request.max_tokens) is int: job.turn["max_tokens"] = request.max_tokens
+            job.turn["sampled"] = int(bool(request.temperature) and request.temperature > 0)
             if metrics.client_request_id(client_request_id): job.turn["client_request_id"] = client_request_id
             # crucible_decode lines: only a request that speculates writes them (metrics.decode_line).
             job.turn["speculative"] = bool(request.spec) and request.max_tokens > 1
             if self.counts_stall: job.turn["stall_s"] = 0.0
+            # Start plan B1a: the block length that the server gave (the turn line's shared_prefix_tokens).
+            job.turn["shared_prefix_tokens"] = int(shared_prefix_tokens or 0)
             # Token classes (crucible_turn): a continuation resumes after the closed think block.
             job.turn["think_open"] = after is None and getattr(request, "kind", None) == "chat" and \
                 getattr(request, "enable_thinking", False) is True
             job.think_cap = think_cap
             job.bounded_at = think_cap if bounded else None
+            if getattr(request, "rope_mode", None):  # the plain_reply counter of a long profile (rope.RopeCounters)
+                job.turn["rope_mode"] = request.rope_mode
+            clamped_from = getattr(request, "rope_clamped_from", 0)
+            if clamped_from and after is None:  # one clamp line for each request (not for its continuation), at done
+                job.turn["rope_clamp"] = [len(ids), clamped_from, request.max_tokens]
+            if clamped_from and not bounded:
+                job.turn["rope_cap"] = request.max_tokens  # the plain limit: a reply that reaches it is a cut
             if after is not None:
                 job.after, after.successor = after, job
             with self.ownership_lock:
@@ -410,6 +446,8 @@ class EngineBackend:
             if job.turn.get("log", True):
                 metrics.emit_turn(metrics.turn_line(summary, event, metrics.draft_fields((job.turn, event)),
                                                     metrics.load_fields((job.turn,))), job.turn)
+            for line in rope.COUNTERS.done_lines(job.turn, event) or ():  # Y2 counters; none in a plain process
+                metrics.emit(line)
             return dict(event, crucible_metrics=summary) if enabled else event
         return event
 

@@ -6,6 +6,8 @@
 #include "../runtime/decode_policy.h"
 #include "../runtime/sampling.h"
 #include "../runtime/tenant.h"
+#include "../runtime/ablate_request.h"
+#include "../runtime/rope_policy.h"
 #include "logprobs.h"
 #include "../model/flashnext/multimodal.h"
 #include <set>
@@ -39,6 +41,13 @@ struct ServeRequest : DecodePolicy {
   // W1: the request's tenant key, 64 hex characters on the line; no field is the local tenant. Every cache,
   // slot and disk match stays inside it. Never logged.
   StateTenant tenant = kLocalTenant;
+  // 1: an ablated request (CRUCIBLE_ABLATE_MODE=request only). Its tenant is then
+  // AblatedTenant of the named one, so no state crosses the modes.
+  int ablate = 0;
+  // Y2: the RoPE mode that the length gate picked (RopeModeFor). A YaRN request's tenant
+  // is then RopeTenant of `plain_tenant`, so no state crosses the modes; a plain request keeps its tenant.
+  RopeMode rope = RopeMode::Plain;
+  StateTenant plain_tenant = kLocalTenant;  // the tenant before the mode (Way A crossing count only)
 };
 // A tenant field that is not 64 hex characters. Only that request is refused (the batch line: a recoverable open
 // error); its message is fixed and holds no part of the value.
@@ -72,6 +81,7 @@ inline ServeRequest ParseServeRequest(const std::string& line, int ctx, const De
   static_cast<DecodePolicy&>(request) = defaults;
   std::set<std::string> fields;
   std::optional<std::string> tenant;
+  std::optional<std::string> rope_word;  // Y2: the server's mode of the request (a YaRN server only)
   scanner.Expect('{');
   while (!scanner.Peek('}')) {
     const std::string key = scanner.Str();
@@ -106,8 +116,15 @@ inline ServeRequest ParseServeRequest(const std::string& line, int ctx, const De
     else if (key == "seed") request.sampling.seed = scanner.Uint();
     else if (key == "top_logprobs") request.top_logprobs = RequestInt(scanner);
     else if (key == "images") request.images = ParseImages(scanner);
+    else if (key == "ablate") {
+      request.ablate = RequestInt(scanner);
+      if (request.ablate < 0 || request.ablate > 1) throw std::runtime_error("ablate must be 0 or 1");
+      if (request.ablate && !AblateRequestMode())
+        throw std::runtime_error("ablate needs an engine started with CRUCIBLE_ABLATE_MODE=request");
+    }
     // A tenant that is not one JSON string (another type, or a second tenant field) is a bad tenant: the empty value
     // fails ParseTenantHex below, so only this request is refused, with the fixed message.
+    else if (key == "rope") rope_word = scanner.Str();
     else if (key == "tenant") tenant = !tenant && scanner.Peek('"') ? scanner.Str() : (scanner.Skip(), std::string());
     else throw std::runtime_error("unknown request field; check the serve protocol documentation");
     scanner.Separator('}');
@@ -138,6 +155,21 @@ inline ServeRequest ParseServeRequest(const std::string& line, int ctx, const De
     if (!parsed) throw ServeTenantError("tenant must be 64 hex characters");
     request.tenant = *parsed;
   }
+  if (request.ablate) request.tenant = AblatedTenant(request.tenant);
+  // Y2: the mode is fixed here, at the open, by the request's own length. A process without a YaRN word has only
+  // plain requests, so this leaves every field of today's request unchanged.
+  const RopeSetting rope = RopeSettingFromEnv();
+  // A job with the server's word keeps the mode of its request (review M1, M2); without it, the length gate.
+  const auto mode = rope_word ? RopeModeForWord(*rope_word, request.ids.size(), request.max_tokens, rope)
+                              : RopeModeFor(request.ids.size(), request.max_tokens, rope);
+  if (!mode && rope_word)
+    throw std::runtime_error("rope must be plain, yarn2 or yarn4 and hold the request in a mode of this engine");
+  if (!mode)
+    throw std::runtime_error("prompt and max_tokens exceed the RoPE mode limit of this engine");
+  request.rope = *mode;
+  request.plain_tenant = request.tenant;
+  // A forced process holds one mode only, so its tenants stay (as the process-wide ablation).
+  if (!rope.Forced()) request.tenant = RopeTenant(request.tenant, request.rope);
   return request;
 }
 inline std::string JsonQuote(const std::string& value) {

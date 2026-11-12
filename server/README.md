@@ -45,6 +45,10 @@ curl -sS -N http://127.0.0.1:8790/v1/chat/completions \
 
 Set `stream` to `false` for one JSON response.
 Use `GET /v1/models` to get the loaded model ID.
+An engine started in request mode (`CRUCIBLE_ABLATE=<file> CRUCIBLE_ABLATE_MODE=request`) serves the stock and
+the ablated model in one process. Select the ablated mode with the model name `<served id>-abliterated` (or the
+same form of `--model-name`) or with the body field `"crucible_ablate": true`. `/v1/models` lists the ablated
+names only then. On a stock engine both forms get HTTP 400, never a stock answer.
 Use `GET /v1/crucible/version` to get the Crucible version and the git commit. `GET /v1/models` also has
 `crucible_version`.
 The server tells you at start when a newer release exists (one request a day to GitHub). Turn it off with
@@ -186,7 +190,8 @@ The server protects itself against a bad client:
 
 - It accepts at most 256 connections at one time. Above that, a new connection gets HTTP 503.
 - A client must send the request head and body in 60 s. Then the server closes the connection.
-- A request that does not fit the engine line limit (2 MiB) gets HTTP 413.
+- A request that does not fit the engine line limit gets HTTP 413. The engine reports the limit in its `ready` event
+  (`line_bytes`: 8 bytes for each context token + 1 MiB, at least 2 MiB). An engine without the field has 2 MiB.
 - With `--serial`, a stream that does not read its output for 30 s stops with an error.
 - `--max-requests-per-client N` limits the open requests of one client address (HTTP 429). It is off by default,
   because all clients on the loopback address share one address.
@@ -373,8 +378,16 @@ Usage counts include the generated stop token.
 The prompt and requested output must fit the configured context.
 Otherwise the server returns HTTP 400 with a message that contains "exceeds the context window".
 Start the server with `--clamp-max-tokens` to lower `max_tokens` to the remaining context instead.
-Request bodies are limited to 1 MiB (HTTP 413). `--max-body-mib N` raises the limit to N MiB (at most 64, or 1024 with `--vision`).
-A 256K-token conversation of code can need more than 1 MiB.
+
+A YaRN server (`--ctx` above 262144, or `CRUCIBLE_ROPE_MODE=auto:2|auto:4`) has a reply reserve R
+(`--yarn-reply-reserve N`, default 32768):
+
+- A request is plain when its prompt plus `min(max_tokens, R) - 1` is 262144 tokens or fewer. Else it runs YaRN.
+- The server lowers the `max_tokens` of a plain request to the plain limit (prompt + `max_tokens` - 1 = 262144).
+- A reply that reaches that limit ends with `finish_reason` `length`. The next request of the conversation runs YaRN.
+- A `crucible_rope` stderr line counts each clamp, each cut (a clamped reply that reached its limit) and each crossing.
+The default body limit holds 16 bytes for each `--ctx` token, at least 1 MiB (HTTP 413 above it): 1 MiB at 32768,
+4 MiB at 262144 and 8 MiB at 524288. `--max-body-mib N` sets N MiB (at most 64, or 1024 with `--vision`).
 
 Without `--streams`, the server uses the batch worker with one stream (`--streams 1`).
 It processes one request at a time. The remaining requests wait in a queue.
@@ -450,7 +463,7 @@ A request that sends a `seed` still gives the same tokens each time.
 
 Start the server with `--vision` to load the vision tower (about 0.3 GB).
 Without `--vision`, a request with an image part gets HTTP 400 with a message that names the flag.
-`--vision` also raises the default body limit to 256 MiB (`--max-body-mib` allows up to 1024 with `--vision`).
+`--vision` also raises the default body limit to at least 256 MiB (`--max-body-mib` allows up to 1024 with `--vision`).
 
 Send each image as an OpenAI `image_url` part with a base64 `data:` URL:
 
@@ -566,7 +579,8 @@ The engine writes accepted token IDs immediately:
 
 A `done` event gives prompt usage, completion usage, timing, and the finish reason.
 A malformed request produces an `error` event without stopping the resident engine.
-The input limit is 2 MiB per line.
+The input limit per line follows the context: 8 bytes for each context token + 1 MiB, at least 2 MiB
+(`engine/serve/serve_line.h`). The `ready` event reports it as `line_bytes`. A longer line gets an `error` event.
 With `--vision 1`, a request can add `"images"` (at most 256): a list of objects with `offset` (first image token),
 `height`, `width`, `digest` (64 hex characters), and `path` (an absolute path to a regular file of
 height x width x 3 RGB bytes, not a symbolic link). The digest is the SHA-256 of the little-endian `uint32` pair

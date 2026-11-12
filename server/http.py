@@ -13,10 +13,12 @@ from http.server import BaseHTTPRequestHandler
 from os.path import basename
 from traceback import extract_tb
 from . import anthropic, metrics
+from . import ablation
 from .api import DEFAULTS, LEGACY_MODEL, MTP_WINDOW, STOP_IDS, ApiError, validate_request
 from .hosts import REFUSED, host_allowed
 from .request_id import DEFAULT_CLIENT_REQUEST_ID_HEADER
 from .response import CompletionResponse
+from .rope import max_room, plain_max_tokens, request_mode
 from .think_budget import SKIPPED_BY, skips_thinking, think_cap
 from .version import server_commit, server_version
 
@@ -159,15 +161,28 @@ def close_connection(connection):
         pass
 
 
+
+# the default request body for a context. A prompt that fills the context must reach the tokenizer: 16 bytes
+# a token holds English text (about 4), code, and \u-escaped CJK text (about 8), with room for the chat JSON.
+BODY_BYTES_PER_TOKEN = 16
+
+
+def context_body_mib(context):
+    """The smallest whole MiB that holds BODY_BYTES_PER_TOKEN bytes for each context token (at least 1)."""
+    return max(1, -(-context * BODY_BYTES_PER_TOKEN // (1 << 20)))
+
+
 class Service:
     def __init__(self, backend, tokenizer, model="crucible", clamp_max_tokens=False, default_thinking=False,
                  max_body_mib=1, thinking_answer_room=None, max_thinking_tokens=None, stream_tool_calls=True,
                  max_requests_per_client=0, vision=None, default_mtp_prefix=MTP_WINDOW, capture=None, allowed_hosts=None,
                  defaults=DEFAULTS, min_thinking_tokens=0, client_request_id_header=DEFAULT_CLIENT_REQUEST_ID_HEADER,
-                 end_of_turn_guard=True, api_key=None):
+                 end_of_turn_guard=True, model_name="", rope_reserve=None, rope_word=None, api_key=None):
         self.backend, self.tokenizer, self.model = backend, tokenizer, model
         self.api_key = api_key  # api_key.KeyGate or None: every route but /health needs the key when it is set
         self.end_of_turn_guard = end_of_turn_guard  # serve --end-of-turn-guard (see Handler.keep_end_of_turn)
+        # serve --model-name: a second public model name, whose -abliterated form also selects the ablated mode.
+        self.ablated_names = ablation.ablated_names(model, model_name)
         self.client_request_id_header = client_request_id_header  # request_id.resolve_client_request_id_header()
         self.allowed_hosts = allowed_hosts  # hosts.parse_allowed_hosts(): None accepts any Host header
         self.capture = capture  # serve --draft-capture: None unless the operator turns it on
@@ -181,8 +196,19 @@ class Service:
         self.vision = vision
         self.max_body_mib = max_body_mib
         self.clamp_max_tokens = clamp_max_tokens
+        self.rope_reserve = rope_reserve  # serve --yarn-reply-reserve with an auto word (server/rope.py); None: off
+        self.rope_word = rope_word  # the auto word (auto:2, auto:4) that goes with the reserve
         self.default_thinking = default_thinking
         self.defaults = defaults  # serve sampling flags and --default-max-tokens (api.ServerDefaults)
+
+    @property
+    def ablate_available(self):
+        """True when the engine serves ablated requests on demand (its ready event, ablation.READY_FIELD)."""
+        return getattr(self.backend, "ablate_request", False) is True
+
+    def ablate_options(self):
+        """The validation arguments of the ablated mode: the accepted names and the engine's capability."""
+        return dict(ablated_names=self.ablated_names, ablate_available=self.ablate_available)
 
     def capture_turn(self, request, prompt_ids, output_ids):
         """Give a finished turn to the draft capture, if any. Only the class and the IDs leave here."""
@@ -241,13 +267,35 @@ class Service:
     def fit(self, request, prompt_count):
         """--default-max-tokens max: a request with no count gets the room left in the context. Opt-in
         --clamp-max-tokens: lower max_tokens to that room. A prompt that alone overflows still fails."""
+        if self.rope_reserve is not None:
+            return self.fit_reserve(request, prompt_count)
         if not (request.max_tokens_all or self.clamp_max_tokens):
             return request
         room = self.backend.context - prompt_count + 1
         if request.max_tokens_all:
+            # Y2: a prompt that fits the native positions stays plain (server/rope.py max_room).
+            room = max_room(self.backend.context, prompt_count)
             # Room below 1 means the prompt overflows: 1 token lets the backend refuse it with the usual message.
             return replace(request, max_tokens=max(room, 1), max_tokens_all=False)
         return replace(request, max_tokens=room) if 1 <= room < request.max_tokens else request
+
+    def fit_reserve(self, request, prompt_count):
+        """Service.fit with the reply reserve (an auto word): the count first (the context room for "max", the opt-in
+        context clamp), then the decided rule: a request that keeps R tokens of reply inside 262,144 positions is
+        plain and its count is clamped to the plain limit; any other request is YaRN with its count."""
+        room = self.backend.context - prompt_count + 1
+        count = request.max_tokens
+        if request.max_tokens_all:
+            count = max(room, 1)  # below 1 the prompt overflows: the backend refuses it with the usual message
+        elif self.clamp_max_tokens and 1 <= room < count:
+            count = room
+        plain = plain_max_tokens(prompt_count, count, self.rope_reserve)
+        clamped_from = count if plain is not None and plain < count else 0
+        if plain is not None:
+            count = plain
+        # The mode of the request, decided here once: every job of it keeps it (a bounded first job, a continuation).
+        mode = "plain" if plain is not None else request_mode(self.rope_word or "auto:2", prompt_count, count)
+        return replace(request, max_tokens=count, max_tokens_all=False, rope_clamped_from=clamped_from, rope_mode=mode)
 
     def plan(self, request):
         """(request, prompt IDs, image offsets) as the engine gets them: the prompt is counted, max_tokens is fitted,
@@ -568,9 +616,12 @@ def handler_for(service):
                     return
                 if self.path != "/v1/models":
                     raise ApiError("This endpoint is not supported.", status=404)
+                # The ablated names are listed only when the engine serves that mode: a client never selects a mode
+                # that this server must refuse.
+                names = [service.model, *(service.ablated_names if service.ablate_available else ())]
                 self.send_json(200, dict(object="list", crucible_version=server_version(),
-                                         data=[dict(id=service.model, object="model", created=0, owned_by="crucible",
-                                                    crucible_version=server_version())]))
+                                         data=[dict(id=name, object="model", created=0, owned_by="crucible",
+                                                    crucible_version=server_version()) for name in names]))
             except ApiError as error:
                 self.send_api_error(error)
 
@@ -844,7 +895,8 @@ def handler_for(service):
             """A chat request from a utility body, with the chat path's validation and server flags."""
             return validate_request(body, "chat", service.model, default_thinking=service.default_thinking,
                                     vision=service.vision, vocab=service.vocab,
-                                    default_mtp_prefix=service.default_mtp_prefix, defaults=service.defaults)
+                                    default_mtp_prefix=service.default_mtp_prefix, defaults=service.defaults,
+                                    **service.ablate_options())
 
         def tokenize(self):
             """OpenAI-compatible /tokenize: {"content": text or IDs} -> the completion prompt's IDs; {"messages": ...} (any
@@ -873,7 +925,7 @@ def handler_for(service):
                     raise ApiError("content must be text or a list of token IDs.", "content")
                 model = {"model": body["model"]} if "model" in body else {}
                 request = validate_request(dict(prompt=body["content"]) | model, "completion", service.model,
-                                           vocab=service.vocab)
+                                           vocab=service.vocab, **service.ablate_options())
                 ids, _ = service.prompt_ids(request)
             else:
                 raise ApiError("Send content (text or token IDs) or messages.", "content")
@@ -907,7 +959,7 @@ def handler_for(service):
                 request = validate_request(self.read_body(), kinds[self.path], service.model,
                                            default_thinking=service.default_thinking, vision=service.vision,
                                            vocab=service.vocab, default_mtp_prefix=service.default_mtp_prefix,
-                                           defaults=service.defaults)
+                                           defaults=service.defaults, **service.ablate_options())
                 admitted = service.admit_client(address)
                 request, prompt_ids, offsets = service.plan(request)
                 options = {}

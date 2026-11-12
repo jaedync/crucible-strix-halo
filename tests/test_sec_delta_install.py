@@ -1,4 +1,4 @@
-"""Delta review of the install and service fixes (sec-delta-wps): N5, N6, N8. Each test states the fixed behaviour."""
+"""Install and service fixes N5, N6 and N8. Each test states the fixed behaviour."""
 import json
 import os
 import re

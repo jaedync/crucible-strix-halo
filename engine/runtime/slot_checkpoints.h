@@ -201,6 +201,13 @@ class SlotCheckpoints {
     for (auto& item : Slot(slot))
       if (item && item->hist.size() > keep) item.reset();
   }
+  // Every point of `slot` as (index, point), for the miss ledger (start plan B1a). Changes nothing.
+  template<class Visit>
+  void ForEach(int slot, Visit visit) const {
+    const auto& held = Slot(slot);
+    for (size_t index = 0; index < held.size(); ++index)
+      if (held[index]) visit(int(index), *held[index]);
+  }
   const SlotCheckpoint& At(int slot, int index) const {
     const auto& item = Slot(slot).at(size_t(index));
     if (!item) throw std::logic_error("slot checkpoint is empty");

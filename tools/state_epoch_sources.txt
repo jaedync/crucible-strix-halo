@@ -1,0 +1,14 @@
+# The files that decide the layout and the bytes of a stored conversation state (cause 3 of the cache thrash,
+# the state epoch design). tools/state_epoch.py hashes them with comments and blank space removed.
+# A change in any of them gives a new state epoch, so a new folder on the SSD. Add a file here when it starts to
+# decide what a state holds. One path per line, relative to the repository root.
+engine/runtime/state_format.h
+engine/runtime/state_blocks.h
+engine/runtime/snapshot_bytes.h
+engine/runtime/conversation_snapshot.h
+engine/runtime/lazy_snapshot.h
+engine/runtime/conversation_resume.h
+engine/runtime/retained_prefix.h
+engine/runtime/sequence_state.h
+engine/runtime/state_disk.h
+engine/runtime/spec_span.h

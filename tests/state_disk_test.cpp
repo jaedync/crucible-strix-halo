@@ -41,6 +41,8 @@ int hipStreamSynchronize(int) { return 0; }
 #include <future>
 #include <thread>
 #include <fcntl.h>
+#include <sys/file.h>
+#include <sys/wait.h>
 #include <sys/stat.h>
 
 using namespace crucible;
@@ -280,7 +282,7 @@ void IdentitiesAndLocks() {
   fs::remove(Root() / ".cache" / "ids" / "notes.txt");
   Disk next(Options("e", logs, "ids"));
   assert(next.Enabled() && next.Entries() == 0);
-  assert(!fs::exists(old_dir));  // the old identity's directory leaves at start
+  assert(fs::exists(old_dir));  // another identity's directory stays at start (a rollback finds its states there)
   assert(!fs::exists(own / "abc.state.tmp.1"));
   // A state root outside the home directory is refused.
   auto outside = Options("f", logs);
@@ -304,7 +306,7 @@ void OldBinaryRemovesBlocks() {
   {
     Disk disk(Options("h", logs, "rollback"));
     assert(disk.Enabled());
-    assert(!fs::exists(newer));  // without the block names, the directory and its blocks stay
+    assert(fs::exists(newer));  // the directory of the previous identity stays, with its block files
     Spill(disk, Make(Tokens(10), 3000, 4));
     assert(disk.Drain(30));
     std::ofstream(disk.Directory() / (digest + ".block")) << "stray";
@@ -483,10 +485,31 @@ void IdentityText() {
   const auto d = StateDiskIdentityFor(b1, c1, {"prefill_rows=4096", "CRUCIBLE_PLE_HOST=1"});
   assert(a.sha != b.sha && a.sha != c.sha && a.sha == d.sha && a.directory != b.directory);
   assert(std::regex_match(a.directory, std::regex("[0-9a-f]{16}-[0-9a-f]{16}-[0-9a-f]{16}")));
-  const char* env[] = {"PATH=/usr/bin", "CRUCIBLE_FUSE=2", "HOME=/x", "CRUCIBLE_PLE_HOST=1", nullptr};
+  const char* env[] = {"PATH=/usr/bin", "CRUCIBLE_HC_WMMA=2", "HOME=/x", "CRUCIBLE_PLE_HOST=1", nullptr};
   const auto settings = StateDiskSettings(const_cast<char**>(env), 4096, false);
-  assert((settings == std::vector<std::string>{"CRUCIBLE_FUSE=2", "CRUCIBLE_PLE_HOST=1", "prefill_rows=4096",
+  assert((settings == std::vector<std::string>{"CRUCIBLE_HC_WMMA=2", "CRUCIBLE_PLE_HOST=1", "prefill_rows=4096",
                                                "vision=0"}));
+  // Switches that cannot change state bytes stay out of the identity (state_switches.h); the others stay in.
+  {
+    const auto settings_of = [](std::vector<const char*> words) {
+      words.push_back(nullptr);
+      return StateDiskSettings(const_cast<char**>(words.data()), 4096, false);
+    };
+    const auto base = settings_of({"CRUCIBLE_PLE_HOST=1"});
+    assert((settings_of({"CRUCIBLE_PLE_HOST=1", "CRUCIBLE_PLE_FETCH=1", "CRUCIBLE_PROFILE=1", "CRUCIBLE_MOE_B128=0",
+                         "CRUCIBLE_WARMUP=0", "CRUCIBLE_LAZY_SHADOW=1", "CRUCIBLE_DEBUG_NONFINITE=1"}) == base));
+    for (const char* kept : {"CRUCIBLE_EXACT=1", "CRUCIBLE_HC_WMMA=2", "CRUCIBLE_COMPACT_STATE=1", "CRUCIBLE_EXACT_RESUME=1",
+                             "CRUCIBLE_PF_LAUNCH_ROWS=8192+128", "CRUCIBLE_DRAFT_CHAIN=hc8", "CRUCIBLE_DRAFT_HEAD=q2",
+                             "CRUCIBLE_NOT_A_SWITCH=1"}) {
+      const auto with = settings_of({"CRUCIBLE_PLE_HOST=1", kept});
+      assert(std::find(with.begin(), with.end(), kept) != with.end() && with != base);
+    }
+    // The directory follows: a neutral switch gives the same folder, a numerics switch another one.
+    assert(StateDiskIdentityFor(b1, c1, base).directory ==
+           StateDiskIdentityFor(b1, c1, settings_of({"CRUCIBLE_PLE_HOST=1", "CRUCIBLE_PLE_FETCH=1"})).directory);
+    assert(StateDiskIdentityFor(b1, c1, base).directory !=
+           StateDiskIdentityFor(b1, c1, settings_of({"CRUCIBLE_PLE_HOST=1", "CRUCIBLE_EXACT=1"})).directory);
+  }
   // The MTP sidecar enters the identity by file content, as the ablation file does: another file at the same path
   // must miss (a stale sidecar would restore wrong MTP rows).
   {
@@ -1057,7 +1080,123 @@ void StoredSumsAndBytesMatchReference() {
   }
 }
 
+// Set the modification time of every file in `dir` (and the directory) to `age_s` seconds ago.
+void Age(const fs::path& dir, double age_s) {
+  const time_t when = ::time(nullptr) - time_t(age_s);
+  const struct timespec times[2] = {{when, 0}, {when, 0}};
+  for (const auto& item : fs::directory_iterator(dir))
+    assert(::utimensat(AT_FDCWD, item.path().c_str(), times, AT_SYMLINK_NOFOLLOW) == 0);
+  assert(::utimensat(AT_FDCWD, dir.c_str(), times, 0) == 0);
+}
+// A folder of another identity with one state file of `bytes` bytes, last used `age_s` seconds ago.
+fs::path OtherFolder(const fs::path& root, char id, size_t bytes, double age_s) {
+  const fs::path dir = root / DirName(id);
+  fs::create_directories(dir);
+  { std::ofstream(dir / (std::string(64, id) + ".state"), std::ios::binary) << std::string(bytes, 'x'); }
+  { std::ofstream(dir / ".lock"); }
+  Age(dir, age_s);
+  return dir;
+}
+// Another identity's folder is not deleted at start (a rollback finds its states). The folder of the previous identity
+// (the last one used before this start) always stays. The others leave when they are older than keep_other_days or
+// when together they hold more than keep_other_bytes, oldest first. A folder that a live engine holds stays.
+void OtherIdentitiesStay() {
+  constexpr double kDay = 86400;
+  const fs::path root = Root() / ".cache" / "keep";
+  Logs logs;
+  const auto start = [&](char id, uint64_t keep_bytes, double keep_days) {
+    auto options = Options(std::string(1, id), logs, "keep");
+    options.keep_other_bytes = keep_bytes;
+    options.keep_other_days = keep_days;
+    return options;
+  };
+  fs::create_directories(root);
+  const fs::path a = OtherFolder(root, '1', 1000, 20 * kDay), b = OtherFolder(root, '2', 1000, 10 * kDay),
+                 c = OtherFolder(root, '3', 1000, 2 * kDay), d = OtherFolder(root, '4', 1000, 3600);
+  {
+    Disk disk(start('5', uint64_t(1) << 30, 7));
+    assert(disk.Enabled());
+    assert(!fs::exists(a) && !fs::exists(b));  // older than 7 days
+    assert(fs::exists(c) && fs::exists(d));
+    assert(logs.Has("removed_dirs=2 kept_dirs=2"));
+  }
+  // The byte limit: c and d (2000 together) are over 500 and leave oldest first. The engine that ran just before ('5')
+  // is the previous identity now and stays, whatever its size.
+  {
+    Disk disk(start('6', 500, 7));
+    assert(disk.Enabled());
+    assert(!fs::exists(c) && !fs::exists(d));
+    assert(fs::exists(root / DirName('5')));
+  }
+  // The previous identity stays when it is older than the age limit and larger than the byte limit.
+  fs::remove_all(root);
+  const fs::path old = OtherFolder(root, '7', 5000, 40 * kDay);
+  {
+    Disk disk(start('8', 100, 1));
+    assert(disk.Enabled() && fs::exists(old));
+  }
+  // A folder that a live engine holds stays, and it does not count as the previous identity.
+  fs::remove_all(root);
+  const fs::path live_dir = OtherFolder(root, '9', 1000, 30 * kDay), spare = OtherFolder(root, 'a', 1000, 29 * kDay);
+  {
+    const int fd = ::open((live_dir / ".lock").c_str(), O_RDWR | O_CLOEXEC);
+    assert(fd >= 0 && ::flock(fd, LOCK_EX | LOCK_NB) == 0);
+    Disk disk(start('b', uint64_t(1) << 30, 7));
+    assert(fs::exists(live_dir));  // held: untouched
+    assert(fs::exists(spare));     // the previous identity, older than 7 days
+    ::close(fd);
+  }
+  // Removal takes the tier's own file names only: a note in an old folder stays, with its folder.
+  fs::remove_all(root);
+  const fs::path noted = OtherFolder(root, 'c', 1000, 30 * kDay);
+  const fs::path newer = OtherFolder(root, 'd', 1000, 29 * kDay);
+  { std::ofstream(noted / "notes.blocks") << "keep"; }
+  Age(noted, 30 * kDay);
+  {
+    Disk disk(start('e', uint64_t(1) << 30, 7));
+    assert(fs::exists(newer));
+    assert(fs::exists(noted / "notes.blocks") && !fs::exists(noted / (std::string(64, 'c') + ".state")));
+  }
+  // The engine's own start counts as use: a restart of the same identity keeps the others as they were.
+  fs::remove_all(root);
+  const fs::path keep = OtherFolder(root, 'f', 1000, 3 * kDay);
+  { Disk disk(start('0', 0, 7)); assert(fs::exists(keep)); }
+  { Disk disk(start('0', 0, 7)); assert(fs::exists(keep)); }
+}
+
+// tools/state_digest.py reads the real files of this writer: two identities that spill the same state give equal digests,
+// and one changed byte of the payload gives another. (The tool is the equality check of the state-equality gate.)
+void DigestIgnoresIdentity() {
+  const auto digest_of = [](char id, const std::shared_ptr<TestSnapshot>& snapshot, const std::string& name) {
+    Logs logs;
+    auto options = Options(std::string(1, id), logs, name);
+    fs::remove_all(options.root);
+    fs::path dir;
+    {
+      Disk disk(options);
+      assert(disk.Enabled());
+      Spill(disk, snapshot);
+      assert(disk.Drain(30));
+      dir = disk.Directory();
+    }
+    return dir;
+  };
+  const auto a = digest_of('a', Make(Tokens(40), 2 * kChunk + 12345, 9), "dg-a");
+  const auto b = digest_of('b', Make(Tokens(40), 2 * kChunk + 12345, 9), "dg-b");
+  const auto c = digest_of('c', Make(Tokens(40), 2 * kChunk + 12345, 10), "dg-c");
+  const auto run = [](const fs::path& x, const fs::path& y) {
+    const std::string command = "python3 -I tools/state_digest.py compare '" + x.string() + "' '" + y.string() + "' > /dev/null";
+    return WEXITSTATUS(std::system(command.c_str()));
+  };
+  assert(a != b);
+  assert(run(a, b) == 0);
+  assert(run(a, c) == 1);
+  assert(run(a, Root() / "nothing") == 2);
+}
+
 int main() {
+  DigestIgnoresIdentity();
+  OtherIdentitiesStay();
   DirectIoFromPinnedMemory();
   IoErrorsNameErrno();
   PaddingIsZeroWithReusedBuffer();

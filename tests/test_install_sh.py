@@ -532,6 +532,47 @@ class TargetRocmTest(InstallTestCase):
         self.assertEqual(r.returncode, 0, self.out(r))
         self.assertEqual(self.w.calls("sudo"), [])
 
+    # The HIP runtime note: the latest ROCm and 7.2.4 give no warning and no request for an older version.
+    def note(self, version=None, lib=None, rocm=True):
+        self.release(self.elf())
+        if version is not None:
+            (self.rocm / ".info").mkdir()
+            (self.rocm / ".info/version").write_text(version + "\n")
+        if lib is not None:
+            (self.rocm / "lib" / lib).write_text("")
+        path = self.rocm if rocm else self.w.t / "no-rocm"
+        r = self.w.install("--yes", ROCM_PATH=str(path))
+        self.assertEqual(r.returncode, 0, self.out(r))
+        self.assertEqual(self.w.calls("sudo"), [])
+        return self.out(r)
+
+    def test_rocm_10_1_is_current_and_gives_no_warning(self):
+        text = self.note("10.1.0")
+        self.assertIn("HIP runtime: ROCm 10.1.0 (current)", text)
+        self.assertNotIn("only 7.2", text.lower())
+        self.assertNotIn("older version", text.lower())
+
+    def test_a_later_major_version_is_current(self):
+        self.assertIn("HIP runtime: ROCm 11.0.2 (current)", self.note("11.0.2"))
+
+    def test_rocm_7_2_4_is_tested_and_gives_no_warning(self):
+        text = self.note("7.2.4")
+        self.assertIn("HIP runtime: ROCm 7.2.4 (tested)", text)
+        self.assertNotIn("warn", text.lower())
+
+    def test_the_library_name_names_the_version_when_there_is_no_version_file(self):
+        self.assertIn("HIP runtime: ROCm 10.1 (current)", self.note(lib="libamdhip64.so.7.16.26385"))
+
+    def test_another_version_is_named_with_the_tested_ones(self):
+        text = self.note("7.1.0")
+        self.assertIn("HIP runtime: ROCm 7.1.0", text)
+        self.assertIn("Tested: 10.1 and 7.2.4", text)
+
+    def test_no_runtime_says_what_setup_can_do_and_does_not_stop(self):
+        text = self.note(rocm=False)
+        self.assertIn("HIP runtime: none found", text)
+        self.assertIn("current ROCm (10.1 tested)", text)
+
     def test_glog_package_names_match_the_soname_of_the_distribution(self):
         text = INSTALL.read_text()
         func = re.search(r"^pkg_for\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)

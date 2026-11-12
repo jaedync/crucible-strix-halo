@@ -890,6 +890,126 @@ class SetupRestartTest(Base):
         self.assertIn("./crucible setup --allowed-host NAME", hosts.REFUSED)
         self.assertIn("restarts the server", hosts.REFUSED)
 
+    def test_the_refusal_text_names_a_server_from_start_and_a_server_made_by_hand(self):
+        from server import hosts
+        self.assertIn("./crucible start", hosts.REFUSED)
+        self.assertIn("python -m server", hosts.REFUSED)
+
+
+class SetupRestartPendingTest(Base):
+    """M1: the restart must not get lost when a setup run stops before it, and a unit in the state "activating"
+    (the model loads) counts as running."""
+
+    def setup_service(self, **props):
+        self.install_unit()
+        self.s = self.ready_repo()
+        runner = FakeSystemd()
+        runner.props.update(props)
+        return self.host(runner=runner)
+
+    def test_a_setup_that_stopped_in_the_download_still_restarts_the_service_next_time(self):
+        host = self.setup_service()
+        pack_file = self.s.ckpt / "m-1.safetensors"
+        pack_file.unlink()
+        host.runner.fail.add("download")
+        code, host, out = self.run_cli(["setup", "--yes", "--allowed-host", "ai.example.org"], host=host)
+        self.assertEqual(code, 1, out)
+        self.assertIn("ai.example.org", (self.repo / ".crucible/serve.sh").read_text())
+        self.assertNotIn("restart", host.runner.verbs())
+        pack_file.write_text("x")
+        host.runner.ctl.clear()
+        code, host, out = self.run_cli(["setup", "--yes", "--allowed-host", "ai.example.org"], host=host)
+        self.assertEqual(code, 0, out)
+        self.assertIn("restart", host.runner.verbs())
+
+    def test_the_restart_is_done_once_after_a_good_restart(self):
+        host = self.setup_service()
+        self.assertEqual(self.run_cli(["setup", "--yes", "--allowed-host", "ai.example.org"], host=host)[0], 0)
+        self.assertIn("restart", host.runner.verbs())
+        host.runner.ctl.clear()
+        self.assertEqual(self.run_cli(["setup", "--yes", "--allowed-host", "ai.example.org"], host=host)[0], 0)
+        self.assertNotIn("restart", host.runner.verbs())
+
+    def test_a_failed_restart_stays_pending(self):
+        host = self.setup_service()
+        host.runner.start_fails = True
+        code, host, out = self.run_cli(["setup", "--yes", "--allowed-host", "ai.example.org"], host=host)
+        self.assertEqual(code, 1, out)
+        host.runner.start_fails = False
+        host.runner.props.update(ActiveState="active", SubState="running", Result="success")
+        host.runner.ctl.clear()
+        code, host, out = self.run_cli(["setup", "--yes", "--allowed-host", "ai.example.org"], host=host)
+        self.assertEqual(code, 0, out)
+        self.assertIn("restart", host.runner.verbs())
+
+    def test_a_service_that_loads_the_model_counts_as_running_for_setup(self):
+        host = self.setup_service(ActiveState="activating", SubState="start", StatusText="loading the model")
+        code, host, out = self.run_cli(["setup", "--yes", "--allowed-host", "ai.example.org"], host=host)
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("blocked", out)
+        self.assertNotIn("held by another program", out)
+        self.assertIn("restart", host.runner.verbs())
+
+    def doctor_checks(self, **props):
+        self.install_unit()
+        self.ready_repo()
+        runner = FakeSystemd()
+        runner.props.update(props)
+        host = self.host(runner=runner, busy_ports=(8790,), gtt_used=90_000_000_000)
+        return {r.id: r for r in doctor.run_checks(host, settings_mod.build(self.repo, host))}
+
+    def test_the_doctor_accepts_a_service_that_loads_the_model(self):
+        checks = self.doctor_checks(ActiveState="activating", SubState="start")
+        self.assertEqual(checks["gpu-free"].status, "pass")
+        self.assertEqual(checks["port"].status, "pass")
+
+    def test_the_doctor_does_not_accept_a_unit_that_waits_for_its_start_check_or_a_restart(self):
+        # ExecStartPre runs doctor --for start while the unit is "activating"; it must still see a busy port and GPU.
+        for sub in ("start-pre", "auto-restart"):
+            checks = self.doctor_checks(ActiveState="activating", SubState=sub)
+            self.assertEqual(checks["gpu-free"].status, "fail", sub)
+            self.assertEqual(checks["port"].status, "fail", sub)
+
+
+class SetupHintTest(Base):
+    """L2 and L4: what the final lines of setup say about the service and about a server that was started by hand."""
+
+    def test_setup_does_not_offer_the_service_again_when_it_is_installed(self):
+        self.install_unit()
+        self.ready_repo()
+        code, host, out = self.run_cli(["setup", "--yes"], host=self.host(runner=FakeSystemd()))
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("To run it as a service", out)
+        self.assertNotIn("server.log", out)
+        self.assertIn("./crucible service logs", out)
+
+    def test_setup_still_offers_the_service_when_it_is_not_installed(self):
+        self.configure()
+        code, host, out = self.run_cli(["setup", "--yes"], host=self.host(runner=FakeRunner()))
+        self.assertEqual(code, 0, out)
+        self.assertIn("To run it as a service: ./crucible service install", out)
+
+    def test_a_server_from_start_gets_the_new_settings_with_a_restart(self):
+        self.configure()
+        pid = int((self.repo / ".crucible/server.pid").read_text().split()[0])
+        runner = FakeRunner()
+        runner.live = {pid}
+        code, host, out = self.run_cli(["setup", "--yes", "--allowed-host", "ai.example.org"], host=self.host(runner=runner))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(runner.terminated, [pid], out)
+        self.assertEqual(len(runner.spawned), 1, out)
+        self.assertIn("restarting", out)
+
+    def test_a_server_from_start_with_the_same_settings_is_left_running(self):
+        self.configure()
+        pid = int((self.repo / ".crucible/server.pid").read_text().split()[0])
+        runner = FakeRunner()
+        runner.live = {pid}
+        code, host, out = self.run_cli(["setup", "--yes"], host=self.host(runner=runner))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(runner.terminated, [])
+        self.assertEqual(runner.spawned, [])
+
 
 class DoctorServiceTest(Base):
     """D2: the service writes no server.pid, so the doctor asks systemd. A running service owns the port and the GPU memory."""

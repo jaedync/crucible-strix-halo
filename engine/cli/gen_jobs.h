@@ -143,7 +143,7 @@ class GenJobOutput {
     if (path.empty()) return;
     std::fflush(nullptr);
     const int file = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (file < 0) throw std::runtime_error("cannot open job output " + path + ": " + std::strerror(errno));
+    if (file < 0) throw std::runtime_error("cannot open job output " + std::filesystem::path(path).filename().string() + ": " + std::strerror(errno));
     saved = dup(fd);
     if (saved < 0 || dup2(file, fd) < 0) {
       close(file);

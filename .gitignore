@@ -9,5 +9,8 @@ ref/fixtures/
 .coverage
 .coverage
 scratch/
+
+# staged copy of a public tokenizer file, copied in by hand: too large for the leak guard to read
+/tools/rival/q2/tokenizer.json
 /.crucible/
 dist/

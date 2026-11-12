@@ -12,7 +12,7 @@ research software for one GPU architecture. It is not a general model backend or
 
 ## Speed of this release
 
-The tables below show the v0.34.0 release. The v0.34.0 column was measured Nov 7, 2026 on a build of v0.34.0 (it differs from the release engine in the version text only), balanced power profile (GPU clock 2,303 MHz on the 4.05 pack and 2,292 MHz on the 3.05 pack), with the public files and the six words listed below. The charts and the by-length text below still show the v0.33.0 release, because no chart run was made for v0.34.0. The tables hold the release ladder of each release, one column each. The 4.05 code value of the v0.34.0 column is the ladder row; the older columns take that row from the decode chart. The v0.33.0 column was measured Nov 3, 2026 on the v0.33.0 build, balanced power profile (GPU clock 2,289 to 2,295 MHz). The v0.32.0 column is the ladder run of Nov 3, 2026 on the v0.32.0 build. The 4-session row of that column has no value on the 4.05 pack: one session of each run stopped early. On the 3.05 pack it is from one of the two runs, for the same reason. The numbers of v0.32.0 in the text and in the charts come from the runs by context length. Those runs were measured Nov 3, 2026. The vision loader fix of v0.32.0 came after these runs; it changes only the vision load path, not prefill or decode.
+The tables below show the v0.34.0 release, measured Nov 7, 2026. This is v0.37.0. Its default configuration (4 sessions of 262,144 tokens) has no column of its own in these tables. The long configurations that v0.37.0 adds are in [Long context](#long-context-opt-in) below. The v0.34.0 column was measured Nov 7, 2026 on a build of v0.34.0 (it differs from the release engine in the version text only), balanced power profile (GPU clock 2,303 MHz on the 4.05 pack and 2,292 MHz on the 3.05 pack), with the public files and the six words listed below. The charts and the by-length text below still show the v0.33.0 release, because no chart run was made for v0.34.0. The tables hold the release ladder of each release, one column each. The 4.05 code value of the v0.34.0 column is the ladder row; the older columns take that row from the decode chart. The v0.33.0 column was measured Nov 3, 2026 on the v0.33.0 build, balanced power profile (GPU clock 2,289 to 2,295 MHz). The v0.32.0 column is the ladder run of Nov 3, 2026 on the v0.32.0 build. The 4-session row of that column has no value on the 4.05 pack: one session of each run stopped early. On the 3.05 pack it is from one of the two runs, for the same reason. The numbers of v0.32.0 in the text and in the charts come from the runs by context length. Those runs were measured Nov 3, 2026. The vision loader fix of v0.32.0 came after these runs; it changes only the vision load path, not prefill or decode.
 In the tables, each value is the median of 2 runs (the v0.34.0 column: 2 runs, A and B). The server ran 4 sessions of 262,144 tokens with image input and speculative decoding (MTP)
 on, as in daily use, with the public files and no tuned draft head file. The v0.34.0, v0.33.0 and v0.32.0 runs set two options that are unset in the engine itself: `CRUCIBLE_DRAFT_HEAD=q2` and `CRUCIBLE_DRAFT_CHAIN=hc8,lead` (see the [Changelog](CHANGELOG.md)); the earlier runs did not. They change the drafts only, and the verify pass checks every draft. `./crucible start` and the [Docker](docs/DOCKER.md) run line set these two words. They also set `CRUCIBLE_PLE_HOST=1` and `CRUCIBLE_COMPACT_STATE=1`, which are part of the measured configuration. The v0.34.0 and v0.33.0 runs also set `CRUCIBLE_PLE_FETCH=1`, a host read hint for the PLE table; the v0.32.0 runs did not. `./crucible start` and the Docker run line set all six words of this paragraph, with 4 streams of 262,144 tokens, `--conversation-cache-mib 9700` and `--host-reserve-mib 11264`. If you start the engine or `python -m server` yourself with none of them (no `CRUCIBLE_DRAFT_HEAD` and no `CRUCIBLE_DRAFT_CHAIN`), we expect decode as in v0.31.0; we did not measure that. `python -m server` alone keeps the conversation cache off (`--conversation-cache-mib 0`): every follow-up turn then prefills the whole conversation again, and the server prints a notice at start. The v0.34.0, v0.33.0 and v0.32.0 runs used prefill launches of 16,384 rows (`CRUCIBLE_PF_LAUNCH_ROWS=16384+128`, the default of the engine; the service sets it by name); the earlier columns used the settings of their own time (4.05 pack: 8,192 rows; 3.05 pack: 16,384 rows for v0.31.0 and v0.30.0, 8,192 rows for v0.26.0 and v0.22.0). Every row uses prompts that no
 cache has seen, except the re-send row. The v0.32.0, v0.31.0, v0.30.0, v0.26.0 and v0.22.0 columns are earlier releases, measured with the same tool (4.05 pack: v0.32.0 on Nov 3, v0.31.0 on Nov 1, v0.30.0 on Oct 31, 2026, the other two in the run series of Oct 27 to 28, 2026; 3.05 pack: v0.33.0 and v0.32.0 on Nov 3, the others on Nov 1 to 2,
@@ -90,6 +90,53 @@ xychart-beta
 All 5 builds got the same prompts. On the same prompts and the same reply text, v0.30.0 decodes 1.06 to 1.08 times as fast as v0.26.0 from 64K to 250K, and 1.07 times at 32K in run 2 (1.20 with run 1, in which v0.26.0 read low). The v0.30.0, v0.31.0 and v0.32.0 lines hold up to 6 samples per point; the other two hold up to 4. The v0.32.0 run set the options named above (draft head, draft chain, launch rows); the others did not. v0.26.0 read low in run 1 at 32K (47.2 and 51.6 tok/s, the others 62.9
 to 64.7); the cause is not found. The third question of each unit of the run of Oct 29 was invalid (a 10-token reply, no decode
 number). The 3.05 chart and the data are in [Results](docs/RESULTS.md#decode-by-context-length).
+
+## Long context (opt-in)
+
+v0.37.0 can serve up to 524,288 tokens in one session with YaRN (factor 2). It is a start option of the same engine: a
+context above 262,144 (`--ctx`) turns it on. A request that needs 262,144 positions or fewer runs with the plain rotary
+positions, also in a long configuration. Setup offers three configurations by name:
+
+| Name | Setup | Server flags | Sessions | Session state (engine formula) |
+|---|---|---|---|---|
+| default | `./crucible setup` | `--streams 4 --ctx 262144` | 4 of 262,144 | 28.28 GB |
+| long | `./crucible setup --layout long` | `--streams 3 --ctx 524288 --short-streams 2 --short-ctx 262144` | 1 of 524,288 and 2 of 262,144 | 28.05 GB |
+| two long | `./crucible setup --layout two-long` | `--streams 2 --ctx 524288` | 2 of 524,288 | 27.83 GB |
+
+All three need about the same memory, so a long configuration fits where the default fits. The formula agrees with the
+measured state of one session of 524,288 tokens (13.84 GB, Nov 10, 2026). `./crucible setup --layout default` goes back.
+
+Measured on the release engine of v0.37.0, 4.05 pack, with the public files, in the configuration `long`: one run, power
+profile balanced, Nov 11, 2026. One server start held both prompts, and both went through HTTP. The command is below the table.
+
+| Row | 250,000 tokens (plain positions) | 490,000 tokens (YaRN) |
+|---|---:|---:|
+| Cold prompt: first token (s) | 149.0 | 340.4 |
+| Cold prompt: prefill (tok/s) | 1,677.6 | 1,436.2 |
+| Decode, code, with drafts (tok/s) | 67.7 | 59.8 |
+| Decode, tool call, with drafts (tok/s) | 97.0 | 100.2 |
+| Decode, all five workloads, with drafts (tok/s) | not measured: 3 of the 5 replies stopped after 12 tokens | 52.6 over 2,366 tokens (code 59.8, tool 100.2, code sampled 46.1, think 50.5, prose 45.1) |
+
+```sh
+CRUCIBLE_PLE_HOST=1 CRUCIBLE_COMPACT_STATE=1 CRUCIBLE_PLE_FETCH=1 CRUCIBLE_DRAFT_HEAD=q2 CRUCIBLE_DRAFT_CHAIN=hc8,lead \
+CRUCIBLE_PF_LAUNCH_ROWS=16384+128 python -m server models/Qwen3.8-Flash-Next-exl3-4.05bpw_h6_ng6 \
+  --streams 3 --ctx 524288 --short-streams 2 --short-ctx 262144 --prefill 4096 --conversation-cache-mib 9700 \
+  --host-reserve-mib 11264 --vision --clamp-max-tokens --default-thinking on --max-body-mib 16 --model-id crucible \
+  --session-replay 1 --slot-resume 1 --slot-checkpoints 1 --draft-capture DIR --draft-stats
+```
+
+The words and the flags up to `--max-body-mib 16` are the ones that `./crucible setup --layout long` writes. The
+measurement tool adds the rest (`--draft-capture` and `--draft-stats` write the draft counters).
+
+What the long configurations cost:
+
+| Item | Effect | Source |
+|---|---|---|
+| A short request in a long configuration | None: it runs with the plain positions, so it gets the tokens of the default configuration. | the server decides the mode of each request |
+| YaRN forced on a short context (a test word, not a configuration) | KL against the BF16 reference +0.00586 (SE 0.00097), top-1 0.52 points lower | 7,168 positions, night of Nov 10 to 11, 2026 |
+| A conversation that grows past 262,144 tokens | One full prefill of the conversation from its first token, in YaRN mode. Later turns use its YaRN states. | by design |
+| Resume of a long conversation | Only from its session slot. The conversation cache in memory cannot hold a 524,288-token state, and a YaRN start has no disk tier (`--state-dir` is refused). | first version |
+| Requests above 524,288 tokens | HTTP 400 `context_length` | |
 
 ## How it compares
 
@@ -175,7 +222,8 @@ To watch the engine live (requests, rates, memory, engine switch), see [Kiln](ht
 
 Ryzen AI Max+ 395, Radeon 8060S (gfx1151), 128 GB shared LPDDR5X-8000; Linux (tested: Arch Linux with kernel 7.2.7 and ROCm 7.2.4); a C++20 HIP compiler, GNU Make and POSIX threads; Python 3.12 or newer
 (`requirements-cpu.txt`); disk space for one checkpoint and the build. Set `CRUCIBLE_PLE_HOST=1` to keep the n-gram table in host
-memory (32.6 GB at 3.05, 39.0 GB at 4.05). The CPU tests run with `make -j2 test-cpu` and need no GPU ([all targets](docs/BUILD.md)).
+memory (32.6 GB at 3.05, 39.0 GB at 4.05). The current ROCm (10.1) is the one that we recommend, and ROCm 7.2.4 is tested too; the
+release notes name the ROCm of each number. The CPU tests run with `make -j2 test-cpu` and need no GPU ([all targets](docs/BUILD.md)).
 
 ## Features
 

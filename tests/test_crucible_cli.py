@@ -66,12 +66,13 @@ class DoctorTest(Base):
         self.assertEqual(res["hipcc"].status, "fail")
         for word in ("Arch", "Ubuntu", "Fedora"):
             self.assertIn(word, res["hipcc"].fix)
-        self.assertIn("7.2.4", res["hipcc"].fix)
+        self.assertIn("10.1", res["hipcc"].fix)  # the current ROCm is the one to install
 
     def test_other_rocm_version_is_a_warning_not_a_failure(self):
         r = self.checks(version="7.1.0")["rocm-version"]
         self.assertEqual(r.status, "warn")
         self.assertIn("7.2.4", r.detail)
+        self.assertIn("10.1", r.detail)
 
     def test_wrong_gpu_architecture_fails(self):
         host = wire(self.t)
@@ -84,7 +85,7 @@ class DoctorTest(Base):
         r = self.checks(gtt=60_000_000_000)["gtt"]
         self.assertEqual(r.status, "fail")
         self.assertIn(GTT_LINE, r.fix)
-        self.assertIn("never changes", r.fix)  # the tool does not edit the boot loader
+        self.assertIn("never restarts", r.fix)  # setup applies the line only after yes, and never restarts
         self.assertIn("memory", r.detail)
 
     def test_gtt_fix_covers_each_boot_method_and_does_not_apply_any(self):
@@ -328,7 +329,7 @@ class SetupTest(Base):
         self.assertTrue([c for c in host.runner.calls if Path(c[0]).name == "hf"])
         self.assertTrue([c for c in host.runner.calls if Path(c[0]).name == "make"])
         self.assertEqual(host.runner.spawned, [])
-        self.assertIn("never changes", out)
+        self.assertIn("never restarts", out)
 
     def test_missing_rocm_blocks_the_build_but_not_the_download(self):
         code, host, out = self.setup(["--yes"], rocm=False, hipcc=False)

@@ -36,7 +36,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from . import packs, release, service, settings as settings_mod, steps
+from . import packs, release, rocm, service, settings as settings_mod, steps
 from .files import SYSTEM_PREFIXES, OutsideRoots, Sandbox
 
 ARCH = "gfx1151"
@@ -55,7 +55,8 @@ MIN_FREE_BYTES = 2 << 30
 FLUSH_SECONDS = 85               # the longest save of conversation states at a stop
 KEEP_OUT = frozenset({".git", "build", "__pycache__"})   # top-level names that never move to the new tree
 CACHE_NAMES = frozenset({"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"})   # made by tools; never yours
-GENERATED_PATHS = ("ref/fixtures/",)   # made by ref/make_fixtures.py, listed in .gitignore, made again on demand; never yours
+GENERATED_PATHS = ("ref/fixtures/",   # made by ref/make_fixtures.py, listed in .gitignore, made again on demand; never yours
+                   "/tools/rival/q2/tokenizer.json")   # a staged copy of a public tokenizer file (private tree only, not exported)
 PIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9,._-]*\])?==[A-Za-z0-9._+!-]+$")
 WORK_PREFIX = ".{name}-update-"
 JOURNAL = ".{name}.update.json"
@@ -1089,6 +1090,9 @@ def _uninstall(host, real, home, args, ask, box):
     say(f"  Remove:  {real} ({_size(real)})")
     if unit_there:
         say(f"  Remove:  the service {service.UNIT}")
+    private = real / ".crucible" / rocm.PRIVATE_DIR
+    if private.is_dir() and not private.is_symlink():
+        say(f"  Remove:  the private ROCm runtime {private} ({_size(private)}; inside the install folder)")
     for p in removable:
         verb = "Remove: " if remove_models else "Keep:   "
         extra = "" if remove_models else "; add --remove-models to remove it"

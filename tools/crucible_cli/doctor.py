@@ -9,14 +9,14 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import keyfile, packs, service
+from . import keyfile, packs, rocm, service
 from .files import Sandbox
 
 GTT_PARAMS = "amdgpu.gttsize=126976 ttm.pages_limit=32505856"
 GTT_MIN_BYTES = 130_000_000_000      # the tested machine shows about 133 GB
 GPU_BUSY_BYTES = 8 * 1024 ** 3        # more than this in use: another program holds the GPU memory
 MEM_MIN_KB = 120 * 1024 * 1024        # 120 GiB: the guide expects "total 120 or more" in free -g
-ROCM_VERSION = "7.2.4"
+ROCM_VERSION = "7.2.4"   # the older tested version; rocm.RECOMMENDED is the one to install
 PY_MIN = (3, 12)
 STEPS_ALL = ("venv", "download", "build", "start")
 GB = 1_000_000_000
@@ -35,7 +35,8 @@ def release_engine(repo):
 NOT_NEEDED = "not needed: the release engine is installed"
 
 ROCM_FIX = (
-    f"Install ROCm {ROCM_VERSION}: the HIP compiler (hipcc) and rocminfo.\n"
+    f"Install the current ROCm ({rocm.RECOMMENDED} tested): the HIP runtime, the HIP compiler (hipcc) and rocminfo. "
+    f"ROCm {rocm.TESTED[1]} works too.\n"
     "Arch Linux: sudo pacman -Syu --needed base-devel git python hip-runtime-amd rocm-llvm rocminfo\n"
     "Ubuntu or Debian: follow AMD's install page for your release (https://rocm.docs.amd.com), then: sudo apt install build-essential git\n"
     "Fedora: follow AMD's install page (https://rocm.docs.amd.com), then: sudo dnf install make gcc-c++ git\n"
@@ -51,7 +52,8 @@ KERNEL_FIX = (
     "  - a unified kernel image: usually /etc/kernel/cmdline, then build the image again (for example: sudo mkinitcpio -P)\n"
     "  - another boot loader: see its documentation\n"
     "Keep a working boot entry until the new one starts. A wrong command line can stop the machine from starting.\n"
-    "This tool never changes the boot loader or the kernel command line. You apply the line yourself."
+    "./crucible setup shows the exact change for this machine. It applies the change with sudo only after you type yes, "
+    "makes a backup first, and never restarts the machine."
 )
 
 
@@ -119,19 +121,20 @@ def run_checks(host, s):
         add("python", "Python 3.12 or newer", "fail", f"this Python is {ver}",
             "Install Python 3.12 or newer, then run the command with it: python3.12 ./crucible setup", STEPS_ALL)
 
-    # ROCm
+    # HIP runtime (the latest ROCm and 7.2.4 both pass)
     hipcc = Path(host.rocm) / "bin/hipcc"
-    version = _read(Path(host.rocm) / ".info/version")
-    if version is None:
-        if hipcc.exists():
-            add("rocm-version", "ROCm version", "warn", f"no version file; the tested version is {ROCM_VERSION}")
-        else:
-            add("rocm-version", f"ROCm {ROCM_VERSION}", "fail", f"no ROCm found under {host.rocm}", ROCM_FIX,
-                ("start",) if rel else ("build", "start"))
-    elif version.startswith(ROCM_VERSION):
-        add("rocm-version", f"ROCm {ROCM_VERSION}", "pass", version)
+    rt = rocm.detect(host, work=s.work)
+    tested = " and ".join(rocm.TESTED)
+    if rt.state == "none":
+        add("rocm-version", "HIP runtime (ROCm)", "fail", f"no ROCm found under {host.rocm}", ROCM_FIX,
+            ("start",) if rel else ("build", "start"))
+    elif rt.state in ("current", "tested"):
+        where = " (private runtime in the install folder)" if rt.source == "private" else ""
+        add("rocm-version", "HIP runtime (ROCm)", "pass", f"{rt.version}{where}")
+    elif rt.state == "unknown":
+        add("rocm-version", "HIP runtime (ROCm)", "warn", f"no version file and an unknown HIP library; tested: {tested}")
     else:
-        add("rocm-version", f"ROCm {ROCM_VERSION}", "warn", f"found {version}; only {ROCM_VERSION} is tested")
+        add("rocm-version", "HIP runtime (ROCm)", "warn", f"found {rt.version}; tested: {tested}")
     if hipcc.exists():
         add("hipcc", "HIP compiler (hipcc)", "pass", str(hipcc))
     elif rel:
@@ -140,7 +143,14 @@ def run_checks(host, s):
         add("hipcc", "HIP compiler (hipcc)", "fail", f"{hipcc} not found", ROCM_FIX, ("build", "start"))
     rocminfo = Path(host.rocm) / "bin/rocminfo"
     if not rocminfo.exists():
-        add("gpu-arch", "GPU is gfx1151", "fail", f"{rocminfo} not found", ROCM_FIX, ("start",))
+        names = rocm.kfd_gfx(host)  # no rocminfo: the kernel reports the GPU name too
+        if "gfx1151" in names:
+            add("gpu-arch", "GPU is gfx1151", "pass", "gfx1151 (from the kernel, rocminfo is not installed)")
+        elif names:
+            add("gpu-arch", "GPU is gfx1151", "fail", f"found {', '.join(names)}; the engine runs on gfx1151 only",
+                "Use a Ryzen AI Max+ 395 machine (Radeon 8060S). Other machines are not supported.", ("start",))
+        else:
+            add("gpu-arch", "GPU is gfx1151", "warn", f"{rocminfo} not found and the kernel names no GPU; setup goes on")
     else:
         res = host.runner.run([str(rocminfo)])
         names = sorted(set(re.findall(r"\bgfx[0-9a-f]+\b", res.out)))
@@ -314,8 +324,8 @@ def _key_file_check(s, add):
 
 
 def _server_alive(host, s):
-    """True when the server that this tool started runs, or the service is active (the service writes no server.pid)."""
-    if service.active(host):
+    """True when the server that this tool started runs, or the service is active or loads the model (the service writes no server.pid)."""
+    if service.serving(host):
         return True
     try:
         pid = int((s.work / "server.pid").read_text().split()[0])

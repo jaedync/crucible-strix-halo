@@ -12,8 +12,13 @@
     size_t total=0;
     for (const auto& span:spans) total+=span.tokens.size();
     const int cap=total>size_t(kMaxRows)?MaxPassRows():kMaxRows;
-    if (const auto error=SpecSpansError(spans,prefixes,cap,kMaxRows,kVocab); !error.empty())
+    // CRUCIBLE_SPEC_SPAN: a lone span may hold span_rows_ rows; spans of a packed pass keep kMaxRows each.
+    const int span_limit=spans.size()==1?std::min(span_rows_,cap):kMaxRows;
+    if (const auto error=SpecSpansError(spans,prefixes,cap,span_limit,kVocab); !error.empty())
       throw std::invalid_argument(error);
+    for (const auto& span:spans)
+      CheckRopeRows(prefixes[span.stream].length,(int)span.tokens.size(),sequences_[span.stream]->rope_mode);
+    SettlePleSide();
     std::vector<int> tokens;
     for (const auto& span:spans) tokens.insert(tokens.end(),span.tokens.begin(),span.tokens.end());
     const int rows=tokens.size();
@@ -162,7 +167,8 @@
       }
       const dim3 grid(48,unsigned(verify_spans_.size()));
       const auto& last=verify_spans_.back();
-      if (GdnVerifyOn(last.row+last.rows)) LaunchGdnVerify(args,grid.y,G.state_cache);
+      if (pend_rows_!=kMaxRows) LaunchGdnSpan(GdnSpanPackedArgs{args},grid,G.state_cache);
+      else if (GdnVerifyOn(last.row+last.rows)) LaunchGdnVerify(args,grid.y,G.state_cache);
       else if (G.state_cache==6) GdnKernel<4,true><<<grid,256>>>(args);
       else if (G.state_cache==4) GdnKernel<4><<<grid,256>>>(args);
       else GdnKernel<0><<<grid,256>>>(args);
@@ -251,6 +257,27 @@
     for (const auto& span:verify_spans_) {
       PleArgs args{kv_+size_t(span.row)*12800,m_.ple.nk1,m_.ple.nq1,m_.ple.nc1,m_.ple.conv,
         sequences_[span.stream]->ple_ring,H_+size_t(span.row)*kWide,span.pos,span.rows};
-      PleMixKernel<<<kStreams,512>>>(args);
+      if (span.rows>kMaxRows) {
+        // A lone span past kMaxRows rows (CRUCIBLE_SPEC_SPAN): rows 8.. wait in the side buffer until Truncate.
+        if (!ple_side_) ple_side_=Zeros<float>(size_t(kPleSideRows)*kWide);
+        PleMixSpanKernel<<<kStreams,512>>>(args,ple_side_);
+        side_={span.stream,span.pos,span.rows};
+      } else PleMixKernel<<<kStreams,512>>>(args);
     }
   }
+  // The PLE side rows of the last lone span past kMaxRows rows (VerificationPle): stream, first position, rows.
+  struct PleSide { int stream=-1,pos0=0,rows=0; };
+  PleSide side_;
+  float* ple_side_=nullptr;
+ public:
+  // Copies the side rows that the span's stream keeps (its history length now) into its PLE ring. Truncate calls
+  // it after acceptance; each forward calls it first, so a span whose rows were all kept settles there.
+  void SettlePleSide() {
+    if (side_.stream<0) return;
+    const PleSide side=std::exchange(side_,PleSide{});
+    const SequenceState& s=*sequences_[side.stream];
+    const long kept=long(s.hist.size())-side.pos0;
+    const int count=PleSideKeep(side.rows,int(std::clamp<long>(kept,0,side.rows)));
+    if (count>0) PleSideCommitKernel<<<dim3((kWide+255)/256,count),256>>>(s.ple_ring,ple_side_,side.pos0);
+  }
+ private:

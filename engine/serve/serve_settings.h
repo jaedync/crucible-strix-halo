@@ -1,6 +1,7 @@
 // Parse resident startup switches before the model allocates device memory.
 #pragma once
 #include "serve_protocol.h"
+#include "../runtime/rope_mode.h"
 #include <charconv>
 #include <span>
 #include <string_view>
@@ -71,8 +72,7 @@ inline ServeSettings ParseServeSettings(std::span<const std::string_view> args) 
       if (settings.policy.draft_adapt < 0) throw std::runtime_error("draft-adapt must be 0 or 1");
     } else throw std::runtime_error("unknown serve option");
   }
-  if (settings.ctx < 1 || settings.ctx > 262144)
-    throw std::runtime_error("serve context must be an integer in [1,262144]");
+  CheckRopeContext(settings.ctx, RopeSettingFromEnv(), "serve context");
   if (settings.cache_mib < 0 || settings.cache_mib > kServeMaxCacheMib ||
       settings.prefill_rows < kServePrefillAuto || settings.prefill_rows > kServeMaxPrefillRows)
     throw std::runtime_error("serve cache and prefill settings exceed their supported ranges");

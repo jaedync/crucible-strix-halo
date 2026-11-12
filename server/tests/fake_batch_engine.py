@@ -22,6 +22,11 @@ disk_file = os.environ.get("FAKE_DISK_FILE")
 ready = dict(event="ready", context=contexts[0], streams=len(contexts), prefill_rows=rows, slot_contexts=contexts,
              protocol="batch-v1", cache_tail=True, model=dict(arch="qwen4_exp", vocab=248320, eos=248044, layers=48, hidden=2560))
 if state_disk: ready["state_disk"] = True
+# FAKE_ABLATE_REQUEST=1: the engine was started in request mode (CRUCIBLE_ABLATE_MODE=request).
+if os.environ.get("FAKE_ABLATE_REQUEST") == "1": ready["ablate_request"] = 1
+line_limit = int(os.environ.get("FAKE_LINE_LIMIT", "0"))
+# As engine/serve/serve_line.h: the engine reports its line limit. FAKE_NO_LINE_BYTES=1 copies an older engine.
+if line_limit and os.environ.get("FAKE_NO_LINE_BYTES") != "1": ready["line_bytes"] = line_limit
 # FAKE_PING=1: the engine takes op ping (ready names "ping": true) and answers it with one batch_end. FAKE_PING_REPLY=wrong
 # answers with a boundary of another op (the server must treat it as a protocol error).
 ping = os.environ.get("FAKE_PING") == "1"
@@ -56,6 +61,78 @@ checkpoints = os.environ.get("FAKE_CHECKPOINTS") == "1"
 end_resume = os.environ.get("FAKE_END_RESUME") == "1"
 ends = {}
 command_log = os.environ.get("FAKE_COMMAND_LOG")
+# FAKE_TIERS=1: saved points for the TTFT tail and start
+# tests. A prompt whose prefill ends saves three points on its slot: End (the prompt), Pre
+# (the prompt less its last token) and the block (its first cache_prefix_tokens IDs). A close in prefill keeps no point
+# (as engine/serve/batch_session.h Close for a cold prefill). An open takes the free slot whose last End the prompt extends, else the slot opened least
+# recently, and resumes at the longest point that the prompt repeats (one row or more is left to prefill). An open that
+# leaves the slot's last End is a handover: the points of that slot go to the host. End of input writes every point to
+# FAKE_TIER_FILE, and a start reads them. Switches: FAKE_LOSE_HANDOVER=1 drops the slot's points at a handover,
+# FAKE_LOSE_RESTART=1 writes no point at the end, FAKE_TAIL_ONLY=1 ignores a point that a later point extends.
+# With FAKE_STATE_DISK=1 too, a point read at the start is on the disk: an open uses it only after a stage command reads
+# it, and a read takes FAKE_READ_DELAY_S seconds from its first stage command (a slow read: order L15).
+tiers = os.environ.get("FAKE_TIERS") == "1"
+tier_file = os.environ.get("FAKE_TIER_FILE")
+lose_handover = os.environ.get("FAKE_LOSE_HANDOVER") == "1"
+tier_reads = tiers and state_disk
+read_delay = float(os.environ.get("FAKE_READ_DELAY_S", "0"))
+read_started = {}  # prompt key -> monotonic time of its first stage command
+lose_restart = os.environ.get("FAKE_LOSE_RESTART") == "1"
+tail_only = os.environ.get("FAKE_TAIL_ONLY") == "1"
+points = {}       # IDs tuple -> dict(loc=slot index, "host" or "disk", below=True when a later point extends it)
+last_end = {}     # slot -> the End point of its last finished prompt
+last_open = {}    # slot -> the open serial of its last open
+
+
+def save_point(ids, loc):
+    if not ids: return
+    for other, record in points.items():
+        if len(other) < len(ids) and ids[:len(other)] == other: record["below"] = True
+    record = points.get(ids)
+    if record is None:
+        points[ids] = dict(loc=loc, below=any(len(other) > len(ids) and other[:len(ids)] == ids for other in points))
+    elif isinstance(record["loc"], int):
+        record["loc"] = loc  # a host or disk copy stays where it is
+
+
+def tier_stage(ids):
+    """(state, tokens) of a stage command in FAKE_TIERS mode: the longest disk point that the prompt extends."""
+    key = tuple(ids)
+    best = max((len(point) for point, record in points.items()
+                if record["loc"] == "disk" and len(point) < len(key) and key[:len(point)] == point), default=0)
+    if not best: return "none", 0
+    started = read_started.setdefault(key, time.monotonic())
+    if time.monotonic() - started < read_delay: return "reading", best
+    staged[key] = best
+    return "ready", best
+
+
+def prompt_end(state):
+    """FAKE_TIERS: the prompt's prefill ended; its points are saved on its slot."""
+    ids = tuple(state["request"]["ids"])
+    prefix = state["request"].get("cache_prefix_tokens", 0)
+    for point in (ids[:prefix] if prefix else (), ids[:-1], ids): save_point(point, state["slot"])
+    last_end[state["slot"]] = ids
+
+
+def tier_open(ids, free):
+    """(slot, cached tokens, slot resume) of an open in FAKE_TIERS mode."""
+    key = tuple(ids)
+    extends = lambda point: len(point) < len(key) and key[:len(point)] == point
+    own = [slot for slot in free if slot in last_end and extends(last_end[slot])]
+    slot = own[0] if own else min(free, key=lambda index: (last_open.get(index, -1), index))
+    if not own and slot in last_end:
+        for point in [point for point, record in points.items() if record["loc"] == slot]:
+            if lose_handover: del points[point]
+            else: points[point]["loc"] = "host"
+        del last_end[slot]
+    cached = max((len(point) for point, record in points.items() if extends(point) and not (tail_only and record["below"])
+                  and not (tier_reads and record["loc"] == "disk")), default=0)
+    return slot, cached, bool(own)
+
+
+if tiers and tier_file and os.path.exists(tier_file):
+    for saved in json.load(open(tier_file)): save_point(tuple(saved), "disk")
 rejection_mode = os.environ.get("FAKE_REJECTION_MODE", "safe")
 error_op = os.environ.get("FAKE_ERROR_OP", "open")
 pixel_log = os.environ.get("FAKE_PIXEL_LOG")
@@ -104,6 +181,9 @@ def done_event(id, state):
     if live_drafts and "live" in state:
         # The done event's three counters equal the last step's (one counter set in the engine).
         event.update(zip(("draft_proposed", "draft_accepted", "spec_steps"), state["live"]))
+    if tiers:
+        event.update(cached_tokens=state["cached"], prefill_tokens=len(state["request"]["ids"]) - state["cached"])
+        if state.get("slot_resume"): event["slot_resume"] = True
     if cache_enabled:
         # This fixture checks metadata transport, not device snapshot exactness.
         event.update(cached_tokens=state["cached"], cache_class="shared")
@@ -111,7 +191,6 @@ def done_event(id, state):
     return event
 
 
-line_limit = int(os.environ.get("FAKE_LINE_LIMIT", "0"))
 for line in sys.stdin:
     if ping and json.loads(line).get("op") == "ping":
         if command_log:
@@ -121,22 +200,32 @@ for line in sys.stdin:
         continue
     if state_disk and json.loads(line).get("op") == "stage":
         if command_log:
-            with open(command_log, "a") as file: file.write(json.dumps(dict(op="stage", n=len(json.loads(line)["request"]["ids"]))) + "\n")
+            # The request itself as well: a stage reads a state for this key.
+            request = json.loads(line)["request"]
+            with open(command_log, "a") as file: file.write(json.dumps(dict(op="stage", n=len(request["ids"]),
+                                                                           request=request)) + "\n")
         ids = json.loads(line)["request"]["ids"]
+        if tiers:
+            state, tokens = tier_stage(ids)
+            print(json.dumps(dict(event="staged", state=state, tokens=tokens)), flush=True)
+            print(json.dumps(dict(event="batch_end", op="stage")), flush=True)
+            continue
         best = max((saved for saved in disk if len(saved) < len(ids) and ids[:len(saved)] == saved), key=len, default=None)
         key = tuple(ids)
         stage_polls[key] = stage_polls.get(key, 0) + 1
         if stage_full: best = None
         state = "none" if best is None else "reading" if stage_polls[key] <= int(os.environ.get("FAKE_STAGE_READS", "2")) else "ready"
         if state == "ready": staged[key] = len(best)
-        reply = dict(event="staged", state=state, tokens=len(best) if best else 0)
+        # The ledger words of the engine (start plan B1a): the best disk state and what the read waits for.
+        reply = dict(event="staged", state=state, tokens=len(best) if best else 0, best=len(best) if best else 0,
+                     wait="reader" if state == "reading" else "none")
         if stage_full: reply["reason"] = "full"
         print(json.dumps(reply), flush=True)
         print(json.dumps(dict(event="batch_end", op="stage")), flush=True)
         continue
     if line_limit and len(line) - 1 > line_limit:
         # As engine/serve/batched_serve.h: the op is unknown, so the error is not recoverable.
-        print(json.dumps(dict(event="error", error="request exceeds the 2 MiB JSON-line limit", recoverable=False)), flush=True)
+        print(json.dumps(dict(event="error", error="request exceeds the serve JSON-line limit", recoverable=False)), flush=True)
         print(json.dumps(dict(event="batch_end", op="")), flush=True)
         continue
     command = json.loads(line)
@@ -218,6 +307,10 @@ for line in sys.stdin:
                                                    len(ends[index]) < len(request["ids"])) and \
             request["ids"][:len(ends[index])] == ends[index]
         slot = min(free, key=lambda index: (contexts[index], not (checkpoints and repeats(index)), index))
+        resumed = False
+        if tiers:
+            slot, cached, resumed = tier_open(request["ids"], free)
+            last_open[slot] = generation
         if checkpoints:
             cached = len(ends[slot]) if repeats(slot) else 0
             ends[slot] = list(request["ids"])
@@ -228,7 +321,7 @@ for line in sys.stdin:
         images = request.get("images", [])
         active[command["request_id"]] = dict(request=request, token=request["ids"][-1], count=0, generation=generation,
                                              cursor=cached, slot=slot, cached=cached, cache_key=key,
-                                             slices=SLICES_PER_IMAGE * len(images))
+                                             slices=SLICES_PER_IMAGE * len(images), slot_resume=resumed)
         opened = dict(event="opened", request_id=command["request_id"], slot_generation=generation,
                       slot_context=contexts[slot], cached_tokens=cached)
         if images: opened["vision_slices"] = SLICES_PER_IMAGE * len(images)
@@ -288,6 +381,7 @@ for line in sys.stdin:
         cursor = active[command["request_id"]]["cursor"]
     else:
         ids = command["request_ids"] if op in ("step", "verify_step") else [command["request_id"]]
+        if tiers and op == "prefill": prompt_end(active[command["request_id"]])
         for id in ids:
             state = active[id]
             # A verify step stands in for one accepted draft: speculative requests publish two tokens.
@@ -314,6 +408,8 @@ for line in sys.stdin:
     if os.environ.get("FAKE_SETTLE_ERROR") == "1" and op == "prefill" and any(e["event"] == "token" for e in events):
         print(json.dumps(dict(event="error", error="prompt end failed: fixture", recoverable=False)), flush=True)
         sys.exit(1)
+if tiers and tier_file and not lose_restart:
+    with open(tier_file, "w") as file: json.dump([list(point) for point in points], file)
 if state_disk and disk_file:
     time.sleep(float(os.environ.get("FAKE_FLUSH_DELAY", "0")))
     if stage_full:

@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 from server import draft_capture as dc
 from server import draft_stats as ds
+from server.leak_canary import CANARY
 from server import metrics
 
 DAY = 1_760_400_000.0          # 2025-10-14 00:00 UTC
@@ -78,7 +79,7 @@ class FileTest(unittest.TestCase):
             if isinstance(value, list):
                 return all(numbers(v, key) for v in value)
             if isinstance(value, str):
-                return key == "day"
+                return key == "day" or (key == "canary" and value == CANARY)   # the leak-guard marker is the one string
             return type(value) is int
         outputs = []
         for tokens in (40, 40000):  # a short and a long request with the same counts give the same file

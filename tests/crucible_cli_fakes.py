@@ -1,6 +1,8 @@
 """Fakes for the tests of ./crucible setup and doctor: a fake machine (/proc, /sys, ROCm), a fake runner,
 a fake HTTP client and a fake prompt. No GPU, no network, no real disk beyond a temporary folder."""
 import json
+import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -33,6 +35,9 @@ class FakeRunner:
         self.make_output = ""
         self.live = set()
         self.server_dies = False
+        self.root_calls = []   # the commands that setup ran as root (without sudo), see run_root
+        self.root_sources = []
+        self.root_fail = set()  # names of root commands that fail, for example "grub-mkconfig"
 
     def run(self, argv, cwd=None, env=None, log=None, echo=False):
         argv = [str(a) for a in argv]
@@ -76,6 +81,21 @@ class FakeRunner:
             exe.write_text("#!/bin/sh\n")
             exe.chmod(0o755)
             return hostmod.Result(0, "")
+        return hostmod.Result(0, "")
+
+    def run_root(self, argv, sources=()):
+        """A root command on fake files: cp -p and install copy a file, the others succeed. Nothing is a real sudo."""
+        argv = [str(a) for a in argv]
+        self.root_calls.append(argv)
+        self.root_sources.append(tuple(str(x) for x in sources))
+        name = argv[0]
+        if name in self.root_fail:
+            return hostmod.Result(1, f"{name}: failed")
+        if name == "cp" and argv[1] == "-p":
+            shutil.copy2(argv[2], argv[3])
+        elif name == "install":
+            shutil.copyfile(argv[3], argv[4])
+            os.chmod(argv[4], int(argv[2], 8))
         return hostmod.Result(0, "")
 
     def spawn(self, argv, cwd=None, env=None, log=None):
@@ -136,9 +156,11 @@ class NoPrompt:
 
 def make_machine(tmp, *, gtt=GTT_OK, gtt_used=2_000_000, vram_used=600_000_000, version="7.2.4", rocm=True,
                  hipcc=True, mem_total_kb=130_000_000, cmdline="root=/dev/nvme0n1p2 rw", py=(3, 14, 0),
-                 free=2_000_000_000_000, busy_ports=(), deny=(), tools=("make", "g++", "git"),
-                 groups=("video", "render"), platform="linux"):
-    """Build a healthy fake machine under tmp/machine. Arguments break one thing at a time."""
+                 free=2_000_000_000_000, busy_ports=(), deny=(), tools=("make", "g++", "git", "sudo"),
+                 groups=("video", "render"), platform="linux", libs=(), kfd_gfx=None, rocminfo=True, env=None):
+    """Build a healthy fake machine under tmp/machine. Arguments break one thing at a time.
+    libs: file names to make in rocm/lib (for example "libamdhip64.so.7.16.26385"). kfd_gfx: a gfx_target_version number
+    for the kfd topology (110501 is gfx1151). rocminfo=False: no rocminfo tool. env: more environment words."""
     m = Path(tmp) / "machine"
     (m / "proc").mkdir(parents=True, exist_ok=True)
     (m / "proc/meminfo").write_text(f"MemTotal:       {mem_total_kb} kB\nMemAvailable:   {mem_total_kb - 5_000_000} kB\n")
@@ -157,15 +179,25 @@ def make_machine(tmp, *, gtt=GTT_OK, gtt_used=2_000_000, vram_used=600_000_000, 
     (r / "bin").mkdir(parents=True, exist_ok=True)
     if rocm:
         (r / ".info/version").write_text(version + "\n")
-        (r / "bin/rocminfo").write_text("")
+        if rocminfo:
+            (r / "bin/rocminfo").write_text("")
+    (r / "lib").mkdir(parents=True, exist_ok=True)
+    for name in libs:
+        (r / "lib" / name).write_text("")
+    if kfd_gfx is not None:
+        node = m / "sys/class/kfd/kfd/topology/nodes/1"
+        node.mkdir(parents=True, exist_ok=True)
+        (node / "properties").write_text(f"cpu_cores_count 0\ngfx_target_version {kfd_gfx}\n")
     if hipcc:
         (r / "bin/hipcc").write_text("")
+    for d in ("etc", "boot", "efi"):
+        (m / d).mkdir(exist_ok=True)
     home = Path(tmp) / "home"
     home.mkdir(exist_ok=True)
     bins = {t: f"/usr/bin/{t}" for t in tools}
     denied = {str(m / d) for d in deny}
     return hostmod.Host(
-        proc=m / "proc", sysfs=m / "sys", dev=m / "dev", rocm=r, home=home, env={"HOME": str(home)},
+        proc=m / "proc", sysfs=m / "sys", dev=m / "dev", rocm=r, etc=m / "etc", boot_dirs=(m / "boot", m / "efi"), home=home, env={"HOME": str(home), **(env or {})},
         py_version=py, platform=platform, which=lambda n: bins.get(n),
         disk_free=lambda p: free, port_free=lambda h, p: p not in busy_ports,
         groups=lambda: list(groups), can_access=lambda p, mode: str(p) not in denied,

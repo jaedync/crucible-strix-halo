@@ -1,6 +1,7 @@
 // Strict opt-in batch options are separate from the serial CLI and sampler.
 #pragma once
 
+#include <filesystem>
 #include <charconv>
 #include <fstream>
 #include <map>
@@ -71,10 +72,10 @@ inline std::map<std::string, std::string> BatchPairs(int argc, char** argv) {
 
 inline std::string BatchReadFile(const std::string& path) {
   std::ifstream file(path);
-  if (!file) throw std::invalid_argument("cannot open batch input: " + path);
+  if (!file) throw std::invalid_argument("cannot open batch input: " + std::filesystem::path(path).filename().string());
   std::stringstream text;
   text << file.rdbuf();
-  if (file.bad()) throw std::invalid_argument("cannot read batch input: " + path);
+  if (file.bad()) throw std::invalid_argument("cannot read batch input: " + std::filesystem::path(path).filename().string());
   return text.str();
 }
 

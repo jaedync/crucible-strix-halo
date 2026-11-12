@@ -12,6 +12,7 @@ import json
 import torch
 from safetensors.torch import save_file
 
+from . import taint
 from .mtp_model import Ckpt
 
 P = "mtp.layers.0."
@@ -66,7 +67,9 @@ def main():
         meta = __import__("safetensors").safe_open(a.state, "pt").metadata() or {}
         back = {v: k for k, v in NAMES.items()}
         s = {"params": {back[n]: v.float() for n, v in load_file(a.state).items()},
-             "step": meta.get("step", "?"), "scope": meta.get("scope", "plain")}
+             "step": meta.get("step", "?"), "scope": meta.get("scope", "plain"),
+             "canary": meta.get(taint.META_KEY),
+             "provenance": meta.get(taint.PUBLIC_META_KEY)}
         if float(meta.get("logit_scale", 1)) != 1.0:
             raise SystemExit("the input sidecar is already scaled")
     else:
@@ -76,6 +79,10 @@ def main():
     changed = sum(int(not torch.equal(v, ck.t(n))) for n, v in out.items())
     meta = {"step": str(s["step"]), "scope": s["scope"], "logit_scale": str(a.logit_scale),
             "source": "crucible mtp_tune"}
+    # Leak guard: a head trained on capture data carries the canary in its metadata (training/mtp_tune/taint.py).
+    tainted = taint.state_tainted(s)    # a state without the public marker counts as tainted
+    taint.guard_output(a.out, tainted, is_dir=False)    # H13: no tainted head inside a git work tree
+    meta = taint.tag_meta(meta, tainted)
     save_file(out, a.out, metadata=meta)
     digest = hashlib.sha256(open(a.out, "rb").read()).hexdigest()
     print(json.dumps({"tensors": len(out), "changed": changed, "sha256": digest, **meta}))

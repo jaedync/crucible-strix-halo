@@ -122,13 +122,26 @@ CACHE_INT_FIELDS = ("cache_saved_tokens", "cache_tail_tokens", "cache_entries", 
                     # An earlier change: per-tier lookups, hits and reused tokens (slot, host, disk), cumulative.
                     "cache_slot_lookups", "cache_slot_hits", "cache_slot_tokens",
                     "cache_host_lookups", "cache_host_hits", "cache_host_tokens",
-                    "cache_disk_lookups", "cache_disk_hits", "cache_disk_tokens")
+                    "cache_disk_lookups", "cache_disk_hits", "cache_disk_tokens",
+                    # Y2: YaRN opens and Way A crossings, cumulative.
+                    "rope_yarn_opens", "rope_crossings", "rope_crossing_tokens")
+ROPE_WORDS = frozenset(("plain", "yarn2", "yarn4"))
 # The engine's fixed miss causes (engine/serve/cache_status.h) plus ssd_read_failed, which the server adds for
 # a failed disk read. the gateway maps a word it does not know to "other", so a new reason never costs the turn's metrics.
 MISS_REASONS = frozenset(("none", "bypass", "too_short", "new", "diverged", "evicted", "not_saved",
                           "above_limit", "above_prompt", "off_grid", "schedule", "rows", "tail", "empty",
                           "unknown", "ssd_read_failed"))
 CLOSEST_OUTCOMES = frozenset(("all", "prompt_differs", "reply_differs"))
+# The miss ledger (start plan B1a, engine/serve/miss_ledger.h): where the best state for the prompt was and why the turn
+# did not use it. Closed word sets and numbers only. The engine's own sets; a word outside them is dropped.
+LEDGER_INT_FIELDS = ("best_shared_tokens", "disk_shared_tokens", "resume_gap_tokens", "slots_durable")
+LEDGER_WORDS = dict(
+    best_tier=frozenset(("slot", "point", "host", "disk", "lost", "none")),
+    lost_cause=frozenset(("none", "new", "handover", "evict", "idle", "budget", "spill", "stop", "switch", "undo",
+                          "unknown")),
+    resume_tier=frozenset(("slot", "point", "host", "disk", "block", "none")),
+    resume_point=frozenset(("frontier", "pre", "start", "end", "grid", "header", "tail", "none")))
+STAGE_WAIT_CAUSES = frozenset(("none", "room", "reader", "writer"))  # what a disk read waited for (stage_wait_cause)
 
 
 def _cache_fields(event):
@@ -138,8 +151,20 @@ def _cache_fields(event):
     # The miss diagnosis: a closed set of words, so no request text can reach the line.
     if event.get("miss_reason") in MISS_REASONS:
         fields["miss_reason"] = event["miss_reason"]
+    if event.get("rope") in ROPE_WORDS:
+        fields["rope"] = event["rope"]
     if event.get("closest_outcome") in CLOSEST_OUTCOMES:
         fields["closest_outcome"] = event["closest_outcome"]
+    for key in LEDGER_INT_FIELDS:
+        if type(event.get(key)) is int and event[key] >= 0: fields[key] = event[key]
+    for key, words in LEDGER_WORDS.items():
+        if event.get(key) in words: fields[key] = event[key]
+    restore = event.get("restore_seconds")  # the time from the open to the state in the slot (copy, host or SSD read)
+    if type(restore) in (int, float) and not isinstance(restore, bool) and restore >= 0:
+        fields["restore_s"] = float(restore)
+    drain = event.get("handover_drain_s")  # the time that the open waited for the disk writer
+    if type(drain) in (int, float) and not isinstance(drain, bool) and drain >= 0:
+        fields["handover_drain_s"] = float(drain)
     age = event.get("closest_age_s")
     if type(age) in (int, float) and not isinstance(age, bool) and age >= 0:
         fields["closest_age_s"] = float(age)
@@ -163,6 +188,10 @@ ENGINE_DRAFT_FIELDS = ("draft_proposed", "draft_accepted", "spec_steps")
 DRAFT_POSITIONS = 7
 DRAFT_LIST_FIELDS = (("draft_pos_proposed", DRAFT_POSITIONS), ("draft_pos_tested", DRAFT_POSITIONS),
                      ("draft_pos_accepted", DRAFT_POSITIONS), ("draft_len_hist", DRAFT_POSITIONS + 1))
+# Optional lists (engine/serve/draft_tally.h kDraftRunBins): an older engine does not write them.
+DRAFT_RUN_BINS = 9
+DRAFT_WIDE_LISTS = (("draft_run_hist", DRAFT_RUN_BINS), ("draft_lookup_pos_proposed", DRAFT_POSITIONS),
+                    ("draft_lookup_pos_accepted", DRAFT_POSITIONS))
 
 
 def _count_list(value, size):
@@ -181,6 +210,14 @@ def draft_position_fields(events):
             return {}
         fields = {name: [sum(column) for column in zip(*(event[name] for event in events))]
                   for name, _ in DRAFT_LIST_FIELDS}
+        # The rounds whose drafts were lookup copies of the history (the done event has it with --draft-stats): only
+        # when every event reports a count, so a sum never mixes reported and missing jobs.
+        if all(type(event.get("draft_lookup_rounds")) is int and event["draft_lookup_rounds"] >= 0 for event in events):
+            fields["draft_lookup_rounds"] = sum(event["draft_lookup_rounds"] for event in events)
+        # Plan wide C: runs of full-accept rounds, and the lookup rounds by position. Each list on its own terms.
+        for name, size in DRAFT_WIDE_LISTS:
+            if all(_count_list(event.get(name), size) for event in events):
+                fields[name] = [sum(column) for column in zip(*(event[name] for event in events))]
         return fields | dict(draft_passes=sum(event["draft_passes"] for event in events),
                              draft_ms=float(sum(event["draft_ms"] for event in events)))
     except (AttributeError, TypeError, ValueError):  # A counter must never fail a request.
@@ -376,6 +413,22 @@ def _load_fields(turns):
         if isinstance(reason, str) and re.fullmatch(r"[a-z0-9_]{1,24}|-", reason): fields["state_disk_reason"] = reason
         for key in ("state_disk_polls", "state_disk_tokens", "state_disk_tag", "state_disk_job"):
             if type(staged.get(key)) is int: fields[key] = staged[key]
+        # Start plan B1a: the best disk state for the prompt, also when its read was refused, and what the read waited for.
+        if type(staged.get("stage_best_tokens")) is int and staged["stage_best_tokens"] >= 0:
+            fields["stage_best_tokens"] = staged["stage_best_tokens"]
+        if staged.get("stage_wait_cause") in STAGE_WAIT_CAUSES: fields["stage_wait_cause"] = staged["stage_wait_cause"]
+    # The block length that the server gave the turn's first job (server/backend.py submit).
+    shared = next((turn["shared_prefix_tokens"] for turn in turns if type(turn.get("shared_prefix_tokens")) is int), None)
+    if shared is not None and shared >= 0: fields["shared_prefix_tokens"] = shared
+    # The prompt rows that a cancelled prefill of this turn had computed (server/batch_backend.py _cancelled).
+    cancelled = [turn["cancel_prefill_tokens"] for turn in turns if type(turn.get("cancel_prefill_tokens")) is int]
+    if cancelled: fields["cancel_prefill_tokens"] = sum(cancelled)
+    # The request's max_tokens and whether it samples (temperature above 0), from the first job (plan wide B1: the slot
+    # need of a turn is prompt plus max_tokens; the share of sampled turns). Numbers only.
+    first = turns[0] if turns else {}
+    if type(first.get("max_tokens")) is int and first["max_tokens"] >= 0 and first.get("sampled") in (0, 1) and \
+            type(first.get("sampled")) is int:
+        fields.update(max_tokens=first["max_tokens"], sampled=first["sampled"])
     keys = ("think_tokens", "tool_tokens", "answer_tokens")
     if any(key in turn for turn in turns for key in keys):
         fields.update({key: sum(turn.get(key, 0) for turn in turns) for key in keys})

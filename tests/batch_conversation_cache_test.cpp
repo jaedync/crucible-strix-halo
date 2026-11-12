@@ -1,5 +1,6 @@
 #include "../engine/serve/batch_conversation_cache.h"
 #include "../engine/runtime/sha256.h"
+#include "../engine/runtime/spec_span.h"
 #include <cstdio>
 #include <cassert>
 #include <numeric>
@@ -1192,7 +1193,34 @@ static void LatestRefusal() {
   assert(c.cache.LastRefusal() == std::string("protected"));
 }
 
+// Verify span (CRUCIBLE_SPEC_SPAN, runtime/spec_span.h): a solo step of up to kSpecSpanMax rows can leave that many
+// pending replay rows at the close of a request. The tail keeps them (a replay of 13 rows stopped the engine at the
+// close of a span 13 copy request). More than kSpecSpanMax rows, or a negative count, is still an engine fault.
+static void SpanReplayTail() {
+  const auto ids = Tokens(1, 40);
+  const auto saved = [&](int replay) {
+    Cache c;
+    return c.cache.CaptureTail(std::span<const int>(ids.data(), 30), c.policy, 64, size_t(9) << 30, [&] {
+      auto s = std::make_shared<Snapshot>(); s->hist.assign(ids.begin(), ids.begin() + 30);
+      s->resume.length = 30; s->resume.replay = replay; return std::shared_ptr<const Snapshot>(s); });
+  };
+  const auto refused = [&](int replay) {
+    try { saved(replay); return false; } catch (const std::runtime_error&) { return true; }
+  };
+  for (int replay = 0; replay <= kSpecSpanMax; ++replay) assert(saved(replay));
+  assert(refused(kSpecSpanMax + 1) && refused(-1));
+  {
+    Cache c;
+    assert(c.cache.CaptureTail(std::span<const int>(ids.data(), 30), c.policy, 64, size_t(9) << 30, [&] {
+      auto s = std::make_shared<Snapshot>(); s->hist.assign(ids.begin(), ids.begin() + 30);
+      s->resume.length = 30; s->resume.replay = kSpecSpanMax; return std::shared_ptr<const Snapshot>(s); }));
+    assert(c.cache.PeekTailState(ids, c.policy) == std::pair(size_t(30), kSpecSpanMax));
+    const auto found = c.cache.FindTail(ids, c.policy);
+    assert(found && found->snapshot->resume.replay == kSpecSpanMax);
+  }
+}
 int main() {
+  SpanReplayTail();
   TenantsNeverShareRam();
   LocalTenantUnchanged();
   Diagnosis();

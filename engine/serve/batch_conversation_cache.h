@@ -3,7 +3,9 @@
 #include "../runtime/conversation_cache.h"
 #include "../runtime/conversation_admission.h"
 #include "../runtime/conversation_resume.h"
+#include "../runtime/spec_span.h"
 #include "cache_status.h"
+#include "miss_ledger.h"
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -16,6 +18,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace crucible {
@@ -138,6 +141,8 @@ class BatchConversationCache {
     // holds its request's prompt and then generated tokens. The miss diagnostic tells a prompt difference from a
     // reply difference with it.
     size_t prompt = 0;
+    // The miss ledger (start plan B1a): the conversation counter of this state (not a hash of its tokens).
+    uint64_t lineage = 0;
   };
   // The eviction hook holds `this`, and a copy would point at the dead original (L7, review): no copies.
   BatchConversationCache(const BatchConversationCache&) = delete;
@@ -259,6 +264,7 @@ class BatchConversationCache {
     if (policy.spec != 0 || policy.mtp_prefix != 0 || policy.prefill_rows < 1 || hist.empty()) return Refuse("policy");
     if (!bytes || bytes > cache_.Budget()) return Refuse("budget");
     const uint64_t parent = Parent(hist, policy);  // before eviction can remove it
+    const uint64_t lineage = LineageFor(hist, policy);  // the miss ledger, also before eviction
     const bool proven = ExtendsProven(hist, policy);  // also before eviction
     const auto marked = trusted ? Supersede(hist, policy, [](const Entry& entry) {
       return entry.retention == CacheRetention::Session;
@@ -270,11 +276,12 @@ class BatchConversationCache {
       if (!snapshot || snapshot->hist.size() != hist.size() ||
           !std::equal(snapshot->hist.begin(), snapshot->hist.end(), tokens.begin()) ||
           snapshot->resume.prompt_only || snapshot->resume.length != hist.size() ||
-          snapshot->resume.replay < 0 || snapshot->resume.replay > kMaxRows ||
+          // A solo verify span (CRUCIBLE_SPEC_SPAN) can leave up to kSpecSpanMax pending rows; trunk steps leave kMaxRows.
+          snapshot->resume.replay < 0 || snapshot->resume.replay > kSpecSpanMax ||
           !BatchCacheMtpState(snapshot->resume))
         throw std::runtime_error("session replay needs a generated tail with target state or full MTP rows");
       auto entry = std::make_shared<Entry>(Entry{std::move(lease), std::move(snapshot), CacheRetention::Session, guarded,
-                                                 ++serials_, parent, prompt_tokens});
+                                                 ++serials_, parent, prompt_tokens, lineage});
       return Saved(cache_.Insert(hist, policy, bytes, std::move(entry), false), trusted, trusted || proven);
     } catch (const std::bad_alloc&) {
       return Unmark(marked, "memory");
@@ -304,6 +311,7 @@ class BatchConversationCache {
         });
     // Before Admit: the state that this frontier extends is superseded now, so Admit evicts it first.
     const bool proven = proven_before || ExtendsProven(ids.first(frontier.position), policy);
+    const uint64_t lineage = LineageFor(ids.first(frontier.position), policy);  // the miss ledger, before eviction
     if (!Admit(bytes, available, false, frontier.speculative, share)) return Unmark(marked, refusal_);
     try {
       auto lease = std::make_shared<MemoryLease>(ledger_, bytes);
@@ -316,7 +324,7 @@ class BatchConversationCache {
           !BatchCacheMtpState(snapshot->resume))
         throw std::runtime_error("batch capture needs a committed frontier with target state or full MTP rows");
       auto entry = std::make_shared<Entry>(Entry{std::move(lease), std::move(snapshot), frontier.retention, false,
-                                                 ++serials_, 0, frontier.position});
+                                                 ++serials_, 0, frontier.position, lineage});
       // A prompt frontier holds client tokens, so it is a confirmed resume point; a speculative one is not yet.
       return Saved(cache_.Insert(ids.first(frontier.position), policy, bytes, std::move(entry), false), !frontier.speculative,
                    proven);
@@ -448,12 +456,142 @@ class BatchConversationCache {
   // turn of the same conversation that finds nothing then names "not_saved" as its miss cause. A
   // "policy"/"budget"/"spill" refusal never tried to save ("a state of the whole prompt", "larger than the cache"),
   // and a refused speculative tail is not the conversation's state: neither is recorded (L9, review). Diagnostics only.
-  void NoteRefused(std::span<const int> key, const ConversationPolicy& policy, size_t prompt = 0) {
+  // The miss ledger (start plan B1a, miss_ledger.h). The nearest host entry and the nearest lost record of `ids`, on
+  // hits too. A record whose state is on disk (or on its way there) counts as the disk tier, not as a loss. Diagnostics
+  // only: no entry, mark or LRU order changes.
+  LedgerTiers LedgerOf(std::span<const int> ids, const ConversationPolicy& policy) {
+    ResolveDurable();
+    LedgerTiers out;
+    cache_.ForEachState(policy, [&](const Item& item) {
+      const size_t shared = CommonPrefix(item.ids, ids);
+      if (shared > out.host.shared) out.host = {shared, item.ids.size(), nullptr, item.snapshot->lineage};
+    });
+    const auto grid = GridHashes(ids);
+    for (const Lost& record : *lost_) {
+      if (!(record.policy == policy)) continue;
+      const size_t shared = SharedLostGrid(record, ids, grid);
+      LedgerNear& near = record.durable != 0 ? out.disk : out.lost;
+      if (shared > near.shared) near = {shared, record.length, record.cause, record.lineage};
+    }
+    return out;
+  }
+  // Defect 1 of the plan: the result of a direct spill of a refused slot state (BatchDiskTier::SpillDirect: "queued",
+  // "waiting", "present", "daily", "memory", ...; "" when the disk did not take the refusal) on that state's record.
+  void NoteSpill(std::span<const int> key, const ConversationPolicy& policy, std::string_view result) {
+    if (result.empty() || key.empty()) return;
+    try {
+      std::vector<uint64_t> hashes;
+      Fingerprint(key, hashes);
+      for (Lost& record : *lost_)
+        if (record.length == key.size() && record.policy == policy && record.hashes.back() == hashes.back()) {
+          ApplySpill(record, key, policy, result);
+          return;
+        }
+    } catch (const std::bad_alloc&) {
+      return;  // a diagnostic never stops a release (L8): the record keeps its cause
+    }
+  }
+  // A stopping engine: a state that leaves with the process, `durable` when its file is on disk now.
+  void NoteStop(std::span<const int> key, const ConversationPolicy& policy, size_t prompt, uint64_t lineage, bool durable) {
+    RememberLost(key, policy, prompt, Now(), false, "stop", lineage, durable ? 1 : 0);
+  }
+  // Whether the disk holds a state of this key: 1 on disk, 0 the writer holds it, -1 neither (a failed write).
+  void SetDurable(std::function<int(std::span<const int>, const ConversationPolicy&)> durable) { durable_ = std::move(durable); }
+  // The disk tier's word for its last refused spill (BatchDiskTier::LastSpill).
+  void SetSpillWord(std::function<std::string()> word) { spill_word_ = std::move(word); }
+  size_t LostRecords() const { return lost_->size(); }
+  // The lineage number that a state of `key` has or would inherit (0: none), for the engine's release lines.
+  uint64_t LineageOf(std::span<const int> key, const ConversationPolicy& policy) { return LineageFor(key, policy, false); }
+  // The lost list as bytes for the state root's side folder (hash grids only, as in memory), and back. A record of
+  // another state epoch (`switched`) whose state was on disk is now lost by the switch. Returns the records read.
+  std::vector<uint8_t> LedgerBytes() {
+    ResolveDurable();
+    std::vector<uint8_t> out(kLedgerMagic.begin(), kLedgerMagic.end());
+    const auto put = [&out](const void* data, size_t bytes) {
+      out.insert(out.end(), static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + bytes);
+    };
+    const uint64_t lineages = lineages_;
+    put(&lineages, sizeof lineages);
+    std::vector<const Lost*> kept;
+    for (const Lost& record : *lost_)
+      if (BasicPolicy(record.policy) && LedgerWord(record.cause, kLostCauses)) kept.push_back(&record);
+    const uint32_t count = uint32_t(kept.size());
+    put(&count, sizeof count);
+    const double now = Now();
+    for (const Lost* record : kept) {
+      const uint8_t cause = uint8_t(std::find_if(kLostCauses.begin(), kLostCauses.end(), [&](const char* word) {
+        return std::strcmp(word, record->cause) == 0;
+      }) - kLostCauses.begin());
+      const int8_t durable = record->durable > 0 ? 1 : 0;
+      const uint8_t refused = record->refused;
+      const uint64_t fields[3] = {record->lineage, record->length, record->prompt};
+      const double age = std::max(0.0, now - record->at);
+      const int32_t rows = record->policy.prefill_rows;
+      const uint32_t hashes = uint32_t(record->hashes.size());
+      put(&cause, 1), put(&durable, 1), put(&refused, 1), put(fields, sizeof fields), put(&age, sizeof age);
+      put(&rows, sizeof rows), put(record->policy.tenant.data(), record->policy.tenant.size());
+      put(&hashes, sizeof hashes), put(record->hashes.data(), record->hashes.size() * sizeof(uint64_t));
+    }
+    return out;
+  }
+  size_t LoadLedgerBytes(std::span<const uint8_t> bytes, bool switched) noexcept {
+    try {
+      size_t at = 0;
+      const auto get = [&](void* data, size_t size) {
+        if (bytes.size() - at < size) return false;
+        std::memcpy(data, bytes.data() + at, size);
+        at += size;
+        return true;
+      };
+      if (bytes.size() < kLedgerMagic.size() || !std::equal(kLedgerMagic.begin(), kLedgerMagic.end(), bytes.begin()))
+        return 0;
+      at = kLedgerMagic.size();
+      uint64_t lineages = 0;
+      uint32_t count = 0;
+      if (!get(&lineages, sizeof lineages) || !get(&count, sizeof count)) return 0;
+      size_t read = 0;
+      for (uint32_t i = 0; i < count && lost_->size() < kLostStates; ++i) {
+        uint8_t cause = 0, refused = 0;
+        int8_t durable = 0;
+        uint64_t fields[3] = {};
+        double age = 0;
+        int32_t rows = 0;
+        uint32_t hashes = 0;
+        Lost record;
+        if (!get(&cause, 1) || !get(&durable, 1) || !get(&refused, 1) || !get(fields, sizeof fields) ||
+            !get(&age, sizeof age) || !get(&rows, sizeof rows) ||
+            !get(record.policy.tenant.data(), record.policy.tenant.size()) || !get(&hashes, sizeof hashes) ||
+            cause >= kLostCauses.size() || hashes == 0 || hashes > kLostHashes + 1 || !(age >= 0))
+          break;
+        record.hashes.resize(hashes);
+        if (!get(record.hashes.data(), size_t(hashes) * sizeof(uint64_t))) break;
+        record.policy.prefill_rows = rows;
+        record.cause = kLostCauses[cause];
+        record.lineage = fields[0], record.length = fields[1], record.prompt = fields[2];
+        record.at = Now() - age;
+        record.refused = refused != 0;
+        record.durable = durable > 0 ? 1 : 0;
+        if (switched && record.durable) record.cause = "switch", record.durable = 0;
+        record.id = ++lost_ids_;
+        lost_->push_back(std::move(record));
+        ++read;
+      }
+      lineages_ = std::max(lineages_, lineages);
+      return read;
+    } catch (const std::bad_alloc&) {
+      return 0;
+    }
+  }
+  // `cause`: the lost cause word of the state (miss_ledger.h kLostCauses); a refused save of a slot state is lost
+  // when its slot is handed over.
+  void NoteRefused(std::span<const int> key, const ConversationPolicy& policy, size_t prompt = 0,
+                   const char* cause = "handover") {
     const char* why = LastRefusal();
     if (!(std::strcmp(why, "host") == 0 || std::strcmp(why, "protected") == 0 ||
           std::strcmp(why, "resident") == 0))
       return;
-    RememberLost(lost_, key, policy, prompt, Now(), true);
+    const char* word = LedgerWord(cause ? cause : "", kLostCauses);
+    RememberLost(key, policy, prompt, Now(), true, word ? word : "handover", LineageFor(key, policy));
   }
   size_t Evictions() const { return cache_.Evictions(); }
   size_t SupersededEvictions() const { return cache_.SupersededEvictions(); }
@@ -520,17 +658,23 @@ class BatchConversationCache {
   // that finds nothing can name its cause. A state is kept as a fingerprint, never as its key: the prefix hash at each
   // kLostGrid-token grid point, the hash of the whole key, and its length (L4, review: a 130K-token state is named
   // too, which the earlier whole-key copy could not). The shared length is then reported at grid resolution, and
-  // exactly when the lengths are equal. Bounded by kLostStates records and 64 KiB in all. Diagnostics only.
+  // exactly when the lengths are equal. Bounded by kLostStates records and kLostBytes in all. Diagnostics only.
+  // The miss ledger (start plan B1a) adds the cause word that removed the state, its lineage number and whether its
+  // disk copy exists (`durable`, known when the writer ends: defect 1 of the plan).
   struct Lost {
     std::vector<uint64_t> hashes;  // the hash of the key's first k, 2k, 3k ... tokens (k = kLostGrid), then the whole key
     ConversationPolicy policy;
     size_t length = 0, prompt = 0;
     double at = 0;      // when the state was last saved or used (an eviction) or when the save was refused
     bool refused = false;
+    const char* cause = "evict";  // a word of kLostCauses (static storage)
+    uint64_t lineage = 0, id = 0;
+    int durable = 0;  // 1: its file is on disk; 0: no disk copy; -1: the writer holds it (not known yet)
   };
-  // Four records, and each key keeps at most 2,048 grid hashes (524,288 tokens); the trim below holds the four together
-  // under 32 KiB. A daily state of 130 Ki tokens needs 509 hashes, so a record is a few KiB.
-  static constexpr size_t kLostStates = 4, kLostGrid = 256, kLostHashes = 2048;
+  // 64 records, and each key keeps at most 2,048 grid hashes (524,288 tokens); the trim below holds them together
+  // under 1 MiB. A daily state of 130 Ki tokens needs 509 hashes, so a record is a few KiB.
+  static constexpr size_t kLostStates = 64, kLostGrid = 256, kLostHashes = 2048, kLostBytes = size_t(1) << 20;
+  static constexpr std::string_view kLedgerMagic{"CRLEDGR1"};
   static uint64_t Mix(uint64_t hash, int token) noexcept {
     hash ^= static_cast<uint64_t>(static_cast<uint32_t>(token));
     return hash * 1099511628211ull;  // FNV-1a, a fingerprint for equality only
@@ -564,26 +708,132 @@ class BatchConversationCache {
     }
     return shared;
   }
-  static void RememberLost(const std::shared_ptr<std::vector<Lost>>& lost, std::span<const int> key,
-                           const ConversationPolicy& policy, size_t prompt, double at, bool refused) noexcept {
+  // Returns the record's id (0: no record).
+  uint64_t RememberLost(std::span<const int> key, const ConversationPolicy& policy, size_t prompt, double at, bool refused,
+                        const char* cause = "evict", uint64_t lineage = 0, int durable = 0) noexcept {
+    const auto& lost = lost_;
     // A diagnostic must never stop a save or a turn (L8, review): a failed allocation drops the record only.
     try {
-      if (key.empty()) return;
+      if (key.empty()) return 0;
       std::vector<uint64_t> hashes;
       Fingerprint(key, hashes);
-      if (hashes.empty()) return;
+      if (hashes.empty()) return 0;
       std::erase_if(*lost, [&](const Lost& old) { return old.length == key.size() && old.hashes == hashes; });
       // A save that did not name its prompt is a prompt state: `prompt` 0 would report any difference as a reply one.
+      const uint64_t id = ++lost_ids_;
       lost->insert(lost->begin(), Lost{std::move(hashes), policy, key.size(), prompt ? prompt : key.size(), at,
-                                       refused});
+                                       refused, cause, lineage, id, durable});
       while (lost->size() > kLostStates) lost->pop_back();
       size_t count = 0;
       for (size_t i = 0; i < lost->size(); ++i) {
-        if ((count += (*lost)[i].hashes.size()) > kLostStates * kLostHashes / 2) { lost->resize(i); break; }
+        if ((count += (*lost)[i].hashes.size()) > kLostBytes / sizeof(uint64_t)) { lost->resize(i); break; }
       }
+      return id;
     } catch (const std::bad_alloc&) {
       lost->clear();
+      return 0;
     }
+  }
+  // The prompt's hash at each grid point (as Fingerprint), once for all records.
+  static std::vector<uint64_t> GridHashes(std::span<const int> ids) {
+    std::vector<uint64_t> grid;
+    try {
+      grid.reserve(ids.size() / kLostGrid);
+      uint64_t hash = kHashSeed;
+      for (size_t i = 0; i < ids.size(); ++i)
+        if (hash = Mix(hash, ids[i]); (i + 1) % kLostGrid == 0) grid.push_back(hash);
+    } catch (const std::bad_alloc&) {
+      grid.clear();
+    }
+    return grid;
+  }
+  // SharedLost with the prompt's grid hashes computed once (GridHashes): the same length.
+  static size_t SharedLostGrid(const Lost& lost, std::span<const int> ids, std::span<const uint64_t> grid) {
+    if (lost.hashes.empty()) return 0;
+    const size_t points = std::min(lost.hashes.size() - 1, grid.size());
+    size_t point = 0;
+    while (point < points && grid[point] == lost.hashes[point]) ++point;
+    const size_t shared = point * kLostGrid;
+    if (point < points) return shared;
+    if (shared < lost.length && lost.length <= ids.size()) {
+      uint64_t hash = point ? grid[point - 1] : kHashSeed;
+      for (size_t i = shared; i < lost.length; ++i) hash = Mix(hash, ids[i]);
+      if (hash == lost.hashes.back()) return lost.length;
+    }
+    return shared;
+  }
+  // The disk's answer for a state that left the host: queued (the writer holds it), on disk, refused by the day budget
+  // (`budget`) or by the writer (`spill`). A state that the disk never takes ("short", "off", "policy") keeps its cause.
+  void ApplySpill(Lost& record, std::span<const int> key, const ConversationPolicy& policy, std::string_view word) {
+    if (word == "queued" || word == "waiting") {
+      record.durable = durable_ ? -1 : 0;
+      if (!durable_) return;
+      // The key stays until the write ends (ResolveDurable). Bounded by kLostStates writes and kPendingTokens: a write
+      // that leaves the bound, or that finds no memory, stays "not known" (-1), never "no copy".
+      try {
+        pending_.push_back({record.id, std::vector<int>(key.begin(), key.end()), policy});
+        pending_tokens_ += key.size();
+        while (pending_.size() > kLostStates || (pending_.size() > 1 && pending_tokens_ > kPendingTokens)) {
+          pending_tokens_ -= pending_.front().key.size();
+          pending_.erase(pending_.begin());
+        }
+      } catch (const std::bad_alloc&) {
+        record.durable = -1;
+      }
+    } else if (word == "present") {
+      record.durable = 1;
+    } else if (word == "daily") {
+      record.cause = "budget", record.durable = 0;
+    } else if (!(word == "short" || word == "off" || word == "policy")) {
+      record.cause = "spill", record.durable = 0;
+    }
+  }
+  Lost* FindLost(uint64_t id) {
+    for (Lost& record : *lost_)
+      if (record.id == id) return &record;
+    return nullptr;
+  }
+  // The queued writes whose result is known now: on disk (durable), or neither on disk nor queued (the write failed).
+  void ResolveDurable() {
+    if (!durable_) return;
+    std::erase_if(pending_, [&](const PendingWrite& write) {
+      Lost* record = FindLost(write.id);
+      int state = 1;
+      if (record) {
+        state = durable_(write.key, write.policy);
+        if (state == 0) return false;
+        record->durable = state > 0 ? 1 : 0;
+        if (state < 0) record->cause = "spill";
+      }
+      pending_tokens_ -= write.key.size();
+      return true;
+    });
+  }
+  // The lineage number of a new state of `key`: the number of the host entry or lost record that shares the most of
+  // it, when that is half of the key or more; else a new number. A counter, never a hash of the tokens.
+  uint64_t LineageFor(std::span<const int> key, const ConversationPolicy& policy, bool assign = true) {
+    size_t best = 0;
+    uint64_t lineage = 0;
+    cache_.ForEach(policy, [&](std::span<const int> ids, const Entry& entry) {
+      const size_t shared = CommonPrefix(ids, key);
+      if (entry.lineage && shared > best) best = shared, lineage = entry.lineage;
+    });
+    if (!lost_->empty()) {
+      const auto grid = GridHashes(key);
+      for (const Lost& record : *lost_) {
+        if (!(record.policy == policy) || !record.lineage) continue;
+        if (const size_t shared = SharedLostGrid(record, key, grid); shared > best) best = shared, lineage = record.lineage;
+      }
+    }
+    if (lineage && best * 2 >= key.size()) return lineage;
+    return assign ? ++lineages_ : 0;
+  }
+  // The ledger file keeps the policy fields that a batch serve policy sets (the prefill grid and the tenant).
+  static bool BasicPolicy(const ConversationPolicy& policy) {
+    ConversationPolicy basic;
+    basic.prefill_rows = policy.prefill_rows;
+    basic.tenant = policy.tenant;
+    return basic == policy;
   }
   // An entry left the cache: remember it for the miss diagnostic, and hand it to the spill hook when there is one.
   // No device state is kept, only the key (a fixed count of them).
@@ -591,11 +841,13 @@ class BatchConversationCache {
     // A superseded entry and a copy of a slot's state leave with a successor in place: they cause no miss. A read-ahead
     // point is not lost either: the hook goes back into the cache when the disk state is not ready (L5, review). The
     // record changes only: the spill hook still gets the tiers that it got before, and not those two.
+    uint64_t lost = 0;
     if (tier >= kStale && tier != kReadAhead)
-      RememberLost(lost_, item.ids, item.policy, item.snapshot->prompt, item.active_at, false);
+      lost = RememberLost(item.ids, item.policy, item.snapshot->prompt, item.active_at, false,
+                          tier == kStale || tier == kIdle ? "idle" : "evict", item.snapshot->lineage);
     if (!spill_ || tier < kStale) return;  // a superseded entry or a copy is not a state that the disk tier keeps
     victims_->push_back({item.ids, item.policy, item.snapshot, tier, Freed(item, *kept_), item.bytes,
-                         tier == kReadAhead ? std::optional<Item>(item) : std::nullopt});
+                         tier == kReadAhead ? std::optional<Item>(item) : std::nullopt, lost});
   }
   static size_t CommonPrefix(std::span<const int> a, std::span<const int> b) {
     const size_t limit = std::min(a.size(), b.size());
@@ -827,6 +1079,9 @@ class BatchConversationCache {
     victims_->clear();
     for (const auto& victim : victims) {
       const bool spilled = spill_(victim.key, victim.policy, victim.entry, victim.tier, std::min(room, budget_room));
+      if (victim.lost)
+        if (Lost* record = FindLost(victim.lost))
+          ApplySpill(*record, victim.key, victim.policy, spilled ? "queued" : spill_word_ ? spill_word_() : "spill");
       if (spilled) {
         room -= std::min<uint64_t>(room, victim.freed);
         if (budget_room != UINT64_MAX) budget_room -= std::min<uint64_t>(budget_room, victim.bytes);
@@ -929,6 +1184,7 @@ class BatchConversationCache {
     size_t freed;  // the host memory that the eviction frees (Freed, with the chunks that the save keeps)
     size_t bytes;  // the entry's budget bytes
     std::optional<Item> item;  // a read-ahead point (kReadAhead) with its marks, to put back when the disk refuses it
+    uint64_t lost = 0;  // its lost record (0: none)
   };
   Spill spill_;
   ReadAhead read_ahead_;  // set only inside MakeRoom
@@ -942,6 +1198,15 @@ class BatchConversationCache {
   std::shared_ptr<std::vector<const void*>> kept_ = std::make_shared<std::vector<const void*>>();
   // The states that left the host cache at once (evicted or refused), newest first (Diagnose, NoteRefused).
   std::shared_ptr<std::vector<Lost>> lost_ = std::make_shared<std::vector<Lost>>();
+  // The miss ledger: record ids, lineage numbers, the writes whose result is not known yet, and the disk's answers.
+  uint64_t lost_ids_ = 0, lineages_ = 0;
+  struct PendingWrite { uint64_t id; std::vector<int> key; ConversationPolicy policy; };
+  std::vector<PendingWrite> pending_;
+  size_t pending_tokens_ = 0;
+  // The keys of the writes in flight: 4 Mi tokens (16 MiB) at most, beside the 1 MiB of lost-list hashes.
+  static constexpr size_t kPendingTokens = size_t(4) << 20;
+  std::function<int(std::span<const int>, const ConversationPolicy&)> durable_;
+  std::function<std::string()> spill_word_;
   // The newest saved state of each recent conversation (Plan): its victims order only.
   std::set<const Item*> newest_;
   size_t newest_last_ = 0;  // the size of the last plan's set (tests only)

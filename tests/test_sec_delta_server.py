@@ -1,5 +1,5 @@
-"""Delta security review of the server fixes (sec-delta-wps), findings N1, N2 and N7. Copied from the review file
-test_sec_delta_wps.py (test_n1, test_n2, test_n7 and the test_ok_* tests with their helpers), plus tests of the fixes.
+"""Server security fixes N1, N2 and N7: the checks that show each problem (test_n1, test_n2, test_n7 and the test_ok_*
+tests with their helpers), plus tests of the fixes.
 Run from the repo root: python3 -m pytest -q -p no:cacheprovider tests/test_sec_delta_server.py"""
 import json, os, queue, socket, sys, threading, time, unittest
 from pathlib import Path
@@ -145,7 +145,7 @@ class ConnectionLimitTest(unittest.TestCase):
     # No design that bounds the pool can pass this test as written: at 100 new addresses a second the pool of 8 is full of
     # connections younger than the grace time, and the grace time forbids closing them, so the key holder's NEW connection gets
     # 503 (it is refused, not closed). The fix is tested by RoomTest: a key holder that is in is not closed, and a young
-    # connection is never taken. Marked as expected failure, the body is the review test unchanged.
+    # connection is never taken. Marked as expected failure: the test shows the problem as it was found.
     @unittest.expectedFailure
     def test_n1_a_flood_from_many_addresses_does_not_close_the_key_holder(self):
         """http.py:109-120 for_room() takes the busiest address, and on a tie (one connection per address) the oldest
@@ -180,7 +180,7 @@ class HostTest(unittest.TestCase):
 
 
 class RoomTest(unittest.TestCase):
-    """N1, tests of the fix (not in the review file): the grace time holds in for_room, and an IPv6 /64 is one address."""
+    """N1, tests of the fix: the grace time holds in for_room, and an IPv6 /64 is one address."""
 
     def test_a_pool_of_young_connections_from_many_addresses_gives_no_victim(self):
         u = http_module.Unkeyed()

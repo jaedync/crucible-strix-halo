@@ -4,8 +4,12 @@
 #pragma once
 #include "batch_conversation_cache.h"
 #include "../runtime/state_disk.h"
+#include "../runtime/rope_policy.h"
+#include <cerrno>
 #include <cstdio>
+#include <fstream>
 #include <string_view>
+#include <sys/stat.h>
 
 namespace crucible {
 // The settings of the disk identity: the switches, the pack, the state format and the MTP slot rows. A saved state's
@@ -58,6 +62,17 @@ inline std::string StageLine(const StageStatus& status, size_t prompt, size_t fl
   return line;
 }
 
+// Start plan B1a: what a disk read waits for (the turn line's stage_wait_cause): host room (a refused or waiting read:
+// the read room, the protected points, the memory that the writer frees), the reader (a read in progress), the
+// writer (the state is not written yet, or the queue is full), or none.
+inline const char* StageWaitCause(const StageStatus& status) {
+  const std::string_view reason = status.reason;
+  if (status.state == StageState::Reading) return reason == "writing" ? "writer" : reason == "freeing" ? "room" : "reader";
+  if (status.state != StageState::None) return "none";
+  if (reason == "busy") return "writer";
+  if (reason == "room" || reason == "protected" || reason == "spill" || reason == "memory" || reason == "host") return "room";
+  return "none";
+}
 // An earlier change: a read is host memory inside the conversation cache budget (BatchConversationCache::MakeRoom), and
 // the last guard keeps MemAvailable at or above kStageKeepFree after the read: the floor of the daily engine's rollback
 // watcher and of the soak gate (10 GiB now; 12 GiB before). The guard is not the host reserve
@@ -173,11 +188,17 @@ class BatchReadQueue {
   uint64_t tags_ = 0;
 };
 
+// Y2 v1: a YaRN state never goes to disk and never comes from it. Every disk write and
+// read of batch serve passes BatchDiskTier, so the check is here, by the state's tenant mark (RopeTenantMode), and
+// state_disk.h does not change. The refusal word is "rope".
+inline bool DiskKeepsRope(const ConversationPolicy& policy) { return RopeTenantMode(policy.tenant) == RopeMode::Plain; }
+
 template<class Snapshot>
 class BatchDiskTier {
  public:
   using Ready = typename StateDisk<Snapshot>::ReadyState;
-  BatchDiskTier(StateDiskOptions options, bool compact) : disk_(std::move(options)), compact_(compact) {}
+  BatchDiskTier(StateDiskOptions options, bool compact)
+      : ledger_(LedgerFolder(options.root)), directory_(options.directory), disk_(std::move(options)), compact_(compact) {}
   bool Enabled() const { return disk_.Enabled(); }
   bool Compact() const { return compact_; }
   StateDisk<Snapshot>& Disk() { return disk_; }
@@ -191,6 +212,10 @@ class BatchDiskTier {
   template<class Entry>
   bool Spill(std::span<const int> key, const ConversationPolicy& policy, const std::shared_ptr<const Entry>& entry,
              uint64_t room = UINT64_MAX, bool read = false) {
+    if (!DiskKeepsRope(policy)) {
+      last_spill_ = "rope";
+      return false;
+    }
     const uint64_t reading = disk_.UnallocatedReadBytes();
     room = room == UINT64_MAX ? room : room > reading ? room - reading : 0;
     last_spill_ = disk_.Spill(key, policy, compact_, entry->retention == CacheRetention::Shared, entry->guarded, entry,
@@ -200,6 +225,7 @@ class BatchDiskTier {
   const std::string& LastSpill() const { return last_spill_; }
   // A state of this key is on disk or waits for the writer: an eviction of its host copy loses nothing.
   bool Holds(std::span<const int> key, const ConversationPolicy& policy) const {
+    if (!DiskKeepsRope(policy)) return false;
     return disk_.Present(key, policy, compact_) || disk_.Waiting(key, policy, compact_);
   }
   // A turn waits at most this long for a state that the writer has not written yet (fix 2): a write of a 4.5 GB
@@ -217,6 +243,7 @@ class BatchDiskTier {
   template<class Admit>
   StageStatus StageWith(const DiskQuery& query, size_t floor, Admit admit) {
     if (!Enabled()) return {StageState::None, 0, "off"};
+    if (!DiskKeepsRope(query.policy)) return {StageState::None, 0, "rope"};
     const auto fits = [&](const StateMeta& m) { return DiskStateFits(m, query); };
     if (auto held = disk_.PollStaged(query.key, query.policy, compact_, floor, fits)) return *held;
     const auto meta = disk_.Best(query.key, query.policy, compact_, fits);
@@ -241,7 +268,7 @@ class BatchDiskTier {
   // The longest read state for `query`, if longer than `beat` (the host cache's state). Call Consume after the
   // restore.
   Ready Take(const DiskQuery& query, size_t beat) {
-    if (!Enabled()) return {};
+    if (!Enabled() || !DiskKeepsRope(query.policy)) return {};
     auto ready = disk_.Ready(query.key, query.policy, compact_, [&](const StateMeta& m) { return DiskStateFits(m, query); });
     if (!ready.snapshot || ready.meta.key.size() <= beat) return {};
     return ready;
@@ -258,7 +285,7 @@ class BatchDiskTier {
   size_t FlushHost(Cache& cache) {
     size_t queued = 0;
     cache.ForEachEntry([&](std::span<const int> key, const ConversationPolicy& policy, const auto& entry, bool superseded) {
-      if (superseded || key.size() < disk_.MinTokens()) return;
+      if (superseded || key.size() < disk_.MinTokens() || !DiskKeepsRope(policy)) return;
       queued += disk_.Spill(key, policy, compact_, entry->retention == CacheRetention::Shared, entry->guarded, entry,
                             *entry->snapshot, true).empty();
     });
@@ -268,11 +295,110 @@ class BatchDiskTier {
   // state holds extra host memory at a time.
   bool FlushOne(std::span<const int> key, const ConversationPolicy& policy, bool guarded,
                 const std::shared_ptr<const Snapshot>& snapshot, double seconds) {
-    if (key.size() < disk_.MinTokens()) return false;
+    if (key.size() < disk_.MinTokens() || !DiskKeepsRope(policy)) return false;
     const auto result = disk_.Spill(key, policy, compact_, false, guarded, snapshot, *snapshot, true);
     return (result.empty() || result == "queued") ? disk_.Drain(seconds) : result == "present";
   }
   bool Drain(double seconds) { return disk_.Drain(seconds); }
+  // The miss ledger (start plan B1a). The cache learns whether a spilled state reached the disk (defect 1) and the
+  // disk's word for a refused spill, and it reads the lost list that the last stop wrote.
+  template<class Cache>
+  void Attach(Cache& cache) {
+    cache.SetDurable([this](std::span<const int> key, const ConversationPolicy& policy) {
+      if (disk_.Present(key, policy, compact_)) return 1;
+      return disk_.Waiting(key, policy, compact_) ? 0 : -1;
+    });
+    cache.SetSpillWord([this] { return last_spill_; });
+    if (Enabled()) LoadLedger(cache);
+  }
+  // A stopping engine, after its flush: every host entry that is not superseded leaves with the process. Its record
+  // says whether its file is on disk now.
+  template<class Cache>
+  void NoteStop(Cache& cache) {
+    cache.ForEachEntry([&](std::span<const int> key, const ConversationPolicy& policy, const auto& entry, bool superseded) {
+      if (!superseded) cache.NoteStop(key, policy, entry->prompt, entry->lineage, disk_.Present(key, policy, compact_));
+    });
+  }
+  // The lost list goes to a side folder beside the state root (`<root>.ledger/<identity folder>/lost.ledger`): the
+  // root itself may hold only the tier's own files (StateDisk PrepareRoot), and an identity folder with another file
+  // would never leave (PruneOtherIdentities). False when it was not written (a log line names why).
+  template<class Cache>
+  bool SaveLedger(Cache& cache) {
+    if (!Enabled() || ledger_.empty()) return false;
+    std::error_code error;
+    const auto bytes = cache.LedgerBytes();
+    const auto folder = ledger_ / directory_;
+    for (const auto& path : {ledger_, folder})
+      if (::mkdir(path.c_str(), 0700) != 0 && errno != EEXIST) {
+        std::fprintf(stderr, "state_disk ledger_save result=refused reason=mkdir\n");
+        return false;
+      }
+    const auto file = folder / kLedgerFile, temporary = folder / (std::string(kLedgerFile) + ".tmp");
+    {
+      std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+      out.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
+      if (!out.good()) {
+        std::fprintf(stderr, "state_disk ledger_save result=refused reason=write\n");
+        return false;
+      }
+    }
+    std::filesystem::rename(temporary, file, error);
+    std::fprintf(stderr, "state_disk ledger_save result=%s records=%zu bytes=%zu\n", error ? "refused" : "saved",
+                 cache.LostRecords(), bytes.size());
+    return !error;
+  }
+  // At start: this identity's lost list, else the newest list of another identity (the epoch before a switch: its
+  // records of states on disk are lost by the switch). Returns the records read.
+  template<class Cache>
+  size_t LoadLedger(Cache& cache) {
+    if (ledger_.empty()) return 0;
+    std::error_code error;
+    std::filesystem::path from = ledger_ / directory_ / kLedgerFile;
+    bool switched = false;
+    if (!std::filesystem::is_regular_file(from, error)) {
+      from.clear();
+      std::filesystem::file_time_type newest{};
+      for (const auto& item : std::filesystem::directory_iterator(ledger_, error)) {
+        const auto file = item.path() / kLedgerFile;
+        if (item.path().filename() == directory_ || !std::filesystem::is_regular_file(file, error)) continue;
+        const auto time = std::filesystem::last_write_time(file, error);
+        if (!error && (from.empty() || time > newest)) from = file, newest = time;
+      }
+      switched = !from.empty();
+    }
+    if (from.empty()) return 0;
+    std::ifstream in(from, std::ios::binary);
+    std::vector<uint8_t> bytes;
+    char chunk[65536];
+    while (in && bytes.size() <= kLedgerFileLimit) {
+      in.read(chunk, sizeof chunk);
+      bytes.insert(bytes.end(), chunk, chunk + in.gcount());
+    }
+    const size_t read = bytes.size() <= kLedgerFileLimit ? cache.LoadLedgerBytes(bytes, switched) : 0;
+    std::fprintf(stderr, "state_disk ledger_load records=%zu switched=%d bytes=%zu\n", read, int(switched), bytes.size());
+    return read;
+  }
+  // The disk states nearest to the prompt for the ledger: the longest state on disk or in the writer's queue whose
+  // key starts the prompt, whether or not this request can restore it.
+  LedgerNear DiskNear(const DiskQuery& query) const {
+    LedgerNear near;
+    const auto any = [](const StateMeta&) { return true; };
+    if (const auto meta = disk_.Best(query.key, query.policy, compact_, any)) near = {meta->key.size(), meta->key.size()};
+    if (const auto queued = disk_.Pending(query.key, query.policy, compact_, any, kPendingSeconds);
+        queued && queued->key.size() > near.shared)
+      near = {queued->key.size(), queued->key.size()};
+    return near;
+  }
+  // The host and lost tiers of the cache with the disk tier (defect 3: disk_shared_tokens also when no disk state is
+  // usable; a key that leaves the prompt counts at the grid of its lost record).
+  template<class Cache>
+  LedgerTiers Ledger(Cache& cache, const DiskQuery& query) {
+    LedgerTiers tiers = cache.LedgerOf(query.key, query.policy);
+    if (!Enabled()) return tiers;
+    const LedgerNear near = DiskNear(query);
+    if (near.shared > tiers.disk.shared) tiers.disk = {near.shared, near.length, nullptr, tiers.disk.lineage};
+    return tiers;
+  }
   // MEDIUM-5: a slot state that the host cache refused goes straight
   // to disk, else the state is lost. `refused`: the cache's reason; a state that the cache cannot hold for lack of
   // room or memory goes, a policy refusal does not (and a resident copy stays in its slot). `bytes`: the whole state
@@ -286,6 +412,7 @@ class BatchDiskTier {
   std::string SpillDirect(std::span<const int> key, const ConversationPolicy& policy, bool guarded,
                           std::string_view refused, size_t bytes, size_t need, uint64_t room, Save save, size_t host = 0) {
     if (!Enabled() || !DirectRefusal(refused)) return {};
+    if (!DiskKeepsRope(policy)) return "rope";
     if (key.size() < disk_.MinTokens()) return "short";
     if (auto skip = Skip(key, policy, bytes); !skip.empty()) return skip;
     if (disk_.Waiting(key, policy, compact_)) return "waiting";
@@ -309,12 +436,25 @@ class BatchDiskTier {
   // Why a stop flush of a slot state of `bytes` would write nothing ("present": its file is on disk; "daily": the
   // daily write budget), or "" when it would write. The caller then skips the device copy.
   std::string Skip(std::span<const int> key, const ConversationPolicy& policy, size_t bytes) {
+    if (!DiskKeepsRope(policy)) return "rope";
     if (disk_.Present(key, policy, compact_)) return "present";
     if (disk_.OverDailyBudget(bytes)) return "daily";
     return {};
   }
 
  private:
+  static constexpr const char* kLedgerFile = "lost.ledger";
+  static constexpr size_t kLedgerFileLimit = size_t(2) << 20;
+  static std::filesystem::path LedgerFolder(const std::filesystem::path& root) {
+    std::error_code error;
+    auto path = std::filesystem::weakly_canonical(root, error);
+    if (error) path = root.lexically_normal();
+    if (path.filename().empty()) path = path.parent_path();
+    if (path.filename().empty()) return {};
+    return path.parent_path() / (path.filename().string() + ".ledger");
+  }
+  const std::filesystem::path ledger_;  // the side folder of the lost lists (empty: none)
+  const std::string directory_;         // this identity's folder name
   StateDisk<Snapshot> disk_;
   const bool compact_;
   std::string last_spill_;

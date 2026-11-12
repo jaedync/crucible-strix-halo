@@ -12,7 +12,7 @@ vision = pytest.importorskip("server.vision")
 Image = pytest.importorskip("PIL.Image")
 from server.api import ApiError, validate_request
 
-# kMaxLine in engine/serve/serve.h: one limit for text and image lines.
+# ServeLineBytes in engine/serve/serve_line.h: one limit for text and image lines.
 ENGINE_LINE = 2 * 1024 * 1024
 
 
@@ -38,8 +38,10 @@ def test_an_accepted_image_request_fits_the_engine_line():
 
 def test_the_engine_line_limit_matches_the_engine_source():
     from pathlib import Path
-    source = (Path(__file__).parents[2] / "engine/serve/serve.h").read_text()
-    assert "constexpr size_t kMaxLine = 2 * 1024 * 1024;" in source and "kServeVisionLine" not in source
+    # the limit follows the context (serve_line.h), the same for text and image lines.
+    root = Path(__file__).parents[2] / "engine/serve"
+    assert "kServeVisionLine" not in (root / "serve.h").read_text() + (root / "serve_line.h").read_text()
+    assert "inline constexpr size_t kServeLineFloorBytes = size_t(2) << 20;" in (root / "serve_line.h").read_text()
 
 
 def test_the_decoder_never_starts_ghostscript(monkeypatch):

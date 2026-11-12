@@ -3,7 +3,7 @@ import argparse
 import os
 from pathlib import Path
 
-from . import doctor, keyfile, packs, service, settings as settings_mod, steps, update
+from . import doctor, keyfile, measured, packs, rocm, runtime, service, settings as settings_mod, steps, update
 from .host import Host
 from .settings import UNSET
 
@@ -17,8 +17,9 @@ DESCRIPTION = """Run Crucible on a Strix Halo machine.
   ./crucible update   move to the newest release (checks every file first, goes back if the new release does not start)
   ./crucible uninstall  remove the service and the install folder (keeps the models unless you add --remove-models)
 
-The command uses only the Python standard library. It never uses sudo, never installs system packages and
-never changes the boot loader or the kernel command line: when a system change is needed, it prints the text to apply.
+The command uses only the Python standard library. It never installs system packages and never restarts the machine.
+When a system change is needed, it prints the exact text to apply. The one change that setup can apply is the kernel
+command line (two GPU memory parameters): it does so with sudo only after you type yes, with a backup of the file.
 """
 
 
@@ -65,6 +66,9 @@ def _common(p):
                         "(for a reverse proxy; repeat the flag for more). The names replace the saved list")
     p.add_argument("--streams", type=int, choices=range(1, 9), default=None, help="sessions at the same time (default 4)")
     p.add_argument("--ctx", type=int, default=None, help="tokens per session (default 262144)")
+    p.add_argument("--layout", choices=tuple(measured.LAYOUTS), default=None,
+                   help="named sessions: default (4 x 262,144), long (1 x 524,288 and 2 x 262,144), two-long (2 x 524,288). "
+                        "Above 262,144 tokens the engine uses YaRN and the conversation cache stays in memory")
 
 
 def parser():
@@ -77,6 +81,9 @@ def parser():
     st.add_argument("--smoke", action="store_true", help="after the test request, stop the server and exit")
     st.add_argument("--service", choices=("yes", "no"), default=None,
                     help="install the systemd user service (the question of setup); with --yes and no --service: no service")
+    st.add_argument("--private-runtime", choices=("yes", "no"), default=None,
+                    help="when the machine has no HIP runtime (ROCm): download a private copy into .crucible (the question of "
+                         "setup); with --yes and no --private-runtime: no download")
     st.add_argument("--jobs", type=int, default=None, help="compile jobs (default 1; more need more memory)")
     st.add_argument("--start-timeout", type=int, default=3600, help="seconds to wait for the server (default 3600)")
     dr = sub.add_parser("doctor", help="check the machine")
@@ -118,13 +125,22 @@ def parser():
 
 
 def _settings(args, host, repo, **extra):
+    try:
+        return _build_settings(args, host, repo, **extra)
+    except ValueError as exc:  # a bad combination of flags (for example --layout long with --ctx)
+        host.out(str(exc))
+        raise SystemExit(2) from None
+
+
+def _build_settings(args, host, repo, **extra):
     return settings_mod.build(
         repo, host, pack=getattr(args, "pack", None), models_dir=getattr(args, "models_dir", None),
         state_dir=getattr(args, "state_dir", None) or UNSET, no_state_dir=getattr(args, "no_state_dir", False),
         state_disk_gib=getattr(args, "state_disk_gib", None), port=getattr(args, "port", None),
         bind=getattr(args, "bind", None), api_key=getattr(args, "api_key", False),
         allowed_hosts=getattr(args, "allowed_host", None),
-        streams=getattr(args, "streams", None), ctx=getattr(args, "ctx", None), jobs=getattr(args, "jobs", None), **extra)
+        streams=getattr(args, "streams", None), ctx=getattr(args, "ctx", None), layout=getattr(args, "layout", None),
+        jobs=getattr(args, "jobs", None), **extra)
 
 
 def _ask_settings(args, host, repo):
@@ -210,6 +226,44 @@ def service_answer(args, host, print_hint=True):
     return "no" if answer.strip().lower() in ("n", "no") else "yes"
 
 
+RUNTIME_QUESTION = "Download the private ROCm runtime now? (y/n)"
+RUNTIME_HINT = ("No HIP runtime (ROCm) was found. Install the current ROCm (10.1 tested) from your system, or run: "
+                "./crucible setup --private-runtime yes (downloads a private copy of the runtime into this folder).")
+
+
+def runtime_answer(args, host, s, repo):
+    """"yes" (download the private runtime), "no", "offer" (a dry run: it would ask) or "" (nothing to offer).
+    The offer is for a machine with no HIP runtime and a release engine (a source build needs the compiler of a system
+    ROCm). --private-runtime answers it. --yes, or no terminal, gives "no" and a hint. Enter means yes."""
+    rt = rocm.detect(host, s.work)
+    if rt.state != "none":
+        if args.private_runtime == "yes":
+            host.out(f"A HIP runtime is installed ({rt.source}, {rt.version or 'unknown version'}), so the private runtime is not needed.")
+        return ""
+    if not doctor.release_engine(repo):
+        if args.private_runtime == "yes":
+            host.out("The private runtime is for the release engine. A source build needs the compiler of a system ROCm.")
+        return ""
+    if args.private_runtime:
+        return args.private_runtime
+    if args.dry_run:
+        return "offer"
+    ask = host.prompt if host.is_tty else host.tty_prompt
+    if args.yes or ask is None:
+        host.out(RUNTIME_HINT)
+        return "no"
+    try:
+        host.out(runtime.offer_text(runtime.load_pin(), s.work))
+    except runtime.RuntimeFailed as exc:
+        host.out(f"The private runtime is not available: {exc}")
+        return "no"
+    answer = ask(RUNTIME_QUESTION, "y")
+    if answer.strip().lower() in ("n", "no"):
+        host.out(RUNTIME_HINT)
+        return "no"
+    return "yes"
+
+
 def main(argv=None, host=None, repo=None):
     args = parser().parse_args(argv)
     host = host or Host.real()
@@ -260,17 +314,20 @@ def main(argv=None, host=None, repo=None):
         host.prompt = ask
     if not args.yes:
         host.out("Crucible setup. It checks this machine, downloads the model, builds the engine and starts the server.")
-        host.out("It never uses sudo and never changes the boot loader. Press Enter to take a default.")
+        host.out("It uses sudo only when you type yes to a kernel-parameter change, and never restarts the machine. Press Enter to take a default.")
         _ask_settings(args, host, repo)
     s = _settings(args, host, repo)
     if not _validate(s, host):
         return 2
+    runtime_choice = runtime_answer(args, host, s, repo)
+    ask_fn = host.prompt if host.is_tty else host.tty_prompt
     wants = "no" if args.smoke else service_answer(args, host, print_hint=False)
     if wants == "yes" and not args.dry_run and not service.manager_ok(host):
         host.out(service.NO_MANAGER)
         return 3
     run = steps.Setup(host, s, smoke=args.smoke, start_timeout=args.start_timeout, service=wants,
-                      hint=getattr(args, "service_hint", False) and not args.smoke)
+                      hint=getattr(args, "service_hint", False) and not args.smoke, runtime=runtime_choice,
+                      kernel_ask=None if (args.yes or ask_fn is None) else ask_fn)
     if args.dry_run:
         run.plan()
         results = doctor.run_checks(host, s)

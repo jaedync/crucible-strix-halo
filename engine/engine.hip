@@ -111,8 +111,23 @@ class Engine {
       std::fprintf(stderr, "%s\n", error.what());
       std::exit(2);
     }
+    try {
+      rope_ = RopeSettingFromEnv();
+      CheckRopeContext(ctx_, rope_, "context");
+    } catch (const std::exception& error) {
+      std::fprintf(stderr, "%s\n", error.what());
+      std::exit(2);
+    }
     const bool streaming = explicit_policy.blocks != 0 || RowPolicyInt("CRUCIBLE_TUNE_ROWS", 1, 0, 1) != 0;
     Loader(dir).Load(m_, streaming);
+    rope_tables_ = Scratch<float>((size_t)kRopeModes * kRopeTableFloats);
+    FillRopeTables(rope_tables_);
+    if (rope_.start != RopeMode::Plain || rope_.allow != RopeMode::Plain) {
+      float m = 1.f;
+      if (rope_.start != RopeMode::Plain) m = kYarnTable[static_cast<int>(rope_.start) - 1][kRopeMul];
+      std::fprintf(stderr, "rope: mode=%s allow=%s m=%.7f max_ctx=%d%s\n", RopeModeName(rope_.start),
+                   RopeModeName(rope_.allow), m, rope_.ContextCap(), rope_.Forced() ? " forced (test only)" : " auto");
+    }
     // Decide the prefill path before the row-sized buffers.
     prefill_rows_ = ChoosePrefillRows(prefill_rows);
     const char* launch_value = crucible::SwitchText("CRUCIBLE_PF_LAUNCH_ROWS");
@@ -367,11 +382,13 @@ class Engine {
   // commit: rows of this forward whose GDN updates are certain (R unless verifying).
   std::vector<int> Forward(const int* tokens, int R, int replay, int commit,
                            const std::string& dump = "", int mtp_pos = -1) {
+    SettlePleSide();
     const int pos0 = (int)sequence_->hist.size();
     if (!ContextRowsFit(pos0, R, sequence_->capacity, kMaxRows)) {
       std::fprintf(stderr, "context full or invalid forward row count\n");
       std::exit(1);
     }
+    CheckRopeRows(sequence_->hist.size(), R, sequence_->rope_mode);
     if (!ValidTokenIds(std::span(tokens, R), kVocab)) {
       std::fprintf(stderr, "token IDs must be in [0, %d)\n", kVocab);
       std::exit(2);
@@ -419,6 +436,8 @@ class Engine {
   // trunk (or draft) stacks [R][10240] on the device and the next tokens.
   // Leaves each row's stack in H(). By default only the last ID is scored;
   // earlier IDs are -1. score=false skips the head and returns no IDs.
+  // A scored call with the last-row head leaves only the last row's stack in H() (row R - 1): the earlier rows
+  // skip the MoE half (see MtpLastRowMoe).
   // CRUCIBLE_DRAFT_CHAIN lead (lead_keep set; DraftLead(), scored, the q block head): no host wait. The choice goes
   // to its own pinned slot (MtpLeadWait), the last row's stack to lead_keep (H() is scratch for every later pass),
   // and the call returns no IDs.
@@ -444,7 +463,16 @@ class Engine {
     RunGroup(P.mtp_in, true, true);
     MtpFuseKernel<<<dim3(kWide / 256, R), 256>>>(mhp_, mep_, H_);
     Mark("mtp_in");
-    Block(kLayers, m_.mtp.L, P.L[kLayers], R, mpos, 0, R);
+    if (MtpLastRowMoe(R, score)) {
+      BlockAttention(kLayers, m_.mtp.L, P.L[kLayers], R, mpos, 0, R);
+      // The last row's MoE half runs as a one-row pass on row 0, then its stack goes back to row R - 1.
+      float* const last_row = H_ + (size_t)(R - 1) * kWide;
+      HIP_OK(hipMemcpyAsync(H_, last_row, sizeof(float) * kWide, hipMemcpyDeviceToDevice, 0));
+      BlockMoe(kLayers, m_.mtp.L, PlansFor(1).L[kLayers], 1);
+      HIP_OK(hipMemcpyAsync(last_row, H_, sizeof(float) * kWide, hipMemcpyDeviceToDevice, 0));
+    } else {
+      Block(kLayers, m_.mtp.L, P.L[kLayers], R, mpos, 0, R);
+    }
     if (!score) {
       lookahead_.Stop();
       Collect();
@@ -496,6 +524,15 @@ class Engine {
     return out;
   }
 
+  // A scored call with the last-row head reads only the last row after the MTP layer: the HC mixer and the draft head
+  // take row R - 1, and every caller chains from that row's stack. So the MoE half of the earlier (catch-up) rows is
+  // dead work; their attention half still runs, because it writes their MTP cache rows. The expert counter keeps
+  // the R-row pass, so its MTP counts stay those of every row. The draft choice may differ in the last bits (another
+  // MoE kernel); verification commits the target's tokens, so the output does not change.
+  bool MtpLastRowMoe(int R, bool score) const {
+    return score && draft_last_only_ && R > 1 && !ecount_ && batch_streams_.empty() && !VerificationSpansActive();
+  }
+
   // CRUCIBLE_DRAFT_CHAIN lead: the first MTP pass of the next round, launched at the end of a solo step (after the
   // accept), so it runs while the server handles the step's tokens: Mtp with `lead_keep` (see there). LeadEpoch()
   // names the latest such pass; MtpLeadWait(epoch) gives its choice.
@@ -517,7 +554,12 @@ class Engine {
     for (int r = 1; r <= kMaxRows; ++r) PlansFor(r);
     if (sequences_.size() > 1 && MaxPassRows() > kMaxRows)
       for (int r = kMaxRows + 1; r <= kPackedRows; ++r) PlansFor(r);
+    else if (span_rows_ > kMaxRows && MaxPassRows() > kMaxRows)
+      for (int r = kMaxRows + 1; r <= span_rows_; ++r) PlansFor(r);
   }
+  // Rows of one lone verify span (CRUCIBLE_SPEC_SPAN): span_rows_ where the engine runs passes of that many rows
+  // (MaxPassRows), else kMaxRows. The first call with a span builds the 16-row plans.
+  int SpanRows() { return span_rows_ > kMaxRows && MaxPassRows() >= span_rows_ ? span_rows_ : kMaxRows; }
 
   // Rows one packed verify pass may hold (pass_rows.h): kMaxRows when a static
   // group has neither front order nor chunk-aligned spans. The first call
@@ -574,6 +616,7 @@ class Engine {
       std::exit(1);
     }
     sequence_->hist.resize(n);
+    SettlePleSide();
   }
   size_t Length() const { return sequence_->hist.size(); }
   int Context() const { return ctx_; }
@@ -843,6 +886,7 @@ class Engine {
 
   void AddSequence(int capacity = 0) {
     auto state = std::make_unique<SequenceState>(m_, capacity ? capacity : ctx_, compact_state_, mtp_rows_);
+    state->rope_mode = rope_.start;
     const auto spans = state->Spans();
     buffers_.insert(buffers_.end(), spans.begin(), spans.end());
     sequences_.push_back(std::move(state));
@@ -942,6 +986,8 @@ class Engine {
 
   struct LayerGroups {
     Group a_in, a_out, gu, dn;
+    // CRUCIBLE_ABLATE_MODE=request: the ablated output projection of an ablated layer (a_out is then the stock one).
+    Group a_out_abl;
     int kr = 3;  // routed expert K; the shared expert has kr + 2
     // The shared expert's width: kr + 2 on the K3..6 packs, 7 or 8 on the h6_ng8 packs.
     int ks = 5;
@@ -952,7 +998,8 @@ class Engine {
     int moe_ib = 16;  // column blocks per expert item: 16, or 20 for the Q4 body (CRUCIBLE_MOE_B128=2, R > 1)
     int state_cache = 0;
   };
-  struct PrefillLayer { PrefillLinear input, output; };
+  // output_abl: CRUCIBLE_ABLATE_MODE=request only, the ablated output projection (output is then the stock one).
+  struct PrefillLayer { PrefillLinear input, output, output_abl; };
   // The bulk MTP warm-up of one row count: fc_embedding and fc_hidden groups, and the MTP layer's input projections.
   struct MtpPrefillPlan {
     std::vector<PrefillLinear> fuse;
@@ -962,7 +1009,8 @@ class Engine {
     PrefillLayer layers[kLayers];
     size_t DeviceBytes() const {
       size_t bytes = 0;
-      for (const auto& layer : layers) bytes += layer.input.DeviceBytes() + layer.output.DeviceBytes();
+      for (const auto& layer : layers)
+        bytes += layer.input.DeviceBytes() + layer.output.DeviceBytes() + layer.output_abl.DeviceBytes();
       return bytes;
     }
   };
@@ -1095,6 +1143,17 @@ class Engine {
   // is not a reviewed sidecar for this checkpoint's geometry.
   void LoadAblation(int rows) {
     const char* path = crucible::SwitchText("CRUCIBLE_ABLATE");
+    if (const char* mode = crucible::SwitchText("CRUCIBLE_ABLATE_MODE")) {
+      if (std::string(mode) != "request") {
+        std::fprintf(stderr, "CRUCIBLE_ABLATE_MODE must be request (or unset for the process-wide ablation)\n");
+        std::exit(2);
+      }
+      if (!path || !*path) {
+        std::fprintf(stderr, "CRUCIBLE_ABLATE_MODE=request needs CRUCIBLE_ABLATE=FILE\n");
+        std::exit(2);
+      }
+      abl_request_ = true;
+    }
     if (!path || !*path) return;
     AblationSet set;
     try {
@@ -1114,11 +1173,74 @@ class Engine {
     }
     abl_rows_ = rows;
     abl_y_ = Scratch<float>((size_t)rows * kHidden);
-    std::fprintf(stderr, "ablation: %zu sublayers from %s (sha256 %s, %s)\n", set.sites.size(), path,
-                 set.sha256.c_str(), set.pin->source);
+    std::fprintf(stderr, "ablation: %zu sublayers from %s (sha256 %s, %s)%s\n", set.sites.size(), path,
+                 set.sha256.c_str(), set.pin->source, abl_request_ ? ", per request" : "");
   }
 
-  const float* AblMlp(int li) const { return li < kLayers ? abl_mlp_[li] : nullptr; }
+ public:
+  // CRUCIBLE_ABLATE_MODE=request: each request chooses.
+  bool AblateRequests() const { return abl_request_; }
+  // The mode of the request on `stream`; BatchSession::Open and serial serve set it before the request's forwards.
+  // The RoPE mode of the sequence on `stream` (rope_mode.h). The same mode does
+  // nothing. A different mode needs an empty sequence (a full prefill from token 0) and a mode that the process allows;
+  // a forced process (CRUCIBLE_ROPE_MODE=yarn:F) keeps its mode.
+  void SetStreamRope(int stream, RopeMode mode) {
+    if (stream < 0 || size_t(stream) >= sequences_.size()) throw std::out_of_range("SetStreamRope: no such stream");
+    SequenceState& s = *sequences_[size_t(stream)];
+    if (s.rope_mode == mode) return;
+    if (!s.hist.empty()) throw std::logic_error("a RoPE mode change needs an empty sequence");
+    if (rope_.Forced() || RopeFactor(mode) > RopeFactor(rope_.allow))
+      throw std::logic_error(std::string("CRUCIBLE_ROPE_MODE does not allow ") + RopeModeName(mode));
+    s.rope_mode = mode;
+  }
+  RopeMode StreamRope(int stream) const {
+    if (stream < 0 || size_t(stream) >= sequences_.size()) throw std::out_of_range("StreamRope: no such stream");
+    return sequences_[size_t(stream)]->rope_mode;
+  }
+  const RopeSetting& Rope() const { return rope_; }
+
+  void SetStreamAblate(int stream, bool on) {
+    if (on && !abl_request_) {
+      std::fprintf(stderr, "an ablated request needs CRUCIBLE_ABLATE_MODE=request\n");
+      std::exit(2);
+    }
+    if (stream < 0) std::abort();
+    if (size_t(stream) >= stream_ablate_.size()) stream_ablate_.resize(size_t(stream) + 1, 0);
+    stream_ablate_[size_t(stream)] = on;
+  }
+
+ private:
+  bool StreamAblated(int stream) const {
+    return stream >= 0 && size_t(stream) < stream_ablate_.size() && stream_ablate_[size_t(stream)];
+  }
+  // The ablation of the current pass: `on` when some row is ablated; `stock` marks the stock rows of a mixed pass.
+  // Process-wide mode: every row. Request mode: each row's stream. A pass with no ablated row takes the stock path.
+  struct AblPassRows { bool on = false; uint32_t stock = 0; };
+  AblPassRows AblPass(int R) const {
+    if (!abl_y_) return {};
+    if (!abl_request_) return {true, 0};
+    AblPassRows pass;
+    const auto row = [&](int r, int stream) {
+      if (StreamAblated(stream)) pass.on = true;
+      else {
+        if (r >= 32) std::abort();  // the kernel's mask holds 32 rows; a batch or verify pass has at most 16
+        pass.stock |= 1u << r;
+      }
+    };
+    if (!batch_streams_.empty()) {
+      for (int r = 0; r < R; ++r) row(r, batch_streams_[size_t(r)]);
+    } else if (VerificationSpansActive()) {
+      for (const auto& span : verify_spans_)
+        for (int r = span.row; r < span.row + span.rows; ++r) row(r, span.stream);
+    } else {
+      return {StreamAblated(ActiveStream()), 0};
+    }
+    if (!pass.on) pass.stock = 0;
+    return pass;
+  }
+
+  const float* AblMlp(int li) const { return li < kLayers && abl_now_.on ? abl_mlp_[li] : nullptr; }
+  const float* AblAttn(int li) const { return li < kLayers && abl_now_.on ? abl_attn_[li] : nullptr; }
 
   // y is in abl_y_; post_ holds the inject gates of the current HC read.
   void AblateWrite(const float* ab, float* H, int ldh, int R) {
@@ -1126,7 +1248,7 @@ class Engine {
       std::fprintf(stderr, "ablation scratch holds %d rows, not %d\n", abl_rows_, R);
       std::abort();
     }
-    AblateWriteKernel<<<R, kAblateThreads>>>(abl_y_, ab, post_, H, ldh);
+    AblateWriteKernel<<<R, kAblateThreads>>>(abl_y_, ab, post_, H, ldh, abl_now_.stock);
   }
 
   // Opt-in (CRUCIBLE_PERSISTENT_GDN=1): one persistent kernel runs the R=1
@@ -1168,13 +1290,23 @@ class Engine {
 
   void Block(int li, const Layer& L, const LayerGroups& G, int R, int pos0, int replay,
              int commit) {
+    abl_now_ = li < kLayers ? AblPass(R) : AblPassRows{};
+    const float* const abl_attn = AblAttn(li);
     if (li < kLayers && !L.attn && R == 1 && replay == 0 && commit == 1 && batch_streams_.empty() && !VerificationSpansActive() &&
-        PersistentGdnOn() && !abl_attn_[li]) {
+        PersistentGdnOn() && !abl_attn) {
       PersistentGdnSide(li, L, G, pos0);
       Mark("gdn_side");
       BlockMoe(li, L, G, R);
       return;
     }
+    BlockAttention(li, L, G, R, pos0, replay, commit);
+    BlockMoe(li, L, G, R);
+  }
+
+  // The attention half of Block: HC read, projections, attention core and output projection into H().
+  // Block sets abl_now_ for layer li < kLayers; the scored MTP catch-up (li == kLayers) has no ablation: AblAttn is null there.
+  void BlockAttention(int li, const Layer& L, const LayerGroups& G, int R, int pos0, int replay, int commit) {
+    const float* const abl_attn = AblAttn(li);
     HcRead(L.hca, R, true);
     Mark("hc_mix");
     RunGroup(G.a_in, true, true);
@@ -1187,10 +1319,9 @@ class Engine {
       BatchAttentionCore(li, L, G, R);
     }
     Mark(L.attn ? "qsa_core" : "gdn_core");
-    RunGroup(G.a_out, false, true);
-    if (li < kLayers && abl_attn_[li]) AblateWrite(abl_attn_[li], H_, kWide, R);
+    RunGroup(abl_attn && abl_request_ ? G.a_out_abl : G.a_out, false, true);
+    if (abl_attn) AblateWrite(abl_attn, H_, kWide, R);
     Mark(L.attn ? "qsa_oproj" : "gdn_oproj");
-    BlockMoe(li, L, G, R);
   }
 
   void BlockMoe(int li, const Layer& L, const LayerGroups& G, int R) {
@@ -1387,9 +1518,11 @@ class Engine {
       std::fprintf(stderr, "ablation scratch holds %d rows, not %d\n", abl_rows_, StaticRows(R));
       std::exit(2);
     }
-    float* const out_dst = abl ? abl_y_ : H_;
-    const int out_ld = abl ? kHidden : 0, out_epi = abl ? kEpiStore : kEpiResidual;
-    float* const out_aux = abl ? nullptr : post_;
+    // Request mode: a_out is the stock plan and a_out_abl the ablated one; each pass picks (Block).
+    const bool split = abl && abl_request_;
+    float* const out_dst = abl && !split ? abl_y_ : H_;
+    const int out_ld = abl && !split ? kHidden : 0, out_epi = abl && !split ? kEpiStore : kEpiResidual;
+    float* const out_aux = abl && !split ? nullptr : post_;
     G.state_cache = ResolveRowPolicy(R, m_.head.K, m_.L[0].moe.experts[0].K[0]).state;
     // Static projections of a packed pass (R > kMaxRows) run kPackedRows rows;
     // each row's values do not depend on the row count, and rows >= R are
@@ -1404,6 +1537,9 @@ class Engine {
             N, false, 0, {L.qsa.q.front_s, L.qsa.k.front_s, L.qsa.v.front_s, L.qsa.idx.front_s});
       Build(G.a_out, {Job(L.qsa.o, nullptr, 0, out_dst, out_ld, out_epi, out_aux, N)}, N, false, 0,
             {L.qsa.o.front_s});
+      if (split)
+        Build(G.a_out_abl, {Job(L.qsa.o, nullptr, 0, abl_y_, kHidden, kEpiStore, nullptr, N)}, N, false, 0,
+              {L.qsa.o.front_s});
     } else {
       Build(G.a_in,
             {Job(L.gdn.qkv, x_, kHidden, qkv_, kGdnQkvWidth, kEpiStore, nullptr, N),
@@ -1411,6 +1547,14 @@ class Engine {
             N, false, 0, {L.gdn.qkv.front_s, L.gdn.z.front_s});
       Build(G.a_out, {Job(L.gdn.out, nullptr, 0, out_dst, out_ld, out_epi, out_aux, N)}, N, false, 0,
             {L.gdn.out.front_s});
+      if (split)
+        Build(G.a_out_abl, {Job(L.gdn.out, nullptr, 0, abl_y_, kHidden, kEpiStore, nullptr, N)}, N, false, 0,
+              {L.gdn.out.front_s});
+    }
+    // The attention core writes the input of G.a_out (its xh); the ablated plan must read the same rows.
+    if (split && (G.a_out_abl.jobs[0].xh != G.a_out.jobs[0].xh || G.a_out_abl.R != G.a_out.R)) {
+      std::fprintf(stderr, "ablated output plan does not share the stock plan's input\n");
+      std::exit(2);
     }
     // Unique-expert jobs [0, R*kTopK), then the shared expert in chunks of
     // kMaxRows rows (moe_chunk_map.h). Routed slots start on expert 0;
@@ -1832,9 +1976,13 @@ class Engine {
     }
   }
 
-  QsaArgs QArgs(const Qsa& w, const QsaCache& c, __half* xh_o, int R, int pos0, const int* mrope) {
+  QsaArgs QArgs(const Qsa& w, const QsaCache& c, __half* xh_o, int R, int pos0, const SequenceState& state) {
+    // A row never runs above its mode's positions: plain stays within the native 262,144 (yarn-interface.md). The
+    // entry of each forward checks this before any kernel (CheckRopeRows); this is the last line of defense.
+    CheckRopeRows(size_t(pos0), R, state.rope_mode);
     QsaArgs a{};
-    a.mrope = mrope;
+    a.mrope = state.Mrope();
+    a.rope = rope_tables_ + kRopeTableFloats * static_cast<int>(state.rope_mode);
     a.q = q_;
     a.k = k_;
     a.v = v_;
@@ -2031,6 +2179,8 @@ class Engine {
   SequenceState* sequence_ = nullptr;
   std::unique_ptr<VisionEncoder> vision_;
   bool compact_state_ = false;
+  RopeSetting rope_;               // CRUCIBLE_ROPE_MODE
+  float* rope_tables_ = nullptr;   // kRopeModes tables of kRopeTableFloats (FillRopeTables)
   std::vector<int> batch_streams_;
   int ctx_, mtp_rows_, prefill_rows_, pf_launch_rows_ = 0;
   int pf_join_rows_ = 0, pf_room_rows_ = 0;  // x4-tail: join rows, and launch rows plus join rows
@@ -2103,6 +2253,17 @@ class Engine {
   // CRUCIBLE_GDN_VERIFY (gdn_verify_switch.h): resolved here so a bad value stops the engine at start, not at the first
   // GDN launch. The launch paths read the same value through GdnVerifyOn.
   [[maybe_unused]] const int gdn_verify_ = GdnVerifyMinRows();
+  // CRUCIBLE_SPEC_SPAN (runtime/spec_span.h): rows of one single-session verify span, and the pending GDN rows per head
+  // of every sequence (16 with a span). GdnVerifyKernel keeps the 8-row stride, so the two switches do not combine.
+  const int span_rows_ = [] {
+    const int n = SpecSpanRows();
+    if (n > kMaxRows && GdnVerifyMinRows() > 0) {
+      std::fprintf(stderr, "CRUCIBLE_SPEC_SPAN above 8 needs CRUCIBLE_GDN_VERIFY=0\n");
+      std::exit(2);
+    }
+    return n;
+  }();
+  const int pend_rows_ = SpecPendRows(span_rows_);
   RingMode ring_mode_ = [] {
     const char* v = crucible::SwitchText("CRUCIBLE_DECODE_RING");
     if (v && std::string(v) == "0") return kRingOff;
@@ -2124,6 +2285,10 @@ class Engine {
   std::array<const float*, kLayers> abl_attn_{}, abl_mlp_{};
   float* abl_y_ = nullptr;
   int abl_rows_ = 0;
+  // CRUCIBLE_ABLATE_MODE=request: the mode of each stream's request, and the rows of the current pass.
+  bool abl_request_ = false;
+  std::vector<uint8_t> stream_ablate_;
+  AblPassRows abl_now_;
   float *eple_, *kv_, *logits_, *partial_, *scores_, *qsa_scratch_;
   mutable PinnedVector<float> logit_host_;
   __half* xh_;

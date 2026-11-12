@@ -262,6 +262,12 @@ inline float AblationDotRef(const float* y, const float* a) {
   return part[0];
 }
 
+// A stock row of a mixed step (CRUCIBLE_ABLATE_MODE=request): H[s] += post[s] * y, the stock residual epilogue.
+inline void AblateWriteStockRef(const float* y, const float* post, float* H) {
+  for (int d = 0; d < kHidden; ++d)
+    for (int s = 0; s < kStreams; ++s) H[s * kHidden + d] = std::fmaf(post[s], y[d], H[s * kHidden + d]);
+}
+
 inline void AblateWriteRef(const float* y, const float* a, const float* b, const float* post, float* H) {
   const float c = AblationDotRef(y, a);
   for (int d = 0; d < kHidden; ++d) {

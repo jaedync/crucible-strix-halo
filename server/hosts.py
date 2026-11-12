@@ -4,8 +4,10 @@ defence against DNS rebinding for a machine whose browser can reach the server."
 ALLOWED_HOSTS_ENV = "CRUCIBLE_ALLOWED_HOSTS"
 MAX_PORT = 65535
 
-REFUSED = ("The Host header is not allowed. For the service, run `./crucible setup --allowed-host NAME` (it restarts the server). "
-           f"For a server that you start by hand, add the name to {ALLOWED_HOSTS_ENV} (comma-separated) or give it to --allowed-host.")
+REFUSED = ("The Host header is not allowed. For the service or a server that ./crucible start made, run "
+           "`./crucible setup --allowed-host NAME` (it restarts the server). "
+           f"For a server that you start by hand with python -m server, add the name to {ALLOWED_HOSTS_ENV} "
+           "(comma-separated) or give it to --allowed-host.")
 
 
 class HostError(ValueError):

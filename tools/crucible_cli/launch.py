@@ -79,10 +79,14 @@ def allowed_hosts(s):
 
 def server_command(s, python):
     env = {**measured.ENV, **s.spec.extra_env, **own_head_env(s)}
+    if getattr(s, "runtime_lib", None) is not None:
+        env["LD_LIBRARY_PATH"] = os.fspath(s.runtime_lib)   # the private ROCm runtime (process_env puts it before the caller's path)
     flags = measured.SERVER_FLAGS
     argv = [str(python), "-m", "server", str(s.ckpt), "--engine", str(s.engine), "--host", s.bind,
             "--port", str(s.port), "--streams", str(s.streams), "--ctx", str(s.ctx), "--prefill", flags["--prefill"],
             "--conversation-cache-mib", flags["--conversation-cache-mib"], "--host-reserve-mib", flags["--host-reserve-mib"]]
+    if getattr(s, "short_streams", 0):
+        argv += ["--short-streams", str(s.short_streams), "--short-ctx", str(s.short_ctx)]
     if s.api_key_file is not None:
         argv += ["--api-key-file", str(s.api_key_file)]  # the path only: the key is never in an argument
     hosts = allowed_hosts(s)
@@ -101,6 +105,8 @@ def process_env(base, env):
     for key, value in env.items():
         if value is None:
             merged.pop(key, None)
+        elif key == "LD_LIBRARY_PATH" and base.get(key):
+            merged[key] = f"{value}:{base[key]}"
         elif key not in measured.ENV or key not in base:
             merged[key] = value
     return merged
@@ -110,6 +116,8 @@ def serve_script(s, python):
     """The script resolves the own head each time it runs, so a head installed later is used at the next start."""
     env, argv = server_command(s, python)
     env.pop("CRUCIBLE_MTP_SIDECAR", None)  # resolved below, at each start
+    lib = env.pop("LD_LIBRARY_PATH", None)  # the private runtime goes before the library path of the caller
+    libline = f"LD_LIBRARY_PATH={shlex.quote(lib)}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}\nexport LD_LIBRARY_PATH\n" if lib else ""
     # A measured word is a default: the script sets it only when the caller's environment does not hold it (also empty).
     defaults = "".join(f'[ -n "${{{k}+x}}" ] || {k}={shlex.quote(v)}\nexport {k}\n' for k, v in env.items() if k in measured.ENV)
     words = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items() if k not in measured.ENV)
@@ -122,4 +130,4 @@ def serve_script(s, python):
         head = (f"HEAD=$({q(os.fspath(python))} -I -c {q(look)} {q(os.fspath(Path(s.repo) / 'tools'))} {q(os.fspath(s.own_head_dir))} 2>/dev/null)\n"
                 'case "$HEAD" in\n  "") ;;\n  -) unset CRUCIBLE_MTP_SIDECAR ;;\n  *) export CRUCIBLE_MTP_SIDECAR="$HEAD" ;;\nesac\n')
     return (f"#!/bin/sh\n# Written by ./crucible setup. The server command of this machine.\n"
-            f"cd {q(os.fspath(s.repo))} || exit 1\n{defaults}{head}exec env {words} {cmd} \"$@\"\n")
+            f"cd {q(os.fspath(s.repo))} || exit 1\n{libline}{defaults}{head}exec env {words} {cmd} \"$@\"\n")

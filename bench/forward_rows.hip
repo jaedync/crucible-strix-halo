@@ -110,11 +110,14 @@ int main(int argc,char** argv) {
     engine.Forward(prefix.data()+i,n,0,n);
   }
   const auto saved=EngineStateIO::Save(engine);
-  const std::array<int,8> tokens{71093,12305,198,727,73111,1393,25,514};
+  // Rows 9..13: CRUCIBLE_SPEC_SPAN (one lone verify span past kMaxRows rows).
+  const std::array<int,kSpecSpanMax> tokens{71093,12305,198,727,73111,1393,25,514,279,1879,315,13,576};
+  const int span=engine.SpanRows();
+  if (prefix.size()+size_t(span)>512) return 2;
   const size_t one_h=kWide*sizeof(float), one_l=kVocab*sizeof(float);
-  std::vector<uint8_t> serial_h(8*one_h), serial_l(8*one_l);
+  std::vector<uint8_t> serial_h(size_t(span)*one_h), serial_l(size_t(span)*one_l);
   EngineStateIO::Restore(engine,saved,prefix);
-  for (int r=0;r<8;++r) {
+  for (int r=0;r<span;++r) {
     engine.Forward(tokens.data()+r,1,0,1);
     const auto output=EngineStateIO::Outputs(engine,1);
     std::copy_n(output.begin(),one_h,serial_h.begin()+r*one_h);
@@ -132,7 +135,8 @@ int main(int argc,char** argv) {
   const std::array<std::pair<const char*,int>,1> policies{{{"base",0}}};
   std::fprintf(stdout,"R,policy,median_ms,min_ms,experts_per_layer,roof_ms,roof_pct,exact\n");
 #endif
-  for (int R=1;R<=8;++R) {
+  // R 9..span: one lone verify span (ForwardVerifySpans, the serve path of a solo step past kMaxRows rows).
+  for (int R=1;R<=span;++R) {
     std::vector<uint8_t> reference(serial_h.begin(),serial_h.begin()+R*one_h);
     reference.insert(reference.end(),serial_l.begin(),serial_l.begin()+R*one_l);
     for (const auto& [name,policy] : policies) {
@@ -142,7 +146,9 @@ int main(int argc,char** argv) {
       std::vector<double> times; engine.ClearExpertCounts();
     for (int rep=0;rep<7;++rep) {
       EngineStateIO::Restore(engine,saved,prefix);
-      const double begin=Now(); engine.Forward(tokens.data(),R,0,1);
+      const double begin=Now();
+      if (R<=kMaxRows) engine.Forward(tokens.data(),R,0,1);
+      else engine.ForwardVerifySpans({VerifySpan{0,std::vector<int>(tokens.begin(),tokens.begin()+R),0,1}});
       if (rep>=2) times.push_back((Now()-begin)*1000);
     }
     const auto counts=engine.ExpertCounts();
@@ -151,13 +157,13 @@ int main(int argc,char** argv) {
     const double roof=(dense+routed*48*experts)/245.5e6;
     const auto output=EngineStateIO::Outputs(engine,R);
     const bool exact=output==reference;
-    std::printf("%d,%s,%.6f,%.6f,%.3f,%.3f,%.2f,%s\n",R,name,times[2],times[0],experts,roof,
+    std::printf("%d,%s,%.6f,%.6f,%.3f,%.3f,%.2f,%s\n",R,R<=kMaxRows ? name : "span",times[2],times[0],experts,roof,
                 100*roof/times[2],exact ? "PASS" : "FAIL");
     std::fflush(stdout);
     if (!exact) return 1;
     }
     // FORWARD_ROWS_PROFILE=1: per-stage GPU time of this R (event marks; the marks add their own small cost).
-    if (std::getenv("FORWARD_ROWS_PROFILE")) {
+    if (std::getenv("FORWARD_ROWS_PROFILE") && R<=kMaxRows) {
       std::fprintf(stderr, "R=%d ", R);
       engine.EnableProfile(true);
       for (int rep=0;rep<5;++rep) { EngineStateIO::Restore(engine,saved,prefix); engine.Forward(tokens.data(),R,0,1); }

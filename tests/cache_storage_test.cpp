@@ -112,5 +112,8 @@ int main() {
   Reject([] { QsaSequenceCacheBytes(1024, false, true, 1025); });
   Reject([] { QsaSequenceCacheBytes(1024, false, true, 0); });
   Reject([] { QsaCacheBytes(0, true); });
+  // YaRN contexts: the storage formula holds to 1,048,576; the mode decides the cap.
+  assert(QsaCacheBytes(524288, true)[0] == size_t(524288) * 1024 && QsaCacheBytes(1048576, false)[2] == size_t(1048576) * 512);
+  Reject([] { QsaCacheBytes(1048577, true); });
   AllocationTest(); LifetimeTest();
 }

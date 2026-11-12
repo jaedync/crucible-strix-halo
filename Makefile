@@ -64,6 +64,7 @@ SPLIT_GROUPS ?= tools/devsplit_groups.tsv
 SPLIT_FACTS ?= tools/devsplit_facts.tsv
 SPLIT_CHECK ?= 1
 SPLIT_WORK ?= build/engine/split
+STATE_EPOCH ?= 1
 ENGINE_FLAGS = $(CPPFLAGS) $(HIPFLAGS) -std=c++20 --offload-arch=$(GPU_ARCH) --rocm-path=$(ROCM_PATH) -I$(ROCM_PATH)/include -MMD -MP -MF $@.d $< $(LDFLAGS) $(LDLIBS)
 # Every hipcc recipe runs through tools/hipcc_checked.sh: hipcc exits 0 when its clang child is killed (out of memory),
 # so the helper removes the old output first and fails when the compiler leaves none.
@@ -84,6 +85,12 @@ ifeq ($(SPLIT),1)
 	rc=$$?; if [ $$rc -eq 2 ]; then echo "devsplit could not plan the build, using hipcc"; $(ENGINE_HIPCC) -o $@; else exit $$rc; fi
 else
 	$(ENGINE_HIPCC) -o $@
+endif
+# Stamp the state epoch into the binary (tools/state_epoch.py, engine/runtime/state_epoch.h): the SSD conversation cache
+# keeps its states over a new binary that has the same epoch. A failed stamp removes the binary, so an unstamped one
+# does not stay behind. STATE_EPOCH=0 skips the stamp (the binary then uses its own sha256 as the epoch: the old rule).
+ifneq ($(STATE_EPOCH),0)
+	@$(PYTHON) -I tools/state_epoch.py stamp $@ || { rm -f $@; exit 1; }
 endif
 	@$(ENGINE_STAMP_END)
 
@@ -149,7 +156,7 @@ test-fast:
 test-server:
 	$(PYTHON) -m pytest -q -p no:cacheprovider -n $(TEST_JOBS) server/tests
 
-# The service tests need a systemd user manager (systemd-run --user), so the bwrap workers skip them: run this target on a
+# The service tests need a systemd user manager (systemd-run --user), so a sandboxed build worker skips them: run this target on a
 # normal user session. tests/service holds the fault tests F1 to F12 (CRUCIBLE_SERVICE_TESTS=1 turns them on). The last line is the
 # CPU dry run of the night driver (design s5 C): every step N1 to N11 against the fake engine, with scaled times. It writes
 # ~/.cache/crucible-ft/work/report.json and removes its own unit at the end.

@@ -3,6 +3,79 @@
 Releases are numbered `v0.<train>.<fix>`. This file lists the newest release first.
 The same text is in the notes of each release on GitHub.
 
+## v0.37.0 (2026-11-11)
+
+Release v0.37.0 is the engine of train 37. It follows v0.34.0.
+It adds an opt-in long context of up to 524,288 tokens (YaRN), and the installer now finds the ROCm runtime and can
+install a private copy of it. The default configuration (4 sessions of 262,144 tokens) does not use YaRN.
+
+### Long context (opt-in)
+
+- `--ctx` above 262,144 turns on YaRN (factor 2, up to 524,288 positions). It is a start option of the same engine.
+  At or below 262,144 the server sets nothing, and the engine starts as before.
+- A request that needs 262,144 positions or fewer runs with the plain rotary positions, also in a long configuration.
+  A longer request runs with YaRN. A request above 524,288 tokens gets HTTP 400 `context_length`.
+- The named configurations (each needs about the same GPU memory for the session state as the default, about 28 GB):
+
+  | Name | Server flags | Sessions |
+  |---|---|---|
+  | default | `--streams 4 --ctx 262144` | 4 of 262,144 |
+  | long | `--streams 3 --ctx 524288 --short-streams 2 --short-ctx 262144` | 1 of 524,288 and 2 of 262,144 |
+  | two long | `--streams 2 --ctx 524288` | 2 of 524,288 |
+
+  `./crucible setup --layout long` (or `two-long`) writes the flags. `--layout default` goes back.
+- `--yarn-reply-reserve N` (default 32,768) is the reply room that the server counts when it decides the mode of a
+  request: plain when the prompt plus `min(max_tokens, N)` fits in 262,144 positions, else YaRN.
+- A conversation that grows past 262,144 tokens prefills once from its first token, in YaRN mode. Later turns use
+  its YaRN states.
+- Limits of this first version: a YaRN start refuses `--state-dir` (no disk tier), and the host conversation cache does
+  not hold a 524,288-token state. A long conversation resumes only from its session slot.
+- The engine line limit and the default request body follow `--ctx` (4 MiB at 262,144, 8 MiB at 524,288; `--vision`
+  keeps 256 MiB). A prompt that fills the context reaches the engine. You do not need to raise `--max-body-mib`.
+
+### Setup and service
+
+- `./crucible setup` does not lose a restart. When a setup run stops before the restart (a stopped download, for example),
+  the next run restarts the server with the new settings.
+- `./crucible doctor` and `./crucible setup` accept a service that is still loading the model at boot. They no longer
+  report "GPU memory is held by another program".
+- After `./crucible service install`, `./crucible setup` no longer offers the service again, and it names the service logs.
+- `./crucible setup` restarts a server that `./crucible start` made when a setting changed.
+- The "Host header is not allowed" message names the command for both cases.
+
+### ROCm
+
+- Current ROCm. Crucible recommends the current ROCm (10.1 tested) and supports ROCm 7.2.4. Setup passes both with no message and
+  asks for no older version. The guide's first step says "install the current ROCm (10.1 tested)".
+- The release engine was built with ROCm 7.2.4. It was checked on the ROCm 10.1 runtime and on ROCm 7.2.4 with the same
+  greedy tokens. The speed numbers of this release come from ROCm 7.2.4.
+- Private runtime. When a machine has no HIP runtime, `./crucible setup` offers a private copy of the ROCm 10.1 runtime (90 MB from
+  AMD's package index, with a sha256 check of each file). The default answer is yes. Script use: `--private-runtime yes|no`.
+  It needs no root and changes no system package. `./crucible uninstall` removes it. A system ROCm is always used first.
+- Kernel parameters. When the GPU memory check fails, setup finds the boot method (GRUB, systemd-boot or a unified kernel
+  image) and prints the exact change. It applies the change with `sudo` only after you type `yes`, makes a backup first, and never
+  restarts the machine. `--yes` never applies it.
+
+### Other changes
+
+- Per-request abliteration: with `CRUCIBLE_ABLATE_MODE=request` one engine serves stock and ablated requests (request
+  field `ablate`). `--model-name NAME` adds a second public model name; its `-abliterated` form selects the ablated mode.
+- The server accepts `reasoning` as another name of `reasoning_content`, and treats an empty or null value as absent.
+- The SSD conversation cache keeps its states over an engine update when the new engine has the same state epoch.
+
+### Speed
+
+- The default configuration has no new speed column: the README speed tables show v0.34.0. The GPU code of the default
+  path is the same as in the gated build of this release; we did not measure its speed against v0.34.0 for this release.
+- The README section "Long context" has rows measured on the release engine of v0.37.0 (4.05 pack, public files,
+  configuration `long`), with the power profile, the number of runs and the date.
+
+### Known limits
+
+- With more active agent sessions than slots (for example 6 or 8 sessions on 4 slots), a session can lose its saved
+  state; its next turn then computes the whole prompt again, which takes seconds to minutes at 100,000 tokens or more.
+  The output does not change. A fix is in test.
+
 ## v0.34.0 (2026-11-09)
 
 Release v0.34.0 is the engine of train 34. It follows v0.33.1.

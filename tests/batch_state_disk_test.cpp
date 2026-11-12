@@ -29,6 +29,8 @@ int hipMemcpy(void* out, const void* in, size_t n, int) { std::memcpy(out, in, n
 int hipStreamSynchronize(int) { return 0; }
 #define HIP_OK(expr) assert((expr) == 0)
 #include "../engine/serve/batch_state_disk.h"
+#include "../engine/serve/handover_spill.h"
+#include "../engine/runtime/rope_policy.h"
 #include "support/disk_test_dir.h"
 #include <chrono>
 #include <thread>
@@ -112,6 +114,40 @@ StageStatus StageWait(Tier& tier, const DiskQuery& query, size_t floor) {
   }
   assert(false);
   return {};
+}
+
+// Y2 v1: a YaRN state never goes to the disk tier and never comes from it. The check is
+// at the tier boundary (BatchDiskTier), by the state's tenant mark; state_disk.h does not change.
+void YarnStatesStayOffDisk() {
+  auto options = Options();
+  options.root = Home() / "states-yarn";
+  Tier tier(options, false);
+  ConversationPolicy yarn = Policy();
+  yarn.tenant = RopeTenant(kLocalTenant, RopeMode::Yarn2);
+  const auto x = Tokens(1, 40);
+  const auto key = std::span<const int>(x).first(16);
+  const auto xs = Make(key, false, x.size() - 1);
+  const auto entry = std::make_shared<const Cache::Entry>(Cache::Entry{{}, xs, CacheRetention::Session});
+  // A host eviction, a stop flush, a direct spill and the skip check all refuse with "rope".
+  assert(!tier.Spill(key, yarn, entry, UINT64_MAX) && tier.LastSpill() == "rope");
+  assert(!tier.FlushOne(key, yarn, false, xs, 30));
+  bool saved = false;
+  assert(tier.SpillDirect(key, yarn, false, "memory", xs->bytes.size(), xs->bytes.size(), UINT64_MAX,
+                          [&] { saved = true; return xs; }) == "rope" && !saved);
+  assert(tier.Skip(key, yarn, xs->bytes.size()) == "rope");
+  Cache cache(uint64_t(1) << 30);
+  assert(cache.Capture(x, yarn, {16, CacheRetention::Session}, 64, uint64_t(64) << 30,
+                       [&] { return Make(key, false, x.size() - 1); }));
+  assert(tier.FlushHost(cache) == 0);
+  assert(tier.Drain(30) && !tier.Holds(key, yarn) && !tier.Holds(key, Policy()));
+  // A YaRN request reads nothing: a stage says "rope", and Take and Peek give no state.
+  DiskQuery query = Query(x);
+  query.policy = yarn;
+  const auto status = tier.Stage(query, 0, UINT64_MAX);
+  assert(status.state == StageState::None && status.reason == "rope");
+  assert(!tier.Take(query, 0).snapshot && tier.Peek(query) == 0);
+  // The plain states keep the tier: the same key under the plain tenant goes to disk.
+  assert(tier.Spill(key, Policy(), entry, UINT64_MAX) && tier.Drain(30) && tier.Holds(key, Policy()));
 }
 
 // Stage reserves a read before the reader allocates it, so MemAvailable does not show those bytes
@@ -741,7 +777,38 @@ void PrefixStaysWithoutRoom() {
   assert(tier.Disk().QueuedBytes() == 0 && other.Disk().QueuedBytes() == 0);
 }
 
+// a handover waits for the writer, with a bound (Release -> DrainHandover -> Drain). A writer
+// that is fast enough ends the wait at once with the state on disk. A writer that is slower than the bound ends the wait
+// at the bound with `false`; the state still reaches disk when nothing overwrites it (here nothing does).
+void HandoverDrainBound() {
+  auto options = Options();
+  options.root = Home() / "states-handover";
+  const auto a = Tokens(3901, 40);
+  const auto as = Make(std::span<const int>(a).first(20), true, 0);
+  const ReleaseSpill handover = PlanReleaseSpill(false, true, size_t(1) << 30, size_t(64) << 20);
+  assert(handover.lazy && handover.drain_seconds == kHandoverDrainSeconds);
+  {
+    Tier tier(options, false);
+    assert(tier.Disk().Spill(as->hist, Policy(), false, false, false, as, *as).empty());
+    assert(DrainHandover(handover, true, [&](double seconds) { return tier.Drain(seconds); }));
+    assert(tier.Disk().Present(as->hist, Policy(), false));
+  }
+  options.root = Home() / "states-handover-slow";
+  options.write_delay_ms = 1500;
+  {
+    Tier tier(options, false);
+    assert(tier.Disk().Spill(as->hist, Policy(), false, false, false, as, *as).empty());
+    const ReleaseSpill short_bound{true, 0.2};
+    const auto start = std::chrono::steady_clock::now();
+    assert(!DrainHandover(short_bound, true, [&](double seconds) { return tier.Drain(seconds); }));
+    const auto waited = std::chrono::steady_clock::now() - start;
+    assert(waited >= std::chrono::milliseconds(190) && waited < std::chrono::milliseconds(1200));
+    assert(tier.Drain(30) && tier.Disk().Present(as->hist, Policy(), false));
+  }
+}
+
 int main() {
+  HandoverDrainBound();
   const auto x = Tokens(1, 40), y = Tokens(101, 40), z = Tokens(201, 40), w = Tokens(301, 40);
   std::shared_ptr<const Snapshot> x_tail;
   {
@@ -831,6 +898,7 @@ int main() {
   HoldSendsReleasedTailToDisk();
   TailTakesPrefixQueuePlace();
   PrefixStaysWithoutRoom();
+  YarnStatesStayOffDisk();
   fs::remove_all(Home());
   {
     // the disk identity names the MTP slot rows, so a state saved with another MTP bound

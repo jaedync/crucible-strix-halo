@@ -1,8 +1,8 @@
 """One server in a systemd user unit with the fake batch engine.
 
 The unit text comes from the generator of the service CLI (tools/crucible_cli/service.py render_unit) when it exists, so
-the tests run the shipped unit. Only the paths and the timing values are changed. Without the generator, the text of
-the design stands in."""
+the tests run the shipped unit. Only the paths and the timing values are changed. Without the generator, a copy of
+the unit text in this file stands in."""
 import http.client
 import importlib.util
 import json

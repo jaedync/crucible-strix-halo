@@ -182,11 +182,23 @@ const Engine::PrefillPlans& Engine::PrefillPlansFor(int R) {
     g.input.Build(input,pf_tiles_.In(R),nullptr,partial_,partial_capacity_,xh_,xh_capacity_,front,
                   pf_wcopy_,pf_wcopy_cap_);
     const Lin& out=w.attn ? w.qsa.o : w.gdn.out;
-    // An ablated output projection stores y; AblateWrite does the write-back.
-    const LinJob oj=abl_attn_[l] ? Job(out,nullptr,0,abl_y_,kHidden,kEpiStore,nullptr,R)
+    // An ablated output projection stores y; AblateWrite does the write-back. Request mode builds both: output is
+    // the stock plan and output_abl the ablated one; each prefill pass picks (PrefillBlock).
+    const LinJob ablated=Job(out,nullptr,0,abl_y_,kHidden,kEpiStore,nullptr,R);
+    const bool split=abl_attn_[l] && abl_request_;
+    const LinJob oj=abl_attn_[l] && !split ? ablated
                                  : Job(out,nullptr,0,PrefillH(R),PrefillHStride(R),kEpiResidual,post_,R);
     g.output.Build({oj},pf_tiles_.Out(R),pf_xpack_,partial_,partial_capacity_,xh_,xh_capacity_,
                    {out.front_s},pf_wcopy_,pf_wcopy_cap_);
+    if (split) {
+      g.output_abl.Build({ablated},pf_tiles_.Out(R),pf_xpack_,partial_,partial_capacity_,xh_,xh_capacity_,
+                         {out.front_s},pf_wcopy_,pf_wcopy_cap_);
+      // The attention core writes the stock plan's input (xh or repack); the ablated plan must read the same.
+      if (g.output_abl.jobs[0].xh!=g.output.jobs[0].xh || g.output_abl.repack!=g.output.repack) {
+        std::fprintf(stderr,"ablated prefill output plan does not share the stock plan's input\n");
+        std::exit(2);
+      }
+    }
   }
   const size_t bytes=p->DeviceBytes();
   if (bytes>kPrefillPlanBytes)
@@ -217,7 +229,7 @@ void Engine::FreePrefillPlans(bool oldest_only) {
     prefill_plan_bytes_-=bytes;
     if (oldest_only)
       std::fprintf(stderr,"prefill plan for %d rows evicted (%.1f MiB)\n",i->first,bytes/1048576.0);
-    for (auto& layer : i->second.second->layers) { layer.input.Free(); layer.output.Free(); }
+    for (auto& layer : i->second.second->layers) { layer.input.Free(); layer.output.Free(); layer.output_abl.Free(); }
     i=prefill_plans_.erase(i);
     if (oldest_only) break;  // The erased LRU iterator is no longer comparable.
   }
@@ -242,6 +254,8 @@ int Engine::PrefillFirstRow(int R, bool predict, int keep, const std::string& du
 
 void Engine::PrefillBlock(int li, const Layer& L, const PrefillLayer& P, int R, int pos0, bool cache_only,
                           int first) {
+  abl_now_=li<kLayers ? AblPass(R) : AblPassRows{};
+  const float* const abl_attn=AblAttn(li);
   // Above 8 rows the bulk inputs are fp16 (x_ is fp16-exact); the fp32 opt-in was deleted in train 18.
   const bool half_x=R>8;
   HcRead(L.hca,R,true,half_x ? pf_x_ : nullptr,half_x,PrefillH(R),PrefillHStride(R)); Mark("hc_mix");
@@ -260,7 +274,7 @@ void Engine::PrefillBlock(int li, const Layer& L, const PrefillLayer& P, int R, 
     // The same cache kernels as LaunchQsaPrefill on the same parts; the layer's output rows are dead.
     for (const auto& piece : pieces) {
       const int o=piece.offset, n=piece.rows;
-      auto a=QArgs(L.qsa,sequence_->qc.at(li),nullptr,n,pos0+o,sequence_->Mrope());
+      auto a=QArgs(L.qsa,sequence_->qc.at(li),nullptr,n,pos0+o,*sequence_);
       a.q+=(size_t)o*kQsaQWidth; a.k+=(size_t)o*kQsaKvWidth; a.v+=(size_t)o*kQsaKvWidth; a.idx+=(size_t)o*kQsaIdxWidth;
       prefill::LaunchQsaPrefillCache(a);
       PrefillCutAfter(o+n,{sequence_->qc.at(li).ik_raw,PrefillCutPool(li,pos0)});
@@ -281,13 +295,13 @@ void Engine::PrefillBlock(int li, const Layer& L, const PrefillLayer& P, int R, 
       const int o=piece.offset, n=piece.rows, skip=PrunePieceSkip(first,o,n);
       if (skip==n) {
         // No output row of this part is read: cache rows only.
-        auto c=QArgs(L.qsa,sequence_->qc.at(li),nullptr,n,pos0+o,sequence_->Mrope());
+        auto c=QArgs(L.qsa,sequence_->qc.at(li),nullptr,n,pos0+o,*sequence_);
         c.q+=(size_t)o*kQsaQWidth; c.k+=(size_t)o*kQsaKvWidth; c.v+=(size_t)o*kQsaKvWidth; c.idx+=(size_t)o*kQsaIdxWidth;
         prefill::LaunchQsaPrefillCache(c);
         PrefillCutAfter(o+n,{sequence_->qc.at(li).ik_raw,PrefillCutPool(li,pos0)});
         continue;
       }
-      auto a=QArgs(L.qsa,sequence_->qc.at(li),direct ? out : out+(size_t)o*kQsaOutWidth,n,pos0+o,sequence_->Mrope());
+      auto a=QArgs(L.qsa,sequence_->qc.at(li),direct ? out : out+(size_t)o*kQsaOutWidth,n,pos0+o,*sequence_);
       if (direct) { a.pack_rows=R; a.pack_off=o; }
       a.q+=(size_t)o*kQsaQWidth; a.k+=(size_t)o*kQsaKvWidth; a.v+=(size_t)o*kQsaKvWidth; a.idx+=(size_t)o*kQsaIdxWidth;
       const auto mark=[&](const char* n) { Mark(n); };
@@ -345,8 +359,8 @@ void Engine::PrefillBlock(int li, const Layer& L, const PrefillLayer& P, int R, 
     }
     Mark("gdn_core");
   }
-  P.output.Run(false,true,lin,direct);
-  if (abl_attn_[li]) AblateWrite(abl_attn_[li],PrefillH(R),PrefillHStride(R),R);
+  (abl_attn && abl_request_ ? P.output_abl : P.output).Run(false,true,lin,direct);
+  if (abl_attn) AblateWrite(abl_attn,PrefillH(R),PrefillHStride(R),R);
   Mark(L.attn ? "qsa_oproj" : "gdn_oproj");
   // The MoE half keeps the shapes and numerics of all R rows; it runs on rows [first, R) only.
   const PrefillGemmShape moe=pf_tiles_.Moe(R);
@@ -388,7 +402,13 @@ void Engine::PrefillBlock(int li, const Layer& L, const PrefillLayer& P, int R, 
   // Only the byte-tested K sets take the pair path (prefill_moe_kset.h).
   const bool tested=PrefillMoePairKSet(k6,L.moe.sg.K,L.moe.su.K,L.moe.sd.K,L.moe.experts);
   const bool pair=!tile && fused && tested && PrefillMoePairShape(moe);
-  if (tile) {
+  // The producer/consumer kernels, bitwise equal to the tile kernels, for the KMAX
+  // codes 5 and 6. kPrefillMoePc (prefill_moe_tile.h) is a compile-time switch, on: the fat gate/up kernel with the tile
+  // down kernel (kPcFatDown false). Off, pc is false and the pc launches instantiate no kernel.
+  const bool pc=tile && PrefillMoePcOn(kmax);
+  if (pc) {
+    LaunchPrefillMoePcEngine(kmax,a,PrefillTileFxLead()); Mark("moe_gateup");
+  } else if (tile) {
     LaunchPrefillMoeTilePair(kmax,a,PrefillTileFxLead()); Mark("moe_gateup");
   } else if (pair) {
     LaunchPrefillMoePair(moe.rm,a,k6); Mark("moe_gateup");
@@ -401,7 +421,8 @@ void Engine::PrefillBlock(int li, const Layer& L, const PrefillLayer& P, int R, 
     LaunchPrefillMoeGemmK(moe,a.g_gu,a.i_gu,a.item_counts,kmax); Mark("moe_gateup");
   }
   if (!pair && !tile) { PrefillMoeMidKernel<<<(R*kSlots*5+7)/8,256>>>(a); Mark("moe_mid"); }
-  if (tile) LaunchPrefillMoeTileDown(kmax,a.g_down,a.i_down,a.item_counts+1);
+  if (pc) LaunchPrefillMoePcDownEngine(kmax,a.g_down,a.i_down,a.item_counts+1);
+  else if (tile) LaunchPrefillMoeTileDown(kmax,a.g_down,a.i_down,a.item_counts+1);
   else LaunchPrefillMoeGemmK(moe,a.g_down,a.i_down,a.item_counts+1,kmax,half_pd);
   Mark("moe_down");
   if (const float* ab=AblMlp(li)) {
@@ -491,7 +512,9 @@ void Engine::PrefillCutPle(int pos0) {
 
 std::vector<int> Engine::Prefill(const int* tokens, int R, const std::string& dump, bool predict,
                                  const PrefillBetween* between, int keep) {
+  SettlePleSide();
   if (!ContextRowsFit((int)Length(),R,sequence_->capacity,pf_room_rows_)) std::abort();
+  CheckRopeRows(sequence_->hist.size(),R,sequence_->rope_mode);
   if (!ValidTokenIds(std::span<const int>(tokens,R),kVocab)) std::abort();
   // Prefill commits every row, so the retained ledger advances like Forward(R,0,R).
   const std::string state_error=sequence_->retained.Forward(R,0,R);

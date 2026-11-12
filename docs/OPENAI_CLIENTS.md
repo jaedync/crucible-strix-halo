@@ -97,7 +97,8 @@ Diagnostic token IDs can therefore contain text that the visible response exclud
 The server returns OpenAI error objects with `message`, `type`, `param`, and `code`.
 Unsupported request features return HTTP 400 before queue submission.
 An unknown model returns HTTP 404.
-A request body above `--max-body-mib` (default 1 MiB, or 32 MiB with `--vision`) returns HTTP 413.
+A request body above `--max-body-mib` (default 16 bytes for each `--ctx` token and at least 1 MiB, or 256 MiB with
+`--vision`) returns HTTP 413.
 A client address above `--max-requests-per-client` returns HTTP 429. This limit is off by default.
 A full or failed engine queue returns HTTP 503.
 Invalid generated function calls come back as content with `usage.tool_call_fallback` (see server/README.md, "Tool calls").

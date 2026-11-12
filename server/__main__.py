@@ -17,6 +17,7 @@ from .backend import EngineBackend, LOOKUP_DEPTH, MAX_CONVERSATION_CACHE_MIB
 from .batch_scheduler import INTERLEAVE_MIN_ROWS
 from .hosts import ALLOWED_HOSTS_ENV, HostError, resolve_allowed_hosts
 from .http import Service, handler_for
+from .rope import ROPE_ENV, YARN_REPLY_RESERVE, context_error, implied_word, reserve_word, state_dir_error
 from .sd_notify import Notifier, Watchdog
 from .request_id import CLIENT_REQUEST_ID_HEADER_ENV, HeaderNameError, resolve_client_request_id_header
 from .think_budget import MIN_THINKING_DEFAULT
@@ -99,6 +100,9 @@ def main():
     parser.add_argument("--engine", type=Path, default=Path(__file__).resolve().parents[1] / "build/engine/crucible")
     parser.add_argument("--ctx", type=int, default=32768)
     parser.add_argument("--model-id", default="crucible")
+    # A second public model name (for example qwen3.8-flash-next). Its -abliterated form also selects the ablated mode:
+    # clients that know the model by that name select the mode that way.
+    parser.add_argument("--model-name", default="")
     parser.add_argument("--host", type=listen_address, default="127.0.0.1", metavar="ADDRESS",
                         help="Bind address: an IPv4 or IPv6 literal (default 127.0.0.1). An address that is not "
                              "loopback (127.0.0.0/8 and ::1) needs --api-key-file: 0.0.0.0, ::, an IPv4-mapped address "
@@ -183,6 +187,11 @@ def main():
                              "browser can reach the server, for example --allowed-host 127.0.0.1,localhost,[::1].")
     parser.add_argument("--clamp-max-tokens", action="store_true",
                         help="Lower max_tokens to the context room instead of rejecting the request.")
+    parser.add_argument("--yarn-reply-reserve", type=int, default=None, metavar=f"1..{MAX_COUNT}",
+                        help=f"YaRN servers only (--ctx above 262144 or CRUCIBLE_ROPE_MODE=auto:F): a request is plain "
+                             f"when its prompt plus min(max_tokens, N) - 1 fits 262144 positions, else YaRN. The server "
+                             f"lowers the max_tokens of a plain request to that limit; a reply that reaches it ends with "
+                             f"finish_reason length, and the next request runs YaRN (default {YARN_REPLY_RESERVE}).")
     parser.add_argument("--temperature", type=float, default=None, metavar="0..2",
                         help="Server default temperature for requests that send none (default 0, greedy). A request "
                              "with logprobs and no temperature stays at 0. A request field always wins.")
@@ -196,8 +205,8 @@ def main():
                         help="Output tokens for a request that sends no max_tokens or max_completion_tokens (default "
                              "128). max gives it all the context room after its prompt. A request count is not changed.")
     parser.add_argument("--max-body-mib", type=int, default=None, metavar="N",
-                        help="Largest request body: 1..64 MiB (default 1), or 1..1024 MiB with --vision (default 256). "
-                             "A 256K-token conversation of code needs more than 1 MiB.")
+                        help="Largest request body: 1..64 MiB, or 1..1024 MiB with --vision (default 256). The default "
+                             "holds 16 bytes for each --ctx token, at least 1 MiB: 1 at 32768, 4 at 262144, 8 at 524288.")
     parser.add_argument("--vision", action="store_true",
                         help="Load the vision tower and accept image_url parts (base64 data: URLs).")
     parser.add_argument("--vision-max-pixels", type=int, default=None,
@@ -333,8 +342,16 @@ def main():
         parser.error("--min-thinking-tokens must be in [0,262144]")
     if args.max_thinking_tokens is not None and not 1 <= args.max_thinking_tokens <= 262144:
         parser.error("--max-thinking-tokens must be in [1,262144]")
-    if not 1 <= args.ctx <= 262144:
-        parser.error("--ctx must be in [1,262144]")
+    # Y2: above 262,144 the engine needs a YaRN word (server/rope.py); at or below it every request stays plain.
+    if error := context_error(args.ctx, os.environ):
+        parser.error(error)
+    rope_reserve = rope_word = None
+    if reserve_word(word := os.environ.get(ROPE_ENV) or implied_word(args.ctx, os.environ)):
+        rope_reserve = YARN_REPLY_RESERVE if args.yarn_reply_reserve is None else args.yarn_reply_reserve
+        rope_word = word
+    if args.yarn_reply_reserve is not None and (rope_reserve is None or not 1 <= rope_reserve <= MAX_COUNT):
+        parser.error(f"--yarn-reply-reserve needs a count in [1,{MAX_COUNT}] and a YaRN context (--ctx above 262144 "
+                     f"or {ROPE_ENV}=auto:2 or auto:4)")
     if (not 0 <= args.conversation_cache_mib <= MAX_CONVERSATION_CACHE_MIB or
             (args.prefill is not None and not 0 <= args.prefill <= 4096)):
         parser.error(f"The cache must fit 0..{MAX_CONVERSATION_CACHE_MIB} MiB. Prefill rows must fit 0..4096.")
@@ -352,6 +369,8 @@ def main():
     if args.state_dir is not None:
         if args.serial or not args.session_replay:
             parser.error("--state-dir needs session replay (a conversation cache) and not --serial")
+        if error := state_dir_error(os.environ, args.ctx):
+            parser.error(error)
         args.state_dir = args.state_dir.expanduser().absolute()
     if args.cache_idle_minutes is not None and (args.serial or not args.conversation_cache_mib or
                                                 not 1 <= args.cache_idle_minutes <= 10080):
@@ -384,11 +403,14 @@ def main():
             max_images=args.vision_max_images or MAX_IMAGES,
             max_image_bytes=args.vision_max_image_mib << 20 if args.vision_max_image_mib else MAX_IMAGE_BYTES)
     from .vision import VISION_BODY_MIB, VISION_BODY_MIB_MAX
+    from .http import context_body_mib
     body_high = VISION_BODY_MIB_MAX if args.vision else 64
     if args.max_body_mib is not None and not 1 <= args.max_body_mib <= body_high:
         parser.error(f"--max-body-mib must be in [1,{body_high}]" + ("" if args.vision else " without --vision"))
     if args.max_body_mib is None:
-        args.max_body_mib = VISION_BODY_MIB if args.vision else 1
+        # the default body holds a text prompt that fills --ctx, so a 524,288-token YaRN server does not refuse
+        # a long prompt with 413 before it reaches the tokenizer. The default context (32768) keeps 1 MiB.
+        args.max_body_mib = min(body_high, max(VISION_BODY_MIB if args.vision else 1, context_body_mib(args.ctx)))
     engine_options = ("--vision", "1") if args.vision else ()
     # Sent only when set, so the default engine command stays as before; the engine prints its reserve at startup.
     if args.host_reserve_mib is not None:
@@ -407,6 +429,8 @@ def main():
         parser.error("--port must be in [1024,65535]")
     if not args.model_id or len(args.model_id) > 200:
         parser.error("--model-id must contain 1 to 200 characters")
+    if len(args.model_name) > 200:
+        parser.error("--model-name must contain at most 200 characters")
     if args.api_key_file is not None:
         args.api_key_file = args.api_key_file.expanduser()
         if not args.api_key_file.is_absolute():
@@ -422,6 +446,12 @@ def main():
             print(f"server error: {error}", file=sys.stderr, flush=True)
             return EXIT_BAD_KEY_FILE
     metrics.LOG_ENGINE_TEXT = args.log_engine_errors
+    # --ctx above 262,144 alone turns YaRN on (one binary, a start option). The engine reads the word;
+    # at or below 262,144 the server sets nothing, so the engine starts as today.
+    if word := implied_word(args.ctx, os.environ):
+        os.environ[ROPE_ENV] = word
+        print(f"rope: --ctx {args.ctx} starts the engine with {ROPE_ENV}={word} (plain at or below 262144 positions, "
+              "YaRN above)", file=sys.stderr, flush=True)
     def stop(_signal, _frame):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, stop)
@@ -474,15 +504,16 @@ def main():
             # A ping must fit well inside the stall time (the default 50 s gives the design's 10 s).
             if args.systemd: backend.ping_idle_seconds = min(10.0, args.watchdog_stall_seconds / 5)
         server = bind_server(args.host, args.port, handler_for(
-            Service(backend, tokenizer, args.model_id, clamp_max_tokens=args.clamp_max_tokens,
+            Service(backend, tokenizer, args.model_id, model_name=args.model_name,
+                    clamp_max_tokens=args.clamp_max_tokens,
                     default_thinking=args.default_thinking == "on", max_body_mib=args.max_body_mib,
                     thinking_answer_room=None if room == "auto" else int(room),
                     max_thinking_tokens=args.max_thinking_tokens, min_thinking_tokens=args.min_thinking_tokens,
                     stream_tool_calls=args.stream_tool_calls == "on", end_of_turn_guard=args.end_of_turn_guard == "on",
                     max_requests_per_client=args.max_requests_per_client, vision=vision,
                     default_mtp_prefix=args.mtp_window, capture=capture, allowed_hosts=allowed_hosts,
-                    defaults=defaults, client_request_id_header=request_id_header,
-                    api_key=api_gate)))
+                    defaults=defaults, client_request_id_header=request_id_header, rope_reserve=rope_reserve,
+                    rope_word=rope_word, api_key=api_gate)))
         server.daemon_threads = True
         commit = server_commit()
         print(f"Crucible v{server_version()}" + (f" ({commit})" if commit else ""), file=sys.stderr, flush=True)

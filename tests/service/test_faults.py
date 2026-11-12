@@ -1,4 +1,4 @@
-"""Fault tests F1 to F6 and F9 to F12 of the design: each fault has a pass rule.
+"""Fault tests F1 to F6 and F9 to F12 of the service design: each fault has a pass rule.
 
 Timing is scaled (WatchdogSec 3 s, stall 10 s) unless the test says real_values; the unit text is the shipped one."""
 import json
@@ -84,7 +84,7 @@ def test_f3_sigstop_of_the_engine_during_a_decode(make_unit):
     assert found <= SCALED_FOUND, found
     unit.wait_ready(30)
     assert unit.state()["NRestarts"] == "1"
-    assert not unit.alive(engine)
+    unit.wait_for(lambda: not unit.alive(engine), 10, what="the killed engine process gone")  # SIGKILL: wait for the exit
     no_core_file(unit)
 
 
@@ -97,7 +97,7 @@ def test_f3_real_values(make_unit):
     found = stop_and_time(unit, engine, REAL_FOUND)
     connection.close()
     assert found <= REAL_FOUND, found
-    assert not unit.alive(engine)
+    unit.wait_for(lambda: not unit.alive(engine), 10, what="the killed engine process gone")  # SIGKILL: wait for the exit
     unit.wait_ready(60)
     no_core_file(unit)
 

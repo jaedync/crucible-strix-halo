@@ -51,6 +51,12 @@ def scheduled_body(source, name):
         if reference.count(binding) != 1:
             raise ValueError('the GDN state binding changed; review the persistent adapter')
         reference = reference.replace(binding, '', 1)
+        # The pending-row stride of the argument type: the persistent caller holds one trunk GdnArgs (kMaxRows; it
+        # never runs with a verify span, CRUCIBLE_SPEC_SPAN).
+        stride = '\n  constexpr int PEND = kGdnPendRows<Args>;  // pending rows per head in a.pend'
+        if reference.count(stride) != 1:
+            raise ValueError('the GDN pending stride changed; review the persistent adapter')
+        reference = reference.replace(stride, '\n  constexpr int PEND = kMaxRows;  // pending rows per head in a.pend', 1)
     result = adapt(reference)
     # Lookahead progress belongs to the per-op kernels; the persistent side
     # requires the lookahead off, so it publishes nothing.

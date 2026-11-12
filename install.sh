@@ -7,7 +7,7 @@
 # What it does, in order:
 #   1. checks this system and the tools it needs (git, curl, python3, gzip, sha256sum)
 #   2. downloads SHA256SUMS and the manifest of the pinned release tag into a temp folder
-#   3. downloads the release engine (gfx1151, ROCm 7.2) into the same folder
+#   3. downloads the release engine (gfx1151, built with ROCm 7.2.4; it runs on 7.2.4 and on the latest ROCm) into the same folder
 #   4. checks the sha256 of every download. It runs nothing before this check passes
 #   5. checks that the libraries of the engine exist on this machine. A missing package is shown as an exact command,
 #      and the installer asks once before it runs sudo
@@ -20,7 +20,7 @@
 # Environment (for mirrors and tests): CRUCIBLE_TAG, CRUCIBLE_RELEASE_BASE (https:// or file://), CRUCIBLE_REPO_URL,
 # CRUCIBLE_DIR, CRUCIBLE_SUMS_SHA256, CRUCIBLE_TTY, CRUCIBLE_OS_RELEASE, ROCM_PATH.
 
-PIN_TAG="v0.34.0"
+PIN_TAG="v0.37.0"
 PIN_SUMS_SHA256=""
 REPO_URL_DEFAULT="https://github.com/jaedync/crucible-strix-halo.git"
 RELEASE_BASE_DEFAULT="https://github.com/jaedync/crucible-strix-halo/releases/download"
@@ -589,6 +589,46 @@ check_target() {
   return 0
 }
 
+# hip_runtime_note: one line about the HIP runtime of this machine. It never stops the install and never asks for an older
+# version. The latest ROCm (major 10 or later) is current, 7.2.4 is tested, any other version is named with the tested ones.
+# The version comes from $ROCM_DIR/.info/version, else from the file name of libamdhip64 (7.16.26385 is 10.1, 7.2.53211 is 7.2.4).
+hip_runtime_note() {
+  local ver="" f name major
+  if [ -r "$ROCM_DIR/.info/version" ]; then
+    ver=$(head -n 1 "$ROCM_DIR/.info/version" 2>/dev/null | tr -d '[:space:]')
+  fi
+  if [ -z "$ver" ]; then
+    for f in "$ROCM_DIR"/lib/libamdhip64.so.*; do
+      [ -e "$f" ] || continue
+      name=${f##*/}
+      case "${name#libamdhip64.so.}" in
+        7.16.26385) ver=10.1 ;;
+        7.2.53211) ver=7.2.4 ;;
+      esac
+      [ -n "$ver" ] && break
+    done
+  fi
+  if [ -z "$ver" ]; then
+    if ls "$ROCM_DIR"/lib/libamdhip64.so.* >/dev/null 2>&1; then
+      say "  HIP runtime: found under $ROCM_DIR, version not known. Tested: 10.1 and 7.2.4."
+    else
+      say "  HIP runtime: none found under $ROCM_DIR. Install the current ROCm (10.1 tested), or let ./crucible setup offer a private runtime."
+    fi
+    return 0
+  fi
+  major=${ver%%.*}
+  case "$major" in
+    '' | *[!0-9]*) say "  HIP runtime: ROCm $ver. Tested: 10.1 and 7.2.4."; return 0 ;;
+  esac
+  if [ "$major" -ge 10 ]; then
+    say "  HIP runtime: ROCm $ver (current)."
+  elif [ "${ver%%-*}" = "7.2.4" ]; then
+    say "  HIP runtime: ROCm $ver (tested)."
+  else
+    say "  HIP runtime: ROCm $ver. Tested: 10.1 and 7.2.4."
+  fi
+}
+
 # lib_packages: LIB_PKGS = the packages for MISSING. Stops (exit 3) when a library has no known package.
 lib_packages() {
   local family lib p unknown=()
@@ -671,6 +711,7 @@ get_engine() {
   else
     say "  $ENGINE_WHY"
   fi
+  hip_runtime_note
 }
 
 place_engine() {

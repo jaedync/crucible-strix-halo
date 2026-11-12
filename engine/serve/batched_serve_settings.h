@@ -117,8 +117,13 @@ inline BatchedServeSettings ParseBatchedServeSettings(std::span<const std::strin
     }
     else throw std::invalid_argument("unsupported batch option");
   }
-  if (result.ctx<1 || result.ctx>262144 || result.streams<1 || result.streams>kServeBatchSlots)
+  const RopeSetting rope=RopeSettingFromEnv();
+  if (result.ctx<1 || result.ctx>rope.ContextCap() || result.streams<1 || result.streams>kServeBatchSlots)
     throw std::invalid_argument("invalid batch context or stream count");
+  // v1 (review M2): a YaRN state never goes to the disk tier. The tier does not
+  // record the mode yet, so any YaRN word (yarn:F and auto:F) refuses it.
+  if (rope.allow != RopeMode::Plain && !result.state_dir.empty())
+    throw std::invalid_argument("CRUCIBLE_ROPE_MODE=yarn:F or auto:F keeps states out of the disk tier: remove --state-dir");
   if (result.prefill_rows<kServePrefillAuto || result.prefill_rows>kServeMaxPrefillRows)
     throw std::invalid_argument("batch prefill rows exceed the supported range");
   if (result.cache_mib<0 || result.cache_mib>kServeMaxCacheMib)

@@ -10,6 +10,10 @@ Both modes write no text, no request ID and no time finer than the UTC day (file
 server at a time writes a directory (DIR/.lock). The spool stops at max_bytes over all its files; later turns are
 dropped and counted.
 
+Leak guard (WP part 1): every file here carries the canary (server/leak_canary.py): the JSON files as the key
+"canary", the spool as its header, the lock file as its content. The export scan and the repository guard fail on any
+file that holds it. The directory must lie outside every git work tree: the server refuses to start otherwise.
+
 Export floor: the per-day files never leave the serving machine. Any export sums 7 or more days and drops each class with
 fewer than 20 sequences.
 """
@@ -24,11 +28,14 @@ import threading
 import time
 from pathlib import Path
 
+from .leak_canary import CANARY, CANARY_BYTES, refuse_inside_git_tree, shield_folder
+
 VOCAB, BLOCK = 248320, 128
 BLOCKS = VOCAB // BLOCK
 MODES = ("counts", "tokens")
 WRITE_SECONDS = 600
-SPOOL_MAGIC = b"DCT1"
+SPOOL_MAGIC = b"DCT1"                      # the old header, without the canary: read, and upgraded on the next write
+SPOOL_HEADER = b"DCT2" + CANARY_BYTES      # the header of every new spool file
 RECORD = struct.Struct("<BII")             # class index, prompt length, output length; then uint32 IDs
 CLASSES = ("chat", "chat+think", "tool", "tool+think")
 
@@ -41,6 +48,10 @@ def _check_ids(ids):
     for token in ids:
         if type(token) is not int or not 0 <= token < VOCAB:
             raise ValueError("draft capture needs token IDs in [0, 248320)")
+
+
+def _refuse_git_tree(directory):
+    refuse_inside_git_tree(directory, "private capture text data")
 
 
 def _open_private(path, flags):
@@ -62,6 +73,15 @@ def _private_dir(directory):
         raise ValueError("the draft capture directory must be closed to group and other (0700)")
 
 
+def without_canary(doc):
+    """DOC as the reader sees it: a day file that the writer made (write_day_file adds the "canary" key at every flush) loses
+    that one key; anything else is returned as it is. The input is not changed. The server (_load) and the daily-switch
+    rehearsal both read a counts file through this function, so they accept the same key and no other."""
+    if isinstance(doc, dict):
+        return {key: value for key, value in doc.items() if key != "canary"}
+    return doc
+
+
 def _valid_counts(doc, day):
     """True when doc is a counts document of this day with the expected shape (numbers only)."""
     def count(v):
@@ -79,7 +99,12 @@ def _valid_counts(doc, day):
 
 
 def write_day_file(directory, path, data, day_start):
-    """Write DATA to PATH as a private file: a temp file in DIRECTORY, fsync, then rename, then the day's time."""
+    """Write DATA (a JSON document) to PATH as a private file with the canary key: a temp file in DIRECTORY, fsync,
+    then rename, then the day's time."""
+    shield_folder(directory)
+    doc = json.loads(data)
+    doc["canary"] = CANARY
+    data = json.dumps(doc, separators=(",", ":")).encode()
     fd, temp = tempfile.mkstemp(dir=directory, prefix=".draft-", suffix=".tmp")
     try:
         os.fchmod(fd, 0o600)
@@ -104,19 +129,85 @@ class DraftCapture:
         if mode not in MODES:
             raise ValueError("the draft capture mode is counts or tokens")
         self.dir, self.mode, self.max_bytes, self.clock = directory, mode, int(max_bytes), clock
+        _refuse_git_tree(self.dir)
         _private_dir(self.dir)
+        shield_folder(self.dir)         # no `git add` takes this folder, even in a work tree that .git does not mark (H10)
         self.lock_fd = os.open(self.dir / ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
             fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             os.close(self.lock_fd)
             raise RuntimeError("another server writes this draft capture directory") from None
+        if os.fstat(self.lock_fd).st_size != len(CANARY_BYTES):   # the lock file carries the canary too
+            os.ftruncate(self.lock_fd, 0)
+            os.pwrite(self.lock_fd, CANARY_BYTES, 0)
+        self._migrate()
         self.lock = threading.Lock()
         self.day, self.doc, self.last_write, self.dropped = None, None, 0.0, 0
         self.stats = None
         if draft_stats:   # per-token acceptance counters (server/draft_stats.py); counts files only
             from .draft_stats import DraftStats
             self.stats = DraftStats(self)
+
+    def _rewrite(self, path, produce):
+        """Replace PATH by a temp file that PRODUCE(handle) fills, keep its modification time and make it 0600."""
+        times = os.stat(path, follow_symlinks=False)
+        fd, temp = tempfile.mkstemp(dir=self.dir, prefix=".draft-", suffix=".tmp")
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                produce(handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, path)
+        except BaseException:
+            if os.path.exists(temp):
+                os.unlink(temp)
+            raise
+        os.utime(path, ns=(times.st_atime_ns, times.st_mtime_ns), follow_symlinks=False)
+
+    def _migrate(self):
+        """Once at the start: every file of an older server gets the canary (outside check H16). A spool with the old
+        header gets the new one, a JSON object gets the key, any other file (a .bad file, a left-over temp file) gets a
+        trailer line. Modification times stay. Run again, it changes nothing. The lock is held, so no other server writes."""
+        for path in sorted(self.dir.iterdir()):
+            name = path.name
+            if name in (".lock", ".gitignore") or path.is_symlink() or not path.is_file():
+                continue
+            if name.startswith("draft-tokens-") and name.endswith(".bin"):
+                with open(path, "rb") as handle:
+                    head = handle.read(len(SPOOL_HEADER))
+                if head[: len(SPOOL_MAGIC)] != SPOOL_MAGIC:
+                    if CANARY_BYTES not in head:
+                        self._trailer(path)          # not a spool of any known header: still no file without the canary
+                    continue
+
+                def produce(out, path=path):
+                    out.write(SPOOL_HEADER)
+                    with open(path, "rb") as src:
+                        src.seek(len(SPOOL_MAGIC))
+                        while chunk := src.read(1 << 22):
+                            out.write(chunk)
+                self._rewrite(path, produce)
+                continue
+            data = path.read_bytes()
+            if CANARY_BYTES in data:
+                continue
+            try:
+                doc = json.loads(data)
+            except ValueError:
+                doc = None
+            if isinstance(doc, dict):
+                doc["canary"] = CANARY
+                text = json.dumps(doc, separators=(",", ":")).encode()
+                self._rewrite(path, lambda out, text=text: out.write(text))
+            else:
+                self._trailer(path, data)
+
+    def _trailer(self, path, data=None):
+        data = path.read_bytes() if data is None else data
+        tail = b"" if data.endswith(b"\n") or not data else b"\n"
+        self._rewrite(path, lambda out: out.write(data + tail + CANARY_BYTES + b"\n"))
 
     def record_draft(self, *, tools, thinking, events):
         """Add the per-token draft counters of a finished turn (the done events of its jobs), if the flag is on."""
@@ -165,6 +256,7 @@ class DraftCapture:
                 doc = json.loads(path.read_text())
             except (OSError, ValueError):
                 doc = None
+            doc = without_canary(doc)        # the writer adds the canary again at every flush
             if _valid_counts(doc, day):
                 return doc
             os.replace(path, path.with_name(path.name + ".bad"))
@@ -183,18 +275,43 @@ class DraftCapture:
     def _spool(self, day, cls, prompt_ids, output_ids):
         if self.mode != "tokens":
             raise RuntimeError("only the tokens mode writes token IDs")
+        shield_folder(self.dir)
         path = self.dir / f"draft-tokens-{day}.bin"
         new = not path.exists()
-        size = (len(SPOOL_MAGIC) if new else 0) + RECORD.size + 4 * (len(prompt_ids) + len(output_ids))
+        if not new:
+            self._upgrade_spool(path, day)
+        size = (len(SPOOL_HEADER) if new else 0) + RECORD.size + 4 * (len(prompt_ids) + len(output_ids))
         if self._spool_bytes() + size > self.max_bytes:
             self.dropped += 1
             return
-        data = (SPOOL_MAGIC if new else b"") + RECORD.pack(cls, len(prompt_ids), len(output_ids))
+        data = (SPOOL_HEADER if new else b"") + RECORD.pack(cls, len(prompt_ids), len(output_ids))
         data += struct.pack(f"<{len(prompt_ids) + len(output_ids)}I", *prompt_ids, *output_ids)
         with _open_private(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND) as handle:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+        start = self._day_start(day)
+        os.utime(path, (start, start), follow_symlinks=False)
+
+    def _upgrade_spool(self, path, day):
+        """A spool file of an older server has no canary. Rewrite it once with the new header, in place of the old."""
+        with open(path, "rb") as handle:
+            head = handle.read(len(SPOOL_MAGIC))
+        if head != SPOOL_MAGIC:
+            return
+        old = path.read_bytes()
+        fd, temp = tempfile.mkstemp(dir=self.dir, prefix=".draft-", suffix=".tmp")
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(SPOOL_HEADER + old[len(SPOOL_MAGIC):])
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, path)
+        except BaseException:
+            if os.path.exists(temp):
+                os.unlink(temp)
+            raise
         start = self._day_start(day)
         os.utime(path, (start, start), follow_symlinks=False)
 
@@ -215,7 +332,11 @@ class DraftCapture:
 def read_spool(path):
     """Yield (class, prompt IDs, output IDs) of a spool file. For the test machine pipeline only: never print them."""
     with open(path, "rb") as handle:
-        if handle.read(len(SPOOL_MAGIC)) != SPOOL_MAGIC:
+        head = handle.read(len(SPOOL_MAGIC))
+        if head == b"DCT2":
+            if handle.read(len(CANARY_BYTES)) != CANARY_BYTES:
+                raise ValueError("not a draft token spool of this version (the canary is missing)")
+        elif head != SPOOL_MAGIC:
             raise ValueError("not a draft token spool")
         while header := handle.read(RECORD.size):
             if len(header) != RECORD.size:

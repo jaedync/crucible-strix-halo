@@ -9,7 +9,9 @@
 #include "../model/flashnext/multimodal.h"
 #include "../exl3/plans.h"
 #include "retained_prefix.h"
+#include "spec_span.h"
 #include "../model/flashnext/fixed_state.h"
+#include "rope_mode.h"
 
 namespace crucible {
 struct SequenceState {
@@ -41,15 +43,19 @@ struct SequenceState {
   float* vision_x = nullptr;  // the encoder residual stream of this request, while an image is in progress
   std::vector<uint8_t> vision_rgb;  // verified host pixels of vision_images[vision_next], read before its first slice
   const int* Mrope() const { return mrope_on ? mrope : nullptr; }
+  // The RoPE mode (rope_mode.h): the process start mode at construction; only
+  // Engine::SetStreamRope changes it, and only while hist is empty. Reset() keeps it.
+  RopeMode rope_mode = RopeMode::Plain;
 
-  static constexpr size_t kPendBytes = sizeof(float) * 48 * kMaxRows * kPend;
-  static constexpr size_t FixedBytes() {
-    return 36ull * (kGdnStateBytes + kGdnHistBytes + kPendBytes) + kPleRingBytes;
+  // One layer's pending GDN rows: [48 heads][pend rows][kPend]; 16 pend rows with a verify span (spec_span.h).
+  static size_t PendBytes() { return sizeof(float) * 48 * SpecPendRows(SpecSpanRows()) * kPend; }
+  static size_t FixedBytes() {
+    return 36ull * (kGdnStateBytes + kGdnHistBytes + PendBytes()) + kPleRingBytes;
   }
   // The fixed-size buffers (fixed_state.h): every copy of a sequence's state visits this one list.
   std::vector<DeviceSpan> FixedSpans() const {
     std::vector<DeviceSpan> spans;
-    VisitFixedState(*this, kPendBytes, [&](const void* pointer, size_t bytes) { spans.push_back({pointer, bytes}); });
+    VisitFixedState(*this, PendBytes(), [&](const void* pointer, size_t bytes) { spans.push_back({pointer, bytes}); });
     return spans;
   }
   static size_t Bytes(int ctx, bool compact = false, bool mtp = false, int mtp_rows = 0) {
@@ -90,7 +96,7 @@ struct SequenceState {
       } else {
         gstate[l] = Zeros<float>(kGdnStateBytes / sizeof(float));
         ghist[l] = Zeros<float>(kGdnHistBytes / sizeof(float));
-        gpend[l] = Zeros<float>(kPendBytes / sizeof(float));
+        gpend[l] = Zeros<float>(PendBytes() / sizeof(float));
       }
     }
     ple_ring = Zeros<float>(kPleRingBytes / sizeof(float));
@@ -101,7 +107,7 @@ struct SequenceState {
     for (size_t i = 0; i < 4 * qc.size(); ++i) HIP_OK(hipMemset(const_cast<void*>(spans[i].pointer), 0xFF, spans[i].bytes));
 #endif
     // The admission formula and the copy list must name the same buffers.
-    if (!FixedStateMatches(*this, kPendBytes, FixedBytes()))
+    if (!FixedStateMatches(*this, PendBytes(), FixedBytes()))
       throw std::logic_error("sequence state buffers do not match SequenceState::FixedBytes");
   }
   void AllocateMtpCache() {

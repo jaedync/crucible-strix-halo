@@ -31,10 +31,14 @@
 
 namespace st {
 
+// The file name without its folder. A message never prints a folder: the file may be a draft sidecar in a
+// private folder (leak guard, review item M5).
+inline std::string BaseName(const std::string& path) { return path.substr(path.find_last_of('/') + 1); }
+
 [[noreturn]] inline void Fail(const std::string& file, const std::string& tensor,
                              const std::string& reason) {
   std::fprintf(stderr, "checkpoint error: %s, tensor %s: %s; check or replace the checkpoint\n",
-               file.c_str(), tensor.empty() ? "<header>" : tensor.c_str(), reason.c_str());
+               BaseName(file).c_str(), tensor.empty() ? "<header>" : tensor.c_str(), reason.c_str());
   std::exit(1);
 }
 
@@ -240,7 +244,11 @@ class Checkpoint {
         }
         sc.Expect('}');
         sc.Tensor("");
-      } else sc.Skip();
+      } else {
+        // A mixed pack links whole shards of several packs; its index picks the copy.
+        if (k == "crucible_mixed_pack") mixed_ = true;
+        sc.Skip();
+      }
       sc.Separator('}');
     }
     sc.Expect('}');
@@ -261,11 +269,15 @@ class Checkpoint {
   // error when its header loads later; the file's tensor is the one that Info returns. Call before any other header loads.
   void AddFile(const std::string& file, bool wins = false) {
     CheckFile(file);
-    LoadHeader(file);
+    LoadHeader(file, /*index_shard=*/false);
     if (wins) wins_.insert(file);
     for (const auto& [n, t] : tensors_) if (t.file == file) shard_of_[n] = file;
   }
   bool Has(const std::string& name) const { return shard_of_.count(name) != 0; }
+  // The index holds "crucible_mixed_pack": an index shard may hold copies of names that the index puts in another
+  // file or does not list. LoadHeader skips them and counts them here (complete once every shard header has loaded).
+  bool mixed() const { return mixed_; }
+  size_t shadowed() const { return shadowed_; }
   // Index shards are plain names in dir_ (CheckFile); an override key is the sidecar's own path.
   std::string PathOf(const std::string& shard) const {
     return shard.find('/') == std::string::npos ? dir_ + "/" + shard : shard;
@@ -434,11 +446,22 @@ class Checkpoint {
     }
     if (bytes != uint64_t(offsets[1] - offsets[0])) Fail(path, name, "shape and dtype do not match payload size");
   }
-  void LoadHeader(const std::string& file) {
+  void LoadHeader(const std::string& file, bool index_shard = true) {
     if (maps_.count(file)) return;
-    for (auto& [name, ti] : ParseHeader(file, dir_ + "/" + file))
+    for (auto& [name, ti] : ParseHeader(file, dir_ + "/" + file)) {
+      // A mixed index is the only source of names: a shard gives only the names that the index maps to it. A name
+      // that the index does not list could not be read anyway (Info needs the index), so its copies are skipped too
+      // (two source packs both hold the vision tower in their shards).
+      if (mixed_ && index_shard) {
+        const auto owner = shard_of_.find(name);
+        if (owner == shard_of_.end() || owner->second != file) {
+          ++shadowed_;
+          continue;
+        }
+      }
       if (!tensors_.emplace(name, ti).second && !wins_.count(tensors_.at(name).file))
         Fail(dir_ + "/" + file, name, "duplicate tensor name across checkpoint shards");
+    }
   }
   // Maps path under the key file and returns its tensors in header order.
   std::vector<std::pair<std::string, TensorInfo>> ParseHeader(const std::string& file, const std::string& path) {
@@ -513,6 +536,8 @@ class Checkpoint {
   std::unordered_map<std::string, TensorInfo> tensors_;
   std::map<std::string, Map> maps_;
   std::unordered_set<std::string> wins_;
+  bool mixed_ = false;
+  size_t shadowed_ = 0;
   bool no_mapped_reads_ = false;
   std::unordered_map<std::string, std::vector<uint8_t>> small_;
 };

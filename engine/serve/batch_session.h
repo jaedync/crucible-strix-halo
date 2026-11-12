@@ -10,6 +10,7 @@
 #include "../layers/numerics.h"
 #include "../runtime/draft_warmup.h"
 #include "../runtime/packed_rows_option.h"
+#include "../runtime/spec_span.h"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -45,6 +46,12 @@ struct BatchDraftCounts {
   long proposed = 0, accepted = 0, steps = 0;
 };
 
+// Y2: cumulative counts of the session's YaRN opens and of its Way A crossings (a YaRN
+// open that ran a full prefill while a plain state of the same conversation was on a slot or in the host cache), with
+// the plain tokens that those crossings prefilled again. Numbers only.
+struct BatchRopeCounters {
+  uint64_t yarn_opens = 0, crossings = 0, crossing_tokens = 0;
+};
 struct BatchEvent {
   uint64_t request_id = 0, slot_generation = 0;
   std::optional<int> token;
@@ -81,6 +88,17 @@ struct BatchEvent {
   double closest_age_s = 0;
   BatchCacheCounters counters;
   bool counters_reported = false;
+  // Done events: the request's RoPE mode and the session's rope counters, reported only by a process with a YaRN
+  // word (rope_report), so the done line of a plain process keeps its bytes.
+  RopeMode rope = RopeMode::Plain;
+  bool rope_report = false;
+  BatchRopeCounters rope_counters;
+  // The miss ledger of the open (start plan B1a, miss_ledger.h): closed words and numbers only. `handover_drain_s`:
+  // the seconds that the open waited for the disk writer to read a released slot (negative: no wait).
+  BatchLedger ledger;
+  bool ledger_reported = false;
+  double handover_drain_s = -1;
+  int slots_durable = -1;  // the slots whose tail or a point the disk held at the open (negative: no durable hook)
   std::optional<BatchDraftStats> draft;  // done events of speculative requests, when the spec hooks report them
   std::optional<BatchDraftCounts> step_draft;  // token events: the counts after this step (BatchDraftCounts)
   std::vector<TokenLogprob> logprobs;  // the first token's top-N, only when the request asked
@@ -120,6 +138,14 @@ inline std::string BatchTierFields(const BatchCacheCounters& counters) {
   };
   return pair("slot", counters.slot) + pair("host", counters.host) + pair("disk", counters.disk);
 }
+// The done event's RoPE fields (JSON members with a leading comma); empty in a process without a YaRN word.
+inline std::string BatchRopeFields(const BatchEvent& event) {
+  if (!event.done || !event.rope_report) return {};
+  return std::string(",\"rope\":\"") + RopeWord(event.rope) + "\",\"rope_yarn_opens\":" +
+         std::to_string(event.rope_counters.yarn_opens) + ",\"rope_crossings\":" +
+         std::to_string(event.rope_counters.crossings) + ",\"rope_crossing_tokens\":" +
+         std::to_string(event.rope_counters.crossing_tokens);
+}
 // The done event's cache fields (JSON members with a leading comma); empty when the cache did not report.
 inline std::string BatchCacheFields(const BatchEvent& event) {
   if (!event.done || !event.cache_reported) return {};
@@ -147,6 +173,22 @@ inline std::string BatchCacheFields(const BatchEvent& event) {
            ",\"closest_outcome\":\"" + std::string(event.closest_outcome) + "\"";
   }
   if (event.counters_reported) out += BatchTierFields(event.counters);
+  if (event.ledger_reported) {
+    const BatchLedger& ledger = event.ledger;
+    out += ",\"best_shared_tokens\":" + std::to_string(ledger.best_shared) + ",\"disk_shared_tokens\":" +
+           std::to_string(ledger.disk_shared) + ",\"resume_gap_tokens\":" + std::to_string(ledger.resume_gap);
+    const std::pair<const char*, const char*> words[] = {{"best_tier", ledger.best_tier}, {"lost_cause", ledger.lost_cause},
+                                                         {"resume_tier", ledger.resume_tier},
+                                                         {"resume_point", ledger.resume_point}};
+    for (const auto& [name, word] : words)
+      if (BatchCacheWord(word)) out += std::string(",\"") + name + "\":\"" + word + "\"";
+  }
+  if (event.slots_durable >= 0) out += ",\"slots_durable\":" + std::to_string(event.slots_durable);
+  if (event.handover_drain_s >= 0) {
+    char drain[32];
+    std::snprintf(drain, sizeof drain, "%.6f", event.handover_drain_s);
+    out += std::string(",\"handover_drain_s\":") + drain;
+  }
   return out;
 }
 
@@ -175,10 +217,35 @@ struct BatchResident { size_t length = 0; int replay = 0; bool guarded = false; 
 inline bool HostTailFirst(size_t length, int replay, const BatchResident& resident) {
   return length > resident.length || (length == resident.length && replay != resident.replay);
 }
+// The miss ledger's word of a checkpoint kind (miss_ledger.h kResumePoints).
+inline const char* CheckpointKindWord(CheckpointKind kind) {
+  switch (kind) {
+    case CheckpointKind::Start: return "start";
+    case CheckpointKind::Grid: return "grid";
+    case CheckpointKind::End: return "end";
+    case CheckpointKind::Frontier: return "frontier";
+    case CheckpointKind::Pre: return "pre";
+  }
+  return "none";
+}
+// The tokens that two keys share from the start.
+inline size_t CommonTokens(std::span<const int> a, std::span<const int> b) {
+  const size_t limit = std::min(a.size(), b.size());
+  return size_t(std::mismatch(a.begin(), a.begin() + std::ptrdiff_t(limit), b.begin()).first - a.begin());
+}
 // The disk read for a request (state_disk.h): none (no longer state on disk, or no disk tier), reading, ready, or
 // failed. `tokens`: the length of the disk state.
 // `reason`: why a read did or did not start (BatchDiskTier::Stage, StageReason), for the server's turn line.
-struct BatchStage { std::string state = "none"; size_t tokens = 0; std::string reason; uint64_t tag = 0; };
+// Start plan B1a: `best_tokens`, the length of the best disk state also when the read was refused; `wait_cause`, what
+// the read waits for (miss_ledger.h kStageWaitCauses).
+struct BatchStage {
+  std::string state = "none";
+  size_t tokens = 0;
+  std::string reason;
+  uint64_t tag = 0;
+  size_t best_tokens = 0;
+  std::string wait_cause = "none";
+};
 // An earlier change: where a staging turn waits. `position`: its place among the server's waiting long turns (0: next in
 // line); `read`: false for a turn behind the first, which only says that it waits and reports a read that it holds.
 // `in_slot(key)`: `key` is a prefix of a state that a slot holds or runs (that session's points never leave for a read).
@@ -312,6 +379,13 @@ struct BatchCacheHooks {
   std::function<std::vector<PrefillCutCopy>(size_t position, size_t window_start)> cut_prepare;
   std::function<void(int slot, int index)> cut_save;
   std::function<void(const ServeRequest&, size_t position)> cut_capture;
+  // Optional, the miss ledger (start plan B1a): the nearest host entry, lost record and disk state of the request's
+  // prompt, before its open writes any tier. `drained`: the seconds that the last release or handover waited for the
+  // disk writer (negative: none); it resets. Both change nothing.
+  std::function<LedgerTiers(const ServeRequest&)> ledger;
+  std::function<double()> drained;
+  // Optional (start plan B1a, slots_durable): the disk holds the state of this full key on `slot`. It changes nothing.
+  std::function<bool(int slot, std::span<const int> key, const StateTenant&)> durable;
 };
 
 // Speculative decode callbacks (G6a). Each runs inside the command of the
@@ -408,6 +482,8 @@ class BatchSession {
     engine_.ConfigureServeStreams(slots, cache_budget, short_slots, short_ctx);
     resident_.resize(size_t(slots));
     checkpoints_ = SlotCheckpoints(slots);
+    // Y2: every slot starts in the process start mode (plain, or the forced test word's mode).
+    slot_rope_.assign(size_t(slots), rope_setting_.start);
     for (int slot = 0; slot < slots; ++slot) {
       contexts_.push_back(slot < slots - short_slots ? engine.Context() : short_ctx);
       // Short slots may carry verification headroom beyond their admitted context.
@@ -456,18 +532,22 @@ class BatchSession {
     SettlePrompt();
     ValidateOpen(id, request);
     const int slot = FreeSlot(request);
+    // Y2: a slot that last ran the other RoPE mode holds no state that this request may resume (a state keeps its
+    // mode from token 0): the open resets it, sets the mode, then restores or prefills (Way A).
+    const bool rope_change = slot_rope_[size_t(slot)] != request.rope;
+    const size_t plain_tokens = request.rope == RopeMode::Plain ? 0 : PlainStateTokens(request);
     if (generations_[slot] == std::numeric_limits<uint64_t>::max())
       throw std::overflow_error("sequence slot generation limit reached; restart the worker");
     auto state = std::make_unique<Request>(id, slot, ++generations_[slot], request);
     std::optional<BatchResident> resident;
     const bool held = resident_[size_t(slot)].has_value();
     const std::vector<int> key = Key(request, request.ids);
-    if (cache_.resume && Resumable(slot, request, key))
+    if (cache_.resume && !rope_change && Resumable(slot, request, key))
       resident = BatchResident{resident_[size_t(slot)]->key.size(), resident_[size_t(slot)]->replay,
                                resident_[size_t(slot)]->guarded};
     // frontier-copy: another slot's Frontier point that is longer than the host state and this slot's own point.
     const auto donor = resident ? std::nullopt : Donor(slot, request, key);
-    const auto point = resident || donor ? std::nullopt : Checkpoint(slot, request, key);
+    const auto point = resident || donor || rope_change ? std::nullopt : Checkpoint(slot, request, key);
     const bool from_frontier = point && checkpoints_.At(slot, *point).kind == CheckpointKind::Frontier;
     // Where the prompt leaves the slot's previous tail, for the divergence line of a checkpoint resume.
     std::optional<std::pair<size_t, size_t>> left;
@@ -478,9 +558,37 @@ class BatchSession {
                                    tail.begin());
       if (common < tail.size()) left = {tail.size(), common};
     }
+    // Start plan B1a: the nearest state of every tier, before this open writes the slot (the slot tails and points of
+    // every slot of this tenant, then the host, lost and disk tiers of the hook).
+    LedgerTiers ledger_tiers;
+    const char* const point_kind = point ? CheckpointKindWord(checkpoints_.At(slot, *point).kind) : nullptr;
+    if (cache_.ledger) {
+      // A diagnostic must never stop a turn (L8, review): a failed allocation leaves the tiers empty.
+      try {
+        ledger_tiers = cache_.ledger(request);
+      } catch (const std::bad_alloc&) {
+        ledger_tiers = {};
+      }
+      for (int other = 0; other < slots_; ++other) {
+        if (const auto& tail = resident_[size_t(other)]; tail && tail->tenant == request.tenant) {
+          const size_t shared = CommonTokens(tail->key, key);
+          if (shared > ledger_tiers.slot.shared) ledger_tiers.slot = {shared, tail->key.size()};
+        }
+        checkpoints_.ForEach(other, [&](int, const SlotCheckpoint& saved) {
+          if (saved.tenant != request.tenant) return;
+          const std::vector<int>& point_key = saved.key.empty() ? saved.hist : saved.key;
+          const size_t shared = CommonTokens(point_key, key);
+          if (shared > ledger_tiers.point.shared) ledger_tiers.point = {shared, point_key.size()};
+        });
+      }
+    }
+    const int slots_durable = cache_.durable ? SlotsDurable() : -1;
     resident_[size_t(slot)].reset();  // this request writes the slot
     DeviceUpdate([&] {
       engine_.SelectStream(slot);
+      // The request's mode holds for every forward on this slot until the next open.
+      if constexpr (requires { engine_.SetStreamAblate(slot, true); }) engine_.SetStreamAblate(slot, request.ablate == 1);
+      else if (request.ablate) throw RecoverableOpenError("this engine serves no ablated requests");
       if (cache_.request) cache_.request(id);
       // The hold ends on every exit of this block, also on a throw.
       if (cache_.hold) cache_.hold(&request);
@@ -497,8 +605,13 @@ class BatchSession {
         if (cache_.overwrite) cache_.overwrite(slot);
         engine_.Reset();
       }
+      // Y2: on the reset slot (a mode change) or on a resume of this mode (a no-op), before any forward or restore.
+      SetSlotRope(slot, request.rope);
+      if (request.rope != RopeMode::Plain) ++rope_counters_.yarn_opens;
       Request& owned = *state;
       active_.emplace(id, std::move(state));
+      if (cache_.drained) owned.handover_drain_s = cache_.drained();
+      owned.slots_durable = slots_durable;
       if (cache_.restore) {
         const double start = Clock();
         BatchRestore hit;
@@ -554,9 +667,28 @@ class BatchSession {
         // An earlier change: the open asks the slot tier first; the restore hook counts the host and disk tiers.
         const bool slot_served = point || donor || hit.slot || owned.frontier_copy;
         if (cache_.slot_served) cache_.slot_served(slot_served ? hit.tokens : 0);
+        // Start plan B1a: what the open used, and the verdict against the best state of any tier.
+        if (cache_.ledger) {
+          const char* tier = "none";
+          const char* kind = "none";
+          if (hit.tokens) {
+            if (point) tier = "point", kind = point_kind;
+            else if (owned.frontier_copy) tier = "point", kind = "frontier";
+            else if (hit.slot) tier = "slot", kind = "tail";
+            else if (hit.tier == BatchCacheTier::Disk) tier = "disk", kind = hit.tail ? "tail" : "frontier";
+            else tier = hit.shared ? "block" : "host", kind = hit.tail ? "tail" : "frontier";
+          }
+          owned.ledger_tiers = ledger_tiers;
+          owned.ledger = LedgerVerdict(ledger_tiers, owned.options.ids.size(), hit.tokens, tier, kind);
+          owned.ledger_set = true;
+        }
         // The slot keeps the copied state as its own Frontier point: the host holds no copy of it (frontier-copy.md).
         if (owned.frontier_copy) KeepFrontier(owned);
         owned.restore = Clock() - start;
+        if (request.rope != RopeMode::Plain && !owned.cached && plain_tokens) {
+          ++rope_counters_.crossings;
+          rope_counters_.crossing_tokens += plain_tokens;
+        }
         // The last prompt row must run here: it produces the first token's logits. Fix A: an End point with outputs
         // holds that row's results.
         if (owned.cached >= owned.options.ids.size() && !(owned.end_outputs && owned.cached == owned.options.ids.size()))
@@ -1120,7 +1252,8 @@ class BatchSession {
       const double start = Clock();
       const auto tokens = spec_.step(id, state.last, size_t(state.options.max_tokens) - state.count,
                                      state.options.ids.size() + state.count);
-      if (tokens.empty() || tokens.size() > size_t(kMaxRows)) throw std::runtime_error("spec step returned no tokens");
+      // A solo step verifies at most kSpecSpanMax rows (CRUCIBLE_SPEC_SPAN; kMaxRows on the trunk path).
+      if (tokens.empty() || tokens.size() > size_t(crucible::kSpecSpanMax)) throw std::runtime_error("spec step returned no tokens");
       state.decode += Clock() - start;
       std::vector<BatchEvent> events;
       auto counts = StepCounts(id);  // before Publish, as in VerifyEvents
@@ -1180,6 +1313,12 @@ class BatchSession {
     std::vector<int> generated;  // kept only when the tail hook is set
     // The open's cache diagnosis: the miss word and the state nearest to the prompt.
     BatchCacheDiagnosis diag;
+    // The miss ledger (start plan B1a): the tiers' nearest states before the open, and the open's verdict.
+    LedgerTiers ledger_tiers;
+    BatchLedger ledger;
+    bool ledger_set = false;
+    double handover_drain_s = -1;
+    int slots_durable = -1;
     // Serial generation runs one plain step when a single token is requested; so does batch serving.
     const bool spec;
     double prefill = 0, decode = 0, restore = 0, capture = 0, vision = 0;
@@ -1314,6 +1453,8 @@ class BatchSession {
     state.from_tail = true;
     state.core_point = BulkResumes(tokens, state.options.ids.size());
     state.diag.miss = "none";
+    if (state.ledger_set)
+      state.ledger = LedgerVerdict(state.ledger_tiers, state.options.ids.size(), tokens, "point", "header");
     state.restore += Clock() - start;
     if (cache_.header_copied) cache_.header_copied(state.slot, from, tokens);
     // The draft state of the open assumed a cold start; a restored prefix starts a fresh MTP warm-up (Open's rule).
@@ -1397,6 +1538,29 @@ class BatchSession {
     uint64_t used = 0;
     StateTenant tenant = kLocalTenant;
   };
+  // Start plan B1a: the slots whose resident tail or one of whose points the disk holds (the durable hook). A slot
+  // counts once. A failed allocation in the hook counts the slot as not durable: a diagnostic never stops a turn.
+  int SlotsDurable() {
+    int count = 0;
+    for (int other = 0; other < slots_; ++other) {
+      bool held = false;
+      const auto probe = [&](std::span<const int> key, const StateTenant& tenant) {
+        if (held || key.empty()) return;
+        try {
+          held = cache_.durable(other, key, tenant);
+        } catch (const std::bad_alloc&) {
+          held = false;
+        }
+      };
+      if (const auto& tail = resident_[size_t(other)]) probe(tail->key, tail->tenant);
+      // A point's cache key: `key`, or its tokens when the key is empty (slot_checkpoints.h).
+      checkpoints_.ForEach(other, [&](int, const SlotCheckpoint& saved) {
+        probe(saved.key.empty() ? saved.hist : saved.key, saved.tenant);
+      });
+      count += held;
+    }
+    return count;
+  }
   // Runs after the command's last publication and draft settle, so every stream holds its final state.
   // The command's done events then report the tail saves and the cache they leave.
   void SaveTails(std::vector<BatchEvent>* events) {
@@ -1507,6 +1671,13 @@ class BatchSession {
     RequireHealthy();
     if (id == 0 || active_.contains(id)) throw std::invalid_argument("request ID must be unique and positive");
     if (active_.size() >= size_t(slots_)) throw std::invalid_argument("all sequence slots are in use");
+    // Y2: the mode and the state tenant agree (ParseServeRequest derives one from the other), so a restore that
+    // matches the tenant always matches the mode.
+    if (!rope_setting_.Forced() && RopeTenantMode(request.tenant) != request.rope)
+      throw RecoverableOpenError("the request's RoPE mode does not match its state tenant");
+    // Y2: an engine without per-stream RoPE modes serves plain requests only.
+    if constexpr (!requires { engine_.SetStreamRope(0, RopeMode::Plain); })
+      if (request.rope != RopeMode::Plain) throw RecoverableOpenError("this engine serves no YaRN requests");
     if (request.spec > 0 && request.max_tokens > 1) {
       const std::string error = spec_.check ? spec_.check(request) : "this batch worker has no speculative decoder";
       if (!error.empty()) throw RecoverableOpenError(error);
@@ -1530,6 +1701,27 @@ class BatchSession {
   // Within the class, a returning session takes the slot that still holds its tail, else its own older slot when the
   // prompt repeats almost all of that state; then an empty slot; then a slot that shares more than the system prompt
   // (its own older slot); else the slot left longest ago, so other sessions keep their states.
+  // Y2: sets the RoPE mode of `slot` (the engine refuses a change on a sequence that holds a token).
+  void SetSlotRope(int slot, RopeMode mode) {
+    if constexpr (requires { engine_.SetStreamRope(slot, mode); }) engine_.SetStreamRope(slot, mode);
+    else if (mode != RopeMode::Plain) throw std::logic_error("this engine serves no YaRN requests");
+    slot_rope_[size_t(slot)] = mode;
+  }
+  // Y2, Way A count: the longest plain state of this YaRN request's conversation (its tenant before the mode) that a
+  // slot tail or the host cache holds for its prompt. The open cannot use it: a crossing prefills it again.
+  size_t PlainStateTokens(const ServeRequest& request) const {
+    if (request.cache_control != "auto") return 0;
+    ServeRequest plain = request;
+    plain.rope = RopeMode::Plain;
+    plain.tenant = request.plain_tenant;
+    const std::vector<int> key = Key(plain, plain.ids);
+    size_t best = 0;
+    for (int slot = 0; slot < slots_; ++slot)
+      if (slot_rope_[size_t(slot)] == RopeMode::Plain && Resumable(slot, plain, key))
+        best = std::max(best, resident_[size_t(slot)]->key.size());
+    if (cache_.peek) best = std::max(best, cache_.peek(plain));
+    return best;
+  }
   int FreeSlot(const ServeRequest& request) const {
     const std::vector<int> key = Key(request, request.ids);
     int best = -1;
@@ -1780,7 +1972,14 @@ class BatchSession {
       done.closest_tokens = state.diag.shared;
       done.closest_age_s = state.diag.age_s;
       done.closest_outcome = state.diag.outcome;
+      done.ledger = state.ledger;
+      done.ledger_reported = state.ledger_set;
+      done.handover_drain_s = state.handover_drain_s;
+      done.slots_durable = state.slots_durable;
       done.slot_context = contexts_[size_t(state.slot)];
+      done.rope = state.options.rope;
+      done.rope_report = rope_setting_.allow != RopeMode::Plain;
+      done.rope_counters = rope_counters_;
       const bool spec = state.spec;
       if (spec && spec_.stats) done.draft = spec_.stats(id);
       events.push_back(done);
@@ -1797,6 +1996,10 @@ class BatchSession {
   E& engine_;
   const int slots_;
   std::vector<int> contexts_;
+  // Y2: the process RoPE setting (CRUCIBLE_ROPE_MODE), the mode that each slot's sequence holds, and the counters.
+  const RopeSetting rope_setting_ = RopeSettingFromEnv();
+  std::vector<RopeMode> slot_rope_;
+  BatchRopeCounters rope_counters_;
   bool poisoned_ = false;
   std::optional<size_t> prefill_cursor_;
   std::optional<PromptEnd> prompt_end_;

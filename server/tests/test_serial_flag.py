@@ -16,14 +16,17 @@ from server.batch_scheduler import INTERLEAVE_MIN_ROWS
 FAKE = Path(__file__).parent / "fake_batch_engine.py"
 
 
-def run_main(argv):
-    """Run server.__main__.main with both backends mocked; return (serial mock, batched mock)."""
+def run_main(argv, on_backend=None):
+    """Run server.__main__.main with both backends mocked; return (serial mock, batched mock). `on_backend` runs when
+    a backend starts (it sees the process environment at that point)."""
     listener = MagicMock()
     listener.serve_forever.side_effect = KeyboardInterrupt
     with patch.object(sys, "argv", ["crucible", "checkpoint", *argv]), patch.object(startup.signal, "signal"), \
             patch.object(startup, "ModelTokenizer"), patch.object(startup, "EngineBackend") as serial, \
             patch("server.batch_backend.BatchedEngineBackend") as batched, \
             patch.object(startup, "ThreadingHTTPServer", return_value=listener):
+        if on_backend is not None:
+            serial.side_effect = batched.side_effect = lambda *args, **kwargs: (on_backend(), MagicMock())[1]
         assert startup.main() == 0
     return serial, batched
 

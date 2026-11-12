@@ -1,6 +1,7 @@
 """Every write of this tool goes through a Sandbox. A path outside its roots raises OutsideRoots.
 
-The tool never edits the boot loader, the kernel command line or any system file. It never uses sudo.
+A Sandbox never writes a system file. The one system change of the tool, the kernel command line, goes through
+Runner.run_root after the user typed yes (see kernelparams.py), never through a Sandbox.
 """
 import json
 import os

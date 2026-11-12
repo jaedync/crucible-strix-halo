@@ -853,6 +853,20 @@ class UninstallTest(Base):
         self.host = host
         return code
 
+    def test_the_plan_names_the_private_rocm_runtime_and_the_uninstall_removes_it(self):
+        w = self.world()
+        lib = w.dir / ".crucible/rocm-runtime/lib"
+        lib.mkdir(parents=True)
+        (lib / "libamdhip64.so.7").write_bytes(b"x" * 2048)
+        self.assertEqual(self.uninstall("--yes"), 0, self.out)
+        self.assertIn("private ROCm runtime", self.out)
+        self.assertFalse((w.dir / ".crucible").exists())
+
+    def test_the_plan_has_no_runtime_line_without_one(self):
+        self.world()
+        self.assertEqual(self.uninstall("--yes"), 0, self.out)
+        self.assertNotIn("private ROCm runtime", self.out)
+
     def test_removes_the_service_the_unit_and_the_tree_and_keeps_the_models(self):
         w = self.world()
         self.assertEqual(self.uninstall("--yes"), 0, self.out)

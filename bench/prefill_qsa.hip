@@ -65,6 +65,7 @@ void Run(int rows, int past) {
   QsaArgs a{q.p, key.p, value.p, idx.p, norm256.p, norm256.p, norm128.p, norm128.p,
     {ck.p, cv.p, raw.p, pool.p}, scores.p, std::max(1, blocks), sel.p, nsel.p,
     suh.p, output.p, past, rows};
+  a.rope = PlainRopeTable();
   QsaPrefill f{a, context.p, qhi.p, qlo.p};
   QsaPrepKernel<<<dim3(33, rows), 256>>>(a);
   QsaPoolKernel<<<1, 256>>>(a);

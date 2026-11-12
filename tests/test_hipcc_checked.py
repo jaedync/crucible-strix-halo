@@ -107,7 +107,7 @@ class MakeTest(Base):
         env = dict(os.environ, FAKE_MODE=mode)
         env.pop("MAKEFLAGS", None)
         env.pop("MFLAGS", None)
-        return subprocess.run(["make", target, f"HIPCC=bash {self.fake}", "PYTHON=" + sys.executable, *more],
+        return subprocess.run(["make", target, f"HIPCC=bash {self.fake}", "PYTHON=" + sys.executable, "STATE_EPOCH=0", *more],
                               cwd=self.tree, capture_output=True, text=True, env=env)
 
     def old_output(self, target):

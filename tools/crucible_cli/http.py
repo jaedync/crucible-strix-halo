@@ -27,7 +27,41 @@ def _request(url, key_file, data=None, headers=None):
     return request
 
 
+class _HttpsOnly(urllib.request.HTTPRedirectHandler):
+    """A download may follow a redirect, but only to https."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not newurl.startswith("https://"):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+# The proxy settings of the environment count here: a download goes to a public host, and no key is sent.
+_DOWNLOAD_OPENER = urllib.request.build_opener(_HttpsOnly)
+
+
 class Http:
+    def download(self, url, out, start=None, end=None, timeout=600):
+        """Write the bytes START..END (inclusive) of URL to OUT, a binary file that the caller opened (through its Sandbox).
+        Returns (status, bytes written); (0, 0) when no server answered."""
+        headers = {"User-Agent": "crucible-setup"}
+        if start is not None:
+            headers["Range"] = f"bytes={start}-{end}"
+        written = 0
+        try:
+            with _DOWNLOAD_OPENER.open(urllib.request.Request(url, headers=headers), timeout=timeout) as resp:
+                while True:
+                    chunk = resp.read(1 << 20)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    written += len(chunk)
+                return resp.status, written
+        except urllib.error.HTTPError as exc:
+            return exc.code, 0
+        except (OSError, ValueError):
+            return (0, 0) if written == 0 else (206, written)
+
     def get(self, url, timeout=5, key_file=None):
         try:
             with _OPENER.open(_request(url, key_file), timeout=timeout) as resp:

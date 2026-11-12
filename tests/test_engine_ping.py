@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BATCHED = (ROOT / "engine/serve/batched_serve.h").read_text()
 READY = BATCHED[BATCHED.index('"{\\"event\\":\\"ready\\"'):]
 READY = READY[:READY.index("std::fflush")]
-LOOP = BATCHED[BATCHED.index("while (ServeLine(line, oversized))"):]
+LOOP = BATCHED[BATCHED.index("while (reader.Next(line, oversized))"):]  # the block line reader of the serve loop (serve_line.h)
 LOOP = LOOP[:LOOP.index("// End of input")]
 
 

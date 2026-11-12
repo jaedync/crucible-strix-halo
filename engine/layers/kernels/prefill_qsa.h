@@ -44,7 +44,7 @@ __global__ void __launch_bounds__(256) QsaPrefillPoolKernel(QsaArgs a) {
   }
   __syncthreads();
   CNormLds(x, 128, a.ik_norm1, red);
-  RopeAt(x, a.mrope, b * 4);
+  RopeAt(x, a.rope, a.mrope, b * 4);
   if (j < 128) a.c.ik_pool[PrefillPoolOffset(b, j)] = x[j];
 }
 
@@ -234,7 +234,7 @@ __global__ void __launch_bounds__(256) QsaPrefillQueryKernel(QsaPrefill f, int s
     if (k + 1 < HPB) next = src[(k + 1) * 512];
     __syncthreads();
     CNormLds(x, 256, a.q_norm1, red);
-    RopeAt(x, a.mrope, p);
+    RopeAt(x, a.rope, a.mrope, p);
     const size_t i = ((size_t)o * kQHeads + u) * 256 + j;
     const __half h = __float2half(x[j]);
     f.q_hi[i] = h;

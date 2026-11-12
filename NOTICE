@@ -49,3 +49,16 @@ ROCm HIP, LLVM/Clang, the GNU compiler runtime, Python, NumPy, PyTorch CPU, safe
 tokenizers, huggingface_hub, Jinja2, MarkupSafe and pytest are installed separately and are not
 copied into this repository. Their licenses are in their distributions.
 See docs/THIRD_PARTY.md for the list and the principal license of each one.
+
+Optional private ROCm runtime
+-----------------------------
+
+When a machine has no HIP runtime, `./crucible setup` can download one into the install folder
+(.crucible/rocm-runtime), only after you answer yes. The files are AMD software (the ROCm 10.1 runtime
+from the rocm-sdk-core package on https://stable.repo.amd.com). They are not part of Crucible, and this
+repository and the release files do not contain them. Setup checks each file against a sha256 pinned in
+tools/crucible_cli/runtime-pin.json. Setup copies the license files that the AMD package holds into
+.crucible/rocm-runtime/licenses/: ROCR-Runtime (NCSA), Comgr (Apache License 2.0 with LLVM Exceptions) and
+rocprofiler-register (MIT). The package also holds the HIP runtime (MIT), LLVM and Clang
+(Apache License 2.0 with LLVM Exceptions) and system libraries (libelf, libnuma, libdrm, zlib, bzip2, xz, zstd)
+under their own licenses. The user receives these files from AMD, not from Crucible.

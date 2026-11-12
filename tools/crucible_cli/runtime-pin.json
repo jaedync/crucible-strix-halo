@@ -1,0 +1,185 @@
+{
+ "arch": "x86_64",
+ "disk_bytes": 287725673,
+ "download_bytes": 94882777,
+ "format": 1,
+ "hip": "7.16.26385",
+ "licenses": [
+  {
+   "csize": 912,
+   "method": 8,
+   "name": "_rocm_sdk_core/share/doc/rocr/LICENSE.md",
+   "offset": 416829455,
+   "sha256": "dac0a5360f50972cceaed16767bc9e94642aa497d558a74471e842f7192c7403",
+   "size": 1770,
+   "to": "licenses/rocr-LICENSE.md"
+  },
+  {
+   "csize": 5163,
+   "method": 8,
+   "name": "_rocm_sdk_core/share/doc/amd_comgr/LICENSE.txt",
+   "offset": 416812875,
+   "sha256": "6ad4983498652cb8c73c70a705a0d9175c5e3ff5db93c799d8e09557a04af140",
+   "size": 15014,
+   "to": "licenses/amd_comgr-LICENSE.txt"
+  },
+  {
+   "csize": 633,
+   "method": 8,
+   "name": "_rocm_sdk_core/share/doc/rocprofiler-register/LICENSE.md",
+   "offset": 416828752,
+   "sha256": "b185aaa652b0bf066c37a0d6314ce4bf4521e4a3c9bf46edd2f6a777ac522223",
+   "size": 1080,
+   "to": "licenses/rocprofiler-register-LICENSE.md"
+  }
+ ],
+ "members": [
+  {
+   "csize": 13557485,
+   "method": 8,
+   "name": "_rocm_sdk_core/lib/libamdhip64.so.7",
+   "offset": 62817383,
+   "sha256": "6d1dbee8cb3ad924e4c1bca7734e22f2c93026eb3bc871a7f64a916778d55e36",
+   "size": 28275305,
+   "to": "lib/libamdhip64.so.7"
+  },
+  {
+   "csize": 4108795,
+   "method": 8,
+   "name": "_rocm_sdk_core/lib/libamd_comgr.so.3",
+   "offset": 53874407,
+   "sha256": "6bf2f6fe6b243c5ac3621cd5745887933d3a41edd944a447c88c21ec77da5d5b",
+   "size": 14061305,
+   "to": "lib/libamd_comgr.so.3"
+  },
+  {
+   "csize": 1358235,
+   "method": 8,
+   "name": "_rocm_sdk_core/lib/libhsa-runtime64.so.1",
+   "offset": 77403783,
+   "sha256": "12d49db16881b9505629192231d5b3971e9030b26a326fc2c003e92da7de0c44",
+   "size": 4928105,
+   "to": "lib/libhsa-runtime64.so.1"
+  },
+  {
+   "csize": 130531,
+   "method": 8,
+   "name": "_rocm_sdk_core/lib/librocm_kpack.so.0",
+   "offset": 85766632,
+   "sha256": "e2af394dea58ad53d6074c7aa9d56de5dc027ca186f6bbc27d6f32d7b8f12ac3",
+   "size": 388329,
+   "to": "lib/librocm_kpack.so.0"
+  },
+  {
+   "csize": 383221,
+   "method": 8,
+   "name": "_rocm_sdk_core/lib/librocprofiler-register.so.0",
+   "offset": 86059333,
+   "sha256": "a67764cf46d1d579eb27311576ba9c0b4dbfa5052ddd64a062131f716faa11b6",
+   "size": 1103313,
+   "to": "lib/librocprofiler-register.so.0"
+  },
+  {
+   "csize": 44069332,
+   "method": 8,
+   "name": "_rocm_sdk_core/lib/llvm/lib/libLLVM.so.24.0git",
+   "offset": 205487015,
+   "sha256": "3e7b50e1f252792eba7380b8503c05c899bf8ae9deeb70faf3f9be5f995c8e0a",
+   "size": 136689433,
+   "to": "lib/llvm/lib/libLLVM.so.24.0git"
+  },
+  {
+   "csize": 30067364,
+   "method": 8,
+   "name": "_rocm_sdk_core/lib/llvm/lib/libclang-cpp.so.24.0git",
+   "offset": 290419935,
+   "sha256": "18ef4cb8bd32366a68599fb6d723ed38814707a2ada1ff34b722dafc7856663b",
+   "size": 98749705,
+   "to": "lib/llvm/lib/libclang-cpp.so.24.0git"
+  },
+  {
+   "csize": 43855,
+   "method": 8,
+   "name": "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_bz2.so",
+   "offset": 392217636,
+   "sha256": "37a39b12a7e6e9f480d10e5e139b9aedbe5824e63b6b9e12a16837baee608602",
+   "size": 113641,
+   "to": "lib/rocm_sysdeps/lib/librocm_sysdeps_bz2.so"
+  },
+  {
+   "csize": 364227,
+   "method": 8,
+   "name": "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_zstd.so.1",
+   "offset": 407833463,
+   "sha256": "fc3edd0b74fa071079b0095abe7b3f41418ca39be138f4ec0c57d0640a0b2d8b",
+   "size": 899921,
+   "to": "lib/rocm_sysdeps/lib/librocm_sysdeps_zstd.so.1"
+  },
+  {
+   "csize": 105447,
+   "method": 8,
+   "name": "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_liblzma.so.5",
+   "offset": 403975679,
+   "sha256": "d17f947bfe3947db5aefee897f6d32dfe98c73bf80b477764ba7f4107594a671",
+   "size": 234537,
+   "to": "lib/rocm_sysdeps/lib/librocm_sysdeps_liblzma.so.5"
+  },
+  {
+   "csize": 87818,
+   "method": 8,
+   "name": "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_drm_amdgpu.so.1",
+   "offset": 392413875,
+   "sha256": "b25742cda500eaa61e39b2b32492bb482235ad3e3df8a988d8f4130054d94cad",
+   "size": 267897,
+   "to": "lib/rocm_sysdeps/lib/librocm_sysdeps_drm_amdgpu.so.1"
+  },
+  {
+   "csize": 319454,
+   "method": 8,
+   "name": "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_elf.so.1",
+   "offset": 394232988,
+   "sha256": "692dd9fe3575a45df78b319ad0e2a58ee36814958771dd810d5d91f9616c6d8f",
+   "size": 1213481,
+   "to": "lib/rocm_sysdeps/lib/librocm_sysdeps_elf.so.1"
+  },
+  {
+   "csize": 78947,
+   "method": 8,
+   "name": "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_numa.so.1",
+   "offset": 406618717,
+   "sha256": "26fffd0f85369950b834cfb8f56fa9e1ea4804be8bbc40db98b788c554802bc3",
+   "size": 234697,
+   "to": "lib/rocm_sysdeps/lib/librocm_sysdeps_numa.so.1"
+  },
+  {
+   "csize": 64980,
+   "method": 8,
+   "name": "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_z.so.1",
+   "offset": 407768392,
+   "sha256": "e1d7568f4a0b77eeab26f30cc9d2794dfe7ffd14e34b4ae55a9f80bc4f94ba7a",
+   "size": 142857,
+   "to": "lib/rocm_sysdeps/lib/librocm_sysdeps_z.so.1"
+  },
+  {
+   "csize": 132361,
+   "method": 8,
+   "name": "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_drm.so.2",
+   "offset": 392281417,
+   "sha256": "b715ae24e1d62e407ffceca56b546e8a35abe37ac50878cbb16fa8b93d9c9fd5",
+   "size": 379521,
+   "to": "lib/rocm_sysdeps/lib/librocm_sysdeps_drm.so.2"
+  },
+  {
+   "csize": 4017,
+   "method": 8,
+   "name": "_rocm_sdk_core/lib/rocm_sysdeps/share/libdrm/amdgpu.ids",
+   "offset": 408197775,
+   "sha256": "540cb1423221d31cf77c65c21176bff22913aa5733df1543d27a9de314237259",
+   "size": 25762,
+   "to": "lib/rocm_sysdeps/share/libdrm/amdgpu.ids"
+  }
+ ],
+ "rocm": "10.1",
+ "url": "https://stable.repo.amd.com/rocm/core/whl-next/rocm-sdk-core/rocm_sdk_core-10.1.0-py3-none-linux_x86_64.whl",
+ "wheel_size": 419364838
+}

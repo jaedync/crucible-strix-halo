@@ -60,4 +60,11 @@ int main() {
     try { Parse(options); } catch (const std::invalid_argument&) { rejected = true; }
     assert(rejected);
   }
+  {
+    // Leak guard (M5): the message names the file, never its folder (a list may sit in a private folder).
+    std::string what;
+    try { Parse({"--batch-list", "/missing/crucible/batch-list"}); } catch (const std::invalid_argument& error) { what = error.what(); }
+    assert(what.find("batch-list") != std::string::npos);
+    assert(what.find("/missing") == std::string::npos && what.find("crucible/") == std::string::npos);
+  }
 }

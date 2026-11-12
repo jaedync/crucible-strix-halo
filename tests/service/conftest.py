@@ -1,7 +1,7 @@
 """Fault tests that run the server under a real systemd user manager (make test-service).
 
 They are collected only when CRUCIBLE_SERVICE_TESTS=1 (the test-fast run does not see them). They need `systemctl --user`
-and a running user manager: a bwrap worker has none, so the coordinator runs them on the test machine."""
+and a running user manager: a sandboxed build worker has none, so run them in a normal user session."""
 import os
 import shutil
 import subprocess

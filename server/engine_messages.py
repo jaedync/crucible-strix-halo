@@ -16,6 +16,19 @@ PREFIXES = ("duplicate request field: ", "MTP cache allocation failed: ", "MTP c
 _SUFFIX = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,39}")  # a name, never a number such as a token ID
 
 KNOWN = frozenset((
+    # Per-request ablation (engine/serve/serve_protocol.h, engine/serve/batch_session.h).
+    'ablate must be 0 or 1',
+    'ablate needs an engine started with CRUCIBLE_ABLATE_MODE=request',
+    'this engine serves no ablated requests',
+    # YaRN (engine/runtime/rope_mode.h, engine/serve/serve_protocol.h, engine/serve/batch_session.h).
+    'CRUCIBLE_ROPE_MODE=yarn:F or auto:F keeps states out of the disk tier: remove --state-dir',
+    'SetStreamRope: no such stream',
+    'StreamRope: no such stream',
+    'a RoPE mode change needs an empty sequence',
+    'prompt and max_tokens exceed the RoPE mode limit of this engine',
+    "the request's RoPE mode does not match its state tenant",
+    'this engine serves no YaRN requests',
+    'rope must be plain, yarn2 or yarn4 and hold the request in a mode of this engine',
     'CRUCIBLE_COMPACT_STATE must be 0 or 1',
     'CRUCIBLE_STATE_CACHE needs 0, 4, or 6',
     'CRUCIBLE_STATIC_CACHE needs 0 or 4',
@@ -153,13 +166,13 @@ KNOWN = frozenset((
     'proposal has no draft probability',
     'replay must equal the retained pending prefix from the previous forward',
     'request ID must be unique and positive',
-    'request exceeds the 2 MiB JSON-line limit',
+    'request exceeds the serve JSON-line limit',
     'request integer exceeds the supported range',
     'request is not active',
     'request is not waiting for prefill',
     'sequence slot generation limit reached; restart the worker',
     'serve cache and prefill settings exceed their supported ranges',
-    'serve context must be an integer in [1,262144]',
+    # 'serve context must be an integer in [1,N]' is built from the RoPE word's cap: see BUILT below.
     'serve options must contain complete numeric values',
     'serve options need a value after each switch',
     'session replay needs --conversation-cache-mib',
@@ -247,10 +260,18 @@ class ProtocolError(RuntimeError):
     """A server-side failure with a fixed text that the server wrote; the worker log may show it."""
 
 
+# Texts that the engine builds from a closed set of values, so each one is still a fixed text: the context start errors
+# of rope_mode.h CheckRopeContext (the cap of the RoPE word, and the hint for a context above 262,144).
+BUILT = frozenset(
+    f"{what} must be an integer in [1,{cap}]{hint}" for what in ("serve context", "context")
+    for cap, hints in ((262144, 2), (524288, 2), (1048576, 1))
+    for hint in ("", " (a context above 262144 needs CRUCIBLE_ROPE_MODE=yarn:F or auto:F with 262144*F >= ctx)")[:hints])
+
+
 def loggable(text):
     if not isinstance(text, str):
         return "other"
-    if text in KNOWN:
+    if text in KNOWN or text in BUILT:
         return text
     for prefix in PREFIXES:
         if text.startswith(prefix) and _SUFFIX.fullmatch(text[len(prefix):]):

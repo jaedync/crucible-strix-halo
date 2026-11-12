@@ -16,6 +16,9 @@ engine/batch_session.h	engine/serve/batch_session.h	serve	Batched serve session:
 engine/batch_spec_contract.h	engine/runtime/batch_spec_contract.h	runtime	Span checks before a request changes recurrent state.	
 engine/batch_spec_forward.h	engine/runtime/batch_spec_forward.h	runtime	Fragment inside class Engine: packed verification.	
 engine/batch_state_disk.h	engine/serve/batch_state_disk.h	serve	Disk tier of batched serve.	
+engine/serve/handover_spill.h	engine/serve/handover_spill.h	serve	Release plan for a refused slot tail: lazy spill for every release, bounded handover drain.	New file (cache-epoch); tests/handover_spill_test.cpp.
+engine/serve/miss_ledger.h	engine/serve/miss_ledger.h	serve	Miss ledger of batched serve: closed word sets, the verdict of one open, the release line (start plan B1a).	New file; tests/miss_ledger_test.cpp.
+engine/serve/serve_line.h	engine/serve/serve_line.h	serve	Serve JSON-line limit that follows the context, and the block line reader of both serve loops.	New file; tests/serve_line_test.cpp.
 engine/batched_serve.h	engine/serve/batched_serve.h	serve	Batched serve protocol loop.	
 engine/batched_serve_protocol.h	engine/serve/batched_serve_protocol.h	serve	Batched serve commands.	
 engine/batched_serve_settings.h	engine/serve/batched_serve_settings.h	serve	Batched serve startup settings.	
@@ -181,8 +184,11 @@ engine/cli/README.md	engine/cli/README.md	cli	Module charter; the move puts it i
 engine/serve/draft_tally.h	engine/serve/draft_tally.h	serve	Per-position and per-token draft acceptance counters of batched serve.	
 engine/runtime/state_blocks.h	engine/runtime/state_blocks.h	runtime	Block plan, range copies and block digests of the NVMe tier.	New file (ssd-blocks); tests/state_blocks_test.cpp.
 engine/runtime/lazy_snapshot.h	engine/runtime/lazy_snapshot.h	runtime	Lazy save plan: the full blocks of a slot tail stay on the device for the disk writer.	New file (cache-direct); tests/lazy_snapshot_test.cpp.
+engine/runtime/ablate_request.h	engine/runtime/ablate_request.h	runtime	Per-request ablation: the start switch read and the ablated state tenant (CRUCIBLE_ABLATE_MODE=request).	New file; tests/ablate_request_test.cpp.
 engine/runtime/tenant.h	engine/runtime/tenant.h	runtime	Tenant key of a request and of every cached state.	New file (w1-key); tests/tenant_test.cpp.
 engine/runtime/state_format.h	engine/runtime/state_format.h	runtime	File formats of the NVMe tier: checksums, state and block headers.	New file (ssd-blocks): moved out of state_disk.h.
+engine/runtime/state_epoch.h	engine/runtime/state_epoch.h	runtime	State epoch slot that tools/state_epoch.py stamps; input of the state identity.	New file (cache-epoch); tests/state_epoch_test.cpp.
+engine/runtime/state_switches.h	engine/runtime/state_switches.h	runtime	Which CRUCIBLE_* switches are part of a state identity, with a reason each.	New file (cache-epoch); tests/state_epoch_test.cpp.
 engine/exl3/kernels/lane_window.h	engine/exl3/kernels/lane_window.h	exl3/kernels	Lane geometry and trellis state extraction of DecodeLane, host-visible for tests/lane_window_test.cpp (K7, K8, K3.5).	New file (packs).
 engine/layers/ple_row_codec.h	engine/layers/ple_row_codec.h	layers	N-gram row codec of PleGatherKernel (8-bit n-gram table), host-visible for tests/ple_row_codec_test.cpp.	New file (packs).
 engine/model/flashnext/load_plan.h	engine/model/flashnext/load_plan.h	model/flashnext	Pure load decisions of the Loader: matrix width, dense front order, n-gram row width (tests/load_plan_test.cpp).	New file (packs).
@@ -197,6 +203,7 @@ bench/kernels/moe_flow.h	bench/kernels/moe_flow.h	bench	Bench-only kernel header
 engine/layers/moe_b128.h	engine/layers/moe_b128.h	layers	Exact decode expert bodies with b128 (Q4) and b64 (B64) weight loads (CRUCIBLE_MOE_B128).	New file (moe-b128).
 engine/layers/gdn_verify.h	engine/layers/gdn_verify.h	layers	Exact GDN verify core: row waves compute every row input, state waves run the recurrence with no block barrier per row (CRUCIBLE_GDN_VERIFY).	New file (gdn-verify).
 engine/layers/gdn_verify_switch.h	engine/layers/gdn_verify_switch.h	layers	Resolution of CRUCIBLE_GDN_VERIFY (0 off, 1..8 row threshold) and the row test; host only.	New file (gdn-verify).
+engine/runtime/spec_span.h	engine/runtime/spec_span.h	runtime	Rows of one single-session verify span (CRUCIBLE_SPEC_SPAN): resolution, pending GDN rows, request depth map, PLE side rows, MTP trim passes.	New file.
 engine/layers/moe_sg.h	engine/layers/moe_sg.h	layers	Exact stream-grid decode expert stage: one launch for gate/up, mid and down, b128 weight loads (CRUCIBLE_MOE_B128=12, the default, and 3).	New file (moe-b128).
 bench/kernels/moe_b128.h	bench/kernels/moe_b128.h	bench	Bench-only kernel header (moe-b128): b128 stream ladder and the launchers of verify_moe variants 110 to 163.	New file (moe-b128): no engine launch.
 engine/layers/moe_b128_switch.h	engine/layers/moe_b128_switch.h	layers	Resolution of CRUCIBLE_MOE_B128 (default 12 since moe-r35b, 3 the t28 stream grid, 0 rollback), the stream-grid row range and the mode 12 shape.	New file (t28).
@@ -206,3 +213,6 @@ engine/runtime/draft_quant_host.h	engine/runtime/draft_quant_host.h	runtime	Host
 engine/exl3/dense_rows.h	engine/exl3/dense_rows.h	exl3	Dense fp16 rows of chosen output blocks of an EXL3 linear.	New file for runtime/draft_quant.h.
 engine/model/flashnext/draft_chain_switch.h	engine/model/flashnext/draft_chain_switch.h	model/flashnext	Resolution of CRUCIBLE_DRAFT_CHAIN (MTP-only int8 HC, lead pass, chain prior); host only.	New file; tests/draft_chain_switch_test.cpp.
 engine/model/flashnext/bf16_half.h	engine/model/flashnext/bf16_half.h	model/flashnext	BF16 to F16 conversion of vision tensors at load (host only).	New file; tests/vision_bf16_test.cpp
+engine/layers/rope_tables.h	engine/layers/rope_tables.h	layers	YaRN RoPE tables (factors 2 and 4), generated from the Hugging Face reference by tools/yarn/rope_header.py.	New file; tests/test_yarn_rope_header.py, tests/rope_table_test.hip.
+engine/runtime/rope_mode.h	engine/runtime/rope_mode.h	runtime	RoPE mode of a sequence (plain, YaRN factor 2 or 4), CRUCIBLE_ROPE_MODE and the context cap.	New file; tests/rope_mode_test.cpp.
+engine/runtime/rope_policy.h	engine/runtime/rope_policy.h	runtime	Y2 host policy: the RoPE length gate (RopeModeFor), the YaRN state tenant and its mark (RopeTenant, RopeTenantMode), ApplyStreamRope for serial serve.	New file; tests/rope_policy_test.cpp.

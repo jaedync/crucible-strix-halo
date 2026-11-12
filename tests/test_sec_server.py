@@ -1,4 +1,4 @@
-"""Server-side findings of the security review of the v0.34.0 service work, findings 6, 7, 8, 10, 11, 16, 17: one test per
+"""Server-side security findings 6, 7, 8, 10, 11, 16, 17: one test per
 finding, plus checks that hold. A test named test_f<N>_* states the fixed behavior; a test named test_ok_* checks a rule that held.
 
 Run from the repo root (or set CRUCIBLE_ROOT): python3 -m pytest -q -p no:cacheprovider tests/test_sec_server.py
@@ -251,7 +251,7 @@ class ReleaseTest(unittest.TestCase):
         for args in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "t"]):
             subprocess.run([*git, *args], check=True, capture_output=True)
         env = {k: v for k, v in os.environ.items() if k not in ("MAKEFLAGS", "MFLAGS")}
-        r = subprocess.run(["make", "build/engine/crucible", "SPLIT=0", f"HIPCC=bash {fake}", "PYTHON=" + sys.executable,
+        r = subprocess.run(["make", "build/engine/crucible", "SPLIT=0", f"HIPCC=bash {fake}", "PYTHON=" + sys.executable, "STATE_EPOCH=0",
                             "HIPFLAGS=-O0 -DLOCAL_EXPERIMENT"], cwd=tree, capture_output=True, text=True, env=env)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         info = (tree / "build/engine/crucible.build-info").read_text()
@@ -282,7 +282,7 @@ class FaultDriverTest(unittest.TestCase):
         self.assertTrue(bounded or not seen.get("start_new_session"), seen["argv"][:4])
 
 
-# ---- findings 6, 7, 10, 11 and 8: tests of the fixes (not in the review file) ----------------------------------------
+# ---- findings 6, 7, 10, 11 and 8: tests of the fixes ----------------------------------------
 
 def _hold(test, port, data=b"GET /v1/models HTTP/1.1\r\n", count=1, source=None):
     """Open COUNT connections that send DATA and stay open."""
@@ -524,7 +524,7 @@ class FullmatchTest(unittest.TestCase):
 
 
 class ContainerMarkerTest(unittest.TestCase):
-    """Finding 11: the image switch needs a container marker file. Owner decision 768 keeps working in the image."""
+    """Finding 11: the image switch needs a container marker file. The switch keeps working in the image (a container needs the wildcard address)."""
 
     def test_the_switch_with_a_marker_file_opens_the_wildcard_addresses(self):
         from server import api_key

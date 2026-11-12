@@ -45,6 +45,7 @@ constexpr unsigned N = kNone, S = kServe, R = kRecord, SR = kServe | kRecord;
 inline constexpr SwitchInfo kSwitches[] = {
   {"CRUCIBLE_ABLATE", K::kProfile, "unset", "model", 0, 0, SR, "abliterated profile: direction file (read only)"},
   {"CRUCIBLE_ABLATE_ANY_CHECKPOINT", K::kDiagnostic, "off", "model", 0, 0, R, "measurement-only bypass of the ablation geometry check"},
+  {"CRUCIBLE_ABLATE_MODE", K::kProfile, "unset", "model", 0, 0, SR, "request: one process serves stock and ablated requests, selected per request; unset: the CRUCIBLE_ABLATE file applies to every request"},
   {"CRUCIBLE_COMPACT_STATE", K::kLayout, "0", "runtime", 0, 20, SR, "1: compact sequence storage"},
   {"CRUCIBLE_DEBUG_NONFINITE", K::kBuild, "unset", "runtime", 116, 0, N, "compile-time mask (debug build): 1 non-finite probes, 2 NaN poison of scratch, 4 inject probe, 8 FLIP control, 16 NaN poison of the KV tail"},
   {"CRUCIBLE_DECODE_RING", K::kExactSpeed, "front", "exl3", 0, 20, SR, "decode ring order: 0 off, 1 on"},
@@ -95,8 +96,10 @@ inline constexpr SwitchInfo kSwitches[] = {
   {"CRUCIBLE_QSA_PREFETCH", K::kBuild, "64", "layers", 0, 0, N, "compile-time macro (qsa_long.h)"},
   {"CRUCIBLE_QSA_SPLITS", K::kBuild, "32", "layers", 0, 0, N, "compile-time macro (qsa_long.h)"},
   {"CRUCIBLE_QSA_TRACE", K::kBuild, "unset", "layers", 0, 0, N, "compile-time macro (trace build)"},
+  {"CRUCIBLE_ROPE_MODE", K::kProfile, "plain", "runtime", 606, 0, SR, "RoPE mode (rope_mode.h): plain (default, native 262,144); yarn:2 or yarn:4 TEST ONLY, every sequence YaRN from token 0, context cap 524,288 or 1,048,576, no --state-dir; auto:2 or auto:4 sequences start plain and the host sets YaRN per request"},
   {"CRUCIBLE_ROUTE_DUMP", K::kDiagnostic, "unset", "runtime", 0, 0, N, "appends every MoE routing record to a file"},
   {"CRUCIBLE_SERVE_PROFILE", K::kDiagnostic, "0", "serve", 0, 0, S, "packed-pass timings on stderr every N passes"},
+  {"CRUCIBLE_SPEC_SPAN", K::kExactSpeed, "8", "serve", 0, 20, SR, "rows of one single-session verify span: 8 (default) the trunk limit, 9..13 a longer span (draft depth up to N - 1 for requests at spec 7); bitwise equal"},
   {"CRUCIBLE_SPEC_STATS", K::kDiagnostic, "off", "serve", 0, 0, S, "draft counts on stderr"},
   {"CRUCIBLE_STATE_CACHE", K::kExactSpeed, "tuned", "runtime", 0, 20, SR, "row policy state cache 0..6"},
   {"CRUCIBLE_STATIC_CACHE", K::kExactSpeed, "tuned", "runtime", 0, 20, SR, "row policy static cache 0..4"},

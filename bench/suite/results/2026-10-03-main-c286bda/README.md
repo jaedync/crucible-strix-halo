@@ -12,7 +12,8 @@
 - The effective host policy is `HSA_USERPTR_FOR_PAGED_MEM=0`.
 
 `qualification.json` records the commands, source identity, report hashes, and limits.
-Each subdirectory preserves `results.json`, `results.md`, `stdout.jsonl`, `stderr.log`, `requests.txt`, and `host.json`.
+Each subdirectory preserves `results.json`, `results.md`, `stderr.log`, `requests.txt`, and `host.json`.
+The raw result log of each run is not kept. `results.json` holds every measured record.
 The reports contain checkpoint metadata hashes. They do not hash every weight shard.
 
 ## Short requests

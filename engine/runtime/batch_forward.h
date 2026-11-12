@@ -136,6 +136,8 @@
   std::vector<int> ForwardBatch(const std::vector<int>& tokens, const std::vector<int>& streams,
                                 const std::string& dump = "") {
     CheckBatch(tokens, streams);
+    for (const int stream : streams) CheckRopeRows(sequences_[stream]->hist.size(), 1, sequences_[stream]->rope_mode);
+    SettlePleSide();
     for (const int stream : streams) MaterializeGdn(*sequences_[stream]);
     const int R = (int)tokens.size();
     const Plans& P = PlansFor(R);
@@ -217,7 +219,7 @@
   }
 
   QsaArgs QsaRow(int li, const Layer& L, const LayerGroups& G, int R, int pos0, SequenceState& state, int row) {
-    QsaArgs a = QArgs(L.qsa, state.qc.at(li), G.a_out.jobs[0].xh + (size_t)row * kQsaOutWidth, R, pos0, state.Mrope());
+    QsaArgs a = QArgs(L.qsa, state.qc.at(li), G.a_out.jobs[0].xh + (size_t)row * kQsaOutWidth, R, pos0, state);
     a.q += (size_t)row * kQsaQWidth;
     a.k += (size_t)row * kQsaKvWidth;
     a.v += (size_t)row * kQsaKvWidth;
@@ -259,6 +261,6 @@
 #endif
       if (!warming_) CaptureQsa(a, li);
     } else {
-      LaunchGdnCore(GdnRow(li, L, G, R, pos0, replay, commit, state, row), G.state_cache);
+      LaunchGdnCore(GdnRow(li, L, G, R, pos0, replay, commit, state, row), G.state_cache, 0, pend_rows_);
     }
   }

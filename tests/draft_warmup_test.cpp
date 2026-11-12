@@ -53,13 +53,18 @@ int main() {
   assert(crucible::MtpSlotRows(262144, 0) == 262144);
   assert(crucible::MtpSlotRows(262144, 65536) == 65536 + 33024);
   assert(crucible::MtpSlotRows(262144, 262144) == 262144);
+  // Y2: a long slot (YaRN, up to 1,048,576 positions) keeps the same bounded MTP cache; window 0 keeps its context.
+  assert(crucible::MtpSlotRows(524288, 256) == 33280);
+  assert(crucible::MtpSlotRows(524288, 0) == 524288);
+  assert(crucible::MtpSlotRows(1048576, 0) == 1048576);
+  assert(crucible::MtpSlotRows(524288, 262144) == 262144);
   for (int window : {1, 7, 255, 256, 4096})
     for (int ctx : {1, 128, 33279, 33280, 33281, 106496, 196608, 262144}) {
       const int rows = crucible::MtpSlotRows(ctx, window);
       assert(rows >= 1 && rows <= ctx);
       assert(rows == ctx || rows >= window + 32768 + 2 * 8);
     }
-  for (const auto& [ctx, window] : {std::pair{0, 256}, {262145, 256}, {1024, -1}, {1024, 262145}}) {
+  for (const auto& [ctx, window] : {std::pair{0, 256}, {1048577, 256}, {1024, -1}, {1024, 262145}}) {
     bool threw = false;
     try { crucible::MtpSlotRows(ctx, window); } catch (const std::invalid_argument&) { threw = true; }
     assert(threw);

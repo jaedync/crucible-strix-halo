@@ -24,7 +24,7 @@ void Check(int pos0, int R, int skip, bool lo) {
   const size_t n = (size_t)(R - skip) * 6144;
   Buffer<__half> hia(n), loa(n), hib(n), lob(n);
   QsaArgs a{};
-  a.q = qa.p; a.q_norm1 = w.p; a.pos0 = pos0; a.R = R;
+  a.q = qa.p; a.q_norm1 = w.p; a.pos0 = pos0; a.R = R; a.rope = PlainRopeTable();
   // Old path (before train 20): query units only (grid x 24), then the pack on the output rows.
   QsaPrepKernel<<<dim3(24, R), 256>>>(a);
   QsaPrefill fa{QsaOutputRows(a, skip), nullptr, hia.p, lo ? loa.p : nullptr};

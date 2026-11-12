@@ -13,10 +13,14 @@ namespace crucible {
 
 inline constexpr int kDraftPositions = 7;            // K: the deepest draft position (kDefaultSpecDepth)
 inline constexpr size_t kDraftDetailMax = 2048;      // entries of each per-token map of one request
+inline constexpr int kDraftRunBins = 9;              // runs of full-accept rounds of 1..8 rounds, last bin 9 or more
 
 struct DraftTally {
   std::array<long, kDraftPositions> proposed{}, tested{}, accepted{};
   std::array<long, kDraftPositions + 1> length{};    // rounds by draft length 0..K
+  std::array<long, kDraftPositions> lookup_proposed{}, lookup_accepted{};  // the lookup rounds alone, by position
+  std::array<long, kDraftRunBins> run{};             // closed runs of full-accept rounds by length (plan wide C)
+  long open_run = 0;                                 // full-accept rounds since the last miss
   long passes = 0, lookup_rounds = 0, detail_cut = 0;
   double head_ms = 0;
   bool detail = false;                               // per-token maps (serve --draft-stats)
@@ -35,7 +39,17 @@ struct DraftTally {
       if (i < tested_count) ++tested[size_t(i)];
       if (i < accepted_count) ++accepted[size_t(i)];
     }
-    if (lookup) { ++lookup_rounds; return; }  // copied history tokens say nothing about the draft head
+    // A round with drafts either extends the run (all accepted) or ends it. A round without drafts does neither.
+    if (depth > 0 && accepted_count == depth) ++open_run;
+    else if (depth > 0) CloseRun();
+    if (lookup) {
+      ++lookup_rounds;
+      for (int i = 0; i < std::min(depth, kDraftPositions); ++i) {
+        ++lookup_proposed[size_t(i)];
+        if (i < accepted_count) ++lookup_accepted[size_t(i)];
+      }
+      return;  // copied history tokens say nothing about the draft head
+    }  // copied history tokens say nothing about the draft head
     if (!detail) return;
     for (int i = 0; i < std::min(depth, kDraftPositions); ++i) {
       if (i >= tested_count) break;  // positions after a miss were never checked
@@ -67,6 +81,12 @@ struct DraftTally {
     char ms[40];
     std::snprintf(ms, sizeof ms, "%.3f", head_ms);
     out += ",\"draft_passes\":" + std::to_string(passes) + ",\"draft_ms\":" + ms;
+    auto runs = run;  // the open run counts here; the tally keeps it open
+    if (open_run > 0) ++runs[size_t(std::min<long>(open_run, kDraftRunBins) - 1)];
+    list("draft_run_hist", runs);
+    out += ",\"draft_lookup_rounds\":" + std::to_string(lookup_rounds);
+    list("draft_lookup_pos_proposed", lookup_proposed);
+    list("draft_lookup_pos_accepted", lookup_accepted);
     if (!detail) return out;
     out += ",\"draft_tally\":[";
     bool first = true;
@@ -82,11 +102,14 @@ struct DraftTally {
              std::to_string(key[2]) + "," + std::to_string(n) + "]";
       first = false;
     }
-    return out + "],\"draft_detail_cut\":" + std::to_string(detail_cut) +
-           ",\"draft_lookup_rounds\":" + std::to_string(lookup_rounds);
+    return out + "],\"draft_detail_cut\":" + std::to_string(detail_cut);
   }
 
  private:
+  void CloseRun() {
+    if (open_run > 0) ++run[size_t(std::min<long>(open_run, kDraftRunBins) - 1)];
+    open_run = 0;
+  }
   void Add(std::map<std::array<int, 2>, std::array<long, 2>>& map, std::array<int, 2> key, std::array<long, 2> n) {
     auto found = map.find(key);
     if (found != map.end()) { found->second[0] += n[0]; found->second[1] += n[1]; }

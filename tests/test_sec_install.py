@@ -1,8 +1,7 @@
-"""Security fixes of wp-sec-install (findings 1 to 5, 9).
+"""Security fixes of the install and update scripts (findings 1 to 5, 9, 12 to 15).
 
-The first block is the review's own tests (InstallShTest, UpdateTest), copied unchanged from the review file
-test_sec_review_wps.py (md5 31bc00cb...). The test_f* tests state the fixed behavior. Further tests below the copy
-(class names ending in More) cover the details of the fixes.
+The first block (InstallShTest, UpdateTest) holds the checks that show each problem. The test_f* tests state the fixed
+behavior. Further tests below (class names ending in More) cover the details of the fixes.
 No network, no GPU, no systemd, no sudo. Synthetic data only.
 """
 import json

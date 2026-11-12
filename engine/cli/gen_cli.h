@@ -1,4 +1,5 @@
 #pragma once
+#include <filesystem>
 #include "../runtime/spec_steps.h"
 #include "../switches.h"
 #include "../runtime/sampling_generation.h"
@@ -134,7 +135,7 @@ int CheckGenOptions(const GenOptions& o, std::vector<int>& blocks) {
   if (o.draft_blocks.empty()) return 0;
   std::ifstream f(o.draft_blocks);
   if (!f) {
-    std::fprintf(stderr, "cannot open draft selection: %s\n", o.draft_blocks.c_str());
+    std::fprintf(stderr, "cannot open draft selection: %s\n", std::filesystem::path(o.draft_blocks).filename().string().c_str());
     return 2;
   }
   std::stringstream ss;
@@ -495,7 +496,7 @@ inline int GenJobsCommand(int argc, char** argv) {
   }
   std::ifstream file(argv[4]);
   if (!file) {
-    std::fprintf(stderr, "cannot open job file: %s\n", argv[4]);
+    std::fprintf(stderr, "cannot open job file: %s\n", std::filesystem::path(argv[4]).filename().string().c_str());
     return 2;
   }
   std::stringstream text;

@@ -75,6 +75,8 @@ class Host:
     sysfs: Path = Path("/sys")
     dev: Path = Path("/dev")
     rocm: Path = Path("/opt/rocm")
+    etc: Path = Path("/etc")
+    boot_dirs: tuple = (Path("/boot"), Path("/efi"), Path("/boot/efi"))  # where boot loader files may be (kernelparams reads them)
     home: Path = field(default_factory=Path.home)
     env: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
     py_version: tuple = tuple(sys.version_info[:3])

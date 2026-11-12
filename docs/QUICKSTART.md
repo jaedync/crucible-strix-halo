@@ -18,7 +18,8 @@ The 3.05 bpw pack (faster, lower quality) and the 16-bit n-gram table are option
 
 ## One command
 
-Run this on a machine that has ROCm 7.2.4 and GPU access (step 1 below):
+Run this on a machine that has the current ROCm (10.1 tested; 7.2.4 also works) and GPU access (step 1 below). A machine with
+no ROCm can use the private runtime that setup offers (see "No ROCm on the machine" below):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/jaedync/crucible-strix-halo/main/install.sh | bash
@@ -29,7 +30,7 @@ Press Enter to take a default. It downloads the model (about 107 GB) and starts 
 folder is the folder `crucible` in your home folder, and the default port is 8790.
 
 The one command does not run `make`. It downloads the release engine (about 25 MB), checks its sha256, and puts it in
-`build/engine/`. The line `[build] done: release engine v0.34.0 (verified)` means this. So the 16 minutes of step 4
+`build/engine/`. The line `[build] done: release engine v0.37.0 (verified)` means this. So the 16 minutes of step 4
 do not apply, and no compiler is needed. In our test, with the pack already on the disk, setup took 65 seconds.
 With a new pack, the download time is added, and the first model load takes a few minutes. Add `--source-build` to
 build the engine from source instead (about 16 minutes).
@@ -37,9 +38,9 @@ build the engine from source instead (about 16 minutes).
 What the one command checks for steps 1 and 2:
 
 - The installer checks the tools (`git`, `curl`, `python3`, `gzip`, `sha256sum`) and the libraries of the engine.
-  It does not install ROCm, and it does not change the kernel command line.
+  It does not install ROCm. It does not change the kernel command line (only setup can, after you type yes: see step 2).
 - Setup then prints `[check] done: N of N checks without a failure`. The checks cover the Linux system, Python 3.12 or
-  newer, the ROCm version (7.2.4; another version is a warning), `rocminfo` with `gfx1151`, access to `/dev/kfd` and a
+  newer, the ROCm version (10.1 and 7.2.4 pass with no message; an older or unknown version is a warning), `rocminfo` with `gfx1151`, access to `/dev/kfd` and a
   render node (the result of the `groups` check of step 1), 120 GiB or more of memory, and the GPU memory limit
   (`mem_info_gtt_total` is 130 GB or more, the check of step 2). They also cover free GPU memory, disk space, the state
   folder and the port.
@@ -47,8 +48,8 @@ What the one command checks for steps 1 and 2:
   so do steps 1 and 2 before the one command.
 - The checks do not look at the `pacman` package, the group names, the kernel parameter text or `amd_iommu`. They test
   the result. If every check passes, you do not need to run the check commands of steps 1 and 2 again.
-- The checks cannot do the work of steps 1 and 2: install ROCm 7.2.4, and put the two parameters on the kernel
-  command line (then restart). Do these by hand first.
+- The checks cannot do the work of steps 1 and 2 by themselves: install ROCm (or let setup download the private runtime),
+  and put the two parameters on the kernel command line (then restart). Setup can offer both. See the two sections below.
 
 Setup also sends one test request ("Say hello.") when the server is ready. This is the same as step 7. It shows in the
 server log as one request before yours. With the service, setup stops this first server and lets the service start the
@@ -77,8 +78,28 @@ curl -fsSL https://raw.githubusercontent.com/jaedync/crucible-strix-halo/main/in
 - `--no-state-dir` keeps the conversation cache in memory only. Nothing is saved at a stop. The stop messages then say
   that the cache is in memory only and is lost.
 
-Setup never uses `sudo`. It never changes the boot loader. The installer asks once before it runs `sudo` for a
-missing package, and it shows the exact command first.
+Setup uses `sudo` in one case only: the kernel parameters of step 2, after you type `yes`. It shows the exact commands first, makes a
+backup of the file, and never restarts the machine. Any other answer changes nothing. `--yes` never applies this change. The installer asks
+once before it runs `sudo` for a missing package, and it shows the exact command first. Setup never installs a system package.
+
+### No ROCm on the machine
+
+The best way is to install the current ROCm from your system (step 1). If the machine has no HIP runtime at all, setup offers
+the other way. It asks once (the default is yes):
+
+```text
+No HIP runtime (ROCm) was found on this machine. Setup can download a private copy of the ROCm 10.1 runtime for Crucible:
+90 MB from stable.repo.amd.com, into <install folder>/.crucible/rocm-runtime. It needs no root and changes no system package.
+```
+
+- The files come from AMD's own package index. Setup checks the sha256 of each file against a list that is in this release, and
+  it uses a file only when it matches. Setup copies the license files of AMD into `rocm-runtime/licenses/`.
+- It needs no root and changes no system package. The server then starts with `LD_LIBRARY_PATH` set to that folder. A ROCm that you
+  install later on the system is used instead.
+- `./crucible uninstall` removes it with the install folder (the plan names it).
+- Script use: `./crucible setup --yes --private-runtime yes`. With `--yes` and no `--private-runtime`, setup downloads nothing and prints
+  the two ways. `--private-runtime no` skips the question.
+- It is for the release engine (the one command). A source build (`make`) needs the compiler of a system ROCm.
 
 After the install, the server is ready. Go to step 7 to send a test request (use your port). The steps below are the
 same install in single steps, for a person or an agent that does not use the script.
@@ -89,19 +110,20 @@ same install in single steps, for a person or an agent that does not use the scr
 - If a check fails, you may use only the fallback that the step names. If the fallback also fails, stop. Report the
   step, the command and its full output to the user. Do not try other changes.
 - Step 1 needs `sudo`. Get permission before you use it. Use `sudo` nowhere else.
-- Do not run any command of step 2. It changes the kernel command line, and an error there can stop the machine from
-  starting. Show the user the parameters and the instructions, then wait for a confirmation that the machine has
-  restarted. Never restart the machine yourself.
+- Do not run any command of step 2, and do not answer `yes` to the kernel question of setup for the user. It changes the kernel
+  command line, and an error there can stop the machine from starting. Show the user the parameters and the instructions,
+  then wait for a confirmation that the machine has restarted. Never restart the machine yourself.
 - The "One command" section does the work of steps 3 to 6 in one run. Steps 1 and 2 still come first: do them by
-  hand, because the command does not install ROCm and does not change the kernel command line. The setup checks of the
+  hand, because the command does not install a system ROCm, and the kernel change needs the typed yes of the user. The setup checks of the
   command test the result of steps 1 and 2 (see "What the one command checks"). If you use the command, you can skip
   steps 3 to 6 and go to step 7. Setup sends its own test request.
 - Step 6 runs the server until you stop it. Start it in the background as the step shows, and read its log.
 
-## Step 1: ROCm 7.2.4, the HIP compiler and GPU access
+## Step 1: ROCm, the HIP compiler and GPU access
 
-The engine needs the HIP runtime and compiler of ROCm 7.2.4. It uses no ROCm libraries (no rocBLAS, no hipBLAS).
-The tested system is Arch Linux with kernel 7.2. Other distributions and other ROCm versions are not tested.
+Install the current ROCm (10.1 tested). ROCm 7.2.4 is tested too: if you have it, keep it. Setup passes both with no message.
+The engine needs the HIP runtime. A source build (step 4) also needs the HIP compiler. It uses no ROCm libraries (no rocBLAS, no
+hipBLAS). The tested system is Arch Linux with kernel 7.2. Other distributions are not tested.
 
 On Arch Linux:
 
@@ -110,10 +132,11 @@ sudo pacman -Syu --needed base-devel git python hip-runtime-amd rocm-llvm rocmin
 ```
 
 `-Syu` also updates the rest of the system (Arch does not support a partial update). If the kernel was updated,
-restart before step 2.
+restart before step 2. These packages give the ROCm version of the Arch repository. For the newest ROCm, follow AMD's
+instructions (https://rocm.docs.amd.com).
 
-On another distribution, install ROCm 7.2.4 with AMD's instructions for your distribution
-(https://rocm.docs.amd.com). You need `hipcc` and `rocminfo`.
+On another distribution, install the current ROCm with AMD's instructions for your distribution
+(https://rocm.docs.amd.com). You need `rocminfo`, and `hipcc` for a source build.
 
 Your user must be able to open the GPU. Run `groups`. If `render` or `video` is not in the list:
 
@@ -126,7 +149,7 @@ Then log out and log in again (or restart).
 **Check:**
 
 ```sh
-pacman -Q hip-runtime-amd                      # Arch: expect hip-runtime-amd 7.2.4-1
+pacman -Q hip-runtime-amd                      # Arch: expect a version, for example 7.2.4-1 (10.1 is the current ROCm)
 /opt/rocm/bin/hipcc --version | head -1
 /opt/rocm/bin/rocminfo | grep -m1 -o gfx1151   # expect: gfx1151
 groups                                         # expect: render and video in the list
@@ -138,6 +161,13 @@ The GPU of Strix Halo uses the system memory. By default, Linux lets it use only
 4 long sessions needs most of the 128 GB.
 
 First run the check at the end of this step. If it already shows the values, skip this step.
+
+**Let setup do it.** When the GPU memory check of `./crucible setup` fails, setup finds your boot method (GRUB, systemd-boot or a
+unified kernel image), prints the exact change (the old line, the new line and the commands), and asks. It applies the change with
+`sudo` only after you type `yes`. Any other answer changes nothing, and `--yes` never applies it. Setup makes a backup of the file
+(`FILE.crucible-bak-DATE`) first, restores it if a command fails, and never restarts the machine. You restart it, then run
+`./crucible setup` again. If setup does not find exactly one boot file that matches this machine, it prints the change and stops.
+The sections below are the same change by hand.
 
 The test machine has these kernel parameters:
 
@@ -341,7 +371,7 @@ If the system refuses it, the tool prints a line for you. You can also run this 
 loginctl enable-linger "$USER"
 ```
 
-If that is refused too, run `sudo loginctl enable-linger "$USER"`. This tool never runs `sudo`.
+If that is refused too, run `sudo loginctl enable-linger "$USER"`. The service command never runs `sudo`.
 `./crucible service uninstall` leaves linger on. To turn it off: `loginctl disable-linger`.
 
 ### Remove Crucible
@@ -381,6 +411,28 @@ To watch the engine live (requests, rates, memory, engine switch), see
 [Kiln](https://github.com/jaedync/crucible-kiln), a dashboard and OpenAI-compatible gateway for Crucible.
 
 The default prefill launch rows (`CRUCIBLE_PF_LAUNCH_ROWS=16384+128`) fit 4 sessions of 262K with `--vision` on the 4.05 pack (stage arena 2,174 MiB); `8192+128` uses 1,439 MiB and gives a slower cold prefill.
+
+## Option: a long context (YaRN)
+
+Setup offers three configurations by name. Each needs about the same GPU memory as the default.
+
+| Name | Command | Sessions |
+|---|---|---|
+| default | `./crucible setup` | 4 of 262,144 tokens |
+| long | `./crucible setup --layout long` | 1 of 524,288 tokens and 2 of 262,144 tokens |
+| two long | `./crucible setup --layout two-long` | 2 of 524,288 tokens |
+
+Above 262,144 tokens the engine uses YaRN. A request of 262,144 positions or fewer runs as in the default configuration.
+A long configuration keeps the conversation cache in memory only: setup sets no state folder, because the server refuses
+`--state-dir` with YaRN in this version. Do not give `--streams` or `--ctx` with `--layout long` or `--layout two-long`.
+To go back, run `./crucible setup --layout default`. When the service runs, setup restarts it with the new settings.
+You do not need to change `--max-body-mib`: the request size limit follows the context.
+
+By hand, start the server of step 6 with the flags of the configuration instead of `--streams 4 --ctx 262144`, and
+without `--state-dir` and `--state-disk-gib`:
+
+- long: `--streams 3 --ctx 524288 --short-streams 2 --short-ctx 262144`
+- two long: `--streams 2 --ctx 524288`
 
 ## Option: the 3.05 bpw pack
 
