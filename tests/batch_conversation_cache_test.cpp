@@ -1219,7 +1219,53 @@ static void SpanReplayTail() {
     assert(found && found->snapshot->resume.replay == kSpecSpanMax);
   }
 }
+static void FailedCaptureKeepsFallback() {
+  const auto ids = Tokens(1, 40);
+  Cache c(1, 1);
+  assert(c.Capture(ids, 16, CacheRetention::Session));
+  bool attempted = false;
+  const auto fail = [&]() -> std::shared_ptr<const Snapshot> {
+    attempted = true;
+    throw std::bad_alloc();
+  };
+  assert(!c.cache.Capture(ids, c.policy, {32, CacheRetention::Session}, 64, uint64_t(9) << 30, fail));
+  assert(attempted && c.cache.LastRefusal() == "memory");
+  assert(c.cache.Evictions() == 0 && c.Hit(Fork(ids, 24, 100)) == 16);
+  c.cache.KeepInSlot(std::span(ids).first(32), c.policy, false);
+  attempted = false;
+  assert(!c.cache.Capture(ids, c.policy, {32, CacheRetention::Session}, 64, c.cache.HostReserve() + 64, fail));
+  assert(attempted && c.cache.LastRefusal() == "memory");
+  assert(c.cache.Evictions() == 0 && c.Hit(ids) == 16);
+  assert(c.Capture(ids, 32, CacheRetention::Session));
+  assert(c.Hit(ids) == 32 && c.cache.Bytes() == 64 && c.cache.SupersededEvictions() == 1);
+
+  Cache tail(1, 1);
+  assert(tail.Tail(ids, 21, true));
+  attempted = false;
+  assert(!tail.cache.CaptureTail(std::span(ids).first(32), tail.policy, 64, uint64_t(9) << 30, fail, true));
+  assert(attempted && tail.cache.LastRefusal() == "memory");
+  assert(tail.cache.Evictions() == 0 && tail.HitTail(ids) == 21);
+  assert(tail.Tail(ids, 32, true));
+  assert(tail.HitTail(ids) == 32 && tail.cache.Bytes() == 64 && tail.cache.SupersededEvictions() == 1);
+
+  Cache disk(1, 2, true);
+  disk.cache.SetSpillSlack(64);
+  std::vector<uint64_t> spill_rooms;
+  disk.cache.SetSpill([&](auto, const auto&, const auto&, int, uint64_t room) {
+    spill_rooms.push_back(room);
+    return false;
+  });
+  assert(disk.Capture(Tokens(100, 40), 16, CacheRetention::Session));
+  assert(disk.Capture(ids, 16, CacheRetention::Session));
+  attempted = false;
+  assert(!disk.cache.Capture(ids, disk.policy, {32, CacheRetention::Session}, 128, uint64_t(9) << 30, fail));
+  assert(attempted && disk.Hit(ids) == 16);
+  // While the fallback is retained it still counts against the writer's pinned-memory allowance.
+  assert(spill_rooms == std::vector<uint64_t>{0});
+}
+
 int main() {
+  FailedCaptureKeepsFallback();
   SpanReplayTail();
   TenantsNeverShareRam();
   LocalTenantUnchanged();
