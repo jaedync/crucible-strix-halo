@@ -1,7 +1,6 @@
 # Quality
 
 How much of the 16-bit model each weight file keeps. Speed is in [Results](RESULTS.md).
-The 3-row summary in the [README](../README.md) comes from the first section below.
 
 ## Distance from the 16-bit model, Oct 24 to 25, 2026
 

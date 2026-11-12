@@ -1,7 +1,7 @@
 # Rivals
 
 Our own measurements of Crucible, Halogen and Gufo on one machine. We did not copy any number from another project.
-The README has a short table. This page has all rows, the packs, the dates and the method.
+The README links to this page. This page has all rows, the packs, the dates and the method.
 Where an engine leads, the table shows it.
 
 **Dates and versions.** All rival values on this page were measured Oct 23 to 26, 2026, on Halogen 0.18.14 and Gufo 0.22.0.

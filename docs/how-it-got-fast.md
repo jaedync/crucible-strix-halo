@@ -94,4 +94,4 @@ A GPU is idle between small kernels. Two changes use this time.
 
 Halogen is faster at one-session decode and at cold prefill ([Rivals](RIVALS.md)). Crucible has room left:
 serial decode uses 70% to 77% of the measured memory bandwidth, and cold prefill is at 53% to 56% of the estimated
-compute ceiling (Oct 22 audit). The roadmap in the [README](../README.md#roadmap) lists the next steps.
+compute ceiling (Oct 22 audit). The [roadmap](ROADMAP.md) lists the next steps.

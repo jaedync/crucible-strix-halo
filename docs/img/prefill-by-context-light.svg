@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 286" width="480" height="286" role="img" aria-label="Line chart: Cold prefill by context length, in tokens per second: 4.05 bpw from 1,830 at 32K to 1,622 at 250K; 3.05 bpw from 1,855 at 32K to 1,648 at 250K. v0.33.0, Nov 3, 2026." font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif">
+<title>Line chart: Cold prefill by context length, in tokens per second: 4.05 bpw from 1,830 at 32K to 1,622 at 250K; 3.05 bpw from 1,855 at 32K to 1,648 at 250K. v0.33.0, Nov 3, 2026.</title>
+<rect x="0.5" y="0.5" width="479" height="285" rx="6" fill="#ffffff" stroke="#d1d9e0"/>
+<text x="16" y="29" font-size="17" font-weight="600" fill="#1f2328">Cold prefill by context length</text>
+<text x="16" y="50" font-size="15" fill="#59636e">v0.33.0 · Nov 3, 2026 · median of 2 runs</text>
+<line x1="52" y1="238.0" x2="402" y2="238.0" stroke="#e6eaef" stroke-width="1"/>
+<text x="44" y="243.0" font-size="15" text-anchor="end" fill="#59636e">0</text>
+<line x1="52" y1="197.0" x2="402" y2="197.0" stroke="#e6eaef" stroke-width="1"/>
+<text x="44" y="202.0" font-size="15" text-anchor="end" fill="#59636e">500</text>
+<line x1="52" y1="156.0" x2="402" y2="156.0" stroke="#e6eaef" stroke-width="1"/>
+<text x="44" y="161.0" font-size="15" text-anchor="end" fill="#59636e">1,000</text>
+<line x1="52" y1="115.0" x2="402" y2="115.0" stroke="#e6eaef" stroke-width="1"/>
+<text x="44" y="120.0" font-size="15" text-anchor="end" fill="#59636e">1,500</text>
+<line x1="52" y1="74.0" x2="402" y2="74.0" stroke="#e6eaef" stroke-width="1"/>
+<text x="44" y="79.0" font-size="15" text-anchor="end" fill="#59636e">2,000</text>
+<text x="464" y="29" font-size="15" text-anchor="end" fill="#59636e">tok/s</text>
+<text x="82.0" y="258" font-size="15" text-anchor="middle" fill="#59636e">32K</text>
+<text x="124.6" y="258" font-size="15" text-anchor="middle" fill="#59636e">64K</text>
+<text x="209.7" y="258" font-size="15" text-anchor="middle" fill="#59636e">128K</text>
+<text x="294.8" y="258" font-size="15" text-anchor="middle" fill="#59636e">192K</text>
+<text x="372.0" y="258" font-size="15" text-anchor="middle" fill="#59636e">250K</text>
+<text x="227.0" y="276" font-size="15" text-anchor="middle" fill="#59636e">context length (tokens)</text>
+<polyline points="82.0,87.9 124.6,89.3 209.7,94.3 294.8,99.3 372.0,105.0" fill="none" stroke="#c45a2d" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="82.0" cy="87.9" r="4" fill="#c45a2d"/>
+<circle cx="124.6" cy="89.3" r="4" fill="#c45a2d"/>
+<circle cx="209.7" cy="94.3" r="4" fill="#c45a2d"/>
+<circle cx="294.8" cy="99.3" r="4" fill="#c45a2d"/>
+<circle cx="372.0" cy="105.0" r="4" fill="#c45a2d"/>
+<text x="82.0" y="110.9" font-size="15" font-weight="600" text-anchor="middle" fill="#1f2328">1,830</text>
+<text x="360.0" y="128.0" font-size="15" font-weight="600" text-anchor="start" fill="#1f2328">1,622</text>
+<text x="411" y="118.9" font-size="15" font-weight="600" fill="#c45a2d">4.05 bpw</text>
+<polyline points="82.0,85.9 124.6,87.1 209.7,89.8 294.8,93.1 372.0,102.9" fill="none" stroke="#44576b" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7 4"/>
+<rect x="78.5" y="82.4" width="7" height="7" fill="#ffffff" stroke="#44576b" stroke-width="2"/>
+<rect x="121.1" y="83.6" width="7" height="7" fill="#ffffff" stroke="#44576b" stroke-width="2"/>
+<rect x="206.2" y="86.3" width="7" height="7" fill="#ffffff" stroke="#44576b" stroke-width="2"/>
+<rect x="291.3" y="89.6" width="7" height="7" fill="#ffffff" stroke="#44576b" stroke-width="2"/>
+<rect x="368.5" y="99.4" width="7" height="7" fill="#ffffff" stroke="#44576b" stroke-width="2"/>
+<text x="82.0" y="73.9" font-size="15" font-weight="600" text-anchor="middle" fill="#1f2328">1,855</text>
+<text x="360.0" y="90.9" font-size="15" font-weight="600" text-anchor="start" fill="#1f2328">1,648</text>
+<text x="411" y="98.9" font-size="15" font-weight="600" fill="#44576b">3.05 bpw</text>
+</svg>

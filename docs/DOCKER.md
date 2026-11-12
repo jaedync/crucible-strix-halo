@@ -35,7 +35,7 @@ Example: `docker build --build-arg BUILD_JOBS=2 -t crucible:v0.37.0 .`
 
 ## Model
 
-Download a pack as in the [main README](../README.md#download-a-model). Read the model license note first.
+Download a pack as in [step 5 of the setup guide](QUICKSTART.md#step-5-download-the-405-pack). Read the model license note first.
 
 ## Run
 

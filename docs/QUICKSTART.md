@@ -123,7 +123,7 @@ same install in single steps, for a person or an agent that does not use the scr
 
 For a build from source, install ROCm 7.2.4 (see step 4). The release engine also runs on ROCm 10.1. Setup passes both with no message.
 The engine needs the HIP runtime. A source build (step 4) also needs the HIP compiler. It uses no ROCm libraries (no rocBLAS, no
-hipBLAS). The tested system is Arch Linux with kernel 7.2. Other distributions are not tested.
+hipBLAS). The tested system is Arch Linux with kernel 7.2.
 
 On Arch Linux:
 
@@ -223,7 +223,7 @@ and `. .venv/bin/activate` again.
 **Check:**
 
 ```sh
-python -m server --version    # expect: crucible 0.32.0 or newer
+python -m server --version    # expect: crucible 0.37.0 or newer
 hf version
 ```
 
