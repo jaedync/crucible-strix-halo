@@ -255,6 +255,27 @@ class UpdateSuccessTest(Base):
         self.assertUntouched()
 
 
+class OutsideEnvironmentTest(Base):
+    """The fake home must not depend on the XDG folders of the person or the runner that runs the tests. The GitHub
+    ubuntu-24.04 image sets XDG_CONFIG_HOME=$HOME/.config for its real home (/etc/environment), so the update looked for
+    the unit there, found none and took the service as not installed (21 red cases on the CPU workflow, Nov 12)."""
+
+    OUTSIDE = {"XDG_CONFIG_HOME": "/nonexistent/runner/.config", "XDG_DATA_HOME": "/nonexistent/runner/.local/share",
+               "XDG_STATE_HOME": "/nonexistent/runner/.local/state", "XDG_CACHE_HOME": "/nonexistent/runner/.cache"}
+
+    def test_an_outside_xdg_config_home_does_not_hide_the_unit_of_the_fake_home(self):
+        with mock.patch.dict(os.environ, self.OUTSIDE):
+            w = self.world()
+            self.assertEqual(self.update("--yes"), 0, self.out)
+        self.assertEqual(w.unit.read_text(), "unit 0.2.0\n", self.out)
+        self.assertIn(("ctl", "restart"), w.machine.events, self.out)
+
+    def test_the_fake_home_has_no_xdg_folder_from_outside(self):
+        with mock.patch.dict(os.environ, self.OUTSIDE):
+            env = self.world().host().env
+        self.assertEqual({k: v for k, v in env.items() if k in self.OUTSIDE and v.startswith("/nonexistent")}, {})
+
+
 class RollbackFlagTest(Base):
     """`--rollback` was the flag of tools/update.sh. It gets a clear answer and exit 2, not an argparse error."""
 

@@ -31,6 +31,7 @@ from crucible_cli_fakes import FakePrompt, make_machine  # noqa: E402
 OLD, NEW = "v0.1.0", "v0.2.0"
 STEM = "crucible-engine-{tag}-gfx1151-rocm7.2-linux-x86_64"
 CANARY = "ENGINE-WAS-RUN"
+XDG_HOMES = ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME")
 GIT = shutil.which("git")
 EMAIL = "t" + chr(64) + "example.invalid"   # built, so that the export scan sees no address
 GIT_ENV = {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null", "GIT_TERMINAL_PROMPT": "0",
@@ -253,7 +254,10 @@ class World:
     def host(self, answers=None, tty=True, env=None, **machine):
         h = make_machine(self.t, **machine)
         h.home = self.home
-        h.env = {**os.environ, **GIT_ENV, "HOME": str(self.home), "USER": "tester", "CRUCIBLE_REPO_URL": self.repo_url,
+        # The XDG folders of the outside home would move the unit and the key out of the fake home (the GitHub image sets
+        # XDG_CONFIG_HOME): the fake home starts with none.
+        outside = {k: v for k, v in os.environ.items() if k not in XDG_HOMES}
+        h.env = {**outside, **GIT_ENV, "HOME": str(self.home), "USER": "tester", "CRUCIBLE_REPO_URL": self.repo_url,
                  "CRUCIBLE_RELEASE_BASE": f"file://{self.release}", "CRUCIBLE_TEST_LOG": str(self.log),
                  "CRUCIBLE_TEST_UNIT": str(self.unit), **(env or {})}
         h.runner = UpdateRunner(self)

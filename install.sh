@@ -831,7 +831,7 @@ cmd_install() {
 # engine: the release engine for the tag that is checked out in DIR (used by tools/release_make.sh)
 cmd_engine() {
   check_platform
-  [ -f "$DIR/crucible" ] && [ -d "$DIR/.git" ] || die 2 "$DIR is not a Crucible checkout."
+  if [ ! -f "$DIR/crucible" ] || [ ! -d "$DIR/.git" ]; then die 2 "$DIR is not a Crucible checkout."; fi
   [ "$(dir_state)" = same ] || die 5 "$DIR is not at the release $TAG, so there is no release engine for it."
   start_log
   trap cleanup EXIT

@@ -65,10 +65,15 @@ class Fixture(unittest.TestCase):
 
 @unittest.skipUnless(CC and READELF, "needs a C compiler and readelf")
 class LibraryListTest(Fixture):
+    # Link flags that the system compiler adds by itself. Ubuntu's gcc adds --as-needed (the GitHub ubuntu-24.04 runner);
+    # Arch's gcc adds nothing. The stand-ins must link and list the same libraries under both.
+    compiler_default = ()
+
     def cc(self, out, src, *flags):
         c = self.t / (Path(out).name + ".c")
         c.write_text(src)
-        r = sh([CC, *flags, str(c), "-o", str(out)])
+        # The source goes before the libraries, and --no-as-needed keeps each -l as a NEEDED entry whatever the default.
+        r = sh([CC, *self.compiler_default, str(c), "-Wl,--no-as-needed", *flags, "-o", str(out)])
         self.assertEqual(r.returncode, 0, r.stderr)
 
     def world(self, hip_needs="-lz", register_needs=None, with_register=True, engine_needs=()):
@@ -93,6 +98,16 @@ class LibraryListTest(Fixture):
     def needs(self, binary, rocm, *more):
         r = self.tool("needs", "--binary", str(binary), "--rocm-path", str(rocm), "--json", *more)
         return r, (json.loads(r.stdout) if r.stdout.strip().startswith("{") else None)
+
+    def test_the_stand_ins_link_the_same_when_the_compiler_adds_as_needed(self):
+        # Ubuntu: "undefined reference to `hip_f'" (a library before the object is dropped), and a stand-in that does not
+        # call libz would lose its NEEDED libz entry (CPU workflow, Nov 12).
+        self.compiler_default = ("-Wl,--as-needed",)
+        binary, rocm = self.world()
+        r, data = self.needs(binary, rocm)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(data["external"], [])
+        self.assertEqual(sorted(data["rocm_external"]), ["libz.so.1", "libzstd.so.1"])
 
     def test_the_list_holds_only_what_the_engine_itself_needs(self):
         # The engine needs ROCm and the base runtime. Its ROCm libraries need libz and libzstd on the BUILD host, but
