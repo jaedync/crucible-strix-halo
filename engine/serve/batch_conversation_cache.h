@@ -303,9 +303,8 @@ class BatchConversationCache {
     if (!bytes || bytes > cache_.Budget()) return Refuse("budget");
     // Older Session frontiers that this one extends leave first.
     // Shared frontiers stay in plain LRU: other sessions can still restore them.
-    // A tail is never superseded by a prompt frontier: replay makes it the most valuable entry (G15).
-    // A speculative frontier (past the boundary) is a speculative tail: a retry of this prompt, or a next turn that
-    // drops the reasoning, cannot use it. It marks nothing until a hit confirms it.
+    // A prompt frontier that extends a tail keeps it protected for replay. A confirmed frontier can supersede
+    // a tail when its client tokens disagree with the saved reply. A speculative frontier marks nothing until a hit confirms it.
     if (!frontier.speculative) RetireDeadBranches(ids.first(frontier.position), frontier.position, &policy);
     const auto marked = frontier.speculative ? std::set<const Item*>{} :
         Supersede(ids.first(frontier.position), policy, [](const Entry& entry) {
@@ -975,16 +974,11 @@ class BatchConversationCache {
     return clock_now_ ? clock_now_()
                       : std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
   }
-  // A tail is a dead branch when a later client prompt of its conversation already contradicts its generated tokens:
-  // the client sent its own version of that reply (many drop the reasoning), so no prompt that continues the
-  // conversation repeats this tail, and FindTail and Find never match it again. It leaves first and stays off the
-  // disk, as a superseded entry, and it is no session's resume point any more. Before this, such tails stayed the
-  // protected heads of a growing conversation: after one miss its next tails are untrusted and supersede nothing, so
-  // every save of that conversation was refused as "protected" and each turn re-prefilled the whole prompt.
-  // Only a key whose client-prompt part is known counts as the contradicting prompt: a frontier (prompt tokens only),
-  // or a tail saved with its request's prompt length. A handover copy records no prompt, so it never decides.
-  // A hit clears the mark (PrefixCache::FindEntry), as for any superseded entry.
-  // Whether a client prompt (`ids`, its first `prompt` tokens sent by the client) contradicts `tail`'s reply.
+  // A client can send back an edited reply. Its continuation cannot reuse the old tail, but that tail can
+  // still occupy a protected resume point. Under cache pressure this can prevent saving the new continuation.
+  // Mark the old tail as superseded when known client prompt tokens diverge inside its saved reply.
+  // Prefer it for eviction and skip disk spill. A matching hit can clear the mark while the tail is still cached.
+  // A confirmed frontier or a saved tail with a known prompt length supplies the client tokens for the comparison.
   static bool Contradicts(const Item& tail, std::span<const int> ids, size_t prompt) {
     const size_t own = tail.snapshot->prompt;
     const size_t limit = std::min({prompt, ids.size(), tail.ids.size()});  // what that client prompt covers
@@ -993,8 +987,7 @@ class BatchConversationCache {
                                  tail.ids.begin());
     return common >= own && common < limit;  // the same prompt, then the client wrote a different reply
   }
-  // `ids`/`prompt`: the key of the save in progress and its client-prompt length (0: unknown), checked as a later
-  // prompt too, since it is in no entry yet.
+  // Also compare the pending save when its client prompt length is known.
   void RetireDeadBranches(std::span<const int> ids = {}, size_t prompt = 0, const ConversationPolicy* policy = nullptr) {
     std::vector<Item*> tails, prompts;
     cache_.ForEach([&](Item& item) {

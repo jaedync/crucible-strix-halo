@@ -1192,11 +1192,7 @@ static void LatestRefusal() {
   assert(!c.cache.MakeRoom(64, memory));
   assert(c.cache.LastRefusal() == std::string("protected"));
 }
-
-
-// A tail that a later client prompt contradicts (the client sent its own version of the reply, e.g. without the
-// reasoning) is a dead branch: it stops being a protected resume point and leaves first. Before, a growing
-// conversation kept such tails as its live heads, and after one miss each untrusted save was refused as "protected".
+// A changed reply makes room for a new tail in a full cache while preserving an unrelated resume point.
 static void DeadBranchTails() {
   const auto x = Tokens(1, 40), y = Tokens(101, 40);
   const uint64_t ram = uint64_t(9) << 30;
