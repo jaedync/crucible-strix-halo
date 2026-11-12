@@ -81,6 +81,7 @@ struct SlotCheckpoint {
   SlotFrontier frontier;  // kind Frontier only
   StateTenant tenant = kLocalTenant;  // W1: whose state it is; only that tenant's requests resume from it
   std::shared_ptr<const PromptOutputs> outputs;  // kind End only: the prompt end of fix A
+  size_t retirement_floor = 0;  // the full prompt's evidence when this point was taken
 };
 // Whether `point` resumes a prompt of its own length (fix A): an End point with outputs. Every other point needs the
 // last prompt row to run.
@@ -187,9 +188,12 @@ class SlotCheckpoints {
     return found.empty() ? 0 : Slot(slot)[size_t(found.front())]->hist.size();
   }
   // A hit on a speculative Frontier point shows that a later prompt repeats it.
-  void Confirm(int slot, int index) {
+  void Confirm(int slot, int index, size_t retirement_floor = 0) {
     auto& item = Slot(slot).at(size_t(index));
-    if (item && item->kind == CheckpointKind::Frontier) item->frontier.speculative = false;
+    if (item && item->kind == CheckpointKind::Frontier) {
+      item->frontier.speculative = false;
+      item->retirement_floor = std::max(item->retirement_floor, retirement_floor);
+    }
   }
   // The longest checkpoint length that the prompt key `key` repeats, for slot affinity (0: none).
   size_t Common(int slot, std::span<const int> key, const StateTenant& tenant) const {

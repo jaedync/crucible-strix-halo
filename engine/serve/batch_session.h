@@ -205,6 +205,7 @@ struct BatchRestore {
   // both; a slot resume or a slot checkpoint sets the tier itself and leaves the diagnosis at a hit.
   BatchCacheTier tier = BatchCacheTier::Slot;
   BatchCacheDiagnosis diag;
+  size_t retirement_floor = 0;
   BatchRestore(size_t tokens = 0, bool shared = false, int replay = 0, bool tail = false, bool slot = false,
                bool guarded = false)
       : tokens(tokens), shared(shared), replay(replay), tail(tail), slot(slot), guarded(guarded) {}
@@ -255,9 +256,14 @@ struct BatchStageQueue {
   std::function<bool(std::span<const int> key)> in_slot;
   uint64_t job = 0;  // the server's tag of the turn (log lines only, fix 2 item 10)
 };
-// How a finished request started: from a previous tail (`replayed`), and whether that tail was guarded. `slot`: the
+// How a finished request started: the length of the previous tail it replayed, and whether that tail was guarded. `slot`: the
 // slot that holds the finished state.
-struct BatchTailSource { bool replayed = false, guarded = false; int slot = -1; };
+struct BatchTailSource {
+  size_t replayed = 0;
+  bool guarded = false;
+  int slot = -1;
+  size_t retirement_floor = 0;
+};
 
 // Re-send fix B: the shortest prompt that ends a chunk at its final chunk's core cut, so that an
 // extended prompt resumes there. Below it the extra launch is a larger share of the prefill.
@@ -322,7 +328,8 @@ struct BatchCacheHooks {
   // Optional, all five with the checkpoint hooks: slot frontiers.
   // `frontier`: the session frontier at `cursor` of a normal turn may stay in the slot instead of a host copy. The
   // hook calls `keep` with the frontier's metadata; it returns true when the slot kept it (no host capture there).
-  std::function<bool(const ServeRequest&, size_t cursor, const std::function<bool(const SlotFrontier&)>& keep)> frontier;
+  std::function<bool(const ServeRequest&, size_t cursor,
+                     const std::function<bool(const SlotFrontier&, size_t retirement_floor)>& keep)> frontier;
   // `frontier_fits`: the host restore rule (Find: boundary, BatchRestoreLimit, prompt check) for a Frontier point.
   std::function<bool(const ServeRequest&, const SlotCheckpoint&)> frontier_fits;
   // `handover`: copies Frontier point (slot, index) to the host. Runs on the selected slot before an open writes it.
@@ -635,6 +642,7 @@ class BatchSession {
             // Fix A: the End point of this prompt (Best gives a point of the prompt's length only then).
             if (saved.hist.size() == owned.options.ids.size() && ResumesWhole(saved)) owned.end_outputs = saved.outputs;
           }
+          hit.retirement_floor = saved.retirement_floor;
         } else {
           if (donor) hit = CopyFrontier(slot, owned.options, *donor);
           owned.frontier_copy = hit.tokens > 0;
@@ -654,6 +662,9 @@ class BatchSession {
         if (left && left->second > hit.tokens && cache_.diverged)
           cache_.diverged(owned.options.ids.size(), hit.tokens, left->first, left->second);
         owned.cached = owned.cursor = hit.tokens;
+        // The restored key proves only the part of the original prompt it actually contains.
+        if (hit.retirement_floor <= hit.tokens) owned.retirement_floor = hit.retirement_floor;
+        if (hit.tail && !point) owned.retirement_floor = hit.tokens;
         owned.cache_shared = hit.shared;
         owned.replay = hit.replay;
         owned.from_tail = hit.tail;
@@ -1296,6 +1307,7 @@ class BatchSession {
     const ServeRequest options;
     int last = -1;
     size_t count = 0, cursor = 0, cached = 0;
+    size_t retirement_floor = 0;
     bool cache_shared = false, from_tail = false, slot_resume = false, tail_guarded = false, from_checkpoint = false;
     bool frontier_copy = false;  // the open restored a copy of another slot's Frontier point
     bool grid_point = false;  // resumed from a Grid checkpoint
@@ -1449,6 +1461,7 @@ class BatchSession {
     if (!tokens) return;
     if (tokens != point.hist.size()) throw std::logic_error("a header copy must restore the donor point");
     state.cached = state.cursor = tokens;
+    if (point.retirement_floor <= tokens) state.retirement_floor = point.retirement_floor;
     state.from_checkpoint = true;
     state.from_tail = true;
     state.core_point = BulkResumes(tokens, state.options.ids.size());
@@ -1861,11 +1874,12 @@ class BatchSession {
     const auto [from, index] = donor;
     const SlotCheckpoint& point = checkpoints_.At(from, index);
     if (point.tenant != request.tenant) throw std::logic_error("a frontier copy must restore the donor point");
-    const BatchRestore hit = cache_.frontier_copy(request, from, index, point);
+    BatchRestore hit = cache_.frontier_copy(request, from, index, point);
     if (!hit.tokens) return hit;
     if (hit.tokens != point.hist.size() || hit.tail || hit.slot || hit.shared)
       throw std::logic_error("a frontier copy must restore the donor point");
     if (point.frontier.speculative) checkpoints_.Confirm(from, index);
+    hit.retirement_floor = point.retirement_floor;
     return hit;
   }
   bool FrontiersOn() const {
@@ -1877,20 +1891,21 @@ class BatchSession {
   // x4-tail: `from_cut`: the state at `cursor` is in the cut buffer (a joined launch passed it), not in the slot.
   bool KeepFrontierAt(Request& state, size_t cursor, bool from_cut) {
     if (!FrontiersOn() || state.options.cache_control == "bypass" || (from_cut && !cache_.cut_save)) return false;
-    return cache_.frontier(state.options, cursor, [&](const SlotFrontier& meta) {
+    return cache_.frontier(state.options, cursor, [&](const SlotFrontier& meta, size_t retirement_floor) {
+      retirement_floor = std::max(retirement_floor, state.retirement_floor);
       const std::span<const int> below(state.options.ids.data(), cursor);
       auto key = Key(state.options, below);
       const auto pick = checkpoints_.FrontierVictim(state.slot, key, state.id, state.options.tenant);
       if (!pick.held && !pick.index) return false;
       if (pick.held) {
         // The slot holds this state already; a confirmed frontier confirms it (LOW-3).
-        if (!meta.speculative) checkpoints_.Confirm(state.slot, *pick.index);
+        if (!meta.speculative) checkpoints_.Confirm(state.slot, *pick.index, retirement_floor);
       } else {
         if (from_cut) cache_.cut_save(state.slot, *pick.index);
         else cache_.checkpoint_save(state.slot, *pick.index);
         checkpoints_.Store(state.slot, *pick.index, {std::vector<int>(below.begin(), below.end()), std::move(key), 0,
                                                      false, CheckpointKind::Frontier, state.id, meta,
-                                                     state.options.tenant});
+                                                     state.options.tenant, nullptr, retirement_floor});
       }
       state.saved_tokens = std::max(state.saved_tokens, cursor);
       return true;
@@ -1921,7 +1936,7 @@ class BatchSession {
     else cache_.checkpoint_save(state.slot, *victim);
     checkpoints_.Store(state.slot, *victim, {std::vector<int>(below.begin(), below.end()), std::move(key),
                                              replay, guarded, kind, state.id, {}, state.options.tenant,
-                                             std::move(outputs)});
+                                             std::move(outputs), state.retirement_floor});
     return true;
   }
   // `saved`: the row's logits, copied already (fix A); else they are copied from the engine's row `row`. An End
@@ -1986,7 +2001,8 @@ class BatchSession {
       if (cache_.tail && state.options.cache_control != "bypass")
         tails_.push_back({id, state.slot, state.options, std::move(state.generated),
                           spec && spec_.replay ? spec_.replay(id) : 0,
-                          {state.from_tail && !state.from_checkpoint, state.tail_guarded, state.slot}});
+                          {state.from_tail && !state.from_checkpoint ? state.cached : 0, state.tail_guarded, state.slot,
+                           state.retirement_floor}});
       slot_used_[size_t(state.slot)] = ++resident_tick_;
       active_.erase(id);
       if (spec) spec_.close(id);

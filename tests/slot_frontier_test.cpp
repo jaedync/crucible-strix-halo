@@ -209,10 +209,10 @@ struct FakeCache {
     };
     if (!slot_frontiers) return hooks;
     hooks.frontier = [this](const crucible::ServeRequest& r, size_t cursor,
-                            const std::function<bool(const crucible::SlotFrontier&)>& keep) {
+                            const std::function<bool(const crucible::SlotFrontier&, size_t)>& keep) {
       for (const auto& frontier : Frontiers(r)) {
         if (frontier.position != cursor) continue;
-        if (frontier.shared || !keep({size_t(r.cache_prefix_tokens), frontier.speculative, false})) return false;
+        if (frontier.shared || !keep({size_t(r.cache_prefix_tokens), frontier.speculative, false}, 0)) return false;
         log.push_back("keep " + std::to_string(cursor) + (frontier.speculative ? " speculative" : ""));
         return true;
       }

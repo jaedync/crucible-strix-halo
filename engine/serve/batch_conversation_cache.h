@@ -143,6 +143,7 @@ class BatchConversationCache {
     size_t prompt = 0;
     // The miss ledger (start plan B1a): the conversation counter of this state (not a hash of its tokens).
     uint64_t lineage = 0;
+    size_t retirement_floor = 0;  // only retire tails whose original prompt reaches this boundary
   };
   // The eviction hook holds `this`, and a copy would point at the dead original (L7, review): no copies.
   BatchConversationCache(const BatchConversationCache&) = delete;
@@ -256,7 +257,8 @@ class BatchConversationCache {
   template<class Create>
   bool CaptureTail(std::span<const int> hist, const ConversationPolicy& policy, size_t bytes, uint64_t available,
                    Create create, bool trusted = false, bool guarded = false, bool resident = false,
-                   std::span<const int> tokens = {}, SharedSave share = {}, size_t prompt = 0) {
+                   std::span<const int> tokens = {}, SharedSave share = {}, size_t prompt = 0,
+                   std::optional<size_t> known_floor = std::nullopt) {
     if (tokens.empty()) tokens = hist;
     const size_t prompt_tokens = prompt && prompt < hist.size() ? prompt : hist.size();
     if (tokens.size() != hist.size()) throw std::invalid_argument("tail key and tokens differ in length");
@@ -266,7 +268,9 @@ class BatchConversationCache {
     const uint64_t parent = Parent(hist, policy);  // before eviction can remove it
     const uint64_t lineage = LineageFor(hist, policy);  // the miss ledger, also before eviction
     const bool proven = ExtendsProven(hist, policy);  // also before eviction
-    RetireDeadBranches(hist, prompt_tokens < hist.size() ? prompt_tokens : 0, &policy);
+    const auto client = prompt_tokens < hist.size() ? hist.first(prompt_tokens) : std::span<const int>{};
+    const size_t retirement_floor = known_floor ? *known_floor : RetirementFloor(client, policy);
+    RetireDeadBranches(client, &policy, retirement_floor);
     const auto marked = trusted ? Supersede(hist, policy, [](const Entry& entry) {
       return entry.retention == CacheRetention::Session;
     }) : std::set<const Item*>{};
@@ -282,7 +286,7 @@ class BatchConversationCache {
           !BatchCacheMtpState(snapshot->resume))
         throw std::runtime_error("session replay needs a generated tail with target state or full MTP rows");
       auto entry = std::make_shared<Entry>(Entry{std::move(lease), std::move(snapshot), CacheRetention::Session, guarded,
-                                                 ++serials_, parent, prompt_tokens, lineage});
+                                                 ++serials_, parent, prompt_tokens, lineage, retirement_floor});
       return Saved(cache_.Insert(hist, policy, bytes, std::move(entry), false), trusted, trusted || proven);
     } catch (const std::bad_alloc&) {
       return Unmark(marked, "memory");
@@ -293,7 +297,7 @@ class BatchConversationCache {
   template<class Create>
   bool Capture(std::span<const int> ids, const ConversationPolicy& policy, const CacheFrontier& frontier,
                size_t bytes, uint64_t available, Create create, std::span<const int> tokens = {},
-               SharedSave share = {}, bool proven_before = false) {
+               SharedSave share = {}, bool proven_before = false, size_t known_floor = 0) {
     if (tokens.empty()) tokens = ids;
     if (tokens.size() != ids.size()) throw std::invalid_argument("prompt key and tokens differ in length");
     Try(frontier.position);
@@ -305,7 +309,8 @@ class BatchConversationCache {
     // Shared frontiers stay in plain LRU: other sessions can still restore them.
     // A prompt frontier that extends a tail keeps it protected for replay. A confirmed frontier can supersede
     // a tail when its client tokens disagree with the saved reply. A speculative frontier marks nothing until a hit confirms it.
-    if (!frontier.speculative) RetireDeadBranches(ids.first(frontier.position), frontier.position, &policy);
+    const size_t retirement_floor = RetirementFloor(ids, policy, known_floor);
+    if (!frontier.speculative) RetireDeadBranches(ids.first(frontier.position), &policy, retirement_floor);
     const auto marked = frontier.speculative ? std::set<const Item*>{} :
         Supersede(ids.first(frontier.position), policy, [](const Entry& entry) {
           return entry.retention == CacheRetention::Session && entry.snapshot->resume.prompt_only;
@@ -325,7 +330,7 @@ class BatchConversationCache {
           !BatchCacheMtpState(snapshot->resume))
         throw std::runtime_error("batch capture needs a committed frontier with target state or full MTP rows");
       auto entry = std::make_shared<Entry>(Entry{std::move(lease), std::move(snapshot), frontier.retention, false,
-                                                 ++serials_, 0, frontier.position, lineage});
+                                                 ++serials_, 0, frontier.position, lineage, retirement_floor});
       // A prompt frontier holds client tokens, so it is a confirmed resume point; a speculative one is not yet.
       return Saved(cache_.Insert(ids.first(frontier.position), policy, bytes, std::move(entry), false), !frontier.speculative,
                    proven);
@@ -341,6 +346,29 @@ class BatchConversationCache {
       Supersede(ids, policy, [](const Entry& entry) {
         return entry.retention == CacheRetention::Session && entry.snapshot->resume.prompt_only;
       });
+  }
+  // Capture the evidence while the full prompt and its matching states are still available.
+  size_t RetirementFloor(std::span<const int> prompt, const ConversationPolicy& policy, size_t known_floor = 0) const {
+    if (prompt.empty()) return 0;
+    size_t floor = known_floor;
+    std::set<size_t> confirmed_prompts;
+    cache_.ForEachState(policy, [&](const Item& item) {
+      const auto& entry = *item.snapshot;
+      const bool tail = !entry.snapshot->resume.prompt_only;
+      const auto repeats = [&](size_t length) {
+        return length <= prompt.size() && length <= item.ids.size() &&
+               item.ids[length - 1] == prompt[length - 1] &&
+               std::equal(item.ids.begin(), item.ids.begin() + length, prompt.begin());
+      };
+      // A retried prompt can still repeat the earlier tail after its longer continuation replaced it.
+      if (entry.retirement_floor > floor && repeats(entry.retirement_floor)) floor = entry.retirement_floor;
+      if (tail && item.ids.size() > floor && repeats(item.ids.size())) floor = item.ids.size();
+      // Two confirmed replies to the same prompt make a divergence ambiguous.
+      if (tail && item.confirmed && entry.prompt && entry.prompt >= floor && entry.prompt < item.ids.size() &&
+          entry.prompt < prompt.size() && repeats(entry.prompt) && !confirmed_prompts.insert(entry.prompt).second)
+        floor = entry.prompt + 1;
+    });
+    return floor;
   }
   // Whether `ids` extends a proven state: the slot asks when it keeps a frontier, for its host copy later.
   bool ProvenBelow(std::span<const int> ids, const ConversationPolicy& policy) { return ExtendsProven(ids, policy); }
@@ -979,16 +1007,17 @@ class BatchConversationCache {
   // Mark the old tail as superseded when known client prompt tokens diverge inside its saved reply.
   // Prefer it for eviction and skip disk spill. A matching hit can clear the mark while the tail is still cached.
   // A confirmed frontier or a saved tail with a known prompt length supplies the client tokens for the comparison.
-  static bool Contradicts(const Item& tail, std::span<const int> ids, size_t prompt) {
+  static bool Contradicts(const Item& tail, std::span<const int> prompt, size_t retirement_floor) {
     const size_t own = tail.snapshot->prompt;
-    const size_t limit = std::min({prompt, ids.size(), tail.ids.size()});  // what that client prompt covers
-    if (limit <= own || ids[own - 1] != tail.ids[own - 1]) return false;  // another conversation, or no reply yet
-    const size_t common = size_t(std::mismatch(tail.ids.begin(), tail.ids.begin() + limit, ids.begin()).first -
+    const size_t limit = std::min(prompt.size(), tail.ids.size());
+    if (own < retirement_floor || limit <= own || prompt[own - 1] != tail.ids[own - 1]) return false;
+    const size_t common = size_t(std::mismatch(tail.ids.begin(), tail.ids.begin() + limit, prompt.begin()).first -
                                  tail.ids.begin());
-    return common >= own && common < limit;  // the same prompt, then the client wrote a different reply
+    return common >= own && common < limit;
   }
   // Also compare the pending save when its client prompt length is known.
-  void RetireDeadBranches(std::span<const int> ids = {}, size_t prompt = 0, const ConversationPolicy* policy = nullptr) {
+  void RetireDeadBranches(std::span<const int> prompt = {}, const ConversationPolicy* policy = nullptr,
+                          size_t retirement_floor = 0) {
     std::vector<Item*> tails, prompts;
     cache_.ForEach([&](Item& item) {
       const auto& entry = *item.snapshot;
@@ -999,11 +1028,13 @@ class BatchConversationCache {
       if (!item.superseded && !frontier && entry.prompt && entry.prompt < item.ids.size()) tails.push_back(&item);
     });
     for (Item* tail : tails) {
-      bool dead = prompt && policy && tail->policy == *policy && Contradicts(*tail, ids, prompt);
+      bool dead = !prompt.empty() && policy && tail->policy == *policy && Contradicts(*tail, prompt, retirement_floor);
       for (const Item* other : prompts) {
         if (dead) break;
         if (other == tail || other->policy != tail->policy || other->snapshot->serial <= tail->snapshot->serial) continue;
-        dead = Contradicts(*tail, other->ids, other->snapshot->prompt ? other->snapshot->prompt : other->ids.size());
+        const auto& entry = *other->snapshot;
+        const auto client = std::span<const int>(other->ids).first(entry.prompt);
+        dead = Contradicts(*tail, client, entry.retirement_floor);
       }
       if (dead) {
         tail->superseded = true;

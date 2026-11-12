@@ -28,19 +28,20 @@ struct Cache {
   ConversationPolicy policy;
   explicit Cache(size_t live = 8, size_t entries = 3, bool probation = false)
       : cache(64 * entries, {}, live, kDefaultHostReserve, probation) { policy.prefill_rows = 8; }
-  bool Capture(const std::vector<int>& ids, size_t position, CacheRetention retention) {
+  bool Capture(const std::vector<int>& ids, size_t position, CacheRetention retention, size_t known_floor = 0) {
     return cache.Capture(ids, policy, {position, retention}, 64, size_t(9) << 30, [&] {
       auto s = std::make_shared<Snapshot>(); s->hist.assign(ids.begin(), ids.begin() + position);
       s->resume.length = position; s->resume.prompt_only = true; s->resume.prompt_boundary = ids.size() - 1;
       return std::shared_ptr<const Snapshot>(s);
-    });
+    }, {}, {}, false, known_floor);
   }
   bool Tail(const std::vector<int>& ids, size_t length, bool trusted = false, bool guarded = false,
-            bool resident = false, uint64_t available = uint64_t(9) << 30, size_t prompt = 0) {
+            bool resident = false, uint64_t available = uint64_t(9) << 30, size_t prompt = 0,
+            std::optional<size_t> known_floor = std::nullopt) {
     return cache.CaptureTail(std::span<const int>(ids.data(), length), policy, 64, available, [&] {
       auto s = std::make_shared<Snapshot>(); s->hist.assign(ids.begin(), ids.begin() + length);
       s->resume.length = length; return std::shared_ptr<const Snapshot>(s);
-    }, trusted, guarded, resident, {}, {}, prompt);
+    }, trusted, guarded, resident, {}, {}, prompt, known_floor);
   }
   size_t HitTail(const std::vector<int>& ids) {
     const auto entry = cache.FindTail(ids, policy);
@@ -1235,6 +1236,96 @@ static void DeadBranchTails() {
   }
 }
 
+static void SamePromptSiblingTails() {
+  const auto a = Tokens(1, 40), b = Fork(a, 18, 500);
+  const auto next = Fork(a, 21, 900);
+  const uint64_t ram = uint64_t(9) << 30;
+  const auto fill = [&](Cache& c) {
+    c.cache.SetSlotFrontiers(true);
+    assert(c.Tail(a, 21, false, false, false, ram, 16));
+    assert(c.Tail(b, 21, false, false, false, ram, 16));
+    assert(c.HitTail(b) == 21 && c.HitTail(next) == 21);
+  };
+  {
+    Cache c(2, 2, true);
+    fill(c);
+    assert(c.Tail(next, 30, true, false, false, ram, 25));
+    assert(c.HitTail(b) == 21 && c.HitTail(next) == 30);
+    // A's old tail is gone. A later admission must still keep B.
+    assert(!c.Capture(Tokens(1000, 40), 16, CacheRetention::Session));
+    assert(c.cache.DeadBranches() == 0 && c.HitTail(b) == 21);
+    // Regenerating from the same prompt has no exact RAM tail to replay.
+    const auto retry = Fork(next, 25, 1100);
+    assert(c.cache.PeekTail(std::span<const int>(retry).first(25), c.policy) == 0);
+    assert(!c.Tail(retry, 30, false, false, false, ram, 25));
+    assert(c.cache.Status().last.refused == "protected");
+    assert(c.cache.DeadBranches() == 0 && c.HitTail(b) == 21);
+  }
+  {
+    Cache c(2, 2, true);
+    fill(c);
+    assert(!c.Capture(next, 24, CacheRetention::Session));
+    assert(c.cache.Status().last.refused == "protected");
+    assert(c.cache.DeadBranches() == 0 && c.HitTail(b) == 21);
+  }
+  for (const bool resident : {false, true}) {
+    // A was restored from disk or its slot, so the host has only B and another live session.
+    Cache c(2, 2, true);
+    c.cache.SetSlotFrontiers(true);
+    assert(c.Tail(b, 21, false, false, false, ram, 16) && c.HitTail(b) == 21);
+    const auto other = Tokens(1000, 40);
+    assert(c.Capture(other, 16, CacheRetention::Session) && c.Hit(other) == 16);
+    assert(c.cache.PeekTail(next, c.policy) == 0);
+    const size_t floor = c.cache.RetirementFloor(std::span<const int>(next).first(25), c.policy, 21);
+    assert(!c.Tail(next, 30, true, false, resident, ram, 25, floor));
+    assert(c.cache.Status().last.refused == (resident ? "resident" : "protected"));
+    assert(c.cache.DeadBranches() == 0 && c.HitTail(b) == 21);
+    if (resident) {
+      // A delayed handover has only the checkpoint key and the evidence recorded when it was kept.
+      const std::vector<int> point(next.begin(), next.begin() + 24);
+      assert(!c.Capture(point, 24, CacheRetention::Session, floor));
+      assert(c.cache.Status().last.refused == "protected" && c.cache.DeadBranches() == 0);
+    }
+  }
+  {
+    // B continued past A's last published token. Following A must still keep B's longer tail.
+    Cache c(2, 2, true);
+    c.cache.SetSlotFrontiers(true);
+    const auto longer = Fork(a, 22, 500);
+    assert(c.Tail(a, 21, false, false, false, ram, 16));
+    assert(c.Tail(longer, 30, false, false, false, ram, 16));
+    assert(c.HitTail(longer) == 30 && c.HitTail(a) == 21);
+    assert(c.Tail(a, 30, true, false, false, ram, 25));
+    assert(c.cache.DeadBranches() == 0 && c.HitTail(longer) == 30);
+  }
+  {
+    // Neither cached answer matches the edit. A later admission still cannot attribute it to A or B.
+    Cache c(2, 3, true);
+    fill(c);
+    assert(c.Tail(Fork(a, 17, 900), 30, false, false, false, ram, 25));
+    assert(c.Capture(Tokens(1000, 40), 16, CacheRetention::Session));
+    assert(c.cache.DeadBranches() == 0 && c.HitTail(a) == 21 && c.HitTail(b) == 21);
+  }
+}
+
+static void OldTailHandover() {
+  const auto old = Tokens(1, 40), newer = Fork(old, 23, 500);
+  const auto other = Tokens(1000, 40);
+  const uint64_t ram = uint64_t(9) << 30;
+  Cache c(2, 2, true);
+  c.cache.SetSlotFrontiers(true);
+  assert(c.Tail(newer, 30, false, false, false, ram, 22) && c.HitTail(newer) == 30);
+  assert(c.Capture(other, 16, CacheRetention::Session) && c.Hit(other) == 16);
+  // A slot copy carries its floor, but its old prompt cannot retire the newer reply.
+  assert(!c.Tail(old, 30, true, false, false, ram, 0, 21));
+  assert(c.cache.Status().last.refused == "protected");
+  assert(c.cache.DeadBranches() == 0 && c.HitTail(newer) == 30);
+
+  Cache room(2, 2, true);
+  assert(room.Tail(old, 30, true, false, false, ram, 0, 21));
+  assert(room.cache.RetirementFloor(std::span<const int>(old).first(25), room.policy) == 21);
+}
+
 // Verify span (CRUCIBLE_SPEC_SPAN, runtime/spec_span.h): a solo step of up to kSpecSpanMax rows can leave that many
 // pending replay rows at the close of a request. The tail keeps them (a replay of 13 rows stopped the engine at the
 // close of a span 13 copy request). More than kSpecSpanMax rows, or a negative count, is still an engine fault.
@@ -1287,6 +1378,8 @@ int main() {
   TailRules();
   SessionRules();
   DeadBranchTails();
+  SamePromptSiblingTails();
+  OldTailHandover();
   MissedTail();
   Peek();
   ResidentRules();
