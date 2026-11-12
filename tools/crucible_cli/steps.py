@@ -14,7 +14,7 @@ WHAT = {
     "check": "check the machine",
     "venv": "make the Python environment in .venv",
     "download": "download the pack",
-    "build": "build the engine (make)",
+    "build": "get the engine (the release engine, or a build with make)",
     "config": "write the configuration in .crucible",
     "start": "start the server",
     "test": "send a test request",

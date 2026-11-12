@@ -36,7 +36,8 @@ NOT_NEEDED = "not needed: the release engine is installed"
 
 ROCM_FIX = (
     f"Install the current ROCm ({rocm.RECOMMENDED} tested): the HIP runtime, the HIP compiler (hipcc) and rocminfo. "
-    f"ROCm {rocm.TESTED[1]} works too.\n"
+    f"ROCm {rocm.TESTED[1]} works too. To build the engine from source, use the ROCm {rocm.TESTED[1]} compiler for now "
+    "(see docs/QUICKSTART.md).\n"
     "Arch Linux: sudo pacman -Syu --needed base-devel git python hip-runtime-amd rocm-llvm rocminfo\n"
     "Ubuntu or Debian: follow AMD's install page for your release (https://rocm.docs.amd.com), then: sudo apt install build-essential git\n"
     "Fedora: follow AMD's install page (https://rocm.docs.amd.com), then: sudo dnf install make gcc-c++ git\n"

@@ -7,6 +7,7 @@ The ideas behind the numbers are in [How it got fast](how-it-got-fast.md).
 
 Contents: [release ladder](#release-ladder) · [prefill by context length](#prefill-by-context-length) ·
 [decode by context length](#decode-by-context-length) · [hardware ceilings](#hardware-ceilings) ·
+[earlier releases](#earlier-releases) ·
 [measurement details](#measurement-details) · [history of earlier tables](#history-of-earlier-tables)
 
 ## Release ladder
@@ -263,6 +264,63 @@ data path.
 The percentage is a model ratio. It is not a measured GPU utilization.
 Prefill timing ends at the first target ID. It excludes model load, tokenization, queue time, and
 HTTP transport.
+
+## Earlier releases
+
+The speed section of the README up to v0.37.0, moved here with no change to its text. The charts of that section are the 4.05 charts in [prefill by context length](#prefill-by-context-length) and [decode by context length](#decode-by-context-length).
+
+**4.05 bpw pack (the higher-quality option)**
+
+| Row | v0.34.0 | v0.33.0 | v0.32.0 | v0.31.0 | v0.30.0 | v0.26.0 | v0.22.0 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Cold prompt, 32K: first token (s) | 17.1 | 16.9 | 17.0 | 17.7 | 17.9 | 19.4 | 19.7 |
+| Cold prompt, 32K: prefill (tok/s) | 1,831 | 1,851 | 1,841 | 1,763 | 1,741 | 1,613 | 1,585 |
+| Cold prompt, 130K: first token (s) | 72.4 | 72.1 | 74.3 | 75.6 | 77.3 | 82.0 | 84.5 |
+| Cold prompt, 130K: prefill (tok/s) | 1,782 | 1,789 | 1,736 | 1,707 | 1,669 | 1,574 | 1,527 |
+| Same 32K prompt sent again: first token (s) | 0.019 | 0.020 | 0.021 | 0.021 | 0.023 | 0.014 | 1.870 |
+| Decode at 32K, 1 session, code, paired run (tok/s) | 71.2 | 71.7 | 71.8 | 69.0 | 68.4 | 58.4 (2 low samples) | 64.6 |
+| Decode at 32K, 1 session, prose (tok/s) | 58.4 | 56.3 | 57.6 | 55.2 | 53.3 | 50.5 | 50.4 |
+| Decode, 4 sessions, total (tok/s) | 118.3 | 113.8 | n/a | 117.6 | 102.4 | 106.9 | 106.7 |
+| Serial decode, no speculation, short context (tok/s) | 34.2 | 34.1 | 34.2 | 34.1 | 34.3 | 32.1 | 31.0 |
+
+**3.05 bpw pack (the faster option)**
+
+| Row | v0.34.0 | v0.33.0 | v0.32.0 | v0.31.0 | v0.30.0 | v0.26.0 | v0.22.0 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Cold prompt, 32K: first token (s) | 16.6 | 16.7 | 16.7 | 16.8 | 16.9 | 19.2 | 18.9 |
+| Cold prompt, 32K: prefill (tok/s) | 1,877 | 1,870 | 1,867 | 1,858 | 1,843 | 1,628 | 1,656 |
+| Cold prompt, 130K: first token (s) | 71.1 | 71.3 | 72.4 | 72.8 | 74.2 | 81.5 | 81.0 |
+| Cold prompt, 130K: prefill (tok/s) | 1,814 | 1,809 | 1,783 | 1,771 | 1,739 | 1,583 | 1,594 |
+| Same 32K prompt sent again: first token (s) | 0.015 | 0.020 | 0.023 | 0.017 | 0.017 | 0.025 | 1.736 |
+| Decode at 32K, 1 session, code (tok/s) | 76.8 | 73.9 | 74.0 | 75.4 | 76.7 | 70.8 | 71.5 |
+| Decode at 32K, 1 session, prose (tok/s) | 60.7 | 60.3 | 58.9 | 57.2 | 59.4 | 58.4 | 56.3 |
+| Decode, 4 sessions, total (tok/s) | 129.0 | 118.3 | 130.2 (1 run) | 128.1 | 127.2 | 125.8 | 128.3 |
+| Serial decode, no speculation, short context (tok/s) | 39.1 | 39.3 | 39.3 | 39.2 | 39.5 | 36.5 | 35.4 |
+
+### Method and notes
+
+The tables below show the v0.34.0 release, measured Nov 7, 2026. This is v0.37.0. Its default configuration (4 sessions of 262,144 tokens) has no column of its own in these tables. The long configurations that v0.37.0 adds are in [Long context](../README.md#long-context-opt-in) in the README. The v0.34.0 column was measured Nov 7, 2026 on a build of v0.34.0 (it differs from the release engine in the version text only), balanced power profile (GPU clock 2,303 MHz on the 4.05 pack and 2,292 MHz on the 3.05 pack), with the public files and the six words listed below. The charts and the by-length text below still show the v0.33.0 release, because no chart run was made for v0.34.0. The tables hold the release ladder of each release, one column each. The 4.05 code value of the v0.34.0 column is the ladder row; the older columns take that row from the decode chart. The v0.33.0 column was measured Nov 3, 2026 on the v0.33.0 build, balanced power profile (GPU clock 2,289 to 2,295 MHz). The v0.32.0 column is the ladder run of Nov 3, 2026 on the v0.32.0 build. The 4-session row of that column has no value on the 4.05 pack: one session of each run stopped early. On the 3.05 pack it is from one of the two runs, for the same reason. The numbers of v0.32.0 in the text and in the charts come from the runs by context length. Those runs were measured Nov 3, 2026. The vision loader fix of v0.32.0 came after these runs; it changes only the vision load path, not prefill or decode.
+In the tables, each value is the median of 2 runs (the v0.34.0 column: 2 runs, A and B). The server ran 4 sessions of 262,144 tokens with image input and speculative decoding (MTP)
+on, as in daily use, with the public files and no tuned draft head file. The v0.34.0, v0.33.0 and v0.32.0 runs set two options that are unset in the engine itself: `CRUCIBLE_DRAFT_HEAD=q2` and `CRUCIBLE_DRAFT_CHAIN=hc8,lead` (see the [Changelog](../CHANGELOG.md)); the earlier runs did not. They change the drafts only, and the verify pass checks every draft. `./crucible start` and the [Docker](DOCKER.md) run line set these two words. They also set `CRUCIBLE_PLE_HOST=1` and `CRUCIBLE_COMPACT_STATE=1`, which are part of the measured configuration. The v0.34.0 and v0.33.0 runs also set `CRUCIBLE_PLE_FETCH=1`, a host read hint for the PLE table; the v0.32.0 runs did not. `./crucible start` and the Docker run line set all six words of this paragraph, with 4 streams of 262,144 tokens, `--conversation-cache-mib 9700` and `--host-reserve-mib 11264`. If you start the engine or `python -m server` yourself with none of them (no `CRUCIBLE_DRAFT_HEAD` and no `CRUCIBLE_DRAFT_CHAIN`), we expect decode as in v0.31.0; we did not measure that. `python -m server` alone keeps the conversation cache off (`--conversation-cache-mib 0`): every follow-up turn then prefills the whole conversation again, and the server prints a notice at start. The v0.34.0, v0.33.0 and v0.32.0 runs used prefill launches of 16,384 rows (`CRUCIBLE_PF_LAUNCH_ROWS=16384+128`, the default of the engine; the service sets it by name); the earlier columns used the settings of their own time (4.05 pack: 8,192 rows; 3.05 pack: 16,384 rows for v0.31.0 and v0.30.0, 8,192 rows for v0.26.0 and v0.22.0). Every row uses prompts that no
+cache has seen, except the re-send row. The v0.32.0, v0.31.0, v0.30.0, v0.26.0 and v0.22.0 columns are earlier releases, measured with the same tool (4.05 pack: v0.32.0 on Nov 3, v0.31.0 on Nov 1, v0.30.0 on Oct 31, 2026, the other two in the run series of Oct 27 to 28, 2026; 3.05 pack: v0.33.0 and v0.32.0 on Nov 3, the others on Nov 1 to 2,
+2026, with the public files and no tuned draft head file). What changed since v0.32.0 is in the [Changelog](../CHANGELOG.md).
+
+Two runs per cell is a small sample. Against v0.33.0, the cold prefill rates of the v0.34.0 column are within 1.1% on both packs (the 4.05 pack reads 1.1% lower at 32K, and the two runs of that cell differ by 1.1%), decode with 4 sessions reads 3.9% higher on the 4.05 pack and 9.0% higher on the 3.05 pack, and serial decode is within 0.5%. Decode with 1 session changes between runs and between prompts, because the draft head predicts some text better than other text. In the run series of Oct 27 to 28, 11 builds span 60.5 to 66.9 tok/s on the 4.05 code row, so a difference of that size in the decode rows is not a result. The cold prefill rows and the re-send row move less. The 4.05 code row
+comes from the decode chart (v0.22.0 and v0.26.0 Oct 29, v0.30.0 Oct 31, v0.31.0 Nov 1, v0.32.0 and v0.33.0 Nov 3). Against v0.32.0 in the runs by context length (same tool and prompts; v0.32.0 measured Nov 3, v0.33.0 on Nov 3, see
+[Results](#decode-by-context-length)), the prefill rate of v0.33.0 changes by -1.8% to +1.9% on the 4.05 pack and by +1.5% to +2.6% on the 3.05 pack, per context length from 32K to 250K (ratio of the medians),
+and the decode rate changes by -3.2% to +0.4% on the 4.05 pack and by +1.7% to +2.9% on the 3.05 pack. On the 4.05 pack the change is not the same at each length: prefill reads 1.2% higher at 32K and 1.8% lower at 192K, and decode reads equal at 32K (+0.1%) and 3.2% lower at 250K. The two runs are on the same day but not in one session, so a part of the difference is the clock and the load. We report the ranges and do not claim a gain or a loss on that pack. On the 3.05 pack the gain holds at every length. Decode with 4
+sessions on the 4.05 pack reads 117.6 tok/s for v0.31.0 (Nov 1), 102.4 for v0.30.0 (Oct 31; the two runs gave 98.3 and 106.6) and 106.9 for v0.26.0; this row varies between runs, so a difference of one table value is not a result by itself. All 3.05 columns ran with the public files and no tuned draft head file. The v0.32.0 column on the 4.05 pack has no 4-session value: one session of each run stopped after 13 tokens. On the 3.05 pack one session of the second run stopped after 5 tokens, so that value is from one run. All values use the balanced power profile; the performance profile gives
+other prefill rates ([Rivals](RIVALS.md#the-power-profile-run-of-oct-26-2026)). More data, the method and the older tables are in [Results](#release-ladder).
+
+**Prefill by context length, 4.05 bpw pack** (tokens per second, median of 4 runs per point for v0.22.0 and v0.26.0, run of Oct 28 to 29;
+2 runs per point for v0.30.0, run of Oct 31, for v0.31.0, run of Nov 1, for v0.32.0, run of Nov 3, and for v0.33.0, run of Nov 3, 2026). Lines: v0.22.0 purple, v0.26.0 teal, v0.30.0 orange, v0.31.0 yellow, v0.32.0 blue, v0.33.0 green.
+
+**Decode by context length, 4.05 bpw pack** (tokens per second, median of up to 4 samples for v0.22.0 and v0.26.0, up to 6 for v0.30.0, v0.31.0 and v0.32.0; v0.22.0 and v0.26.0 from the run of
+Oct 29, 2026, v0.30.0 from the run of Oct 31, 2026, v0.31.0 from the run of Nov 1, 2026, v0.32.0 and v0.33.0 from the runs of Nov 3, 2026; v0.22.0 purple, v0.26.0 teal, v0.30.0 orange, v0.31.0 yellow, v0.32.0 blue, v0.33.0 green).
+
+All 5 builds got the same prompts. On the same prompts and the same reply text, v0.30.0 decodes 1.06 to 1.08 times as fast as v0.26.0 from 64K to 250K, and 1.07 times at 32K in run 2 (1.20 with run 1, in which v0.26.0 read low). The v0.30.0, v0.31.0 and v0.32.0 lines hold up to 6 samples per point; the other two hold up to 4. The v0.32.0 run set the options named above (draft head, draft chain, launch rows); the others did not. v0.26.0 read low in run 1 at 32K (47.2 and 51.6 tok/s, the others 62.9
+to 64.7); the cause is not found. The third question of each unit of the run of Oct 29 was invalid (a 10-token reply, no decode
+number). The 3.05 chart and the data are in [Results](#decode-by-context-length).
 
 ## Measurement details
 

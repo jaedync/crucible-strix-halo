@@ -121,7 +121,7 @@ same install in single steps, for a person or an agent that does not use the scr
 
 ## Step 1: ROCm, the HIP compiler and GPU access
 
-Install the current ROCm (10.1 tested). ROCm 7.2.4 is tested too: if you have it, keep it. Setup passes both with no message.
+For a build from source, install ROCm 7.2.4 (see step 4). The release engine also runs on ROCm 10.1. Setup passes both with no message.
 The engine needs the HIP runtime. A source build (step 4) also needs the HIP compiler. It uses no ROCm libraries (no rocBLAS, no
 hipBLAS). The tested system is Arch Linux with kernel 7.2. Other distributions are not tested.
 
@@ -132,10 +132,10 @@ sudo pacman -Syu --needed base-devel git python hip-runtime-amd rocm-llvm rocmin
 ```
 
 `-Syu` also updates the rest of the system (Arch does not support a partial update). If the kernel was updated,
-restart before step 2. These packages give the ROCm version of the Arch repository. For the newest ROCm, follow AMD's
+restart before step 2. These packages give the ROCm version of the Arch repository. For ROCm 10.1 (to run the release engine only), follow AMD's
 instructions (https://rocm.docs.amd.com).
 
-On another distribution, install the current ROCm with AMD's instructions for your distribution
+On another distribution, install ROCm 7.2.4 with AMD's instructions for your distribution
 (https://rocm.docs.amd.com). You need `rocminfo`, and `hipcc` for a source build.
 
 Your user must be able to open the GPU. Run `groups`. If `render` or `video` is not in the list:
@@ -149,7 +149,7 @@ Then log out and log in again (or restart).
 **Check:**
 
 ```sh
-pacman -Q hip-runtime-amd                      # Arch: expect a version, for example 7.2.4-1 (10.1 is the current ROCm)
+pacman -Q hip-runtime-amd                      # Arch: expect a version, for example 7.2.4-1
 /opt/rocm/bin/hipcc --version | head -1
 /opt/rocm/bin/rocminfo | grep -m1 -o gfx1151   # expect: gfx1151
 groups                                         # expect: render and video in the list
@@ -228,6 +228,9 @@ hf version
 ```
 
 ## Step 4: build the engine
+
+To build from source, use the ROCm 7.2.4 compiler for now: an engine built with the ROCm 10.1 compiler does not pass our token
+gates yet. The release engine runs on ROCm 10.1 and on 7.2.4.
 
 ```sh
 make
