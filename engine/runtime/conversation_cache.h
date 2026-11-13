@@ -142,8 +142,8 @@ class PrefixCache {
   }
   // a save that shares host chunks with a held snapshot needs only `host_bytes` of new host memory, and an
   // eviction frees only `freed(entry)` of host memory (its chunks that no other snapshot uses). The budget still
-  // counts every entry at its whole size. A deferred victim can count toward the budget before Insert, but a
-  // protected fallback must stay available if the new snapshot cannot be allocated without freeing it.
+  // counts every entry at its whole size. A selected fallback stays until Insert when the host reserve permits
+  // both snapshots. If admission needs its memory to meet the reserve, it is evicted before capture.
   template<class Tier, class Freed>
   bool ReserveHost(size_t bytes, size_t host_bytes, uint64_t available, uint64_t reserve, Tier tier, Freed freed,
                    DeferredEviction* deferred = nullptr) {

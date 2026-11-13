@@ -1322,7 +1322,7 @@ static void EarlierFrontierOnHistoryRewrite() {
   assert(frontier(candidate, next, next.size() - 1, successor, ram));
   assert(candidate.Evictions() == 1 && restore(candidate, next) == successor.position);
   assert(restore(candidate, Fork(next, common, 300000)) == 8192);
-  std::puts("history rewrite: 8192 -> 57344 cached, 85465 -> 36313 prefill; failed saves retain 57344");
+  std::puts("history rewrite: 8192 -> 57344 cached, 85465 -> 36313 prefill");
 }
 
 static void PromoteExistingStableFrontier() {
@@ -1338,11 +1338,31 @@ static void PromoteExistingStableFrontier() {
   assert(!c.cache.Capture(rewrite, c.policy, {24, CacheRetention::Session, true}, 64, uint64_t(9) << 30,
                           [] { return std::shared_ptr<const Snapshot>(); }));
   assert(c.Hit(rewrite) == 16);
-  // A same-key capture can replace the point only once it has a new snapshot.
+  // With spare host memory, a failed same-key capture keeps the old snapshot.
   bool attempted = false;
   assert(!c.cache.Capture(original, c.policy, {16, CacheRetention::Session}, 64, uint64_t(9) << 30,
                           [&]() -> std::shared_ptr<const Snapshot> { attempted = true; throw std::bad_alloc(); }));
   assert(attempted && c.Hit(rewrite) == 16);
+}
+
+static void FailedStableAdvanceAtHostReserve() {
+  const auto original = Tokens(1, 48);
+  const auto rewrite = Fork(original, 20, 1000);
+  constexpr size_t bytes = 64;
+  for (const bool room_for_both : {true, false}) {
+    Cache c(1, 2);
+    assert(c.Capture(original, 8, CacheRetention::Shared));
+    assert(c.Capture(original, 16, CacheRetention::Session));
+    assert(c.cache.KeepStable(std::span(original).first(16), c.policy));
+    assert(c.Hit(rewrite) == 16);
+
+    const uint64_t available = c.cache.HostReserve() + (room_for_both ? bytes : bytes / 2);
+    assert(!c.cache.Capture(original, c.policy, {32, CacheRetention::Session, false, true}, bytes, available,
+                            []() -> std::shared_ptr<const Snapshot> { throw std::bad_alloc(); }));
+    assert(c.cache.LastRefusal() == "memory");
+    assert(c.cache.Evictions() == (room_for_both ? 0 : 1));
+    assert(c.Hit(rewrite) == (room_for_both ? 16 : 8));
+  }
 }
 
 static void AdvanceFrontierAtHostReserve() {
@@ -1364,6 +1384,7 @@ static void AdvanceFrontierAtHostReserve() {
 int main() {
   EarlierFrontierOnHistoryRewrite();
   PromoteExistingStableFrontier();
+  FailedStableAdvanceAtHostReserve();
   AdvanceFrontierAtHostReserve();
   FailedCaptureKeepsFallback();
   SpanReplayTail();
