@@ -1194,7 +1194,7 @@ static void LatestRefusal() {
   assert(c.cache.LastRefusal() == std::string("protected"));
 }
 // A changed reply makes room for a new tail in a full cache while preserving an unrelated resume point.
-static void DeadBranchTails() {
+static void ContradictedTails() {
   const auto x = Tokens(1, 40), y = Tokens(101, 40);
   const uint64_t ram = uint64_t(9) << 30;
   // The client's next prompt keeps x's first 18 tokens: its prompt (16) and 2 of the 5 generated ones, then differs.
@@ -1203,8 +1203,8 @@ static void DeadBranchTails() {
     Cache c(2, 2);
     assert(c.Tail(x, 21, true, false, false, ram, 16));                 // trusted: x's resume point
     assert(c.Capture(y, 16, CacheRetention::Session));                  // y's resume point: the budget is full
-    assert(c.Tail(next, 30, false, false, false, ram, 25));             // untrusted: x's dead tail makes the room
-    assert(c.cache.DeadBranches() == 1 && c.cache.SupersededEvictions() == 1);
+    assert(c.Tail(next, 30, false, false, false, ram, 25));             // untrusted: x's demoted tail makes the room
+    assert(c.cache.DemotedBranches() == 1 && c.cache.SupersededEvictions() == 0);
     assert(c.HitTail(x) == 0 && c.Hit(y) == 16 && c.HitTail(Fork(next, 30, 700)) == 30);
   }
   {
@@ -1212,27 +1212,27 @@ static void DeadBranchTails() {
     Cache c(2, 2);
     assert(c.Tail(x, 21, true, false, false, ram, 16) && c.Capture(y, 16, CacheRetention::Session));
     assert(!c.Tail(x, 30, false, false, false, ram, 25) && c.cache.Status().last.refused == "protected");
-    assert(c.cache.DeadBranches() == 0 && c.HitTail(x) == 21);
+    assert(c.cache.DemotedBranches() == 0 && c.HitTail(x) == 21);
   }
   {
     // The difference lies in the later request's own generated tokens, past its client prompt: no proof, no mark.
     Cache c(2, 2);
     assert(c.Tail(x, 21, true, false, false, ram, 16) && c.Capture(y, 16, CacheRetention::Session));
     assert(!c.Tail(next, 30, false, false, false, ram, 17) && c.cache.Status().last.refused == "protected");
-    assert(c.cache.DeadBranches() == 0 && c.HitTail(x) == 21);
+    assert(c.cache.DemotedBranches() == 0 && c.HitTail(x) == 21);
   }
   {
     // A handover copy records no prompt length, so it never decides; neither does a tail of another conversation.
     Cache c(2, 2);
     assert(c.Tail(x, 21, true, false, false, ram, 16) && c.Capture(y, 16, CacheRetention::Session));
     assert(!c.Tail(next, 30) && c.cache.Status().last.refused == "protected");
-    assert(!c.Tail(Fork(y, 0, 900), 30, false, false, false, ram, 25) && c.cache.DeadBranches() == 0);
+    assert(!c.Tail(Fork(y, 0, 900), 30, false, false, false, ram, 25) && c.cache.DemotedBranches() == 0);
   }
   {
     // A later frontier (prompt tokens only) contradicts the tail as well.
     Cache c(2, 3);
     assert(c.Tail(x, 21, true, false, false, ram, 16) && c.Capture(y, 16, CacheRetention::Session));
-    assert(c.Capture(next, 24, CacheRetention::Session) && c.cache.DeadBranches() == 1);
+    assert(c.Capture(next, 24, CacheRetention::Session) && c.cache.DemotedBranches() == 1);
   }
 }
 
@@ -1253,20 +1253,20 @@ static void SamePromptSiblingTails() {
     assert(c.HitTail(b) == 21 && c.HitTail(next) == 30);
     // A's old tail is gone. A later admission must still keep B.
     assert(!c.Capture(Tokens(1000, 40), 16, CacheRetention::Session));
-    assert(c.cache.DeadBranches() == 0 && c.HitTail(b) == 21);
+    assert(c.cache.DemotedBranches() == 0 && c.HitTail(b) == 21);
     // Regenerating from the same prompt has no exact RAM tail to replay.
     const auto retry = Fork(next, 25, 1100);
     assert(c.cache.PeekTail(std::span<const int>(retry).first(25), c.policy) == 0);
     assert(!c.Tail(retry, 30, false, false, false, ram, 25));
     assert(c.cache.Status().last.refused == "protected");
-    assert(c.cache.DeadBranches() == 0 && c.HitTail(b) == 21);
+    assert(c.cache.DemotedBranches() == 0 && c.HitTail(b) == 21);
   }
   {
     Cache c(2, 2, true);
     fill(c);
     assert(!c.Capture(next, 24, CacheRetention::Session));
     assert(c.cache.Status().last.refused == "protected");
-    assert(c.cache.DeadBranches() == 0 && c.HitTail(b) == 21);
+    assert(c.cache.DemotedBranches() == 0 && c.HitTail(b) == 21);
   }
   for (const bool resident : {false, true}) {
     // A was restored from disk or its slot, so the host has only B and another live session.
@@ -1279,12 +1279,12 @@ static void SamePromptSiblingTails() {
     const size_t floor = c.cache.RetirementFloor(std::span<const int>(next).first(25), c.policy, 21);
     assert(!c.Tail(next, 30, true, false, resident, ram, 25, floor));
     assert(c.cache.Status().last.refused == (resident ? "resident" : "protected"));
-    assert(c.cache.DeadBranches() == 0 && c.HitTail(b) == 21);
+    assert(c.cache.DemotedBranches() == 0 && c.HitTail(b) == 21);
     if (resident) {
       // A delayed handover has only the checkpoint key and the evidence recorded when it was kept.
       const std::vector<int> point(next.begin(), next.begin() + 24);
       assert(!c.Capture(point, 24, CacheRetention::Session, floor));
-      assert(c.cache.Status().last.refused == "protected" && c.cache.DeadBranches() == 0);
+      assert(c.cache.Status().last.refused == "protected" && c.cache.DemotedBranches() == 0);
     }
   }
   {
@@ -1296,7 +1296,7 @@ static void SamePromptSiblingTails() {
     assert(c.Tail(longer, 30, false, false, false, ram, 16));
     assert(c.HitTail(longer) == 30 && c.HitTail(a) == 21);
     assert(c.Tail(a, 30, true, false, false, ram, 25));
-    assert(c.cache.DeadBranches() == 0 && c.HitTail(longer) == 30);
+    assert(c.cache.DemotedBranches() == 0 && c.HitTail(longer) == 30);
   }
   {
     // Neither cached answer matches the edit. A later admission still cannot attribute it to A or B.
@@ -1304,7 +1304,73 @@ static void SamePromptSiblingTails() {
     fill(c);
     assert(c.Tail(Fork(a, 17, 900), 30, false, false, false, ram, 25));
     assert(c.Capture(Tokens(1000, 40), 16, CacheRetention::Session));
-    assert(c.cache.DeadBranches() == 0 && c.HitTail(a) == 21 && c.HitTail(b) == 21);
+    assert(c.cache.DemotedBranches() == 0 && c.HitTail(a) == 21 && c.HitTail(b) == 21);
+  }
+}
+
+// Without B's first tail, its cold continuation cannot prove that A's reply is dead.
+static void ColdSiblingTail() {
+  const auto a = Tokens(1, 40), b = Fork(a, 18, 500), other = Tokens(1000, 40);
+  const uint64_t ram = uint64_t(9) << 30;
+  {
+    Cache c(1, 2);
+    using Entry = BatchConversationCache<Snapshot>::Entry;
+    std::vector<std::shared_ptr<const Entry>> spilled;
+    c.cache.SetSpill([&](std::span<const int> key, const auto&, const std::shared_ptr<const Entry>& entry,
+                        int, uint64_t) {
+      assert(std::ranges::equal(key, entry->snapshot->hist));
+      spilled.push_back(entry);
+      return true;
+    });
+    assert(c.Tail(a, 21, false, false, false, ram, 16) && c.HitTail(a) == 21);
+    assert(c.cache.PeekTail(b, c.policy) == 0);
+    assert(c.Tail(b, 30, false, false, false, ram, 25));
+    assert(c.cache.DemotedBranches() == 1 && c.cache.Evictions() == 0);
+    assert(c.Capture(other, 16, CacheRetention::Session));
+    assert(c.cache.SupersededEvictions() == 0 && spilled.size() == 1);
+    assert(std::ranges::equal(spilled.front()->snapshot->hist, std::span(a).first(21)));
+    assert(c.cache.PeekTail(b, c.policy) == 30);
+  }
+  for (const bool slot : {false, true}) {
+    Cache c(1, 2);
+    assert(c.Tail(a, 21, false, false, false, ram, 16) && c.HitTail(a) == 21);
+    assert(c.Tail(b, 30, false, false, false, ram, 25));
+    assert(c.cache.DemotedBranches() == 1);
+    // A returns before pressure. The saved B prompt must not demote it again in Plan.
+    if (slot) c.cache.Touch(std::span(a).first(21), c.policy);
+    else assert(c.HitTail(a) == 21);
+    assert(c.Capture(other, 16, CacheRetention::Session));
+    assert(c.cache.DemotedBranches() == 1 && c.cache.SupersededEvictions() == 0);
+    assert(c.HitTail(a) == 21 && c.cache.PeekTail(b, c.policy) == 0);
+  }
+  for (const bool slot : {false, true}) {
+    Cache c(2, 2);
+    assert(c.Tail(a, 21, false, false, false, ram, 16) && c.HitTail(a) == 21);
+    assert(c.Tail(b, 30, false, false, false, ram, 25) && c.HitTail(b) == 30);
+    assert(c.HitTail(a) == 21);
+    // Reusing B refreshes its retention, not the age of its saved contradiction.
+    if (slot) c.cache.Touch(std::span(b).first(30), c.policy);
+    else assert(c.HitTail(b) == 30);
+    assert(!c.Capture(other, 16, CacheRetention::Session));
+    assert(c.cache.LastRefusal() == "protected" && c.cache.DemotedBranches() == 1);
+    assert(c.cache.Evictions() == 0 && c.HitTail(a) == 21 && c.HitTail(b) == 30);
+  }
+  for (const bool revalidate : {false, true}) {
+    Cache c(2, 2);
+    assert(c.Tail(a, 21, false, false, false, ram, 16) && c.HitTail(a) == 21);
+    assert(c.cache.Capture(b, c.policy, {24, CacheRetention::Session, true}, 64, ram, [&] {
+      auto snapshot = std::make_shared<Snapshot>();
+      snapshot->hist.assign(b.begin(), b.begin() + 24);
+      snapshot->resume = BatchFrontierResume(24, 22);
+      return std::shared_ptr<const Snapshot>(snapshot);
+    }));
+    assert(c.HitTail(a) == 21 && c.Hit(b) == 24);
+    // A speculative frontier first becomes client evidence on its first hit, not its save.
+    if (revalidate) assert(c.HitTail(a) == 21 && c.Hit(b) == 24);
+    assert(c.Capture(other, 16, CacheRetention::Session) == !revalidate);
+    assert(c.cache.DemotedBranches() == (revalidate ? 0 : 1));
+    assert(c.cache.SupersededEvictions() == 0);
+    if (revalidate) assert(c.HitTail(a) == 21 && c.Hit(b) == 24);
   }
 }
 
@@ -1319,7 +1385,7 @@ static void OldTailHandover() {
   // A slot copy carries its floor, but its old prompt cannot retire the newer reply.
   assert(!c.Tail(old, 30, true, false, false, ram, 0, 21));
   assert(c.cache.Status().last.refused == "protected");
-  assert(c.cache.DeadBranches() == 0 && c.HitTail(newer) == 30);
+  assert(c.cache.DemotedBranches() == 0 && c.HitTail(newer) == 30);
 
   Cache room(2, 2, true);
   assert(room.Tail(old, 30, true, false, false, ram, 0, 21));
@@ -1377,8 +1443,9 @@ int main() {
   KeyedEntries();
   TailRules();
   SessionRules();
-  DeadBranchTails();
+  ContradictedTails();
   SamePromptSiblingTails();
+  ColdSiblingTail();
   OldTailHandover();
   MissedTail();
   Peek();

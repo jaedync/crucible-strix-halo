@@ -26,8 +26,10 @@ class PrefixCache {
     size_t bytes;
     std::shared_ptr<const Snapshot> snapshot;
     bool superseded = false;
+    bool demoted = false;    // an ambiguous reply contradiction removes protection but allows disk spill
     uint64_t confirmed = 0;  // when a client prompt last showed this state is its prefix; 0: speculative
     uint64_t used = 0;       // the last save or hit
+    uint64_t client_seen = 0; // first save or hit that established client prompt evidence
     bool proven = false;     // a later request used this state or its branch (probation, BatchConversationCache)
     uint64_t active = 0;     // the session clock at the last save or hit that is not on probation
     double active_at = 0;    // the wall clock (seconds) at that save or hit
