@@ -234,8 +234,9 @@ class BatchPrefixCache {
       };
       // slot frontiers, with slot resume.
       if (session_replay_ && slot_resume_) {
+        hooks.client_event = [this] { return cache_.ClientEvent(); };
         hooks.frontier = [this](const crucible::ServeRequest& r, size_t cursor,
-                                const std::function<bool(const crucible::SlotFrontier&)>& keep) {
+                                const std::function<bool(const crucible::SlotFrontier&, size_t)>& keep) {
           return KeepFrontier(r, cursor, keep);
         };
         hooks.frontier_fits = [this](const crucible::ServeRequest& r, const crucible::SlotCheckpoint& point) {
@@ -498,6 +499,7 @@ class BatchPrefixCache {
                    "reason=none\n", tokens, static_cast<unsigned long long>(request_));
       crucible::BatchRestore hit{tokens, entry->retention == crucible::CacheRetention::Shared};
       hit.tier = crucible::BatchCacheTier::Host;
+      hit.retirement_floor = entry->retirement_floor;
       return hit;
     }
     // The host held nothing for this prompt: name why, and count the lookup.
@@ -738,9 +740,11 @@ class BatchPrefixCache {
     const size_t evictions = cache_.Evictions();
     const auto base = Base(slot);
     const auto share = Share(sequence, held->state, bytes, base);
+    // The saved reply predates this handover. Its prompt is not new evidence against other tails.
     const bool saved = cache_.CaptureTail(held->key, Policy(held->tenant), bytes, HostAvailable(),
                                           [&] { return SaveSlot(sequence, held->state, stk, carry, base); },
-                                          held->trusted || resumed, held->guarded, false, held->hist, share);
+                                          held->trusted || resumed, held->guarded, false, held->hist, share,
+                                          0, held->retirement_floor);
     if (!saved) cache_.NoteRefused(held->key, Policy(held->tenant), held->state.length);  // the tail's prompt is its turn's start
     const auto status = cache_.Status();
     std::fprintf(stderr, "session_replay spill slot=%d tokens=%zu replay=%d resumed=%d saved=%d refused=%s evicted=%zu "
@@ -816,7 +820,7 @@ class BatchPrefixCache {
   // host copies (other sessions restore them). A full-window request that warmed its MTP rows keeps its host copy
   // with them (a checkpoint holds target state only; LOW-1).
   bool KeepFrontier(const crucible::ServeRequest& r, size_t cursor,
-                    const std::function<bool(const crucible::SlotFrontier&)>& keep) {
+                    const std::function<bool(const crucible::SlotFrontier&, size_t)>& keep) {
     if (r.cache_control == "bypass") return false;
     for (const auto& frontier : crucible::BatchCacheFrontiers(r.ids.size(), size_t(r.cache_prefix_tokens), rows_,
                                                               size_t(r.shared_prefix_tokens))) {
@@ -829,10 +833,10 @@ class BatchPrefixCache {
       const auto key = Key(r, r.ids);
       const std::span<const int> below(key.data(), cursor);
       // Asked before the marks below, as Capture asks it before Admit.
-      const crucible::SlotFrontier meta{size_t(r.cache_prefix_tokens), frontier.speculative,
-                                        cache_.ProvenBelow(below, Policy(r.tenant))};
-      if (!keep(meta)) return false;
-      cache_.KeepInSlot(below, Policy(r.tenant), frontier.speculative);
+      const auto policy = Policy(r.tenant);
+      const crucible::SlotFrontier meta{size_t(r.cache_prefix_tokens), frontier.speculative, cache_.ProvenBelow(below, policy)};
+      if (!keep(meta, cache_.RetirementFloor(key, policy))) return false;
+      cache_.KeepInSlot(below, policy, frontier.speculative);
       std::fprintf(stderr, "slot_frontier keep slot=%d tokens=%zu speculative=%d\n", Slot(), cursor,
                    int(frontier.speculative));
       return true;
@@ -874,7 +878,7 @@ class BatchPrefixCache {
       return snapshot;
     };
     const bool saved = cache_.Capture(point.key, Policy(point.tenant), frontier, bytes, HostAvailable(), save, point.hist,
-                                      share, point.frontier.proven);
+                                      share, point.frontier.proven, point.retirement_floor, point.frontier.client_seen);
     if (!saved) cache_.NoteRefused(point.key, Policy(point.tenant), point.hist.size());
     // Numeric fields only (a test script sums them). copy_bytes: the bytes that the device copied (not the cache's copy class).
     // `request`: the open that wrote over the point (fix 2, item 10).
@@ -1058,15 +1062,19 @@ class BatchPrefixCache {
     const bool resident = slot_resume_ && source.slot >= 0;
     const size_t evictions = cache_.Evictions();
     auto key = Key(r, hist);
+    const auto policy = Policy(r.tenant);
+    const size_t retirement_floor = cache_.RetirementFloor(std::span<const int>(key).first(r.ids.size()), policy,
+                                                          source.retirement_floor);
     const auto base = Base(slot);
     const auto share = Share(sequence, state, bytes, base);
-    const bool saved = cache_.CaptureTail(key, Policy(r.tenant), bytes, HostAvailable(),
+    const bool saved = cache_.CaptureTail(key, policy, bytes, HostAvailable(),
                                           [&] { return SaveSlot(sequence, state, stk, carry, base); },
-                                          trusted, guarded, resident, hist, share, r.ids.size());
-    if (!saved) cache_.NoteRefused(key, Policy(r.tenant), r.ids.size());
+                                          trusted, guarded, resident, hist, share, r.ids.size(), retirement_floor);
+    if (!saved) cache_.NoteRefused(key, policy, r.ids.size());
     if (resident) {
-      cache_.SetResident(source.slot, key, replay, Policy(r.tenant));
-      held_.at(size_t(source.slot)) = Held{std::move(hist), std::move(key), state, trusted, guarded, r.tenant};
+      cache_.SetResident(source.slot, key, replay, policy);
+      held_.at(size_t(source.slot)) = Held{std::move(hist), std::move(key), state, trusted, guarded, r.tenant,
+                                           retirement_floor};
     }
     std::fprintf(stderr, "session_replay tail tokens=%zu replay=%d saved=%d trusted=%d evicted=%zu bytes=%zu "
                  "cache_bytes=%zu copy_bytes=%zu shared_bytes=%zu seconds=%.6f\n", logical, replay, int(saved),
@@ -1097,6 +1105,7 @@ class BatchPrefixCache {
     crucible::ConversationResume state;
     bool trusted = false, guarded = false;
     crucible::StateTenant tenant = crucible::kLocalTenant;
+    size_t retirement_floor = 0;
   };
   Engine& engine_;
   BatchMtpSlots* mtp_ = nullptr;

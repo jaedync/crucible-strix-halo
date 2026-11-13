@@ -138,6 +138,28 @@ struct FixtureT {
 };
 using Fixture = FixtureT<MockEngine>;
 
+void EndKeepsRetirementFloor() {
+  Fixture f;
+  std::vector<crucible::BatchTailSource> sources;
+  const auto keep = f.hooks.tail;
+  f.hooks.tail = [&](const ServeRequest& r, std::span<const int> generated, int replay, crucible::BatchTailSource source) {
+    sources.push_back(source);
+    return keep(r, generated, replay, source);
+  };
+  f.session.SetCacheHooks(f.hooks);
+
+  const auto prompt = Prompt(25, 1, 6);
+  f.host_tail = 21;
+  const auto first = f.Run(1, prompt).second;
+  assert(first.cached_tokens == 21 && !first.end_resume);
+  f.host_tail = 0;
+  const auto retry = f.Run(2, prompt).second;
+  assert(retry.cached_tokens == 25 && retry.end_resume);
+  assert(sources.size() == 2);
+  assert(sources[0].replayed == 21 && sources[0].retirement_floor == 21);
+  assert(sources[1].replayed == 0 && sources[1].retirement_floor == 21);
+}
+
 // A: greedy, sampled, one token, a stop token, and the switch off.
 void Identical() {
   {
@@ -1301,6 +1323,7 @@ int main() {
   MarginCutKeepsItsBuffer();
   ImageEndResume();
   Identical();
+  EndKeepsRetirementFloor();
   ScoringAtEnd();
   Deferred();
   Speculative();

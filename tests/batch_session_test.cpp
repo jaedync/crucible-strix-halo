@@ -94,7 +94,7 @@ void JoinTests() {
       hooks.checkpoint_save = [&](int slot, int index) { saved.emplace_back(slot, index); };
       hooks.checkpoint_load = [](int, int, const crucible::SlotCheckpoint&) {};
       hooks.frontier = [](const crucible::ServeRequest&, size_t,
-                          const std::function<bool(const crucible::SlotFrontier&)>& keep) { return keep({}); };
+                          const std::function<bool(const crucible::SlotFrontier&, size_t)>& keep) { return keep({}, 0); };
       hooks.frontier_fits = [](const crucible::ServeRequest&, const crucible::SlotCheckpoint&) { return false; };
       hooks.handover = [](int, int, const crucible::SlotCheckpoint&) {};
       hooks.cut_save = [&](int slot, int index) { cut_saved.emplace_back(slot, index); };
@@ -673,11 +673,11 @@ int main() {
     assert((slot_log == std::vector<std::string>{
         "overwrite slot=0", "restore", "tail slot=0 replayed=0 guarded=0", "done slot_resume=0 cached=0",
         "overwrite slot=1", "restore", "tail slot=1 replayed=0 guarded=0", "done slot_resume=0 cached=0",
-        "release slot=0 resumed=1", "resume slot=0", "tail slot=0 replayed=1 guarded=1", "done slot_resume=1 cached=8",
+        "release slot=0 resumed=1", "resume slot=0", "tail slot=0 replayed=8 guarded=1", "done slot_resume=1 cached=8",
         "release slot=0 resumed=0", "overwrite slot=0", "restore", "tail slot=0 replayed=0 guarded=0",
         "done slot_resume=0 cached=0"}));
     // The host path reports the same source: the restored tail was guarded. It has no release hook.
-    assert(host_log[7] == "tail slot=0 replayed=1 guarded=1");
+    assert(host_log[7] == "tail slot=0 replayed=8 guarded=1");
     assert(host_log[6] == "restore" && host_log[8] == "done slot_resume=0 cached=8");
   }
 
