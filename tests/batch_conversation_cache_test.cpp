@@ -1236,6 +1236,11 @@ static void FailedCaptureKeepsFallback() {
   assert(!c.cache.Capture(ids, c.policy, {32, CacheRetention::Session}, 64, c.cache.HostReserve() + 64, fail));
   assert(attempted && c.cache.LastRefusal() == "memory");
   assert(c.cache.Evictions() == 0 && c.Hit(ids) == 16);
+
+  attempted = false;
+  assert(!c.cache.Capture(ids, c.policy, {32, CacheRetention::Session}, 64, c.cache.HostReserve(), fail));
+  assert(!attempted && c.cache.LastRefusal() == "protected");
+  assert(c.cache.Evictions() == 0 && c.Hit(ids) == 16);
   assert(c.Capture(ids, 32, CacheRetention::Session));
   assert(c.Hit(ids) == 32 && c.cache.Bytes() == 64 && c.cache.SupersededEvictions() == 1);
 

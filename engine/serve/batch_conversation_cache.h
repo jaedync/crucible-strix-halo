@@ -311,7 +311,8 @@ class BatchConversationCache {
         Supersede(ids.first(frontier.position), policy, [](const Entry& entry) {
           return entry.retention == CacheRetention::Session && entry.snapshot->resume.prompt_only;
         });
-    // Admit counts older superseded points first and defers the deepest when host memory allows.
+    // Refuse a new prompt frontier when the fallback is needed to meet the host reserve.
+    replaced.fallback.keep_on_pressure = true;
     const bool proven = proven_before || ExtendsProven(ids.first(frontier.position), policy);
     const uint64_t lineage = LineageFor(ids.first(frontier.position), policy);  // the miss ledger, before eviction
     if (!Admit(bytes, available, false, frontier.speculative, share, &replaced.fallback))

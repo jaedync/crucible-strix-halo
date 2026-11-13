@@ -35,6 +35,7 @@ class PrefixCache {
   struct DeferredEviction {
     const Entry* entry = nullptr;
     int tier = -1;
+    bool keep_on_pressure = false;
   };
   template<class Accept = AcceptAny>
   std::shared_ptr<const Snapshot> Find(std::span<const int> ids, const Policy& policy,
@@ -164,8 +165,10 @@ class PrefixCache {
       const Entry& victim = *order[victims].second;
       const size_t released = freed(victim);
       room += victim.bytes;
-      host_room += released;
-      if (deferred && &victim == deferred->entry) fallback_room = released;
+      if (deferred && &victim == deferred->entry) {
+        fallback_room = deferred->keep_on_pressure ? 0 : released;
+        host_room += fallback_room;
+      } else host_room += released;
       ++victims;
     }
     if (room < over || host_room < short_by) return false;
