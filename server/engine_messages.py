@@ -191,6 +191,7 @@ KNOWN = frozenset((
     'session replay needs a generated tail with target state or full MTP rows',
     'session-replay must be 0 or 1',
     'shared_prefix_tokens must be inside the prompt',
+    'stable_prefix_tokens must be inside the cache prefix',
     'short slots must be allocated after the full-context slots',
     'short slots need 1..slots-1 slots and a context below the full context',
     'short streams need 1..streams-1 slots and a short context below --ctx',

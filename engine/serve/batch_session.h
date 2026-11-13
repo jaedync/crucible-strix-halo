@@ -2,6 +2,7 @@
 #pragma once
 #include "../runtime/slot_checkpoints.h"
 #include "serve_protocol.h"
+#include "batch_conversation_cache.h"
 #include "draft_tally.h"
 #include "../runtime/batch_spec_contract.h"
 #include "cache_status.h"
@@ -660,6 +661,14 @@ class BatchSession {
         owned.slot_resume = hit.slot;
         owned.tail_guarded = hit.tail && hit.guarded;
         owned.tail_replay = hit.tail ? hit.replay : 0;
+        // A slot frontier can supply the stable point without running its prefill chunk again.
+        if (owned.options.stable_prefix_tokens && cache_.capture && hit.tokens && !hit.tail &&
+            (point || owned.frontier_copy)) {
+          const int rows = engine_.PrefillRows() > 0 ? engine_.PrefillRows() : kMaxRows;
+          const auto& r = owned.options;
+          if (hit.tokens == BatchStableFrontier(r.cache_prefix_tokens, r.shared_prefix_tokens, r.stable_prefix_tokens, rows))
+            cache_.capture(owned.options, hit.tokens);
+        }
         // An earlier change: the miss cause and the state nearest to the prompt, and the tier that served this open.
         owned.diag = hit.diag;
         if (hit.tokens) owned.diag.miss = "none";

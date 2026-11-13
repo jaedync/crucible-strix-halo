@@ -83,13 +83,55 @@ class ModelTokenizer:
         if request.kind != "chat":
             return 0
         system = request.messages[:1] if request.messages and request.messages[0]["role"] == "system" else ()
-        # The template needs a user turn. A sentinel turn marks where the shared block ends.
+        return self._prefix_before_user(request, ids, system)
+
+    def stable_prefix_tokens(self, request, ids):
+        """An earlier cache point before a suffix the client can rewrite."""
+        if request.kind != "chat":
+            return 0
+        messages = request.messages
+        cut = len(messages)
+        if request.images:
+            # Pi sends tool-result images in a separate user turn. Removing them can also rewrite the tool text.
+            for index, message in enumerate(messages):
+                content = message["content"]
+                if isinstance(content, list) and any(part["type"] == "image" for part in content):
+                    cut = index
+                    while cut and messages[cut - 1]["role"] == "tool":
+                        cut -= 1
+                    break
+        last_user = None
+        for index in range(len(messages) - 1, -1, -1):
+            if messages[index]["role"] == "user":
+                content = messages[index]["content"]
+                if not isinstance(content, str):
+                    last_user = index
+                    break
+                content = content.strip()
+                if not (content.startswith("<tool_response>") and content.endswith("</tool_response>")):
+                    last_user = index
+                    break
+        if last_user is None:
+            return 0
+        if request.preserve_thinking is False:
+            for index in range(last_user + 1, len(messages)):
+                if messages[index]["role"] == "assistant":
+                    cut = min(cut, index)
+                    break
+        if (last_user == len(messages) - 1 and last_user > 0 and
+                messages[last_user - 1]["role"] in ("user", "tool") and
+                any(message["role"] == "assistant" for message in messages[:last_user])):
+            cut = min(cut, last_user)
+        return self._prefix_before_user(request, ids, messages[:cut]) if cut < len(messages) else 0
+
+    def _prefix_before_user(self, request, ids, messages):
+        # A user turn supplies the template's last query and closes any preceding tool block.
         sentinel = dict(role="user", content=SHARED_SENTINEL)
         try:
-            text, restore = self.render_prompt(request, add_generation_prompt=False, messages=system + (sentinel,))
+            text, restore = self.render_prompt(request, add_generation_prompt=False, messages=messages + (sentinel,))
         except ApiError:
-            return 0  # The shared frontier is an optimization; a template that rejects the sentinel turn skips it.
-        end = text.rfind("<|im_start|>", 0, max(text.find(SHARED_SENTINEL), 0))
+            return 0
+        end = text.rfind("<|im_start|>user\n" + SHARED_SENTINEL)
         if end <= 0:
             return 0
         prefix = self.encode_prompt(text[:end], restore)

@@ -164,7 +164,13 @@ class BatchPrefixCache {
       };
     hooks.hold = [this](const crucible::ServeRequest* r) {
       if (!r || r->cache_control != "auto" || r->ids.size() < 2) cache_.Hold({});
-      else cache_.Hold(Key(*r, r->ids));
+      else {
+        const auto key = Key(*r, r->ids);
+        cache_.Hold(key);
+        const size_t early = crucible::BatchStableFrontier(r->cache_prefix_tokens, r->shared_prefix_tokens,
+                                                         r->stable_prefix_tokens, rows_);
+        if (early) cache_.KeepStable(std::span(key).first(early), Policy(r->tenant));
+      }
     };
     hooks.request = [this](uint64_t id) { request_ = id; };
     // The miss ledger (start plan B1a): the nearest host, lost and disk states of the prompt before its open, and the
@@ -818,9 +824,10 @@ class BatchPrefixCache {
   bool KeepFrontier(const crucible::ServeRequest& r, size_t cursor,
                     const std::function<bool(const crucible::SlotFrontier&)>& keep) {
     if (r.cache_control == "bypass") return false;
-    for (const auto& frontier : crucible::BatchCacheFrontiers(r.ids.size(), size_t(r.cache_prefix_tokens), rows_,
-                                                              size_t(r.shared_prefix_tokens))) {
+    for (const auto& frontier : Frontiers(r)) {
       if (frontier.position != cursor) continue;
+      // Keep the stable point in RAM while the slot advances to the late frontier and the generation tail.
+      if (frontier.stable) return false;
       // HIGH-1: off the 128-row grid (--prefill 0, or rows that are not a multiple of 128) the host
       // copy could not be made later, so the host copies it now.
       if (frontier.retention != crucible::CacheRetention::Session || !crucible::SlotFrontierGrid(cursor, rows_))
@@ -969,21 +976,26 @@ class BatchPrefixCache {
     held_.at(size_t(slot)).reset();
     if (held) std::fprintf(stderr, "slot_frontier drop slot=%d tokens=%zu\n", slot, held->state.length);
   }
+  std::vector<crucible::CacheFrontier> Frontiers(const crucible::ServeRequest& r) const {
+    return crucible::BatchCacheFrontiers(r.ids.size(), size_t(r.cache_prefix_tokens), rows_,
+                                        size_t(r.shared_prefix_tokens), size_t(r.stable_prefix_tokens));
+  }
   // The first frontier after `cursor` that Capture may save (merged bulk launches end there).
   size_t NextCapture(const crucible::ServeRequest& r, size_t cursor) const {
     size_t next = SIZE_MAX;
     if (r.cache_control == "bypass") return next;
-    for (const auto& frontier : crucible::BatchCacheFrontiers(r.ids.size(), size_t(r.cache_prefix_tokens), rows_,
-                                                              size_t(r.shared_prefix_tokens)))
+    for (const auto& frontier : Frontiers(r))
       if (frontier.position > cursor) next = std::min(next, frontier.position);
     return next;
   }
   // x4-tail: `from` (the cut buffer) holds the fixed state at `cursor` while the slot holds later rows.
   void Capture(const crucible::ServeRequest& r, size_t cursor, const SlotCheckpointIO::Buffer* from = nullptr) {
     if (r.cache_control == "bypass") return;
-    for (const auto& frontier : crucible::BatchCacheFrontiers(r.ids.size(), size_t(r.cache_prefix_tokens), rows_,
-                                                              size_t(r.shared_prefix_tokens))) {
+    for (const auto& frontier : Frontiers(r)) {
       if (frontier.position != cursor) continue;
+      const auto key = Key(r, r.ids);
+      const auto policy = Policy(r.tenant);
+      if (frontier.stable && cache_.KeepStable(std::span(key).first(cursor), policy)) return;
       auto state = crucible::BatchFrontierResume(cursor, size_t(r.cache_prefix_tokens));
       // A full-window request saves its MTP rows when it warmed the whole prefix (else target state, same key).
       const int slot = Slot();
@@ -1007,9 +1019,9 @@ class BatchPrefixCache {
         if (!base.snapshot || base.rows <= cursor) bases_.Hold(slot, snapshot);
         return snapshot;
       };
-      const bool saved = cache_.Capture(Key(r, r.ids), Policy(r.tenant), frontier, bytes, HostAvailable(), save,
-                                        r.ids, Share(sequence, state, bytes, base));
-      if (!saved) cache_.NoteRefused(std::span<const int>(r.ids.data(), frontier.position), Policy(r.tenant));
+      const bool saved = cache_.Capture(key, policy, frontier, bytes, HostAvailable(), save, r.ids,
+                                        Share(sequence, state, bytes, base));
+      if (!saved) cache_.NoteRefused(std::span<const int>(r.ids.data(), frontier.position), policy);
       // Eviction trace for the retention policy check.
       std::fprintf(stderr, "cache_capture tokens=%zu class=%s saved=%d evicted=%zu superseded_evicted=%zu cache_bytes=%zu\n",
                    cursor, frontier.retention == crucible::CacheRetention::Shared ? "shared" : "session", int(saved),
@@ -1976,8 +1988,10 @@ inline int BatchedServe(const std::string& checkpoint, int context, int streams,
   // the line limit follows the largest slot context (serve_line.h); the server reads it from "line_bytes".
   crucible::ServeLineReader reader(0, crucible::ServeLineBytes(context));
   std::printf("{\"event\":\"ready\",\"context\":%d,\"streams\":%d,\"prefill_rows\":%d,\"slot_contexts\":[%s],"
-              "\"protocol\":\"batch-v1\",\"cache_tail\":true,\"line_bytes\":%zu,\"ping\":true,%s%s%s}\n", context, streams, engine.PrefillRows(),
-              contexts.c_str(), reader.Limit(), crucible::ReadyModelJson().c_str(), disk ? ",\"state_disk\":true,\"stage_job\":true" : "",
+              "\"protocol\":\"batch-v1\",\"cache_tail\":true,\"line_bytes\":%zu,\"ping\":true,%s%s%s%s}\n",
+              context, streams, engine.PrefillRows(),
+              contexts.c_str(), reader.Limit(), crucible::ReadyModelJson().c_str(), cache ? ",\"stable_prefix\":true" : "",
+              disk ? ",\"state_disk\":true,\"stage_job\":true" : "",
               engine.AblateRequests() ? ",\"ablate_request\":1" : "");
   std::fflush(stdout);
   std::string line;

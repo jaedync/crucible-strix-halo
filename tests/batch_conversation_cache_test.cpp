@@ -1269,7 +1269,87 @@ static void FailedCaptureKeepsFallback() {
   assert(spill_rooms == std::vector<uint64_t>{0});
 }
 
+static void EarlierFrontierOnHistoryRewrite() {
+  constexpr size_t rows = 4096, shared = 11674, common = 59401, early = 57344;
+  constexpr size_t old_prompt = 103342, next_prompt = 93657;
+  auto old = Tokens(1, old_prompt + 330);
+  auto next = Fork(old, common, 200000);
+  next.resize(next_prompt);
+  assert(size_t(std::mismatch(old.begin(), old.end(), next.begin(), next.end()).first - old.begin()) == common);
+
+  using HostCache = BatchConversationCache<Snapshot>;
+  ConversationPolicy policy;
+  policy.prefill_rows = rows;
+  const auto frontier = [&](HostCache& cache, const auto& ids, size_t boundary, CacheFrontier point, uint64_t available) {
+    return cache.Capture(ids, policy, point, 64, available, [&] {
+      auto snapshot = std::make_shared<Snapshot>();
+      snapshot->hist.assign(ids.begin(), ids.begin() + point.position);
+      snapshot->resume = BatchFrontierResume(point.position, boundary);
+      return std::shared_ptr<const Snapshot>(snapshot);
+    });
+  };
+  const auto restore = [&](HostCache& cache, const auto& ids) {
+    const auto hit = cache.Find(ids, policy, ids.size() - 1, ids.size(), rows);
+    return hit ? hit->snapshot->hist.size() : 0;
+  };
+
+  HostCache baseline(192, {}, 1);
+  const auto ram = baseline.HostReserve() + 128;
+  const auto stock = BatchCacheFrontiers(old_prompt, old_prompt - 1, rows, shared);
+  assert(stock.size() == 2 && stock[0].position == 8192 && stock[1].position == 102400);
+  for (const auto& point : stock) assert(frontier(baseline, old, old_prompt - 1, point, ram));
+  assert(restore(baseline, next) == 8192 && next.size() - restore(baseline, next) == 85465);
+
+  HostCache candidate(128, {}, 1);
+  const auto points = BatchCacheFrontiers(old_prompt, common, rows, shared);
+  assert(points.size() == 3 && points[1].position == early && points[2].speculative);
+  for (size_t i = 0; i < 2; ++i) assert(frontier(candidate, old, common, points[i], ram));
+  assert(restore(candidate, next) == early && next.size() - restore(candidate, next) == 36313);
+
+  const auto successor = BatchCacheFrontiers(next.size(), next.size() - 1, rows, shared).back();
+  assert(successor.position == 90112);
+  bool attempted = false;
+  const auto fail = [&]() -> std::shared_ptr<const Snapshot> {
+    attempted = true;
+    throw std::bad_alloc();
+  };
+  assert(!candidate.Capture(next, policy, successor, 64, ram, fail));
+  assert(attempted && candidate.LastRefusal() == "memory");
+  assert(candidate.Evictions() == 0 && restore(candidate, next) == early);
+
+  attempted = false;
+  assert(!candidate.Capture(next, policy, successor, 64, candidate.HostReserve() - 1, fail));
+  assert(!attempted && candidate.LastRefusal() == "protected");
+  assert(candidate.Evictions() == 0 && restore(candidate, next) == early);
+  assert(frontier(candidate, next, next.size() - 1, successor, ram));
+  assert(candidate.Evictions() == 1 && restore(candidate, next) == successor.position);
+  assert(restore(candidate, Fork(next, common, 300000)) == 8192);
+  std::puts("history rewrite: 8192 -> 57344 cached, 85465 -> 36313 prefill; failed saves retain 57344");
+}
+
+static void PromoteExistingStableFrontier() {
+  Cache c(1, 2, false);
+  const auto original = Tokens(1, 36);
+  const auto rewrite = Fork(original, 18, 100);
+  assert(c.Capture(original, 16, CacheRetention::Session));
+  assert(c.cache.KeepStable(std::span(original).first(16), c.policy));
+  assert(c.Hit(original) == 16);
+  assert(c.Capture(original, 24, CacheRetention::Session));
+  assert(c.Hit(original) == 24);
+  // A late point from either branch may use spare room but cannot push out the stable point.
+  assert(!c.cache.Capture(rewrite, c.policy, {24, CacheRetention::Session, true}, 64, uint64_t(9) << 30,
+                          [] { return std::shared_ptr<const Snapshot>(); }));
+  assert(c.Hit(rewrite) == 16);
+  // A same-key capture can replace the point only once it has a new snapshot.
+  bool attempted = false;
+  assert(!c.cache.Capture(original, c.policy, {16, CacheRetention::Session}, 64, uint64_t(9) << 30,
+                          [&]() -> std::shared_ptr<const Snapshot> { attempted = true; throw std::bad_alloc(); }));
+  assert(attempted && c.Hit(rewrite) == 16);
+}
+
 int main() {
+  EarlierFrontierOnHistoryRewrite();
+  PromoteExistingStableFrontier();
   FailedCaptureKeepsFallback();
   SpanReplayTail();
   TenantsNeverShareRam();

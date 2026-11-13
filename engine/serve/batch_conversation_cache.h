@@ -28,7 +28,13 @@ struct CacheFrontier {
   size_t position = 0;
   CacheRetention retention = CacheRetention::Session;
   bool speculative = false;
+  bool stable = false;  // the point before an editable suffix
 };
+inline size_t BatchStableFrontier(size_t boundary, size_t shared, size_t stable, int rows) {
+  if (!stable || rows <= 0) return 0;
+  const size_t early = stable / size_t(rows);
+  return early > shared / size_t(rows) && early < boundary / size_t(rows) ? early * size_t(rows) : 0;
+}
 enum class SnapshotMemoryAction { Allocate, Free };
 struct SnapshotMemoryLedger {
   virtual ~SnapshotMemoryLedger() = default;
@@ -36,13 +42,16 @@ struct SnapshotMemoryLedger {
 };
 // A shared system-and-tools frontier sits on the same fixed grid, so another session's chunks
 // before it are identical and its restore stays exact (E6).
-inline std::vector<CacheFrontier> BatchCacheFrontiers(size_t length, size_t boundary, int rows, size_t shared = 0) {
+inline std::vector<CacheFrontier> BatchCacheFrontiers(size_t length, size_t boundary, int rows, size_t shared = 0,
+                                                     size_t stable = 0) {
   std::vector<CacheFrontier> frontiers;
   const size_t own = ConversationAdmission::ForPrompt(length, boundary, rows, 0).frontier;
   const size_t common = shared ? ConversationAdmission::ForPrompt(length, std::min(shared, boundary ? boundary : length),
                                                                   rows, 0).frontier : 0;
+  const size_t early = BatchStableFrontier(boundary, shared, stable, rows);
   if (common && common != own) frontiers.push_back({common, CacheRetention::Shared});
-  if (own) frontiers.push_back({own, common == own ? CacheRetention::Shared : CacheRetention::Session});
+  if (early) frontiers.push_back({early, CacheRetention::Session, false, true});
+  if (own) frontiers.push_back({own, common == own ? CacheRetention::Shared : CacheRetention::Session, early != 0});
   // A grid point inside the generation prompt: the next turn repeats the header but its last token (the reasoning
   // marker), so that state saves one chunk of prefill (an earlier soak run). Grid states are exact for any prompt
   // that repeats them; the stable boundary only predicts which states a later prompt repeats.
@@ -226,6 +235,19 @@ class BatchConversationCache {
   // with slot frontiers the host heads are the sessions without a slot. Protect no more of them than the
   // budget holds (Plan), so a handover copy can still evict the oldest waiting one. Off: the live count as before.
   void SetSlotFrontiers(bool on) { slot_frontiers_ = on; }
+  // The new request may restore a previously ordinary point without prefilling its row again.
+  bool KeepStable(std::span<const int> ids, const ConversationPolicy& policy) {
+    bool found = false;
+    cache_.ForEach([&](Item& item) {
+      if (item.policy == policy && item.snapshot->retention == CacheRetention::Session &&
+          item.snapshot->snapshot->resume.prompt_only && std::ranges::equal(item.ids, ids)) {
+        item.stable = true;
+        item.superseded = false;
+        found = true;
+      }
+    });
+    return found;
+  }
   // The newest tail saved after the restored entry is this conversation's last answer. A prompt that leaves it lost
   // replay by its own tokens: `common` is the first position where it differs. Compares one tail, from the restore on.
   std::optional<TailDivergence> MissedTail(std::span<const int> ids, const ConversationPolicy& policy,
@@ -266,8 +288,8 @@ class BatchConversationCache {
     const uint64_t parent = Parent(hist, policy);  // before eviction can remove it
     const uint64_t lineage = LineageFor(hist, policy);  // the miss ledger, also before eviction
     const bool proven = ExtendsProven(hist, policy);  // also before eviction
-    auto replaced = trusted ? Supersede(hist, policy, [](const Entry& entry) {
-      return entry.retention == CacheRetention::Session;
+    auto replaced = trusted ? Supersede(hist, policy, [](const Item& item) {
+      return item.snapshot->retention == CacheRetention::Session && !item.stable;
     }) : Supersession{};
     if (!Admit(bytes, available, resident, !trusted, share, &replaced.fallback))
       return Unmark(replaced.marked, refusal_);
@@ -307,11 +329,14 @@ class BatchConversationCache {
     // A tail is never superseded by a prompt frontier: replay makes it the most valuable entry (G15).
     // A speculative frontier (past the boundary) is a speculative tail: a retry of this prompt, or a next turn that
     // drops the reasoning, cannot use it. It marks nothing until a hit confirms it.
-    auto replaced = frontier.speculative ? Supersession{} :
-        Supersede(ids.first(frontier.position), policy, [](const Entry& entry) {
-          return entry.retention == CacheRetention::Session && entry.snapshot->resume.prompt_only;
-        });
-    // Refuse a new prompt frontier when the fallback is needed to meet the host reserve.
+    const auto key = ids.first(frontier.position);
+    const bool stable = frontier.stable || ExistingStable(key, policy);
+    auto replaced = frontier.speculative && !stable ? Supersession{} :
+        Supersede(key, policy, [&](const Item& item) {
+          return item.snapshot->retention == CacheRetention::Session && item.snapshot->snapshot->resume.prompt_only &&
+                 item.stable == stable;
+        }, stable);
+    // Refuse the new frontier if allocating it would require losing the fallback first.
     replaced.fallback.keep_on_pressure = true;
     const bool proven = proven_before || ExtendsProven(ids.first(frontier.position), policy);
     const uint64_t lineage = LineageFor(ids.first(frontier.position), policy);  // the miss ledger, before eviction
@@ -330,8 +355,8 @@ class BatchConversationCache {
       auto entry = std::make_shared<Entry>(Entry{std::move(lease), std::move(snapshot), frontier.retention, false,
                                                  ++serials_, 0, frontier.position, lineage});
       // A prompt frontier holds client tokens, so it is a confirmed resume point; a speculative one is not yet.
-      return Saved(cache_.Insert(ids.first(frontier.position), policy, bytes, std::move(entry), false,
-                                 &replaced.fallback), !frontier.speculative, proven);
+      return Saved(cache_.Insert(key, policy, bytes, std::move(entry), false, &replaced.fallback),
+                   stable || !frontier.speculative, proven, stable);
     } catch (const std::bad_alloc&) {
       return Unmark(replaced.marked, "memory");
     }
@@ -341,8 +366,9 @@ class BatchConversationCache {
   // frontier marks nothing, as in Capture.
   void KeepInSlot(std::span<const int> ids, const ConversationPolicy& policy, bool speculative) {
     if (!speculative)
-      Supersede(ids, policy, [](const Entry& entry) {
-        return entry.retention == CacheRetention::Session && entry.snapshot->resume.prompt_only;
+      Supersede(ids, policy, [](const Item& item) {
+        return item.snapshot->retention == CacheRetention::Session && item.snapshot->snapshot->resume.prompt_only &&
+               !item.stable;
       });
   }
   // Whether `ids` extends a proven state: the slot asks when it keeps a frontier, for its host copy later.
@@ -886,13 +912,19 @@ class BatchConversationCache {
     return proven;
   }
   bool Refuse(const char* reason) { last_.refused = reason; refusal_ = reason; return false; }
+  bool ExistingStable(std::span<const int> ids, const ConversationPolicy& policy) {
+    bool stable = false;
+    cache_.ForEach([&](Item& item) { stable |= item.stable && item.policy == policy && std::ranges::equal(item.ids, ids); });
+    return stable;
+  }
   // Identify the deepest point to keep while its successor is captured.
   template<class Accept>
-  Supersession Supersede(std::span<const int> ids, const ConversationPolicy& policy, Accept accept) {
+  Supersession Supersede(std::span<const int> ids, const ConversationPolicy& policy, Accept accept,
+                         bool include_same = false) {
     Supersession replaced;
     cache_.ForEach([&](Item& item) {
-      if (item.policy != policy || item.ids.size() >= ids.size() ||
-          !std::equal(item.ids.begin(), item.ids.end(), ids.begin()) || !accept(*item.snapshot)) return;
+      if (item.policy != policy || item.ids.size() > ids.size() || (!include_same && item.ids.size() == ids.size()) ||
+          !std::equal(item.ids.begin(), item.ids.end(), ids.begin()) || !accept(item)) return;
       if (!replaced.fallback.entry || item.ids.size() > replaced.fallback.entry->ids.size())
         replaced.fallback.entry = &item;
       if (item.superseded) return;
@@ -915,7 +947,7 @@ class BatchConversationCache {
     });
   }
   // `proven`: the request itself continued its branch (a trusted tail). A save that extends a proven state is proven.
-  bool Saved(bool saved, bool confirmed, bool proven) {
+  bool Saved(bool saved, bool confirmed, bool proven, bool stable = false) {
     // An eviction outside Admit gets no room. None happens today: Insert evicts only tiers 0 and 1, which never spill.
     HandVictims(0);
     if (!saved) return Refuse("budget");
@@ -923,6 +955,7 @@ class BatchConversationCache {
     item.used = ++tick_;
     item.confirmed = confirmed ? tick_ : 0;
     item.proven = proven;
+    item.stable = stable;
     cache_.ForEach([&](Item& other) { item.proven |= other.proven && Extends(item, other); });
     // A save on probation does not move the session clock: one-time requests never make a live session idle.
     item.active = OnProbation(item) ? clock_ : ++clock_;
@@ -948,7 +981,8 @@ class BatchConversationCache {
     hit->active_at = Now();
     hit->proven = true;
     cache_.ForEach([&](Item& item) {
-      if (&item != hit && item.snapshot->retention == CacheRetention::Session && Extends(*hit, item))
+      if (&item != hit && item.snapshot->retention == CacheRetention::Session && !item.stable &&
+          Extends(*hit, item))
         item.superseded = true;
     });
     return hit->snapshot;
@@ -1133,7 +1167,8 @@ class BatchConversationCache {
           const int tier = plan.at(&item);
           if (Held(item)) return int(kKept);
           // A speculative save never takes a client prompt's state that waits for its session's next turn.
-          if ((resident && tier > kSuperseded) || (speculative && (tier == kWaiting || tier == kProbation)))
+          if ((resident && tier > kSuperseded) ||
+              (speculative && (tier == kWaiting || tier == kProbation || (item.stable && !item.superseded))))
             return int(kKept);
           if (tier == kKept && read_ahead_ && read_ahead_(item.ids)) return int(kReadAhead);
           // An earlier change: the newest state of a recent conversation leaves after every older or idle entry. The guards

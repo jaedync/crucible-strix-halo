@@ -31,6 +31,7 @@ class PrefixCache {
     bool proven = false;     // a later request used this state or its branch (probation, BatchConversationCache)
     uint64_t active = 0;     // the session clock at the last save or hit that is not on probation
     double active_at = 0;    // the wall clock (seconds) at that save or hit
+    bool stable = false;     // an early history frontier, when the batch client can rewrite the suffix
   };
   struct DeferredEviction {
     const Entry* entry = nullptr;
@@ -142,7 +143,8 @@ class PrefixCache {
   }
   // a save that shares host chunks with a held snapshot needs only `host_bytes` of new host memory, and an
   // eviction frees only `freed(entry)` of host memory (its chunks that no other snapshot uses). The budget still
-  // counts every entry at its whole size. A victim can stay until Insert only when the host can hold both copies.
+  // counts every entry at its whole size. A deferred victim can count toward the budget before Insert, but a
+  // protected fallback must stay available if the new snapshot cannot be allocated without freeing it.
   template<class Tier, class Freed>
   bool ReserveHost(size_t bytes, size_t host_bytes, uint64_t available, uint64_t reserve, Tier tier, Freed freed,
                    DeferredEviction* deferred = nullptr) {
