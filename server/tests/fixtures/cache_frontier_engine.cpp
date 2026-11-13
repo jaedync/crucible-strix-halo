@@ -1,7 +1,7 @@
 // Batch protocol fixture with real host-cache admission and synthetic prefill state.
-#include "engine/serve/batch_conversation_cache.h"
-#include "engine/serve/batch_mtp_history.h"
-#include "engine/serve/batched_serve_protocol.h"
+#include "../../../engine/serve/batch_conversation_cache.h"
+#include "../../../engine/serve/batch_mtp_history.h"
+#include "../../../engine/serve/batched_serve_protocol.h"
 #include <cassert>
 #include <iostream>
 

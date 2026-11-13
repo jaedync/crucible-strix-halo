@@ -14,14 +14,13 @@ from server.tests.test_count_tokens import Server
 from server.tokenization import ModelTokenizer
 
 CHECKPOINT = os.environ.get("CRUCIBLE_TEST_CKPT")
-ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.mark.skipif(not CHECKPOINT, reason="Set CRUCIBLE_TEST_CKPT to use the checkpoint tokenizer.")
 def test_history_rewrite_retains_stable_point_on_failed_capture(tmp_path, capfd):
     executable = tmp_path / "cache_frontier_engine"
     source = Path(__file__).with_name("fixtures") / "cache_frontier_engine.cpp"
-    subprocess.run([*shlex.split(os.environ.get("CXX", "c++")), "-std=c++20", "-I", str(ROOT),
+    subprocess.run([*shlex.split(os.environ.get("CXX", "c++")), "-std=c++20",
                     str(source), "-o", str(executable)], check=True, timeout=60)
     tokenizer = ModelTokenizer(CHECKPOINT)
 
