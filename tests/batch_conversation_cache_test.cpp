@@ -1313,8 +1313,10 @@ static void EarlierFrontierOnHistoryRewrite() {
   assert(attempted && candidate.LastRefusal() == "memory");
   assert(candidate.Evictions() == 0 && restore(candidate, next) == early);
 
+  auto speculative = successor;
+  speculative.speculative = true;
   attempted = false;
-  assert(!candidate.Capture(next, policy, successor, 64, candidate.HostReserve() - 1, fail));
+  assert(!candidate.Capture(next, policy, speculative, 64, candidate.HostReserve() - 1, fail));
   assert(!attempted && candidate.LastRefusal() == "protected");
   assert(candidate.Evictions() == 0 && restore(candidate, next) == early);
   assert(frontier(candidate, next, next.size() - 1, successor, ram));

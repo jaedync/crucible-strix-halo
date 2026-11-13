@@ -76,4 +76,4 @@ def test_history_rewrite_retains_stable_point_on_failed_capture(tmp_path, capfd)
     assert run(True) == (93657, 57344, 36313)
     log = capfd.readouterr().err
     assert "stable capture refused: memory at 90112" in log
-    assert "stable capture refused: protected at 90112" in log
+    assert "stable capture refused: host at 90112" in log

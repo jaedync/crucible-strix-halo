@@ -45,7 +45,8 @@ int main(int argc, char** argv) {
       if (request.cache_control != "bypass") {
         for (const auto& point : points) {
           if (point.position != cursor) continue;
-          const auto available = generation == 4 ? cache.HostReserve() - 1 : cache.HostReserve() + 64;
+          // At this reserve even evicting both 64-byte entries cannot make room for the save.
+          const auto available = generation == 4 ? cache.HostReserve() - 65 : cache.HostReserve() + 64;
           bool attempted = false;
           const bool saved = cache.Capture(request.ids, policy, point, 64, available, [&] {
             attempted = true;
@@ -56,7 +57,7 @@ int main(int argc, char** argv) {
           });
           if (point.stable && (generation == 3 || generation == 4)) {
             assert(!saved && attempted == (generation == 3));
-            assert(std::string_view(cache.LastRefusal()) == (attempted ? "memory" : "protected"));
+            assert(std::string_view(cache.LastRefusal()) == (attempted ? "memory" : "host"));
             std::cerr << "stable capture refused: " << cache.LastRefusal() << " at " << cursor << '\n';
           }
         }

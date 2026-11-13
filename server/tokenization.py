@@ -83,7 +83,7 @@ class ModelTokenizer:
         if request.kind != "chat":
             return 0
         system = request.messages[:1] if request.messages and request.messages[0]["role"] == "system" else ()
-        return self._prefix_before_user(request, ids, system)
+        return self._prefix_before_user(request, ids, system, shared=True)
 
     def stable_prefix_tokens(self, request, ids):
         """An earlier cache point before a suffix the client can rewrite."""
@@ -124,14 +124,18 @@ class ModelTokenizer:
             cut = min(cut, last_user)
         return self._prefix_before_user(request, ids, messages[:cut]) if cut < len(messages) else 0
 
-    def _prefix_before_user(self, request, ids, messages):
+    def _prefix_before_user(self, request, ids, messages, *, shared=False):
         # A user turn supplies the template's last query and closes any preceding tool block.
         sentinel = dict(role="user", content=SHARED_SENTINEL)
         try:
             text, restore = self.render_prompt(request, add_generation_prompt=False, messages=messages + (sentinel,))
         except ApiError:
             return 0
-        end = text.rfind("<|im_start|>user\n" + SHARED_SENTINEL)
+        if shared:
+            # Preserve the shared-prefix boundary for templates with a different user separator.
+            end = text.rfind("<|im_start|>", 0, max(text.find(SHARED_SENTINEL), 0))
+        else:
+            end = text.rfind("<|im_start|>user\n" + SHARED_SENTINEL)
         if end <= 0:
             return 0
         prefix = self.encode_prompt(text[:end], restore)
