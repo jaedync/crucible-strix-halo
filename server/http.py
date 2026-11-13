@@ -973,6 +973,10 @@ def handler_for(service):
                     prefix = service.tokenizer.cache_prefix_tokens(request, prompt_ids)
                     shared = getattr(service.tokenizer, "shared_prefix_tokens", lambda request, ids: 0)(request, prompt_ids)
                     options |= dict(cache_prefix_tokens=prefix) | (dict(shared_prefix_tokens=shared) if shared else {})
+                    if prefix and request.cache_control != "bypass" and getattr(service.backend, "stable_prefix", False):
+                        stable = service.tokenizer.stable_prefix_tokens(request, prompt_ids)
+                        if shared < stable < prefix:
+                            options["stable_prefix_tokens"] = stable
                 # The batch worker holds new chunks for the continuation once the cap token is out.
                 self.jobs.append(service.backend.submit(prompt_ids, request, **options,
                                                         **(dict(think_cap=cap.tokens) if cap else {})))

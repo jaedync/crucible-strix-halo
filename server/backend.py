@@ -194,6 +194,7 @@ class EngineBackend:
             raise ProtocolError("The engine did not return a valid ready event.")
         # Engines before the replay-tail guard reject the field, so it is sent only when the engine names it.
         self.cache_tail = ready.get("cache_tail") is True
+        self.stable_prefix = ready.get("stable_prefix") is True
         # the engine's line limit follows its context; an engine without the field keeps ENGINE_LINE_BYTES.
         if "line_bytes" in ready:
             low, high = ENGINE_LINE_BYTES_RANGE
@@ -264,7 +265,7 @@ class EngineBackend:
         return follow
 
     def submit(self, ids, request, cache_prefix_tokens=0, shared_prefix_tokens=0, log_turn=True, image_offsets=(),
-               after=None, think_cap=None, client_request_id=None):
+               after=None, think_cap=None, client_request_id=None, stable_prefix_tokens=0):
         """log_turn=False leaves the crucible_turn line to the caller (one line for a request that uses two jobs).
         client_request_id: the gateway's id for the request (metrics.client_request_id), for the job's log lines."""
         counts = dict(prompt_tokens=len(ids), max_tokens=request.max_tokens, context=self.context)
@@ -284,6 +285,8 @@ class EngineBackend:
         if shared_prefix_tokens:
             # Sent only when known, so engines without the G7 field see the same payload as before.
             policy = policy | dict(shared_prefix_tokens=shared_prefix_tokens)
+        if stable_prefix_tokens:
+            policy = policy | dict(stable_prefix_tokens=stable_prefix_tokens)
         if self.draft_detail and request.spec and request.max_tokens > 1:
             policy = policy | dict(draft_detail=1)  # sent only with the flag, so the default payload stays as before
         if getattr(request, "rope_mode", None):

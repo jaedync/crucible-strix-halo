@@ -26,6 +26,7 @@ struct ServeRequest : DecodePolicy {
   int cache_prefix_tokens = 0;
   // End of the system-and-tools rendering that sessions share (G7).
   int shared_prefix_tokens = 0;
+  int stable_prefix_tokens = 0;
   std::string cache_control = "auto";
   // "guard": the client may not send this output back (reasoning, or the server's continuation job), so the
   // request's replay tail never replaces an older resume point.
@@ -109,6 +110,7 @@ inline ServeRequest ParseServeRequest(const std::string& line, int ctx, const De
     else if (key == "cache_tail") request.cache_tail = scanner.Str();
     else if (key == "cache_prefix_tokens") request.cache_prefix_tokens = RequestInt(scanner);
     else if (key == "shared_prefix_tokens") request.shared_prefix_tokens = RequestInt(scanner);
+    else if (key == "stable_prefix_tokens") request.stable_prefix_tokens = RequestInt(scanner);
     else if (key == "temperature") request.sampling.temperature = scanner.Real();
     else if (key == "top_k") request.sampling.top_k = RequestInt(scanner);
     else if (key == "top_p") request.sampling.top_p = scanner.Real();
@@ -142,6 +144,8 @@ inline ServeRequest ParseServeRequest(const std::string& line, int ctx, const De
     throw std::runtime_error("cache_prefix_tokens must be inside the prompt");
   if (request.shared_prefix_tokens < 0 || size_t(request.shared_prefix_tokens) > request.ids.size())
     throw std::runtime_error("shared_prefix_tokens must be inside the prompt");
+  if (request.stable_prefix_tokens < 0 || request.stable_prefix_tokens > request.cache_prefix_tokens)
+    throw std::runtime_error("stable_prefix_tokens must be inside the cache prefix");
   if (!ValidTokenIds(request.ids, kVocab)) throw std::runtime_error("prompt token IDs must be in [0,248320)");
   if (!ValidTokenIds(request.stop_ids, kVocab)) throw std::runtime_error("stop IDs must be in [0,248320)");
   CheckImages(request.images, request.ids);

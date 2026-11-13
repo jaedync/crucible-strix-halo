@@ -24,6 +24,39 @@ class TokenizerTests(unittest.TestCase):
         text = self.adapter.tokenizer.decode(ids, skip_special_tokens=False)
         self.assertTrue(text.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n"))
 
+    def test_stable_prefix_precedes_mutable_reasoning(self):
+        user = dict(role="user", content="First question.")
+        assistant = dict(role="assistant", content="Answer.", reasoning_content="Reasoning.")
+        request = validate_request(dict(messages=[user, assistant],
+                                        chat_template_kwargs=dict(preserve_thinking=False)), "chat", "crucible")
+        ids = self.adapter.encode(request)
+        stable = self.adapter.stable_prefix_tokens(request, ids)
+        self.assertEqual(self.adapter.decode(ids[:stable]), "<|im_start|>user\nFirst question.\n")
+
+        following = validate_request(dict(messages=[user, assistant, dict(role="user", content="Next question.")],
+                                          chat_template_kwargs=dict(preserve_thinking=False)), "chat", "crucible")
+        next_ids = self.adapter.encode(following)
+        self.assertEqual(ids[:stable], next_ids[:stable])
+        self.assertEqual(self.adapter.stable_prefix_tokens(following, next_ids), 0)
+
+    def test_stable_prefix_precedes_tool_turn_with_images(self):
+        from types import SimpleNamespace
+
+        user = dict(role="user", content="Inspect the page.")
+        assistant = dict(role="assistant", content="I will open it.")
+        tool = dict(role="tool", content="The page is attached.")
+        picture = dict(role="user", content=[dict(type="image")])
+        opts = dict(kind="chat", tools=(), tool_choice="auto", enable_thinking=False, reasoning_effort="medium",
+                    preserve_thinking=None, images=(SimpleNamespace(tokens=64),))
+        request = SimpleNamespace(messages=(user, assistant, tool, picture), **opts)
+        ids, offsets = self.adapter.encode_images(request)
+        stable = self.adapter.stable_prefix_tokens(request, ids)
+        self.assertGreater(stable, 0)
+        self.assertLess(stable, offsets[0])
+        edited = SimpleNamespace(messages=(user, assistant, dict(tool, content="The page was removed.")),
+                                 **(opts | dict(images=())))
+        self.assertEqual(ids[:stable], self.adapter.encode(edited)[:stable])
+
     def test_forced_think_close_text(self):
         ids = self.adapter.think_close_ids()
         self.assertEqual(self.adapter.decode(list(ids)), "\n\nConsidering the limited time by the user, I have to "

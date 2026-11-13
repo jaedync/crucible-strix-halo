@@ -31,6 +31,11 @@ class PrefixCache {
     bool proven = false;     // a later request used this state or its branch (probation, BatchConversationCache)
     uint64_t active = 0;     // the session clock at the last save or hit that is not on probation
     double active_at = 0;    // the wall clock (seconds) at that save or hit
+    bool stable = false;     // an early history frontier, when the batch client can rewrite the suffix
+  };
+  struct DeferredEviction {
+    const Entry* entry = nullptr;
+    int tier = -1;
   };
   template<class Accept = AcceptAny>
   std::shared_ptr<const Snapshot> Find(std::span<const int> ids, const Policy& policy,
@@ -84,8 +89,11 @@ class PrefixCache {
   // `reserve` false: the caller made the room already (BatchConversationCache::Admit). Its evicted entries that went to
   // the disk writer now count in Outside(), and a second reserve here would evict more entries for them.
   bool Insert(std::span<const int> ids, const Policy& policy, size_t bytes,
-              std::shared_ptr<const Snapshot> snapshot, bool reserve = true) {
+              std::shared_ptr<const Snapshot> snapshot, bool reserve = true,
+              const DeferredEviction* deferred = nullptr) {
     if (ids.empty() || !snapshot || !bytes || bytes > budget_) return false;
+    std::list<Entry> incoming;
+    incoming.push_front({std::vector<int>(ids.begin(), ids.end()), policy, bytes, std::move(snapshot)});
     for (auto it = entries_.begin(); it != entries_.end(); ++it) {
       if (it->policy == policy && it->ids.size() == ids.size() &&
           std::equal(it->ids.begin(), it->ids.end(), ids.begin())) {
@@ -95,7 +103,14 @@ class PrefixCache {
       }
     }
     if (reserve) Reserve(bytes);
-    entries_.push_front({std::vector<int>(ids.begin(), ids.end()), policy, bytes, std::move(snapshot)});
+    if (deferred && deferred->tier >= 0) {
+      for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+        if (&*it != deferred->entry) continue;
+        Evict(it, deferred->tier);
+        break;
+      }
+    }
+    entries_.splice(entries_.begin(), incoming);
     bytes_ += bytes;
     return true;
   }
@@ -127,9 +142,11 @@ class PrefixCache {
   }
   // a save that shares host chunks with a held snapshot needs only `host_bytes` of new host memory, and an
   // eviction frees only `freed(entry)` of host memory (its chunks that no other snapshot uses). The budget still
-  // counts every entry at its whole size.
+  // counts every entry at its whole size. A selected fallback stays until Insert when the host reserve permits
+  // both snapshots. If admission needs its memory to meet the reserve, it is evicted before capture.
   template<class Tier, class Freed>
-  bool ReserveHost(size_t bytes, size_t host_bytes, uint64_t available, uint64_t reserve, Tier tier, Freed freed) {
+  bool ReserveHost(size_t bytes, size_t host_bytes, uint64_t available, uint64_t reserve, Tier tier, Freed freed,
+                   DeferredEviction* deferred = nullptr) {
     if (!bytes || bytes > budget_) return false;
     const uint64_t needed = reserve + host_bytes;
     const uint64_t short_by = needed > available ? needed - available : 0;
@@ -143,15 +160,23 @@ class PrefixCache {
       if (rank >= 0) order.emplace_back(rank, it);
     }
     std::stable_sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
-    uint64_t room = 0, host_room = 0;
+    uint64_t room = 0, host_room = 0, fallback_room = 0;
     size_t victims = 0;
     while ((room < over || host_room < short_by) && victims < order.size()) {
-      room += order[victims].second->bytes;
-      host_room += freed(static_cast<const Entry&>(*order[victims].second));
+      const Entry& victim = *order[victims].second;
+      const size_t released = freed(victim);
+      room += victim.bytes;
+      host_room += released;
+      if (deferred && &victim == deferred->entry) fallback_room = released;
       ++victims;
     }
     if (room < over || host_room < short_by) return false;
-    for (size_t i = 0; i < victims; ++i) Evict(order[i].second, order[i].first);
+    const bool keep_fallback = deferred && host_room - fallback_room >= short_by;
+    for (size_t i = 0; i < victims; ++i) {
+      const auto [rank, victim] = order[i];
+      if (keep_fallback && &*victim == deferred->entry) deferred->tier = rank;
+      else Evict(victim, rank);
+    }
     return true;
   }
   // Puts back an entry that Evict removed (BatchConversationCache: a read-ahead point that the disk refused), with

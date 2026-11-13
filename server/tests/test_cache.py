@@ -39,11 +39,14 @@ class PrefixRenderTests(unittest.TestCase):
 
     def test_shared_prefix_is_the_system_and_tools_block(self):
         class Template:
+            user_separator = "\n"
+
             def render(self, messages, thinking, effort, tools, choice, add_generation_prompt=True):
                 head = "<|im_start|>system\n" + "".join(m["content"] for m in messages if m["role"] == "system")
                 head += "".join(t["name"] for t in tools) + "<|im_end|>\n" if head != "<|im_start|>system\n" or tools else ""
                 if head == "<|im_start|>system\n": head = ""
-                body = "".join(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in messages if m["role"] != "system")
+                body = "".join(f"<|im_start|>{m['role']}{self.user_separator}{m['content']}<|im_end|>\n"
+                               for m in messages if m["role"] != "system")
                 return head + body + ("<|im_start|>assistant\n" if add_generation_prompt else "")
         class Tokenizer:
             def encode(self, text, add_special_tokens=False):
@@ -60,6 +63,9 @@ class PrefixRenderTests(unittest.TestCase):
             ids = tokenizer.encode(request)
             self.assertEqual(tokenizer.shared_prefix_tokens(request, ids), len(block))
             self.assertEqual(tokenizer.shared_prefix_tokens(request, [0] + ids[1:]), 0)
+        tokenizer.template.user_separator = "\n\n"
+        request = chat((system,) + turns, ({"name": "tool"},))
+        self.assertEqual(tokenizer.shared_prefix_tokens(request, tokenizer.encode(request)), len(block))
         self.assertEqual(tokenizer.shared_prefix_tokens(chat(turns), tokenizer.encode(chat(turns))), 0)
         def refuse(*args, **kwargs): raise ApiError("No user query found in messages.", "messages")
         tokenizer.template = SimpleNamespace(render=refuse)
