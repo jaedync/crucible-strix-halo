@@ -234,6 +234,7 @@ class BatchPrefixCache {
       };
       // slot frontiers, with slot resume.
       if (session_replay_ && slot_resume_) {
+        hooks.client_event = [this] { return cache_.ClientEvent(); };
         hooks.frontier = [this](const crucible::ServeRequest& r, size_t cursor,
                                 const std::function<bool(const crucible::SlotFrontier&, size_t)>& keep) {
           return KeepFrontier(r, cursor, keep);
@@ -877,7 +878,7 @@ class BatchPrefixCache {
       return snapshot;
     };
     const bool saved = cache_.Capture(point.key, Policy(point.tenant), frontier, bytes, HostAvailable(), save, point.hist,
-                                      share, point.frontier.proven, point.retirement_floor);
+                                      share, point.frontier.proven, point.retirement_floor, point.frontier.client_seen);
     if (!saved) cache_.NoteRefused(point.key, Policy(point.tenant), point.hist.size());
     // Numeric fields only (a test script sums them). copy_bytes: the bytes that the device copied (not the cache's copy class).
     // `request`: the open that wrote over the point (fix 2, item 10).

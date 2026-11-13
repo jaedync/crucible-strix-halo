@@ -578,7 +578,10 @@ void DonorCopy() {
     MockEngine engine;
     FakeCache cache{engine};
     crucible::BatchSession<MockEngine> session(engine, 2);
-    session.SetCacheHooks(cache.Hooks());
+    auto hooks = cache.Hooks();
+    uint64_t event = 0;
+    hooks.client_event = [&] { return ++event; };
+    session.SetCacheHooks(std::move(hooks));
     assert(Busy(session, engine, 1, Request(kA1, 13)) == 0);
     if (!copy) cache.host[Head(kA1, 12)] = false;  // the host path: the frontier is a host entry
     engine.chunks.clear();
@@ -590,7 +593,11 @@ void DonorCopy() {
       assert(cache.log.front() == "copy slot=1 from=0 at 12" && At(cache.log, "copy slot=1 from=0 at 12") < At(cache.log, "keep 12"));
       assert(cache.restore_slots.empty() && !Has(cache.log, "handover slot=0 at 12"));
       std::map<int, std::vector<size_t>> points;
-      for (const auto& [slot, index, point] : session.FrontierPoints()) points[slot].push_back(point.hist.size());
+      for (const auto& [slot, index, point] : session.FrontierPoints()) {
+        points[slot].push_back(point.hist.size());
+        if (point.hist.size() == 12) assert(point.frontier.client_seen == 1);
+        if (point.hist.size() == 20) assert(point.frontier.client_seen == 0);
+      }
       assert(points[0] == std::vector<size_t>({20, 12}) && points[1].size() == 2 && points[1].back() == 12);
     } else {
       assert(Has(cache.log, "restore 12") && !Has(cache.log, "copy slot=1 from=0 at 12"));
@@ -623,17 +630,29 @@ void DonorChoice() {
   MockEngine engine2;
   FakeCache cache2{engine2};
   crucible::BatchSession<MockEngine> two(engine2, 2);
-  two.SetCacheHooks(cache2.Hooks());
+  auto hooks = cache2.Hooks();
+  uint64_t event = 0;
+  hooks.client_event = [&] { return ++event; };
+  two.SetCacheHooks(std::move(hooks));
   Busy(two, engine2, 1, Request(kA1, 13));
-  const auto speculative = [&] {
+  const auto frontier_twenty = [&](int which) {
     for (const auto& [slot, index, point] : two.FrontierPoints())
-      if (slot == 0 && point.hist.size() == 20) return point.frontier.speculative;
+      if (slot == which && point.hist.size() == 20) return point.frontier;
     assert(false);
-    return false;
+    return crucible::SlotFrontier{};
   };
-  assert(speculative());
-  assert(Finish(two, engine2, 2, Request(Join(Head(kA1, 21), Tokens(9, 4)), 21)).cached == 20);
-  assert(Has(cache2.log, "copy slot=1 from=0 at 20") && !speculative());
+  assert(frontier_twenty(0).speculative && frontier_twenty(0).client_seen == 0);
+  const auto next = Request(Join(Head(kA1, 21), Tokens(9, 2)), 21);
+  assert(Finish(two, engine2, 2, next).cached == 20);
+  assert(Has(cache2.log, "copy slot=1 from=0 at 20"));
+  assert(!frontier_twenty(0).speculative && frontier_twenty(0).client_seen == 2);
+  assert(!frontier_twenty(1).speculative && frontier_twenty(1).client_seen == 2);
+  // An in-slot hit on that now-confirmed point does not renew its age.
+  const auto edited = Request(Join(Head(kA1, 20), Tokens(13, 7)), 21);
+  two.Open(3, edited, true);
+  assert(engine2.selected == 1 && Has(cache2.log, "load slot=1 at 20 frontier"));
+  assert(frontier_twenty(1).client_seen == 2);
+  two.Close(3);
 }
 
 // No donor: the host holds as much; the host rule refuses; bypass; another image (same pad tokens, another digest);

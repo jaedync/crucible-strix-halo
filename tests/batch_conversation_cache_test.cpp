@@ -1374,6 +1374,50 @@ static void ColdSiblingTail() {
   }
 }
 
+// Copying an old slot frontier into RAM cannot contradict a tail used after the frontier was made.
+static void DelayedFrontierHandover() {
+  const auto a = Tokens(1, 640), b = Fork(a, 288, 5000), other = Tokens(10000, 640);
+  const uint64_t ram = uint64_t(9) << 30;
+  const auto retention = CacheRetention::Session;
+  for (const bool full : {false, true}) {
+    Cache c(4, 2, true);
+    c.policy.prefill_rows = 128;
+    c.cache.SetSlotFrontiers(true);
+    assert(c.Tail(a, 336, false, false, false, ram, 256));
+    assert(c.HitTail(a) == 336);
+    if (full) {
+      assert(c.Capture(other, 128, retention));
+      assert(c.cache.Find(other, c.policy, 639, 640, 128));
+    }
+
+    const std::vector<int> point(b.begin(), b.begin() + 384);
+    const auto floor = c.cache.RetirementFloor(b, c.policy);
+    assert(floor == 0);
+    const auto client_seen = c.cache.ClientEvent();
+    c.cache.KeepInSlot(point, c.policy, false);
+    assert(c.HitTail(a) == 336);
+
+    size_t spills = 0;
+    c.cache.SetSpill([&](auto, const auto&, const auto&, int, uint64_t) {
+      ++spills;
+      return true;
+    });
+    assert(c.cache.Capture(point, c.policy, {384, retention}, 64, ram, [&] {
+      auto snapshot = std::make_shared<Snapshot>();
+      snapshot->hist = point;
+      snapshot->resume = BatchFrontierResume(384, 400);
+      return snapshot;
+    }, {}, {}, true, floor, client_seen) == !full);
+    if (!full) {
+      // The successful copy also keeps its original age when later admissions scan saved entries.
+      assert(!c.cache.MakeRoom(64, ram));
+    }
+    assert(c.cache.PeekTail(a, c.policy) == 336);
+    assert(c.cache.DemotedBranches() == 0 && c.cache.SupersededEvictions() == 0);
+    assert(spills == 0 && c.cache.LastRefusal() == "protected");
+  }
+}
+
 static void OldTailHandover() {
   const auto old = Tokens(1, 40), newer = Fork(old, 23, 500);
   const auto other = Tokens(1000, 40);
@@ -1447,6 +1491,7 @@ int main() {
   SamePromptSiblingTails();
   ColdSiblingTail();
   OldTailHandover();
+  DelayedFrontierHandover();
   MissedTail();
   Peek();
   ResidentRules();

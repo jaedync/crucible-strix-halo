@@ -61,6 +61,7 @@ struct SlotFrontier {
   size_t boundary = 0;       // the request's stable boundary (BatchFrontierResume)
   bool speculative = false;  // a header grid point past the boundary; a hit confirms it
   bool proven = false;       // it extends a proven host state
+  uint64_t client_seen = 0;   // the request that first confirmed these tokens, in the host cache clock
 };
 
 // What the last prompt row gave (fix A). `logits`: shared, so copies of a point do not copy the row (about 1 MiB).
@@ -188,9 +189,10 @@ class SlotCheckpoints {
     return found.empty() ? 0 : Slot(slot)[size_t(found.front())]->hist.size();
   }
   // A hit on a speculative Frontier point shows that a later prompt repeats it.
-  void Confirm(int slot, int index, size_t retirement_floor = 0) {
+  void Confirm(int slot, int index, size_t retirement_floor = 0, uint64_t client_seen = 0) {
     auto& item = Slot(slot).at(size_t(index));
     if (item && item->kind == CheckpointKind::Frontier) {
+      if (item->frontier.speculative) item->frontier.client_seen = client_seen;
       item->frontier.speculative = false;
       item->retirement_floor = std::max(item->retirement_floor, retirement_floor);
     }

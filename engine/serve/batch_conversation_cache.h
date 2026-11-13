@@ -297,7 +297,8 @@ class BatchConversationCache {
   template<class Create>
   bool Capture(std::span<const int> ids, const ConversationPolicy& policy, const CacheFrontier& frontier,
                size_t bytes, uint64_t available, Create create, std::span<const int> tokens = {},
-               SharedSave share = {}, bool proven_before = false, size_t known_floor = 0) {
+               SharedSave share = {}, bool proven_before = false, size_t known_floor = 0,
+               std::optional<uint64_t> source_age = std::nullopt) {
     if (tokens.empty()) tokens = ids;
     if (tokens.size() != ids.size()) throw std::invalid_argument("prompt key and tokens differ in length");
     Try(frontier.position);
@@ -310,9 +311,19 @@ class BatchConversationCache {
     // A prompt frontier that extends a tail keeps it protected for replay. A confirmed frontier can demote
     // a tail when its client tokens disagree with the saved reply. A speculative frontier marks nothing until a hit confirms it.
     const size_t retirement_floor = RetirementFloor(ids, policy, known_floor);
-    if (!frontier.speculative) DemoteContradictedTails(ids.first(frontier.position), &policy, retirement_floor);
+    const auto key = ids.first(frontier.position);
+    auto saved_age = source_age;
+    if (source_age) {
+      // Replacing a host copy of the same point preserves the first known client evidence.
+      cache_.ForEachState(policy, [&](const Item& item) {
+        if (item.client_seen && item.snapshot->snapshot->resume.prompt_only && std::ranges::equal(item.ids, key) &&
+            (!*saved_age || item.client_seen < *saved_age))
+          saved_age = item.client_seen;
+      });
+    }
+    if (!frontier.speculative) DemoteContradictedTails(key, &policy, retirement_floor, source_age);
     const auto marked = frontier.speculative ? std::set<const Item*>{} :
-        Supersede(ids.first(frontier.position), policy, [](const Entry& entry) {
+        Supersede(key, policy, [](const Entry& entry) {
           return entry.retention == CacheRetention::Session && entry.snapshot->resume.prompt_only;
         });
     // Before Admit: the state that this frontier extends is superseded now, so Admit evicts it first.
@@ -332,8 +343,8 @@ class BatchConversationCache {
       auto entry = std::make_shared<Entry>(Entry{std::move(lease), std::move(snapshot), frontier.retention, false,
                                                  ++serials_, 0, frontier.position, lineage, retirement_floor});
       // A prompt frontier holds client tokens, so it is a confirmed resume point; a speculative one is not yet.
-      return Saved(cache_.Insert(ids.first(frontier.position), policy, bytes, std::move(entry), false), !frontier.speculative,
-                   proven);
+      return Saved(cache_.Insert(key, policy, bytes, std::move(entry), false),
+                   !frontier.speculative || saved_age.value_or(0) != 0, proven, saved_age);
     } catch (const std::bad_alloc&) {
       return Unmark(marked, "memory");
     }
@@ -370,6 +381,8 @@ class BatchConversationCache {
     });
     return floor;
   }
+  // Order slot requests and host hits on the same clock.
+  uint64_t ClientEvent() { return ++tick_; }
   // Whether `ids` extends a proven state: the slot asks when it keeps a frontier, for its host copy later.
   bool ProvenBelow(std::span<const int> ids, const ConversationPolicy& policy) { return ExtendsProven(ids, policy); }
   // A slot resume copies nothing from the host, so it marks the session's newest host entry that the prompt extends
@@ -937,14 +950,14 @@ class BatchConversationCache {
     });
   }
   // `proven`: the request itself continued its branch (a trusted tail). A save that extends a proven state is proven.
-  bool Saved(bool saved, bool confirmed, bool proven) {
+  bool Saved(bool saved, bool confirmed, bool proven, std::optional<uint64_t> client_seen = std::nullopt) {
     // An eviction outside Admit gets no room. None happens today: Insert evicts only tiers 0 and 1, which never spill.
     HandVictims(0);
     if (!saved) return Refuse("budget");
     Item& item = cache_.Newest();
     item.used = ++tick_;
     item.confirmed = confirmed ? tick_ : 0;
-    item.client_seen = confirmed || !item.snapshot->snapshot->resume.prompt_only ? tick_ : 0;
+    item.client_seen = client_seen.value_or(confirmed || !item.snapshot->snapshot->resume.prompt_only ? tick_ : 0);
     item.proven = proven;
     cache_.ForEach([&](Item& other) { item.proven |= other.proven && Extends(item, other); });
     // A save on probation does not move the session clock: one-time requests never make a live session idle.
@@ -1023,7 +1036,7 @@ class BatchConversationCache {
   }
   // Also compare the pending save when its client prompt length is known.
   void DemoteContradictedTails(std::span<const int> prompt = {}, const ConversationPolicy* policy = nullptr,
-                               size_t retirement_floor = 0) {
+                               size_t retirement_floor = 0, std::optional<uint64_t> source_age = std::nullopt) {
     std::vector<Item*> tails, prompts;
     cache_.ForEach([&](Item& item) {
       const auto& entry = *item.snapshot;
@@ -1035,7 +1048,8 @@ class BatchConversationCache {
         tails.push_back(&item);
     });
     for (Item* tail : tails) {
-      bool contradicted = !prompt.empty() && policy && tail->policy == *policy && Contradicts(*tail, prompt, retirement_floor);
+      bool contradicted = !prompt.empty() && policy && tail->policy == *policy &&
+                          (!source_age || *source_age > tail->used) && Contradicts(*tail, prompt, retirement_floor);
       for (const Item* other : prompts) {
         if (contradicted) break;
         if (other == tail || other->policy != tail->policy || other->snapshot->serial <= tail->snapshot->serial ||

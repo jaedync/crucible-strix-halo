@@ -206,6 +206,7 @@ struct BatchRestore {
   BatchCacheTier tier = BatchCacheTier::Slot;
   BatchCacheDiagnosis diag;
   size_t retirement_floor = 0;
+  uint64_t frontier_client_seen = 0;
   BatchRestore(size_t tokens = 0, bool shared = false, int replay = 0, bool tail = false, bool slot = false,
                bool guarded = false)
       : tokens(tokens), shared(shared), replay(replay), tail(tail), slot(slot), guarded(guarded) {}
@@ -334,6 +335,8 @@ struct BatchCacheHooks {
   std::function<bool(const ServeRequest&, const SlotCheckpoint&)> frontier_fits;
   // `handover`: copies Frontier point (slot, index) to the host. Runs on the selected slot before an open writes it.
   std::function<void(int slot, int index, const SlotCheckpoint&)> handover;
+  // The host cache clock, shared by prompt evidence and host tail hits.
+  std::function<uint64_t()> client_event;
   // `drop`: the open resumes from the slot's own Frontier point, so the tail that the slot holds leaves unsaved.
   std::function<void(int slot)> drop;
   // `resume_host`: with `resume`, whether it would restore a host tail instead of the slot's tail (HostTailFirst).
@@ -597,6 +600,7 @@ class BatchSession {
       if constexpr (requires { engine_.SetStreamAblate(slot, true); }) engine_.SetStreamAblate(slot, request.ablate == 1);
       else if (request.ablate) throw RecoverableOpenError("this engine serves no ablated requests");
       if (cache_.request) cache_.request(id);
+      if (cache_.client_event) state->client_seen = cache_.client_event();
       // The hold ends on every exit of this block, also on a throw.
       if (cache_.hold) cache_.hold(&request);
       const struct Unhold {
@@ -629,7 +633,7 @@ class BatchSession {
             // A host frontier hit at the same position (MEDIUM-1): no head forward; merged launches, captures and
             // no Start point, as after that hit.
             hit = BatchRestore{saved.hist.size()};
-            checkpoints_.Confirm(slot, *point);
+            checkpoints_.Confirm(slot, *point, 0, owned.client_seen);
           } else {
             owned.grid_point = saved.kind == CheckpointKind::Grid;
             // a prompt-state point (End or Pre) with no pending GDN rows resumes as a cold prefill does:
@@ -644,7 +648,7 @@ class BatchSession {
           }
           hit.retirement_floor = saved.retirement_floor;
         } else {
-          if (donor) hit = CopyFrontier(slot, owned.options, *donor);
+          if (donor) hit = CopyFrontier(slot, owned.options, *donor, owned.client_seen);
           owned.frontier_copy = hit.tokens > 0;
           if (!owned.frontier_copy)
             hit = resident ? cache_.resume(owned.options, *resident) : cache_.restore(owned.options);
@@ -694,7 +698,7 @@ class BatchSession {
           owned.ledger_set = true;
         }
         // The slot keeps the copied state as its own Frontier point: the host holds no copy of it (frontier-copy.md).
-        if (owned.frontier_copy) KeepFrontier(owned);
+        if (owned.frontier_copy) KeepFrontierAt(owned, owned.cursor, false, hit.frontier_client_seen);
         owned.restore = Clock() - start;
         if (request.rope != RopeMode::Plain && !owned.cached && plain_tokens) {
           ++rope_counters_.crossings;
@@ -1308,6 +1312,7 @@ class BatchSession {
     int last = -1;
     size_t count = 0, cursor = 0, cached = 0;
     size_t retirement_floor = 0;
+    uint64_t client_seen = 0;
     bool cache_shared = false, from_tail = false, slot_resume = false, tail_guarded = false, from_checkpoint = false;
     bool frontier_copy = false;  // the open restored a copy of another slot's Frontier point
     bool grid_point = false;  // resumed from a Grid checkpoint
@@ -1867,7 +1872,7 @@ class BatchSession {
   }
   // Restores donor point (from, index) into `slot` with a slot-to-slot device copy (SlotCheckpointIO::CopyTo; no
   // host stage). A copy hit confirms a speculative point, as a Frontier hit does.
-  BatchRestore CopyFrontier(int slot, const ServeRequest& request, std::pair<int, int> donor) {
+  BatchRestore CopyFrontier(int slot, const ServeRequest& request, std::pair<int, int> donor, uint64_t client_seen) {
     // the hook reads the donor's stream. The target is selected again on every exit, so the
     // fallback restore and an error never write the donor's slot.
     const struct Reselect { E& engine; int slot; ~Reselect() { engine.SelectStream(slot); } } reselect{engine_, slot};
@@ -1878,7 +1883,8 @@ class BatchSession {
     if (!hit.tokens) return hit;
     if (hit.tokens != point.hist.size() || hit.tail || hit.slot || hit.shared)
       throw std::logic_error("a frontier copy must restore the donor point");
-    if (point.frontier.speculative) checkpoints_.Confirm(from, index);
+    if (point.frontier.speculative) checkpoints_.Confirm(from, index, 0, client_seen);
+    hit.frontier_client_seen = point.frontier.client_seen;
     hit.retirement_floor = point.retirement_floor;
     return hit;
   }
@@ -1889,7 +1895,8 @@ class BatchSession {
   // the session frontier at the cursor stays in the slot (a Frontier point) when the slot has a buffer for it.
   bool KeepFrontier(Request& state) { return KeepFrontierAt(state, state.cursor, false); }
   // x4-tail: `from_cut`: the state at `cursor` is in the cut buffer (a joined launch passed it), not in the slot.
-  bool KeepFrontierAt(Request& state, size_t cursor, bool from_cut) {
+  bool KeepFrontierAt(Request& state, size_t cursor, bool from_cut,
+                      std::optional<uint64_t> copied_age = std::nullopt) {
     if (!FrontiersOn() || state.options.cache_control == "bypass" || (from_cut && !cache_.cut_save)) return false;
     return cache_.frontier(state.options, cursor, [&](const SlotFrontier& meta, size_t retirement_floor) {
       retirement_floor = std::max(retirement_floor, state.retirement_floor);
@@ -1897,14 +1904,20 @@ class BatchSession {
       auto key = Key(state.options, below);
       const auto pick = checkpoints_.FrontierVictim(state.slot, key, state.id, state.options.tenant);
       if (!pick.held && !pick.index) return false;
+      auto frontier = meta;
+      if (copied_age || !frontier.speculative) {
+        frontier.speculative = false;
+        frontier.client_seen = copied_age.value_or(state.client_seen);
+      }
       if (pick.held) {
         // The slot holds this state already; a confirmed frontier confirms it (LOW-3).
-        if (!meta.speculative) checkpoints_.Confirm(state.slot, *pick.index, retirement_floor);
+        if (!frontier.speculative)
+          checkpoints_.Confirm(state.slot, *pick.index, retirement_floor, frontier.client_seen);
       } else {
         if (from_cut) cache_.cut_save(state.slot, *pick.index);
         else cache_.checkpoint_save(state.slot, *pick.index);
         checkpoints_.Store(state.slot, *pick.index, {std::vector<int>(below.begin(), below.end()), std::move(key), 0,
-                                                     false, CheckpointKind::Frontier, state.id, meta,
+                                                     false, CheckpointKind::Frontier, state.id, frontier,
                                                      state.options.tenant, nullptr, retirement_floor});
       }
       state.saved_tokens = std::max(state.saved_tokens, cursor);
