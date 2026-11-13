@@ -28,8 +28,9 @@ struct Cache {
   ConversationPolicy policy;
   explicit Cache(size_t live = 8, size_t entries = 3, bool probation = false)
       : cache(64 * entries, {}, live, kDefaultHostReserve, probation) { policy.prefill_rows = 8; }
-  bool Capture(const std::vector<int>& ids, size_t position, CacheRetention retention) {
-    return cache.Capture(ids, policy, {position, retention}, 64, size_t(9) << 30, [&] {
+  bool Capture(const std::vector<int>& ids, size_t position, CacheRetention retention,
+               uint64_t available = uint64_t(9) << 30) {
+    return cache.Capture(ids, policy, {position, retention}, 64, available, [&] {
       auto s = std::make_shared<Snapshot>(); s->hist.assign(ids.begin(), ids.begin() + position);
       s->resume.length = position; s->resume.prompt_only = true; s->resume.prompt_boundary = ids.size() - 1;
       return std::shared_ptr<const Snapshot>(s);
@@ -1219,7 +1220,70 @@ static void SpanReplayTail() {
     assert(found && found->snapshot->resume.replay == kSpecSpanMax);
   }
 }
+static void FailedCaptureKeepsFallback() {
+  const auto ids = Tokens(1, 40);
+  Cache c(1, 1);
+  assert(c.Capture(ids, 16, CacheRetention::Session));
+  bool attempted = false;
+  const auto fail = [&]() -> std::shared_ptr<const Snapshot> {
+    attempted = true;
+    throw std::bad_alloc();
+  };
+  assert(!c.cache.Capture(ids, c.policy, {32, CacheRetention::Session}, 64, uint64_t(9) << 30, fail));
+  assert(attempted && c.cache.LastRefusal() == "memory");
+  assert(c.cache.Evictions() == 0 && c.Hit(Fork(ids, 24, 100)) == 16);
+  c.cache.KeepInSlot(std::span(ids).first(32), c.policy, false);
+  attempted = false;
+  assert(!c.cache.Capture(ids, c.policy, {32, CacheRetention::Session}, 64, c.cache.HostReserve() + 64, fail));
+  assert(attempted && c.cache.LastRefusal() == "memory");
+  assert(c.cache.Evictions() == 0 && c.Hit(ids) == 16);
+  assert(c.Capture(ids, 32, CacheRetention::Session));
+  assert(c.Hit(ids) == 32 && c.cache.Bytes() == 64 && c.cache.SupersededEvictions() == 1);
+
+  Cache tail(1, 1);
+  assert(tail.Tail(ids, 21, true));
+  attempted = false;
+  assert(!tail.cache.CaptureTail(std::span(ids).first(32), tail.policy, 64, uint64_t(9) << 30, fail, true));
+  assert(attempted && tail.cache.LastRefusal() == "memory");
+  assert(tail.cache.Evictions() == 0 && tail.HitTail(ids) == 21);
+  assert(tail.Tail(ids, 32, true));
+  assert(tail.HitTail(ids) == 32 && tail.cache.Bytes() == 64 && tail.cache.SupersededEvictions() == 1);
+
+  Cache disk(1, 2, true);
+  disk.cache.SetSpillSlack(64);
+  std::vector<uint64_t> spill_rooms;
+  disk.cache.SetSpill([&](auto, const auto&, const auto&, int, uint64_t room) {
+    spill_rooms.push_back(room);
+    return false;
+  });
+  assert(disk.Capture(Tokens(100, 40), 16, CacheRetention::Session));
+  assert(disk.Capture(ids, 16, CacheRetention::Session));
+  attempted = false;
+  assert(!disk.cache.Capture(ids, disk.policy, {32, CacheRetention::Session}, 128, uint64_t(9) << 30, fail));
+  assert(attempted && disk.Hit(ids) == 16);
+  // While the fallback is retained it still counts against the writer's pinned-memory allowance.
+  assert(spill_rooms == std::vector<uint64_t>{0});
+}
+
+static void AdvanceFrontierAtHostReserve() {
+  const auto z = Tokens(1, 40), y = Tokens(100, 40), x = Tokens(200, 40);
+  Cache c(1, 4);
+  size_t spills = 0;
+  c.cache.SetSpill([&](auto, const auto&, const auto&, int, uint64_t) {
+    ++spills;
+    return true;
+  });
+  assert(c.Capture(z, 16, CacheRetention::Session));
+  assert(c.Capture(y, 16, CacheRetention::Session));
+  assert(c.Capture(x, 16, CacheRetention::Session));
+  assert(c.Capture(x, 32, CacheRetention::Session, c.cache.HostReserve()));
+  assert(c.Hit(x) == 32 && c.Hit(y) == 16 && c.Hit(z) == 16);
+  assert(c.cache.Evictions() == 1 && c.cache.SupersededEvictions() == 1 && spills == 0);
+}
+
 int main() {
+  AdvanceFrontierAtHostReserve();
+  FailedCaptureKeepsFallback();
   SpanReplayTail();
   TenantsNeverShareRam();
   LocalTenantUnchanged();

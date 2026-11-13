@@ -266,10 +266,11 @@ class BatchConversationCache {
     const uint64_t parent = Parent(hist, policy);  // before eviction can remove it
     const uint64_t lineage = LineageFor(hist, policy);  // the miss ledger, also before eviction
     const bool proven = ExtendsProven(hist, policy);  // also before eviction
-    const auto marked = trusted ? Supersede(hist, policy, [](const Entry& entry) {
+    auto replaced = trusted ? Supersede(hist, policy, [](const Entry& entry) {
       return entry.retention == CacheRetention::Session;
-    }) : std::set<const Item*>{};
-    if (!Admit(bytes, available, resident, !trusted, share)) return Unmark(marked, refusal_);
+    }) : Supersession{};
+    if (!Admit(bytes, available, resident, !trusted, share, &replaced.fallback))
+      return Unmark(replaced.marked, refusal_);
     try {
       auto lease = std::make_shared<MemoryLease>(ledger_, bytes);
       auto snapshot = create();
@@ -282,9 +283,10 @@ class BatchConversationCache {
         throw std::runtime_error("session replay needs a generated tail with target state or full MTP rows");
       auto entry = std::make_shared<Entry>(Entry{std::move(lease), std::move(snapshot), CacheRetention::Session, guarded,
                                                  ++serials_, parent, prompt_tokens, lineage});
-      return Saved(cache_.Insert(hist, policy, bytes, std::move(entry), false), trusted, trusted || proven);
+      return Saved(cache_.Insert(hist, policy, bytes, std::move(entry), false, &replaced.fallback),
+                   trusted, trusted || proven);
     } catch (const std::bad_alloc&) {
-      return Unmark(marked, "memory");
+      return Unmark(replaced.marked, "memory");
     }
   }
   // `ids` is the cache key; `tokens` as in CaptureTail. `proven`: the state extended a proven state when the slot
@@ -305,14 +307,15 @@ class BatchConversationCache {
     // A tail is never superseded by a prompt frontier: replay makes it the most valuable entry (G15).
     // A speculative frontier (past the boundary) is a speculative tail: a retry of this prompt, or a next turn that
     // drops the reasoning, cannot use it. It marks nothing until a hit confirms it.
-    const auto marked = frontier.speculative ? std::set<const Item*>{} :
+    auto replaced = frontier.speculative ? Supersession{} :
         Supersede(ids.first(frontier.position), policy, [](const Entry& entry) {
           return entry.retention == CacheRetention::Session && entry.snapshot->resume.prompt_only;
         });
-    // Before Admit: the state that this frontier extends is superseded now, so Admit evicts it first.
+    // Admit counts older superseded points first and defers the deepest when host memory allows.
     const bool proven = proven_before || ExtendsProven(ids.first(frontier.position), policy);
     const uint64_t lineage = LineageFor(ids.first(frontier.position), policy);  // the miss ledger, before eviction
-    if (!Admit(bytes, available, false, frontier.speculative, share)) return Unmark(marked, refusal_);
+    if (!Admit(bytes, available, false, frontier.speculative, share, &replaced.fallback))
+      return Unmark(replaced.marked, refusal_);
     try {
       auto lease = std::make_shared<MemoryLease>(ledger_, bytes);
       auto snapshot = create();
@@ -326,10 +329,10 @@ class BatchConversationCache {
       auto entry = std::make_shared<Entry>(Entry{std::move(lease), std::move(snapshot), frontier.retention, false,
                                                  ++serials_, 0, frontier.position, lineage});
       // A prompt frontier holds client tokens, so it is a confirmed resume point; a speculative one is not yet.
-      return Saved(cache_.Insert(ids.first(frontier.position), policy, bytes, std::move(entry), false), !frontier.speculative,
-                   proven);
+      return Saved(cache_.Insert(ids.first(frontier.position), policy, bytes, std::move(entry), false,
+                                 &replaced.fallback), !frontier.speculative, proven);
     } catch (const std::bad_alloc&) {
-      return Unmark(marked, "memory");
+      return Unmark(replaced.marked, "memory");
     }
   }
   // a slot keeps the session frontier `ids` instead of a host copy. The older Session frontiers that it
@@ -654,6 +657,11 @@ class BatchConversationCache {
   }
  private:
   using Item = typename PrefixCache<Entry, ConversationPolicy>::Entry;
+  using DeferredEviction = typename PrefixCache<Entry, ConversationPolicy>::DeferredEviction;
+  struct Supersession {
+    std::set<const Item*> marked;
+    DeferredEviction fallback;
+  };
   // The states that left the host cache at once: the newest evicted entries and refused saves, so a turn
   // that finds nothing can name its cause. A state is kept as a fingerprint, never as its key: the prefix hash at each
   // kLostGrid-token grid point, the hash of the whole key, and its length (L4, review: a 130K-token state is named
@@ -877,17 +885,20 @@ class BatchConversationCache {
     return proven;
   }
   bool Refuse(const char* reason) { last_.refused = reason; refusal_ = reason; return false; }
-  // Marks the Session entries that `ids` extends, as PrefixCache::Supersede, and returns the new marks.
+  // Identify the deepest point to keep while its successor is captured.
   template<class Accept>
-  std::set<const Item*> Supersede(std::span<const int> ids, const ConversationPolicy& policy, Accept accept) {
-    std::set<const Item*> marked;
+  Supersession Supersede(std::span<const int> ids, const ConversationPolicy& policy, Accept accept) {
+    Supersession replaced;
     cache_.ForEach([&](Item& item) {
-      if (item.superseded || item.policy != policy || item.ids.size() >= ids.size() ||
+      if (item.policy != policy || item.ids.size() >= ids.size() ||
           !std::equal(item.ids.begin(), item.ids.end(), ids.begin()) || !accept(*item.snapshot)) return;
+      if (!replaced.fallback.entry || item.ids.size() > replaced.fallback.entry->ids.size())
+        replaced.fallback.entry = &item;
+      if (item.superseded) return;
+      replaced.marked.insert(&item);
       item.superseded = true;
-      marked.insert(&item);
     });
-    return marked;
+    return replaced;
   }
   // A refused save keeps the marks of no older entry: a refused trusted tail must not demote its session's resume
   // point. Entries that a failed save already evicted are gone from the list, so only live items match.
@@ -1099,7 +1110,7 @@ class BatchConversationCache {
   // speculative tail never takes a waiting session's resume point: with more sessions than slots, that state is the
   // next turn of a session that has no slot (tests/slot_copy_soak_test.cpp).
   bool Admit(size_t bytes, uint64_t available, bool resident = false, bool speculative = false,
-             const SharedSave& share = {}) {
+             const SharedSave& share = {}, DeferredEviction* deferred = nullptr) {
     const uint64_t reserve = std::max<uint64_t>(HostReserve(), keep_free_);
     const size_t host_bytes = share.host_bytes && share.host_bytes < bytes ? share.host_bytes : bytes;
     // The eviction hook records what each victim frees with the chunks that this save keeps. The plan's protected set
@@ -1128,7 +1139,7 @@ class BatchConversationCache {
           // above keep their meaning, so this is the order of the victims only.
           if (newest_.contains(&item)) return int(kNewest);
           return tier;
-        }, freed)) {
+        }, freed, deferred)) {
       SpillVictims(available, host_bytes);
       return true;
     }
