@@ -28,8 +28,9 @@ struct Cache {
   ConversationPolicy policy;
   explicit Cache(size_t live = 8, size_t entries = 3, bool probation = false)
       : cache(64 * entries, {}, live, kDefaultHostReserve, probation) { policy.prefill_rows = 8; }
-  bool Capture(const std::vector<int>& ids, size_t position, CacheRetention retention) {
-    return cache.Capture(ids, policy, {position, retention}, 64, size_t(9) << 30, [&] {
+  bool Capture(const std::vector<int>& ids, size_t position, CacheRetention retention,
+               uint64_t available = uint64_t(9) << 30) {
+    return cache.Capture(ids, policy, {position, retention}, 64, available, [&] {
       auto s = std::make_shared<Snapshot>(); s->hist.assign(ids.begin(), ids.begin() + position);
       s->resume.length = position; s->resume.prompt_only = true; s->resume.prompt_boundary = ids.size() - 1;
       return std::shared_ptr<const Snapshot>(s);
@@ -1236,11 +1237,6 @@ static void FailedCaptureKeepsFallback() {
   assert(!c.cache.Capture(ids, c.policy, {32, CacheRetention::Session}, 64, c.cache.HostReserve() + 64, fail));
   assert(attempted && c.cache.LastRefusal() == "memory");
   assert(c.cache.Evictions() == 0 && c.Hit(ids) == 16);
-
-  attempted = false;
-  assert(!c.cache.Capture(ids, c.policy, {32, CacheRetention::Session}, 64, c.cache.HostReserve(), fail));
-  assert(!attempted && c.cache.LastRefusal() == "protected");
-  assert(c.cache.Evictions() == 0 && c.Hit(ids) == 16);
   assert(c.Capture(ids, 32, CacheRetention::Session));
   assert(c.Hit(ids) == 32 && c.cache.Bytes() == 64 && c.cache.SupersededEvictions() == 1);
 
@@ -1347,9 +1343,26 @@ static void PromoteExistingStableFrontier() {
   assert(attempted && c.Hit(rewrite) == 16);
 }
 
+static void AdvanceFrontierAtHostReserve() {
+  const auto z = Tokens(1, 40), y = Tokens(100, 40), x = Tokens(200, 40);
+  Cache c(1, 4);
+  size_t spills = 0;
+  c.cache.SetSpill([&](auto, const auto&, const auto&, int, uint64_t) {
+    ++spills;
+    return true;
+  });
+  assert(c.Capture(z, 16, CacheRetention::Session));
+  assert(c.Capture(y, 16, CacheRetention::Session));
+  assert(c.Capture(x, 16, CacheRetention::Session));
+  assert(c.Capture(x, 32, CacheRetention::Session, c.cache.HostReserve()));
+  assert(c.Hit(x) == 32 && c.Hit(y) == 16 && c.Hit(z) == 16);
+  assert(c.cache.Evictions() == 1 && c.cache.SupersededEvictions() == 1 && spills == 0);
+}
+
 int main() {
   EarlierFrontierOnHistoryRewrite();
   PromoteExistingStableFrontier();
+  AdvanceFrontierAtHostReserve();
   FailedCaptureKeepsFallback();
   SpanReplayTail();
   TenantsNeverShareRam();

@@ -336,8 +336,7 @@ class BatchConversationCache {
           return item.snapshot->retention == CacheRetention::Session && item.snapshot->snapshot->resume.prompt_only &&
                  item.stable == stable;
         }, stable);
-    // Refuse the new frontier if allocating it would require losing the fallback first.
-    replaced.fallback.keep_on_pressure = true;
+    // Admit counts older superseded points first and defers the deepest when host memory allows.
     const bool proven = proven_before || ExtendsProven(ids.first(frontier.position), policy);
     const uint64_t lineage = LineageFor(ids.first(frontier.position), policy);  // the miss ledger, before eviction
     if (!Admit(bytes, available, false, frontier.speculative, share, &replaced.fallback))
