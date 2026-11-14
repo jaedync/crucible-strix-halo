@@ -1192,7 +1192,16 @@ __device__ __forceinline__ void PcFatPairEpilogue(const PrefillMoe& a, int e, in
 template <int N, int MUT>
 __device__ __forceinline__ void PcFatPairItem(const PrefillMoe& a, const Exl3GemmJob& j, const Exl3GemmItem& it,
                                               uint32_t* lds) {
-  GemmF8 acc[kFatSlots][kTileCols] = {};
+  // A fresh zero per item: ROCm 10.x's register allocator keeps a hoisted all-zero 8-VGPR tuple live across the
+  // K loop instead of rematerializing it here, which pushes this kernel past its 240-VGPR budget (772 B/lane spill).
+  float z0;
+  asm volatile("v_mov_b32 %0, 0" : "=v"(z0));
+  const GemmF8 zv = {z0, z0, z0, z0, z0, z0, z0, z0};
+  GemmF8 acc[kFatSlots][kTileCols];
+#pragma unroll
+  for (int i = 0; i < kFatSlots; ++i)
+#pragma unroll
+    for (int c = 0; c < kTileCols; ++c) acc[i][c] = zv;
   PcFatConsume<N, 2, MUT>(j.I / 16, lds, acc);
   PcFatPairEpilogue<N, MUT == 1 || MUT == 2 ? MUT : 0>(a, it.job >> 1, j.M, it.m0, it.b0, acc,
                                                        reinterpret_cast<float*>(lds), PcTid());
