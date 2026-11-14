@@ -232,6 +232,9 @@ The machine has a balanced and a performance power profile. Cold prefill at 32K,
 | Gufo 0.22.0 | 1,693 | 1,843 |
 | Crucible | 1,614 | 1,870 |
 
+Caution (Nov 14, 2026): the Gufo 0.22.0 binary was our own build, and a large part of its GPU code was compiled without
+compiler optimization. Its values can be lower than those of a build with the flags of the Gufo authors. See [Rivals](RIVALS.md).
+
 The balanced Crucible value is from the run of Oct 23 to 24. The performance Crucible value is from a later build of Oct 25.
 The gain of Crucible is therefore not only the profile. Halogen and Gufo ran the same binaries in both profiles:
 their gain is about 9%. All values in the README tables use the balanced profile unless the row says otherwise.

@@ -4,6 +4,12 @@ Our own measurements of Crucible, Halogen and Gufo on one machine. We did not co
 The README links to this page. This page has all rows, the packs, the dates and the method.
 Where an engine leads, the table shows it.
 
+**Caution about the Gufo values (Nov 14, 2026).** We built the Gufo 0.22.0 binary of these runs ourselves, from the release
+source. On Nov 14, 2026 we found that our build method compiled a large part of the Gufo GPU code without compiler optimization.
+Thus the Gufo 0.22.0 values on this page can be lower than the values of a build with the flags of the Gufo authors. We do
+not know the size of the difference yet. We will measure Gufo again with a build that uses the optimization flags of its authors
+and replace these values; no date is set. The Halogen values are not affected: Halogen ran from the container image of its authors.
+
 **Dates and versions.** All rival values on this page were measured Oct 23 to 26, 2026, on Halogen 0.18.14 and Gufo 0.22.0.
 Newer versions exist: Halogen 0.18.18 and Gufo v0.27.0 (both Oct 29, 2026). We did not measure them. We did not measure the
 rivals again for Crucible v0.32.0. The Crucible values in these tables are from the builds named in each section (v0.26.0 or an
@@ -85,7 +91,9 @@ computed 2,058 rows. Halogen computes each row faster; Crucible computes fewer r
 ## Method
 
 - One machine (AMD Strix Halo, 128 GB), one request client for all engines, one engine at a time, and no other work on the GPU.
-- Each engine ran its own weights, with the flags that its authors publish. Halogen ran its container image.
+- Each engine ran its own weights. Halogen ran its container image, with the flags that its authors publish. Gufo 0.22.0
+  ran from our own build of its release source, and that build did not use the compiler optimization of its authors (see
+  the caution at the top of this page).
 - The prompts are the same for all engines. They hold no user text.
 - The rows D1 to D5 and P1 to P2c are the same rows for all engines.
 - We did not measure other engines. A value of another project is not in this table.
