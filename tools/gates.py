@@ -690,7 +690,7 @@ def oracle(checkpoint, dump, ids, baseline, python, output):
     points, runs = {}, []
     env = {**os.environ, 'OMP_NUM_THREADS': '8', 'OPENBLAS_NUM_THREADS': '8', 'MKL_NUM_THREADS': '8'}
     for layer in range(48):
-        cmd = ['flock', '-w', '7200', str(ORACLE_LOCK), 'nice', '-n', '5', 'timeout', '300',
+        cmd = ['flock', '-w', '7200', str(ORACLE_LOCK), 'nice', '-n', '5', 'timeout', '-k', '10', '300',
                str(python), str(ROOT / 'ref/oracle.py'),
                str(checkpoint), str(dump), str(layer), '--pos', '0,14,23', '--ids', str(ids)]
         start = time.time_ns()

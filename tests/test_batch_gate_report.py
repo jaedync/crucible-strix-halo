@@ -139,7 +139,7 @@ class BatchReportTest(unittest.TestCase):
         import subprocess
         kwargs, binding = self.prepare_run()
         binding["candidate_sha256"] = "f" * 64
-        with patch.object(b.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, json.dumps(binding), "")) as run:
+        with patch.object(b, "run_tree", return_value=subprocess.CompletedProcess([], 0, json.dumps(binding), "")) as run:
             with self.assertRaises(ValueError): b.run(**kwargs)
             self.assertEqual(run.call_count, 1)
 
@@ -152,7 +152,7 @@ class BatchReportTest(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, json.dumps(binding), "")
             seen.append((command[3:5], options["timeout"]))
             return subprocess.CompletedProcess(command, 1, b"", b"failed")
-        with patch.object(b.subprocess, "run", side_effect=execute), self.assertRaises(ValueError):
+        with patch.object(b, "run_tree", side_effect=execute), self.assertRaises(ValueError):
             b.run(**kwargs, queue_wait=21600)
         self.assertEqual(seen, [(["-w", "21600"], 21915)])
 
@@ -169,7 +169,7 @@ class BatchReportTest(unittest.TestCase):
             return subprocess.CompletedProcess(command, 0, b"stdout", b"")
         ahead = time.time_ns() + 10**9
         with patch.object(b.time, "time_ns", return_value=ahead), \
-                patch.object(b.subprocess, "run", side_effect=execute):
+                patch.object(b, "run_tree", side_effect=execute):
             result = b.run(**kwargs)
         self.assertEqual(result["status"], "PASS")
 
@@ -186,7 +186,7 @@ class BatchReportTest(unittest.TestCase):
             for size in range(1, 9):
                 for stream in range(size): self.populate(root / f"batch{size}" / f"stream_{stream}", True)
             return subprocess.CompletedProcess(command, 0, b"stdout", b"")
-        with patch.object(b.subprocess, "run", side_effect=execute): result = b.run(**kwargs)
+        with patch.object(b, "run_tree", side_effect=execute): result = b.run(**kwargs)
         self.assertEqual(result["status"], "PASS")
         self.assertTrue((kwargs["output"] / "report.json").is_file())
         self.assertEqual(result["build_binding"], binding)
@@ -208,7 +208,7 @@ class BatchReportTest(unittest.TestCase):
             if change: sidecar.write_bytes(b"sidecar bytez")
             return subprocess.CompletedProcess(command, 0, b"stdout", b"")
         with patch.dict(os.environ, {"CRUCIBLE_MTP_SIDECAR": str(sidecar)}), \
-                patch.object(b.subprocess, "run", side_effect=execute):
+                patch.object(b, "run_tree", side_effect=execute):
             return kwargs, b.run(**kwargs)
 
     def test_report_records_the_sidecar(self):
@@ -225,7 +225,7 @@ class BatchReportTest(unittest.TestCase):
         import os
         kwargs, _ = self.prepare_run()
         with patch.dict(os.environ, {"CRUCIBLE_MTP_SIDECAR": str(self.root)}), \
-                patch.object(b.subprocess, "run") as run:
+                patch.object(b, "run_tree") as run:
             with self.assertRaisesRegex(ValueError, "regular file"): b.run(**kwargs)
             self.assertEqual(run.call_count, 0)
 
@@ -234,14 +234,14 @@ class BatchReportTest(unittest.TestCase):
         kwargs, binding = self.prepare_run()
         wrong = self.root / "wrong_ids"; wrong.write_text("1,2,4")
         kwargs["primary_ids"] = wrong
-        with patch.object(b.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, json.dumps(binding), "")) as execute:
+        with patch.object(b, "run_tree", return_value=subprocess.CompletedProcess([], 0, json.dumps(binding), "")) as execute:
             with self.assertRaises(ValueError): b.run(**kwargs)
             self.assertEqual(execute.call_count, 1)
 
     def test_failed_probe_cannot_pass(self):
         import subprocess
         kwargs, binding = self.prepare_run()
-        with patch.object(b.subprocess, "run", side_effect=[subprocess.CompletedProcess([], 0, json.dumps(binding), ""),
+        with patch.object(b, "run_tree", side_effect=[subprocess.CompletedProcess([], 0, json.dumps(binding), ""),
                                                             subprocess.CompletedProcess([], 1, b"PASS", b"bad")]):
             with self.assertRaises(ValueError): b.run(**kwargs)
         self.assertEqual(json.loads((kwargs["output"] / "report.json").read_text())["status"], "FAIL")

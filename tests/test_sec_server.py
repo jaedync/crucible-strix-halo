@@ -239,7 +239,7 @@ class ReleaseTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         tree = Path(tmp.name) / "tree"
         for rel in ("Makefile", "VERSION", "tools/hipcc_checked.sh", "tools/release_engine.py", "tools/devsplit.py",
-                    "tools/devsplit_ir.py", "tools/devsplit_groups.tsv", "tools/devsplit_facts.tsv"):
+                    "tools/devsplit_ir.py", "tools/devsplit_groups.tsv", "tools/devsplit_facts.tsv", "tools/hipcc_series.py"):
             (tree / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / rel, tree / rel)
         (tree / "engine").mkdir()

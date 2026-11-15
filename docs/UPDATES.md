@@ -69,7 +69,7 @@ A user timer runs only while you are logged in. To let it run when you are logge
 
 The build runs next to your loaded model. A build with one job peaked at 1.4 GB of memory in a test. The service
 file limits the build to 4 GB (`MemoryMax`) and tells the kernel to stop the build first if memory runs out
-(`OOMScoreAdjust`). In the same test the build took 16 minutes.
+(`OOMScoreAdjust`).
 
 The 4 GB limit covers the split build, which is the default. If that build cannot run, the build falls back to the plain
 build, which can need more memory. If the plain build hits the limit, the kernel stops it, `make update` restores the

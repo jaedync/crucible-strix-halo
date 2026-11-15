@@ -12,7 +12,7 @@ name=${6:?baseline name}
 if [[ "$proof" != - ]]; then
   log="results/$tag-proof.txt"
   sha256sum "$proof" "$probe" bench/qsa_prefill_mr8_run.sh engine/layers/kernels/prefill_qsa_score.h >"results/$tag-proof.sha256"
-  "$WORK_GPU_RUN" -p 1 -w 7200 -- timeout 60 env HSA_USERPTR_FOR_PAGED_MEM=0 \
+  "$WORK_GPU_RUN" -p 1 -w 7200 -- timeout -k 10 60 env HSA_USERPTR_FOR_PAGED_MEM=0 \
     bash bench/qsa_prefill_mr8_run.sh "$proof" "$probe" >"$log" 2>&1
   grep -q batch_complete "$log"
 fi

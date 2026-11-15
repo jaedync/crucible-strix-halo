@@ -1,6 +1,6 @@
 # Container image of Crucible for gfx1151, built from a pinned release tag.
 # The image holds no model: mount an EXL3 pack as a volume (docs/DOCKER.md).
-ARG CRUCIBLE_VERSION=v0.37.0
+ARG CRUCIBLE_VERSION=v0.37.2
 ARG ROCM_IMAGE=docker.io/rocm/dev-ubuntu-24.04:7.2.4
 
 FROM ${ROCM_IMAGE} AS build
@@ -32,6 +32,6 @@ ENV CRUCIBLE_NO_UPDATE_CHECK=1
 # Only this image sets the switch (docs/DOCKER.md). With it, --host 0.0.0.0 or :: starts with no API key.
 ENV CRUCIBLE_CONTAINER_OPEN_BIND=1
 EXPOSE 8790
-# Arguments: the EXL3 pack directory, then the server options, for example
-#   /models/pack --host 0.0.0.0 --port 8790 --ctx 32768
+# Use the full docker run line in docs/DOCKER.md for the measured configuration.
+# Arguments: the EXL3 pack directory, then the server options.
 ENTRYPOINT ["/opt/crucible/.venv/bin/python", "-m", "server"]

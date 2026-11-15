@@ -26,12 +26,26 @@ IMPORTS = "import numpy, tokenizers, huggingface_hub, jinja2, PIL"
 HINT = "To run it as a service: ./crucible service install"
 
 
+ROCM10_MARKER = "CRUCIBLE-ROCM10-STOP"   # tools/hipcc_series.py MARKER: make stopped for a ROCm 10 hipcc
+
+
+def rocm10_stop(out):
+    """The message for a make that stopped for a ROCm 10 hipcc (tools/hipcc_series.py), or None for any other output."""
+    if ROCM10_MARKER not in (out or ""):
+        return None
+    return ("hipcc is a ROCm 10 compiler (AMD clang 24 or later). An engine built with it is slower: a 32K prefill gave "
+            "1,091 tok/s against 1,894 tok/s with the ROCm 7.2.4 compiler (42% less, measured Nov 12 2026). Build with the "
+            "ROCm 7.2.4 compiler (set ROCM_PATH to its folder), or use --allow-rocm10 to build with this compiler.")
+
+
 class StepFailed(Exception):
     pass
 
 
 class Setup:
-    def __init__(self, host, s, smoke=False, start_timeout=3600, service="no", hint=False, runtime="", kernel_ask=None):
+    def __init__(self, host, s, smoke=False, start_timeout=3600, service="no", hint=False, runtime="", kernel_ask=None,
+                 allow_rocm10=False):
+        self.allow_rocm10 = allow_rocm10  # --allow-rocm10: make builds also with a ROCm 10 compiler (ALLOW_ROCM10=1)
         self.config_changed = False  # step_config sets it: the settings on the disk differ from the ones of the last run
         self.host, self.s, self.smoke, self.start_timeout = host, s, smoke, start_timeout
         self.service, self.hint = service, hint
@@ -270,16 +284,20 @@ class Setup:
         if rel:
             return f"release engine {rel['tag']} (verified)"
         make = h.which("make") or "make"
-        env = {"ROCM_PATH": h.env["ROCM_PATH"]} if h.env.get("ROCM_PATH") else None
-        if env:
-            env = process_env(h.env, env)
+        env = {"ROCM_PATH": h.env["ROCM_PATH"]} if h.env.get("ROCM_PATH") else {}
+        if self.allow_rocm10:
+            env["ALLOW_ROCM10"] = "1"
+        env = process_env(h.env, env) if env else None
         log = self._log("build.log")
-        self.say(f"  Building with one compile job; this takes about 16 minutes. Log: {s.work / 'build.log'}")
+        self.say(f"  Building with one compile job; this takes about 16 minutes with the ROCm 7.2.4 compiler. Log: {s.work / 'build.log'}")
         argv = [make, f"-j{s.jobs}"]
         res = h.runner.run(argv, cwd=s.repo, env=env, log=log)
         if res.rc != 0 and "argument facts drift" in res.out:
             self.say("  The build stopped with 'argument facts drift' (another ROCm build). Building again with SPLIT=0 (slower).")
             res = h.runner.run(argv + ["SPLIT=0"], cwd=s.repo, env=env, log=log)
+        stop = rocm10_stop(res.out) if res.rc != 0 else None
+        if stop:
+            raise StepFailed(stop + " Run setup again with --allow-rocm10 to build with this compiler all the same.")
         if res.rc != 0 or not s.engine.exists():
             raise StepFailed(f"make failed (log: {s.work / 'build.log'}). Last lines: " + res.out[-400:])
         return "built build/engine/crucible"

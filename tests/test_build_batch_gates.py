@@ -30,7 +30,7 @@ class BatchBuildTest(unittest.TestCase):
 
     def test_frozen_shared_source_and_fixed_flags(self):
         with patch.object(builder, "compiler_identity", return_value=self.identity), \
-             patch.object(builder.subprocess, "run", side_effect=self.compile):
+             patch.object(builder, "run_tree", side_effect=self.compile):
             result = builder.build(self.source, self.root / "build", "test-commit")
         candidate = json.loads(result["engine_record"].read_text())
         probe = json.loads(result["probe_record"].read_text())
@@ -48,13 +48,13 @@ class BatchBuildTest(unittest.TestCase):
             (self.root / "build/source/engine/layers/ops.h").write_text("different arithmetic")
             return result
         with patch.object(builder, "compiler_identity", return_value=self.identity), \
-             patch.object(builder.subprocess, "run", side_effect=mutate):
+             patch.object(builder, "run_tree", side_effect=mutate):
             with self.assertRaises(ValueError): builder.build(self.source, self.root / "build", "test-commit")
         self.assertFalse((self.root / "build/batch_gates.build.json").exists())
 
     def test_compilation_failure_cannot_write_qualified_record(self):
         with patch.object(builder, "compiler_identity", return_value=self.identity), \
-             patch.object(builder.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, b"", b"compile failed")):
+             patch.object(builder, "run_tree", return_value=subprocess.CompletedProcess([], 1, b"", b"compile failed")):
             with self.assertRaises(ValueError): builder.build(self.source, self.root / "build", "test-commit")
         self.assertFalse((self.root / "build/crucible.build.json").exists())
 

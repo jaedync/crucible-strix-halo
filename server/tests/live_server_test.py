@@ -45,7 +45,7 @@ def main():
 
     def gen(name, ids_file, n, chunk=8, spec=0, dump=False):
         log = out / (name + ".txt")
-        command = ["timeout", "300", str(args.engine), "gen", str(args.checkpoint),
+        command = ["timeout", "-k", "10", "300", str(args.engine), "gen", str(args.checkpoint),
                    "--ids-file", str(ids_file), "--n", str(n), "--chunk", str(chunk), "--spec", str(spec)]
         if dump:
             directory = out / name

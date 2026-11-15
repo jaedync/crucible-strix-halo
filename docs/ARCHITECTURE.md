@@ -140,9 +140,8 @@ path. The loader checks the metadata before it uses a tensor.
 The parts of class `Engine` and their rules: decode, verification, sampling, drafts, prefill scheduling,
 batch contracts and state caches.
 
-- The output of a request depends only on the request. Batches, the cache state, the load and the
-  speculation depth do not change it.
-- A restored state is bitwise equal to the state that a new prefill makes.
+- The output of a request depends only on the request. Batches, the load and the speculation depth do
+  not change it.
 
 ### serve (rank 5)
 

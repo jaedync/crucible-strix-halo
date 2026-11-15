@@ -9,7 +9,7 @@ with 128 GB. Its OpenAI-compatible server gives local coding agents 4 sessions o
 <picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/decode-by-context-dark.svg"><img src="docs/img/decode-by-context-light.svg" width="412" alt="Line chart: Decode by context length, in tokens per second: 4.05 bpw from 71.7 at 32K to 62.2 at 250K; 3.05 bpw from 77.0 at 32K to 69.1 at 250K. v0.33.0, Nov 3, 2026."></picture>
 </p>
 
-<sub>One request at a time, default configuration, balanced power profile, v0.33.0 (Nov 3, 2026). No new run for v0.37.0.</sub>
+<sub>One request at a time, default configuration, balanced power profile, v0.33.0 (Nov 3, 2026). No new run for v0.37.2.</sub>
 <!-- results:end charts -->
 
 ## Install
@@ -21,12 +21,12 @@ with 128 GB. Its OpenAI-compatible server gives local coding agents 4 sessions o
 curl -fsSL https://raw.githubusercontent.com/jaedync/crucible-strix-halo/main/install.sh | bash
 ```
 
-**Build from source.** It takes about 16 minutes and needs the ROCm 7.2.4 compiler
-([why](docs/QUICKSTART.md#step-4-build-the-engine)).
+**Build from source.** It takes about 16 minutes with the ROCm 7.2.4 compiler
+([steps](docs/QUICKSTART.md#step-4-build-the-engine)).
 
 <!-- results:start clone -->
 ```sh
-git clone --branch v0.37.0 https://github.com/jaedync/crucible-strix-halo.git
+git clone --branch v0.37.2 https://github.com/jaedync/crucible-strix-halo.git
 cd crucible-strix-halo
 ./crucible setup
 ```
@@ -47,7 +47,7 @@ Read more: [setup guide](docs/QUICKSTART.md) · [service](docs/QUICKSTART.md#run
 
 - **Machine:** Ryzen AI Max+ 395 with Radeon 8060S (gfx1151) and 128 GB of memory. Other machines are not supported.
 - **System:** Linux with Python 3.12 or newer. The tested system is Arch Linux.
-- **ROCm:** the release engine runs on ROCm 10.1 (recommended) and on 7.2.4. A source build needs the 7.2.4 compiler.
+- **ROCm:** the release engine is built with ROCm 7.2.4. It runs on ROCm 10.1 (recommended) and on 7.2.4.
 - **GPU memory:** two kernel parameters let the GPU use the system memory. Setup prints the change and applies it
   only after you type `yes`.
 - **Disk:** an SSD with about 110 GB for the model, and up to 200 GiB for the conversation cache.
@@ -74,7 +74,7 @@ all three. A longer request uses YaRN. Measured in `long`:
 | Cold prompt: prefill | 1,677.6 tok/s | 1,436.2 tok/s |
 | Decode, code | 67.7 tok/s | 59.8 tok/s |
 
-<sub>v0.37.0, measured Nov 11, 2026: 1 run, balanced power profile.</sub>
+<sub>v0.37.0, measured Nov 11, 2026: 1 run, balanced power profile. No new run for v0.37.2.</sub>
 <!-- results:end long -->
 
 Read more: [long context](docs/LONG_CONTEXT.md)
@@ -86,7 +86,7 @@ Read more: [long context](docs/LONG_CONTEXT.md)
 <picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/prefill-by-release-dark.svg"><img src="docs/img/prefill-by-release-light.svg" width="412" alt="Line chart: Cold prefill of a 32K prompt, by release, in tokens per second: 4.05 bpw from 1,585 at v0.22.0 to 1,831 at v0.34.0; 3.05 bpw from 1,656 at v0.22.0 to 1,877 at v0.34.0. Oct 27 to Nov 7, 2026."></picture>
 </p>
 
-<sub>Each release ran with the settings of its own time, balanced power profile. No new run for v0.37.0.</sub>
+<sub>Each release ran with the settings of its own time, balanced power profile. No new run for v0.37.2.</sub>
 <!-- results:end releases -->
 
 <!-- results:start table -->
@@ -99,11 +99,13 @@ Read more: [long context](docs/LONG_CONTEXT.md)
 | Decode at 32K, 1 session, prose | 58.4 tok/s | 60.7 tok/s |
 | Decode, 4 sessions, total | 118.3 tok/s | 129.0 tok/s |
 
-<sub>v0.34.0, measured Nov 7, 2026: median of 2 runs, balanced power profile, default configuration. No new run for v0.37.0.</sub>
+<sub>v0.34.0, measured Nov 7, 2026: median of 2 runs, balanced power profile, default configuration. No new run for v0.37.2.</sub>
 <!-- results:end table -->
 
-Read more: [results and method](docs/RESULTS.md) · [history](docs/HISTORY.md) ·
-[Halogen and Gufo on the same machine](docs/RIVALS.md) · [how it got fast](docs/how-it-got-fast.md)
+The 4-session row uses warm prompts and the all-4 window.
+
+[Method](docs/RESULTS.md) · [History](docs/HISTORY.md) ·
+[Rivals](docs/RIVALS.md) · [Development](docs/how-it-got-fast.md)
 
 ## Features
 

@@ -10,7 +10,7 @@ PY=$WORK_DIR/refenv/.venv/bin/python
 d=$1
 # One oracle process at a time, nice 5, 8 threads.
 for l in $(seq 0 47); do
-  OPENBLAS_NUM_THREADS=8 OMP_NUM_THREADS=8 nice -n 5 timeout 600 $PY ref/oracle.py $CKPT $d $l --pos 0,14,23 --ids $FIB > $d.oracle.$l.txt 2>&1
+  OPENBLAS_NUM_THREADS=8 OMP_NUM_THREADS=8 nice -n 5 timeout -k 10 600 $PY ref/oracle.py $CKPT $d $l --pos 0,14,23 --ids $FIB > $d.oracle.$l.txt 2>&1
 done
 cat $(for l in $(seq 0 47); do echo $d.oracle.$l.txt; done) > $d.oracle.txt
 $PY tools/pl_gate1.py $d.oracle.txt ${PL_BASE:-}

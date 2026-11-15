@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run under $WORK_GPU_RUN -p PRIORITY -- timeout 300. Merge gates use priority 0.
+# Run under $WORK_GPU_RUN -p PRIORITY -- timeout -k 10 300. Merge gates use priority 0.
 set -euo pipefail
 . "$(dirname "$0")/../tools/work_paths.sh"
 cd "$(dirname "$0")/.."

@@ -35,6 +35,12 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
+try:  # the repository: tools/ on the path
+    from tools.proc_tree import run_tree
+except ImportError:  # run as a script: its own folder
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from proc_tree import run_tree
+
 REGEN_TIMEOUT = 900
 DEFAULT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -151,7 +157,7 @@ def run_generator(root: Path, entry: dict) -> tuple[dict[str, bytes] | None, str
         except KeyError as error:
             return None, f"the entry has no {error.args[0]}"
         try:
-            done = subprocess.run(command, cwd=str(work or root), capture_output=True, timeout=REGEN_TIMEOUT)
+            done = run_tree(command, cwd=str(work or root), timeout=REGEN_TIMEOUT)  # uv run starts python: end both at the limit
         except OSError as error:
             return None, f"cannot run the generator ({type(error).__name__})"
         except subprocess.TimeoutExpired:

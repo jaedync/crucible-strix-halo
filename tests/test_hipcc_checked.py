@@ -89,7 +89,7 @@ class MakeTest(Base):
         super().setUp()
         self.tree = self.t / "tree"
         for rel in ("Makefile", "VERSION", "tools/hipcc_checked.sh", "tools/release_engine.py", "tools/devsplit.py",
-                    "tools/devsplit_ir.py", "tools/devsplit_groups.tsv", "tools/devsplit_facts.tsv"):
+                    "tools/devsplit_ir.py", "tools/devsplit_groups.tsv", "tools/devsplit_facts.tsv", "tools/hipcc_series.py"):
             if (ROOT / rel).exists():
                 (self.tree / rel).parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(ROOT / rel, self.tree / rel)

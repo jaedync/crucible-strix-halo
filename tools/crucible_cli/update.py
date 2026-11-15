@@ -41,6 +41,7 @@ from .files import SYSTEM_PREFIXES, OutsideRoots, Sandbox
 
 ARCH = "gfx1151"
 ROCM_SERIES = "7.2"
+SERIES = (ROCM_SERIES, "10.1")  # the series words that update accepts, the preferred one first (v0.37.2: built with 7.2.4)
 REPO_URL_DEFAULT = "https://github.com/jaedync/crucible-strix-halo.git"
 RELEASE_BASE_DEFAULT = "https://github.com/jaedync/crucible-strix-halo/releases/download"
 TAG_RE = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+\Z")
@@ -84,8 +85,16 @@ def crash_point(name):
     """A seam for the tests: they raise here to simulate a kill. It does nothing in a real run."""
 
 
-def asset_stem(tag):
-    return f"crucible-engine-{tag}-{ARCH}-rocm{ROCM_SERIES}-linux-x86_64"
+def asset_stem(tag, series=ROCM_SERIES):
+    return f"crucible-engine-{tag}-{ARCH}-rocm{series}-linux-x86_64"
+
+
+def pick_series(sums_text, tag):
+    """The ROCm series of the engine files of TAG: the first word of SERIES whose manifest name SHA256SUMS lists, else
+    ROCM_SERIES (the download then names the missing file). The release engine of v0.37.2 is a 7.2.4 build under the
+    rocm7.2 name; a release with only the rocm10.1 name (a ROCm 10.1 build) is accepted too."""
+    names = {line.split()[-1].removeprefix("*") for line in sums_text.splitlines() if len(line.split()) == 2}
+    return next((s for s in SERIES if f"{asset_stem(tag, s)}.needs" in names), ROCM_SERIES)
 
 
 def vkey(tag):
@@ -421,12 +430,13 @@ class Update:
         say = self.say
         dl = work / "dl"
         dl.mkdir()
-        stem = asset_stem(tag)
-        gz, needs = f"{stem}.gz", f"{stem}.needs"
         base = self.release_base(tag)
         say(f"Downloading the release files of {tag} ...")
         try:
             fetch(f"{base}/SHA256SUMS", dl / "SHA256SUMS", MAX_SMALL_BYTES, self.box)
+            series = pick_series((dl / "SHA256SUMS").read_text(errors="replace"), tag)
+            stem = asset_stem(tag, series)
+            gz, needs = f"{stem}.gz", f"{stem}.needs"
             fetch(f"{base}/{needs}", dl / needs, MAX_SMALL_BYTES, self.box)
             fetch(f"{base}/{gz}", dl / gz, MAX_DOWNLOAD_BYTES, self.box)
         except CheckFailed as exc:
@@ -441,15 +451,15 @@ class Update:
                 raise CheckFailed(f"The sha256 of {name} does not match SHA256SUMS (expected {want}, got {have}). "
                                   "The download is bad or partial.")
             say(f"  sha256 ok: {name}")
-        manifest = self.read_manifest(dl / needs, tag)
+        manifest = self.read_manifest(dl / needs, tag, series)
         if manifest["commit"] != pinned:
             raise CheckFailed(f"The commit in the release manifest ({manifest['commit']}) is not the commit of tag {tag} ({pinned}).")
         engine = self.unpack(dl / gz, dl / "engine", manifest["binary_sha256"])
         say("  engine sha256 ok after unpacking")
         self.check_target(manifest)
-        return {"path": engine, "manifest": manifest, "asset": gz}
+        return {"path": engine, "manifest": manifest, "asset": gz, "series": series}
 
-    def read_manifest(self, path, tag):
+    def read_manifest(self, path, tag, series=ROCM_SERIES):
         keys, libs = {}, []
         for line in path.read_text(errors="replace").splitlines():
             parts = line.split()
@@ -463,8 +473,8 @@ class Update:
             raise CheckFailed(f"The release manifest is for another release ({keys.get('tag')}), not {tag}.")
         if keys.get("arch") != ARCH:
             raise CheckFailed(f"The release manifest is for another GPU ({keys.get('arch')}), not {ARCH}.")
-        if keys.get("rocm") != ROCM_SERIES:
-            raise CheckFailed(f"The release manifest is for ROCm {keys.get('rocm')}, not {ROCM_SERIES}.")
+        if keys.get("rocm") != series:   # the word of the manifest must be the series of its file name
+            raise CheckFailed(f"The release manifest is for ROCm {keys.get('rocm')}, not {series}.")
         if not HEX40.match(keys.get("commit", "")):
             raise CheckFailed("The release manifest has a bad commit.")
         if not HEX64.match(keys.get("binary_sha256", "")):
@@ -581,7 +591,7 @@ class Update:
         self.box.replace(eng / "crucible.tmp", eng / "crucible")
         m = engine["manifest"]
         record = {"format": 1, "tag": tag, "commit": m["commit"], "engine_sha256": m["binary_sha256"], "arch": ARCH,
-                  "rocm": ROCM_SERIES, "asset": engine["asset"], "glibc_min": m.get("glibc_min", ""),
+                  "rocm": engine.get("series", ROCM_SERIES), "asset": engine["asset"], "glibc_min": m.get("glibc_min", ""),
                   "glibcxx_min": m.get("glibcxx_min", "")}
         self.box.write_text(eng / "release.json", json.dumps(record) + "\n")
 
@@ -595,12 +605,18 @@ class Update:
         if h.which("systemd-run") and service.manager_ok(h):
             argv = ["systemd-run", "--user", "--scope", "--quiet", "-p", "MemoryMax=4G", *argv]
         env = dict(self.env)
-        say("Building the engine from source in the staging folder (about 16 minutes). The server keeps running.")
+        if getattr(self.args, "allow_rocm10", False):
+            env["ALLOW_ROCM10"] = "1"
+        say("Building the engine from source in the staging folder (about 16 minutes with the ROCm 7.2.4 compiler). "
+            "The server keeps running.")
         with self.box.open_log(work / "build.log") as log:
             res = h.runner.run(argv, cwd=str(stage), env=env, log=log)
             if res.rc != 0 and "argument facts drift" in res.out:
                 say("The build stopped with 'argument facts drift'. Building again with SPLIT=0 (slower).")
                 res = h.runner.run(argv + ["SPLIT=0"], cwd=str(stage), env=env, log=log)
+        stop = steps.rocm10_stop(res.out) if res.rc != 0 else None
+        if stop:
+            raise CheckFailed(stop + " Run the update again with --allow-rocm10 to build with this compiler all the same.")
         if res.rc != 0 or not (stage / "build/engine/crucible").is_file():
             raise CheckFailed("The build of the new release failed. " + res.out[-300:].strip())
 
@@ -1072,7 +1088,7 @@ def _uninstall(host, real, home, args, ask, box):
     state_owned = state_ok and settings_mod.state_owned(real, state)
     # Setup may record a folder that did not exist yet (for example ~/.cache), and other programs fill it later. Look inside:
     # the folder is removed only when it holds nothing but what the engine writes there.
-    state_why = settings_mod.state_folder_problem(state) if state_owned else None
+    state_why = settings_mod.state_dir_problem(home, real, state, look_inside=True) if state_owned else None
     if state_why:
         state_owned = False
     models = Path(s.models_dir)

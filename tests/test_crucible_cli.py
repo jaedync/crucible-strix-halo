@@ -697,7 +697,8 @@ class StepWordingTest(unittest.TestCase):
 
 class RocmFixWordingTest(unittest.TestCase):
     def test_the_rocm_fix_names_the_compiler_for_a_source_build(self):
-        # An engine built with the ROCm 10.1 compiler does not pass the token gates yet; the release engine runs on both.
+        # v0.37.2: the release engine is a ROCm 7.2.4 build; a ROCm 10 compiler makes a slower engine (make stops for it).
         line = doctor.ROCM_FIX.splitlines()[0]
         self.assertTrue(line.endswith("ROCm 7.2.4 works too. To build the engine from source, use the ROCm 7.2.4 compiler "
-                                      "for now (see docs/QUICKSTART.md)."), line)
+                                      "(see docs/QUICKSTART.md)."), line)
+        self.assertNotIn("for now", doctor.ROCM_FIX)

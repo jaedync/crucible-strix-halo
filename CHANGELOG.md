@@ -3,6 +3,51 @@
 Releases are numbered `v0.<train>.<fix>`. This file lists the newest release first.
 The same text is in the notes of each release on GitHub.
 
+## v0.37.2 (2026-11-15)
+
+Release v0.37.2 has the engine of v0.37.0, built with ROCm 7.2.4. The engine source is the source of v0.37.0. It fixes
+the installer and the image input. v0.37.1 was not released: its changes to setup and update are in this release, and
+its engine (a ROCm 10.1 build) is not.
+
+### Images
+
+- A PNG or WebP with transparency is put on a white background before the resize. Before, the server
+  dropped the alpha channel, so the transparent pixels kept their stored color, usually black. Images without
+  transparency give the same pixels and the same `image_digest` as before. Thanks to @dblaber for the report and the
+  exact repro.
+
+### Build and ROCm
+
+- `make`, `./crucible setup` and `./crucible update` stop when `hipcc` is a ROCm 10 compiler (AMD clang 24 or later),
+  because its engine is slower (a 32K prefill: 42% less). Use ROCm 7.2.4, or add `ALLOW_ROCM10=1` (make) or
+  `--allow-rocm10` (setup, update). With that compiler, `make` uses plain `hipcc` (no split build).
+- An update from v0.37.0 runs the updater of v0.37.0, which does not know `--allow-rocm10`. To update a source build
+  with a ROCm 10 compiler, use `ALLOW_ROCM10=1 ./crucible update`.
+- `./crucible doctor` again tells you to build the engine from source with the ROCm 7.2.4 compiler.
+- The release engine runs on ROCm 7.2.4 and on ROCm 10.1. Its file name is
+  `crucible-engine-v0.37.2-gfx1151-rocm7.2-linux-x86_64.gz`. `./crucible update` reads the ROCm series of the release
+  files: it takes the `rocm7.2` name first and also accepts the `rocm10.1` name. It also reads a SHA256SUMS line in
+  binary mode (`HASH *NAME`).
+
+### Setup and documentation
+
+- Setup, doctor and uninstall use one check of the state folder. Doctor now accepts a state folder that holds engine
+  files.
+- The setup step `[build]` now reads "get the engine (the release engine, or a build with make)". It no longer says "make"
+  when setup downloads the release engine.
+- The build time of about 16 minutes in the installer and the guide is for the ROCm 7.2.4 compiler.
+- docs/ARCHITECTURE.md and docs/RESULTS.md no longer say that the output does not depend on the cache state and that a
+  restored state is bitwise equal (see [session replay](docs/SESSION_REPLAY.md)).
+
+### Known limits
+
+- An engine built from source with the ROCm 10.1 compiler is slower at a 32K prefill than one built with the 7.2.4
+  compiler. This stays so until the register spill fixes ship. For a source build, use the 7.2.4 compiler.
+- With the disk tier (`--state-dir`) on a slow disk, a state write can wait longer than the 8 s bound of a slot handover.
+  The server then drops that state. The next turn of that session restores the longest saved prefix and computes the
+  rest again, so it is slower. Its tokens are those of the normal path and can differ from a run on a fast disk
+  (see [session replay](docs/SESSION_REPLAY.md)).
+
 ## v0.37.0 (2026-11-11)
 
 Release v0.37.0 is the engine of train 37. It follows v0.34.0.

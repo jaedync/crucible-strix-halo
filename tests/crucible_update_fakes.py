@@ -187,10 +187,12 @@ class World:
         self.repo_url = f"file://{self.src}"
 
     def make_release(self, engine=None, tag=NEW, commit=None, arch="gfx1151", rocm="7.2", needs=(), glibc_min="2.1",
-                     glibcxx_min="3.4", binary_sha=None):
-        for p in self.release.iterdir():
-            p.unlink()
-        stem = STEM.format(tag=tag)
+                     glibcxx_min="3.4", binary_sha=None, series=None, keep=False):
+        """series: the ROCm series word of the file names (default: the manifest word). keep: add to the files that are there."""
+        if not keep:
+            for p in self.release.iterdir():
+                p.unlink()
+        stem = STEM.replace("rocm7.2", f"rocm{series or rocm}").format(tag=tag)
         raw = engine if engine is not None else f"#!/bin/sh\necho {CANARY}\n".encode()
         self.new_engine = raw
         self.new_engine_sha = sha256_bytes(raw)
@@ -203,8 +205,8 @@ class World:
         self.write_sums(tag)
 
     def write_sums(self, tag=NEW, skip=(), extra=()):
-        stem = STEM.format(tag=tag)
-        names = [n for n in (f"{stem}.gz", f"{stem}.needs") if n not in skip]
+        names = sorted(p.name for p in self.release.iterdir() if p.name != "SHA256SUMS")
+        names = [n for n in names if n not in skip]
         lines = [f"{sha256_file(self.release / n)}  {n}" for n in names] + list(extra)
         (self.release / "SHA256SUMS").write_text("\n".join(lines) + "\n")
 

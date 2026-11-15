@@ -18,7 +18,7 @@ mkdir -p results || exit 1
 # Reserve the tag atomically before another process can use the same captures.
 mkdir "$d" || exit 2
 mkdir -p "$d/p24" "$d/c1" "$d/c8" || exit 1
-"${GPU_RUN:-$WORK_GPU_RUN}" -p 1 -- timeout 290 bash -e -c '
+"${GPU_RUN:-$WORK_GPU_RUN}" -p 1 -- timeout -k 10 290 bash -e -c '
   bin=$1; ckpt=$2; fib=$3; src=$4; d=$5
   "$bin" gen "$ckpt" --ids-file "$fib" --n 1 --prefill 24 --dump "$d/p24" > "$d/p24.txt" 2>&1
   "$bin" gen "$ckpt" --ids-file "$fib" --n 1 --chunk 1 --dump "$d/c1" > "$d/c1.txt" 2>&1

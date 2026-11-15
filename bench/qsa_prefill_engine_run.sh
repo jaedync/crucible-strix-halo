@@ -29,7 +29,7 @@ capacity=$((ctx+4))
 # The first output does not consume a cache slot. Keep the supported 256K bound.
 if [[ "$ctx" == 262144 ]]; then priority=3; deadline=600; capacity=$ctx; fi
 sha256sum "$binary" "$ids" >"$out/input.sha256"
-"$WORK_GPU_RUN" -p "$priority" -w 7200 -- timeout "$deadline" \
+"$WORK_GPU_RUN" -p "$priority" -w 7200 -- timeout -k 10 "$deadline" \
   env HSA_USERPTR_FOR_PAGED_MEM=0 CRUCIBLE_QSA_CAPTURE_DIR="$out/capture" \
   CRUCIBLE_QSA_CAPTURE_AT="$ctx" CRUCIBLE_QSA_CAPTURE_INDEX_ONLY=1 \
   "$binary" gen "$ckpt" --ids-file "$ids" --n 1 --prefill 4096 --spec 0 \

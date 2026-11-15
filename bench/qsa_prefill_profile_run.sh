@@ -34,5 +34,5 @@ script="$out/job.sh"
     i=$((i+1))
   done
 } >"$script"
-"$WORK_GPU_RUN" -p 2 -w 7200 -- timeout 300 bash "$script" >"$out/job.log" 2>&1
+"$WORK_GPU_RUN" -p 2 -w 7200 -- timeout -k 10 300 bash "$script" >"$out/job.log" 2>&1
 sha256sum --check "$out/input.sha256" >"$out/inputs-checked.log"

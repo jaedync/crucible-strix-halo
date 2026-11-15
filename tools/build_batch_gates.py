@@ -7,6 +7,11 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
+
+# tests load this file as tools.build_batch_gates, so tools/ may be missing from sys.path.
+sys.path.append(str(Path(__file__).resolve().parent))
+from proc_tree import run_tree  # noqa: E402
 
 COMPILER = Path("/opt/rocm/bin/hipcc")
 FLAGS = ["-O3", "-std=c++20", "--offload-arch=gfx1151", "--rocm-path=/opt/rocm",
@@ -58,7 +63,7 @@ def build(source, output, source_commit):
         binding = [] if kind == "candidate" else [f'-DBATCHING_ENGINE_SHA="{digest(candidate)}"',
                                                    f'-DBATCHING_SOURCE_SHA="{fingerprint}"']
         command = [str(COMPILER), *FLAGS, *binding, "-o", str(binary), str(frozen / entry), "-lpthread"]
-        completed = subprocess.run(command, capture_output=True, env=env, timeout=300, check=False)
+        completed = run_tree(command, env=env, timeout=300)  # hipcc runs clang and the offload tools: end them all at the limit
         (output / f"{kind}.stdout.log").write_bytes(completed.stdout)
         (output / f"{kind}.stderr.log").write_bytes(completed.stderr)
         if completed.returncode != 0: raise ValueError(f"{kind} build failed; read its stderr log")

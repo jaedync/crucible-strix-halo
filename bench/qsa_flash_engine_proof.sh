@@ -14,7 +14,7 @@ P=$WORK_DIR/wt/prefill-scan/results/prompts
 runs="n1k:$P/source-1024.ids:4096:0:0:0:0:0:0 n4k:$P/source-4096.ids:4096:0:0:0:0:0:0 n16k:$P/source-16384.ids:4096:0:0:0:0:0:0"
 mkdir -p "$out"/{d305,s305,d405,b305p,g64}
 sha256sum "$cand" "$base" "$P"/source-{1024,4096,16384}.ids "$saved"/{nx,nxs,nx4}/*.logits.f32 >"$out/inputs.sha256"
-q() { "$WORK_GPU_RUN" -p 2 -w 7200 -- timeout 300 "$@"; }
+q() { "$WORK_GPU_RUN" -p 2 -w 7200 -- timeout -k 10 300 "$@"; }
 cat >"$out/job305.sh" <<JOB
 set -u
 export HSA_USERPTR_FOR_PAGED_MEM=0

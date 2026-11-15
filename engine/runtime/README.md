@@ -32,10 +32,9 @@ Rank 4 (runtime).
 
 ## Invariants
 
-- A request's output depends only on the request: batching, cache state,
-  load and speculation do not change it.
+- A request's output depends only on the request: batching, load and
+  speculation do not change it.
 - Verification, never a proposal, commits tokens.
-- A restored state is bitwise the state that a fresh prefill makes.
 
 ## Allowed includes
 

@@ -76,13 +76,22 @@ ENGINE_STAMP = $(PYTHON) -I tools/release_engine.py stamp
 # variables (HIPCC_COMPILE_FLAGS_APPEND, HIP_CLANG_PATH and the like) itself. A release refuses non-default values and an unknown compiler version.
 shq = $(subst ','\'',$(1))
 ENGINE_STAMP_END = $(ENGINE_STAMP) end --binary $@ --hipcc='$(call shq,$(HIPCC))' --gpu-arch='$(call shq,$(GPU_ARCH))' --hipflags='$(call shq,$(HIPFLAGS))' --cppflags='$(call shq,$(CPPFLAGS))' --ldflags='$(call shq,$(LDFLAGS))' --ldlibs='$(call shq,$(LDLIBS))' --rocm-path='$(call shq,$(ROCM_PATH))'
-build/engine/crucible: engine/engine.hip Makefile tools/devsplit.py tools/devsplit_ir.py tools/devsplit_groups.tsv tools/devsplit_facts.tsv
+# A ROCm 10.x hipcc (AMD clang 24) builds a slower engine (tools/hipcc_series.py): the build stops with a warning unless
+# ALLOW_ROCM10=1 (make word or environment; setup and update --allow-rocm10 set it). The split build cannot plan the clang 24
+# driver, so with that compiler make uses plain hipcc (SPLIT=0).
+ALLOW_ROCM10 ?= 0
+HIPCC_SERIES = $(PYTHON) -I tools/hipcc_series.py
+HIPCC_SERIES_CHECK = $(HIPCC_SERIES) check --hipcc='$(call shq,$(HIPCC))' $(if $(filter 1,$(ALLOW_ROCM10)),--allow)
+build/engine/crucible: engine/engine.hip Makefile tools/devsplit.py tools/devsplit_ir.py tools/devsplit_groups.tsv tools/devsplit_facts.tsv tools/hipcc_series.py
 	@mkdir -p $(@D)
 	@rm -f $@
+	@$(HIPCC_SERIES_CHECK)
 	@$(ENGINE_STAMP) begin --binary $@
 ifeq ($(SPLIT),1)
-	@$(PYTHON) -I tools/devsplit.py --out $@ --work $(SPLIT_WORK) --parts $(SPLIT_PARTS) -j $(SPLIT_JOBS) --groups $(SPLIT_GROUPS) --facts $(SPLIT_FACTS) $(if $(filter 1,$(SPLIT_CHECK)),--check) --hipcc $(HIPCC) -- $(ENGINE_FLAGS); \
-	rc=$$?; if [ $$rc -eq 2 ]; then echo "devsplit could not plan the build, using hipcc"; $(ENGINE_HIPCC) -o $@; else exit $$rc; fi
+	@if $(HIPCC_SERIES) clang24 --hipcc='$(call shq,$(HIPCC))'; then echo "hipcc is clang 24 (ROCm 10.x): the split build cannot plan it, using plain hipcc (SPLIT=0)"; \
+	$(ENGINE_HIPCC) -o $@; else \
+	$(PYTHON) -I tools/devsplit.py --out $@ --work $(SPLIT_WORK) --parts $(SPLIT_PARTS) -j $(SPLIT_JOBS) --groups $(SPLIT_GROUPS) --facts $(SPLIT_FACTS) $(if $(filter 1,$(SPLIT_CHECK)),--check) --hipcc $(HIPCC) -- $(ENGINE_FLAGS); \
+	rc=$$?; if [ $$rc -eq 2 ]; then echo "devsplit could not plan the build, using hipcc"; $(ENGINE_HIPCC) -o $@; else exit $$rc; fi; fi
 else
 	$(ENGINE_HIPCC) -o $@
 endif

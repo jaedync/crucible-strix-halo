@@ -126,6 +126,25 @@ def decode_url(url, settings, used_tokens=0):
     return decode_bytes(raw, settings, used_tokens)
 
 
+ALPHA_MODES = frozenset({"RGBA", "LA", "PA"})
+# Modes whose "transparency" entry convert("RGBA") reads correctly. Pillow cuts an I;16 tRNS key to 8 bits.
+KEY_MODES = frozenset({"1", "L", "P", "RGB"})
+
+
+def flatten_rgb(image, Image):
+    """RGB of a loaded image. Transparent pixels go onto opaque white; convert("RGB") alone
+    keeps their stored colour, often black. Images without transparency take the plain convert path.
+
+    White matches Qwen's vision utility (qwen_vl_utils to_rgb) and transformers main. The pinned transformers
+    v5.18.0 convert_to_rgb does a plain convert("RGB"), so no exact parity is claimed for transparent input.
+    """
+    keyed = image.mode in KEY_MODES and "transparency" in image.info
+    if image.mode not in ALPHA_MODES and not keyed:
+        return image.convert("RGB")
+    rgba = image.convert("RGBA")
+    return Image.alpha_composite(Image.new("RGBA", rgba.size, (255, 255, 255, 255)), rgba).convert("RGB")
+
+
 def decode_bytes(raw, settings, used_tokens=0):
     try:
         from PIL import Image
@@ -145,7 +164,7 @@ def decode_bytes(raw, settings, used_tokens=0):
             raise ApiError(f"The images of this request need at least {tokens} tokens, which exceeds the context "
                            f"window of {settings.max_image_tokens} tokens. Send fewer or smaller images.", "messages")
         image.load()
-        image = image.convert("RGB")
+        image = flatten_rgb(image, Image)
     except ApiError:
         raise
     except Image.DecompressionBombError:

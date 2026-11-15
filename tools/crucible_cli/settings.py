@@ -182,6 +182,21 @@ def state_folder_problem(path, owned=False):
     return None
 
 
+def state_dir_problem(home, repo, path, look_inside=False):
+    """The one check of the state folder (cache folder item 2): setup, doctor and uninstall use it. None when PATH may be the
+    state folder, else the sentence that says why not.
+
+    The folder must be inside the home folder (the rule of the v0.37 engine) and pass state_folder_problem. A folder that
+    setup recorded as its own is accepted as it is, unless LOOK_INSIDE (uninstall: remove only what the engine writes)."""
+    home, sd = Path(os.path.abspath(home)), Path(os.path.abspath(path))
+    real_home, real_sd = Path(os.path.realpath(home)), Path(os.path.realpath(sd))
+    inside = (sd != home and home in sd.parents) or (real_sd != real_home and real_home in real_sd.parents)
+    if not inside:
+        return f"{sd} is not inside your home folder {home}."
+    owned = False if look_inside else state_owned(repo, sd)
+    return state_folder_problem(sd, owned=owned)
+
+
 def state_marker_path(repo):
     return Path(repo) / ".crucible" / STATE_MARKER
 

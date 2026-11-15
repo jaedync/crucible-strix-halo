@@ -5,13 +5,13 @@ import os
 from pathlib import Path
 import re
 import stat
-import subprocess
 import sys
 import time
 
 # tests load this file as tools.batch_gate_report, so tools/ may be missing from sys.path.
 sys.path.append(str(Path(__file__).resolve().parent))
 import layout  # noqa: E402
+from proc_tree import run_tree  # noqa: E402
 
 WIDTH = 10240
 VOCAB = 248320
@@ -241,7 +241,7 @@ def _run(*, checkpoint, engine, probe, build_record, probe_build_record, prompts
     tracked = {str(path): file_record(path) for path in (engine, probe, build_record, probe_build_record, prompts, primary_ids)}
     source, source_hash, frozen_files = validate_builds(engine, probe, build_record, probe_build_record, engine_built)
     tracked.update(frozen_files)
-    info = subprocess.run([str(probe), "--build-info"], capture_output=True, text=True, timeout=30, check=True)
+    info = run_tree([str(probe), "--build-info"], text=True, timeout=30, check=True)
     expected = dict(candidate_sha256=digest(engine), source_sha256=source_hash)
     if json.loads(info.stdout) != expected: raise ValueError("batch probe is not bound to the candidate build")
     names = [name for name in prompts.read_text().splitlines() if name]
@@ -263,7 +263,8 @@ def _run(*, checkpoint, engine, probe, build_record, probe_build_record, prompts
     command = [str(gpu_run), "-p", str(priority), "-w", str(queue_wait), "--", "timeout", "-k", "10", "300",
                str(probe), str(checkpoint), str(prompts), str(root), str(baseline_dump)]
     # The lock wait, the 300 s run, the 10 s kill grace and a small margin.
-    completed = subprocess.run(command, capture_output=True, timeout=queue_wait + 315, check=False)
+    # A grace: TERM lets gpu-run end its job session and write its end record; a KILL to gpu-run would orphan the job.
+    completed = run_tree(command, timeout=queue_wait + 315, grace=15)
     (output / "stdout.log").write_bytes(completed.stdout)
     (output / "stderr.log").write_bytes(completed.stderr)
     recheck(tracked)

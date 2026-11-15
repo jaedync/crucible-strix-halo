@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import keyfile, packs, rocm, service
+from . import keyfile, packs, rocm, service, settings as settings_mod
 from .files import Sandbox
 
 GTT_PARAMS = "amdgpu.gttsize=126976 ttm.pages_limit=32505856"
@@ -36,7 +36,7 @@ NOT_NEEDED = "not needed: the release engine is installed"
 
 ROCM_FIX = (
     f"Install the current ROCm ({rocm.RECOMMENDED} tested): the HIP runtime, the HIP compiler (hipcc) and rocminfo. "
-    f"ROCm {rocm.TESTED[1]} works too. To build the engine from source, use the ROCm {rocm.TESTED[1]} compiler for now "
+    f"ROCm {rocm.TESTED[1]} works too. To build the engine from source, use the ROCm {rocm.TESTED[1]} compiler "
     "(see docs/QUICKSTART.md).\n"
     "Arch Linux: sudo pacman -Syu --needed base-devel git python hip-runtime-amd rocm-llvm rocminfo\n"
     "Ubuntu or Debian: follow AMD's install page for your release (https://rocm.docs.amd.com), then: sudo apt install build-essential git\n"
@@ -257,12 +257,13 @@ def run_checks(host, s):
                 "Lower the limit: ./crucible setup --state-disk-gib N, or use --no-state-dir.")
         home = Path(os.path.abspath(host.home))
         sd = Path(os.path.abspath(s.state_dir))
+        problem = settings_mod.state_dir_problem(home, s.repo, sd)
         if sd == home or home not in sd.parents:
             add("state-dir", "State folder is inside your home folder", "fail", f"{sd} is not inside your home folder {home}",
                 "Use a new folder inside your home folder: ./crucible setup --state-dir ~/.cache/crucible/states", ("start",))
-        elif sd.is_dir() and any(sd.iterdir()) and not (s.work / "server.pid").exists():
-            add("state-dir", "State folder is inside your home folder", "warn", f"{sd} holds files; the server stops at start if "
-                "one of them is not a Crucible state file", "Use a new, empty folder: ./crucible setup --state-dir DIR")
+        elif problem and not (s.work / "server.pid").exists():
+            add("state-dir", "State folder is inside your home folder", "warn", f"{problem} The server stops at start if "
+                "the folder holds a file that is not a Crucible state file", "Use a new, empty folder: ./crucible setup --state-dir DIR")
         else:
             add("state-dir", "State folder is inside your home folder", "pass", str(sd))
     else:

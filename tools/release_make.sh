@@ -9,6 +9,6 @@ if [ -f build/engine/release.json ] && [ -f install.sh ]; then
   if bash ./install.sh engine --dir "$root"; then
     exit 0
   fi
-  echo "release_make: no release engine for this version, so make builds the engine from source (about 16 minutes)." >&2
+  echo "release_make: no release engine for this version, so make builds the engine from source (about 16 minutes with the ROCm 7.2.4 compiler)." >&2
 fi
 exec make

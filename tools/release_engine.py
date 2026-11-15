@@ -14,8 +14,8 @@ not part of ROCm and not part of the base system (libc, libm, libstdc++, libgcc_
 It also prints the lowest glibc and libstdc++ version that the engine needs.
 
 `release` writes three files to a new folder; upload them with the tag:
-  crucible-engine-TAG-gfx1151-rocm7.2-linux-x86_64.gz     the engine, gzip, no name or time inside (reproducible)
-  crucible-engine-TAG-gfx1151-rocm7.2-linux-x86_64.needs  the manifest: tag, commit, sha256 of the engine, version floors,
+  crucible-engine-TAG-gfx1151-rocm7.2-linux-x86_64.gz      the engine, gzip, no name or time inside (reproducible)
+  crucible-engine-TAG-gfx1151-rocm7.2-linux-x86_64.needs   the manifest: tag, commit, sha256 of the engine, version floors,
                                                           `need` lines (required) and `rocm_external` lines (information)
   SHA256SUMS                                              sha256 of the two files above
 `stamp` is the build-info of an engine build (the Makefile runs it before and after the compile). `begin` removes the

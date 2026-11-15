@@ -98,7 +98,8 @@ through DNS rebinding. This is also true for `-p 127.0.0.1:8790:8790`. Choose on
 - Set the Host list. Add `-e CRUCIBLE_ALLOWED_HOSTS=localhost,127.0.0.1,[::1]` to the `docker run` line, before the
   image name. The server then refuses a request with any other `Host` name. Add the name of a reverse proxy to the list.
 
-A key is optional in the container. To reach the port from another machine, make a key file and mount it:
+A key is optional in the container. To reach the port from another machine, make a key file and mount it.
+Use the full run line above for the measured configuration. Add the key mount and options shown below:
 
 ```sh
 mkdir -p -m 700 ~/.config/crucible

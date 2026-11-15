@@ -24,7 +24,7 @@ git archive 5b57ceb | tar -xf - -C baseline-source
 /opt/rocm/bin/hipcc -O3 -std=c++20 --offload-arch=gfx1151 \
   --rocm-path=/opt/rocm -I/opt/rocm/include \
   -o build/engine/baseline baseline-source/engine/engine.hip -lpthread
-flock -w 900 /tmp/crucible-gpu.lock timeout 300 build/engine/baseline gen \
+flock -w 900 /tmp/crucible-gpu.lock timeout -k 10 300 build/engine/baseline gen \
   ~/models/exl3/Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5 \
   --ids-file $WORK_FIB_IDS \
   --n 1 --chunk 8 --dump results/gate-baseline8
@@ -32,7 +32,7 @@ for f in results/gate-baseline8/h_*.f32; do
   cmp "$f" "results/gate-fused8/${f##*/}" || exit 1
 done
 for l in $(seq 0 47); do
-  OPENBLAS_NUM_THREADS=8 timeout 300 \
+  OPENBLAS_NUM_THREADS=8 timeout -k 10 300 \
     $WORK_REFENV_PYTHON ref/oracle.py \
     ~/models/exl3/Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5 \
     results/gate-fused8 "$l" --pos 0,14,23 \

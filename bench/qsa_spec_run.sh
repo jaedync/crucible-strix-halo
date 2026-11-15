@@ -5,7 +5,7 @@ cd "$(dirname "$0")/.."
 checkpoint=~/models/exl3/Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5
 mkdir -p results/spec_long/states
 run_gpu() {
-  flock -w 900 /tmp/crucible-gpu.lock timeout 300 "$@"
+  flock -w 900 /tmp/crucible-gpu.lock timeout -k 10 300 "$@"
 }
 start=0
 previous=-

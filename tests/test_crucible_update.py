@@ -855,6 +855,50 @@ class SumsParserTest(unittest.TestCase):
         self.assertEqual(update.asset_stem("v1.2.3"), STEM.format(tag="v1.2.3"))
 
 
+class SeriesTest(Base):
+    """v0.37.2: the release engine is a ROCm 7.2.4 build again, under the rocm7.2 name. update.py takes the series from the
+    names in SHA256SUMS and the manifest, prefers 7.2, and still accepts a release that has only the rocm10.1 name."""
+
+    def test_a_release_with_only_the_10_1_name_updates(self):
+        w = self.world()
+        w.make_release(rocm="10.1")
+        self.assertEqual(self.update("--yes"), 0, self.out)
+        rec = release.engine_release(w.dir)
+        self.assertEqual((rec["rocm"], rec["asset"]), ("10.1", STEM.replace("rocm7.2", "rocm10.1").format(tag=NEW) + ".gz"))
+        self.assertEqual(sha256_file(w.dir / "build/engine/crucible"), w.new_engine_sha)
+
+    def test_with_both_names_the_7_2_files_are_used(self):
+        w = self.world()
+        w.make_release(rocm="10.1", engine=b"#!/bin/sh\necho ten\n")
+        w.make_release(rocm="7.2", keep=True)
+        self.assertEqual(self.update("--yes"), 0, self.out)
+        rec = release.engine_release(w.dir)
+        self.assertEqual((rec["rocm"], rec["asset"]), ("7.2", STEM.format(tag=NEW) + ".gz"))
+        self.assertEqual(sha256_file(w.dir / "build/engine/crucible"), w.new_engine_sha)
+
+    def test_a_manifest_word_that_differs_from_its_file_name_is_refused(self):
+        w = self.world()
+        w.make_release(rocm="10.1", series="7.2")
+        self.assertEqual(self.update("--yes"), 1, self.out)
+        self.assertIn("ROCm 10.1", self.out)
+        self.assertUntouched()
+
+    def test_a_series_that_is_not_known_is_refused(self):
+        w = self.world()
+        w.make_release(rocm="6.4")
+        self.assertEqual(self.update("--yes"), 1, self.out)
+        self.assertUntouched()
+
+    def test_a_binary_mode_star_in_sha256sums_does_not_hide_the_other_name(self):
+        # sha256sum -b writes `HASH *NAME`; sums_hash strips the star, so pick_series must strip it too.
+        other = STEM.replace("rocm7.2", "rocm10.1").format(tag=NEW)
+        sums = f"{'a' * 64} *{other}.gz\n{'b' * 64} *{other}.needs\n"
+        self.assertEqual(update.pick_series(sums, NEW), "10.1")
+        new = STEM.format(tag=NEW)
+        both = sums + f"{'c' * 64} *{new}.gz\n{'d' * 64} *{new}.needs\n"
+        self.assertEqual(update.pick_series(both, NEW), "7.2")
+
+
 class TagTest(unittest.TestCase):
     def test_the_newest_tag_is_the_highest_version_not_the_last_word(self):
         out = "\n".join(f"{'1' * 40}\trefs/tags/{t}" for t in ("v0.9.0", "v0.10.0", "v0.2.0", "v1.0.0-rc1", "latest", "v0.10.0x"))

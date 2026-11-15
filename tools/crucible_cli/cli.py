@@ -86,6 +86,8 @@ def parser():
                          "setup); with --yes and no --private-runtime: no download")
     st.add_argument("--jobs", type=int, default=None, help="compile jobs (default 1; more need more memory)")
     st.add_argument("--start-timeout", type=int, default=3600, help="seconds to wait for the server (default 3600)")
+    st.add_argument("--allow-rocm10", action="store_true",
+                    help="build from source also with a ROCm 10 compiler (its engine is slower; use ROCm 7.2.4)")
     dr = sub.add_parser("doctor", help="check the machine")
     _common(dr)
     dr.add_argument("--json", action="store_true", help="print the result as JSON")
@@ -99,6 +101,8 @@ def parser():
     up.add_argument("--check", action="store_true", help="only say whether a newer release exists; change nothing")
     up.add_argument("--tag", type=_tag, default=None, metavar="vX.Y.Z", help="install this release, also when it is on hold or older")
     up.add_argument("--source-build", action="store_true", help="build the engine from source instead of the release file")
+    up.add_argument("--allow-rocm10", action="store_true",
+                    help="build from source also with a ROCm 10 compiler (its engine is slower; use ROCm 7.2.4)")
     up.add_argument("--rollback", action="store_true", help="not a flag: a failed start rolls back by itself (see --tag)")
     un = sub.add_parser("uninstall", help="remove the service and the install folder")
     un.add_argument("--yes", "-y", action="store_true", help="no question (for scripts and agents)")
@@ -169,11 +173,11 @@ def _validate(s, host):
     if s.state_dir is not None:
         home = Path(os.path.abspath(host.home))
         sd = Path(os.path.abspath(s.state_dir))
-        if sd == home or home not in sd.parents:
+        problem = settings_mod.state_dir_problem(home, s.repo, sd)
+        if problem and (sd == home or home not in sd.parents):
             host.out(f"The state folder {sd} must be a new folder inside your home folder {home}. "
                      "Use --state-dir ~/.cache/crucible/states or --no-state-dir.")
             return False
-        problem = settings_mod.state_folder_problem(sd, owned=settings_mod.state_owned(s.repo, sd))
         if problem:
             host.out(f"The state folder is not accepted: {problem} Crucible removes this folder with "
                      "./crucible uninstall --remove-models, so it must be a new or empty folder. "
@@ -327,7 +331,8 @@ def main(argv=None, host=None, repo=None):
         return 3
     run = steps.Setup(host, s, smoke=args.smoke, start_timeout=args.start_timeout, service=wants,
                       hint=getattr(args, "service_hint", False) and not args.smoke, runtime=runtime_choice,
-                      kernel_ask=None if (args.yes or ask_fn is None) else ask_fn)
+                      kernel_ask=None if (args.yes or ask_fn is None) else ask_fn,
+                      allow_rocm10=getattr(args, "allow_rocm10", False))
     if args.dry_run:
         run.plan()
         results = doctor.run_checks(host, s)

@@ -10,7 +10,7 @@ tag=$1; bin=$2; maxr=$3; shift 3
 runs=()
 for r in "$@"; do IFS=: read -r t len rest <<<"$r"; runs+=("$t:$P/source-$len.ids:$rest"); done
 mkdir -p results/$tag
-CRUCIBLE_PF_OUT=results/$tag ${GPU_RUN:-$WORK_GPU_RUN} -p 1 -- timeout 300 \
+CRUCIBLE_PF_OUT=results/$tag ${GPU_RUN:-$WORK_GPU_RUN} -p 1 -- timeout -k 10 300 \
   $bin pfbench $CKPT --prefill $maxr "${runs[@]}" > results/$tag/log.txt 2>&1
 rc=$?
 echo "exit $rc" >> results/$tag/log.txt

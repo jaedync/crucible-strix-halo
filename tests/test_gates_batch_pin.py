@@ -68,7 +68,7 @@ class BatchPinTest(unittest.TestCase):
             kwargs['build_record'].write_text(json.dumps(record))
         args = self.gate_arguments(kwargs)
         probes = []
-        # gates.py and batch_gate_report share one subprocess module: one fake serves both.
+        # gates.py (subprocess.run) and batch_gate_report (proc_tree.run_tree): one fake serves both.
         def process(command, **options):
             if command[-1] == '--build-info':
                 probes.append(command)
@@ -77,6 +77,7 @@ class BatchPinTest(unittest.TestCase):
                 return self.engine_process(command, **options)
             raise Stop(command)
         with patch.dict(sys.modules, {'batch_gate_report': b}), patch.object(subprocess, 'run', side_effect=process), \
+                patch.object(b, 'run_tree', side_effect=process), \
                 self.assertRaises(Stop):
             g.run(args)
         return args, probes

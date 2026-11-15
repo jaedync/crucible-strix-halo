@@ -7,7 +7,7 @@
 # What it does, in order:
 #   1. checks this system and the tools it needs (git, curl, python3, gzip, sha256sum)
 #   2. downloads SHA256SUMS and the manifest of the pinned release tag into a temp folder
-#   3. downloads the release engine (gfx1151, built with ROCm 7.2.4; it runs on 7.2.4 and on the latest ROCm) into the same folder
+#   3. downloads the release engine (gfx1151, built with ROCm 7.2.4; it runs on 7.2.4 and on 10.1) into the same folder
 #   4. checks the sha256 of every download. It runs nothing before this check passes
 #   5. checks that the libraries of the engine exist on this machine. A missing package is shown as an exact command,
 #      and the installer asks once before it runs sudo
@@ -20,7 +20,7 @@
 # Environment (for mirrors and tests): CRUCIBLE_TAG, CRUCIBLE_RELEASE_BASE (https:// or file://), CRUCIBLE_REPO_URL,
 # CRUCIBLE_DIR, CRUCIBLE_SUMS_SHA256, CRUCIBLE_TTY, CRUCIBLE_OS_RELEASE, ROCM_PATH.
 
-PIN_TAG="v0.37.0"
+PIN_TAG="v0.37.2"
 PIN_SUMS_SHA256=""
 REPO_URL_DEFAULT="https://github.com/jaedync/crucible-strix-halo.git"
 RELEASE_BASE_DEFAULT="https://github.com/jaedync/crucible-strix-halo/releases/download"
@@ -43,7 +43,7 @@ Usage:
 
 Options:
   --dir DIR         install folder (default $HOME/crucible)
-  --source-build    do not download the engine (the manifest is still checked); ./crucible setup builds it from source (about 16 minutes)
+  --source-build    do not download the engine (the manifest is still checked); ./crucible setup builds it from source (about 16 minutes with the ROCm 7.2.4 compiler)
   --dry-run         show the plan and change nothing
   --yes, -y         no questions in ./crucible setup (the sudo question is never answered for you)
   --remove-models   with uninstall: also remove the model pack and the state folder
@@ -823,7 +823,7 @@ cmd_install() {
       say "  Release engine placed in $DIR/build/engine/crucible"
     fi
   elif [ "$SOURCE_BUILD" = 0 ]; then
-    say "  Setup will build the engine from source (about 16 minutes), because the release engine cannot run here."
+    say "  Setup will build the engine from source (about 16 minutes with the ROCm 7.2.4 compiler), because the release engine cannot run here."
   fi
   hand_over
 }

@@ -14,12 +14,12 @@ The 3.05 bpw pack (faster, lower quality) and the 16-bit n-gram table are option
 | Machine | Ryzen AI Max+ 395 with Radeon 8060S (gfx1151) and 128 GB of memory. Other machines are not supported. |
 | Download | About 107 GB (the 4.05 pack). |
 | Disk | About 110 GB for the pack, plus up to 200 GiB (215 GB) for the conversation cache. Use an SSD. |
-| Time | One command: the pack download, plus about 1 to 2 minutes (it downloads a 25 MB engine; it does not build). Steps 3 to 6 by hand: the download, plus about 16 minutes for the build. |
+| Time | One command: the pack download, plus about 1 to 2 minutes (it downloads a 25 MB engine; it does not build). Steps 3 to 6 by hand: the download, plus a build of about 16 minutes with the ROCm 7.2.4 compiler. |
 
 ## One command
 
-Run this on a machine that has the current ROCm (10.1 tested; 7.2.4 also works) and GPU access (step 1 below). A machine with
-no ROCm can use the private runtime that setup offers (see "No ROCm on the machine" below):
+Use ROCm 7.2.4 for a source build. The release engine runs on ROCm 10.1 and 7.2.4.
+The machine needs GPU access (step 1 below). Without ROCm, use the private runtime that setup offers below:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/jaedync/crucible-strix-halo/main/install.sh | bash
@@ -30,10 +30,10 @@ Press Enter to take a default. It downloads the model (about 107 GB) and starts 
 folder is the folder `crucible` in your home folder, and the default port is 8790.
 
 The one command does not run `make`. It downloads the release engine (about 25 MB), checks its sha256, and puts it in
-`build/engine/`. The line `[build] done: release engine v0.37.0 (verified)` means this. So the 16 minutes of step 4
-do not apply, and no compiler is needed. In our test, with the pack already on the disk, setup took 65 seconds.
+`build/engine/`. The line `[build] done: release engine v0.37.2 (verified)` means this. So the build time of step 4
+does not apply, and no compiler is needed. In our test, with the pack already on the disk, setup took 65 seconds.
 With a new pack, the download time is added, and the first model load takes a few minutes. Add `--source-build` to
-build the engine from source instead (about 16 minutes).
+build the engine from source instead (about 16 minutes with the ROCm 7.2.4 compiler).
 
 What the one command checks for steps 1 and 2:
 
@@ -121,7 +121,7 @@ same install in single steps, for a person or an agent that does not use the scr
 
 ## Step 1: ROCm, the HIP compiler and GPU access
 
-For a build from source, install ROCm 7.2.4 (see step 4). The release engine also runs on ROCm 10.1. Setup passes both with no message.
+Install the current ROCm (10.1 tested). ROCm 7.2.4 is tested too: if you have it, keep it. Setup passes both with no message.
 The engine needs the HIP runtime. A source build (step 4) also needs the HIP compiler. It uses no ROCm libraries (no rocBLAS, no
 hipBLAS). The tested system is Arch Linux with kernel 7.2.
 
@@ -132,10 +132,10 @@ sudo pacman -Syu --needed base-devel git python hip-runtime-amd rocm-llvm rocmin
 ```
 
 `-Syu` also updates the rest of the system (Arch does not support a partial update). If the kernel was updated,
-restart before step 2. These packages give the ROCm version of the Arch repository. For ROCm 10.1 (to run the release engine only), follow AMD's
+restart before step 2. These packages give the ROCm version of the Arch repository. For the newest ROCm, follow AMD's
 instructions (https://rocm.docs.amd.com).
 
-On another distribution, install ROCm 7.2.4 with AMD's instructions for your distribution
+On another distribution, install the current ROCm with AMD's instructions for your distribution
 (https://rocm.docs.amd.com). You need `rocminfo`, and `hipcc` for a source build.
 
 Your user must be able to open the GPU. Run `groups`. If `render` or `video` is not in the list:
@@ -223,21 +223,21 @@ and `. .venv/bin/activate` again.
 **Check:**
 
 ```sh
-python -m server --version    # expect: crucible 0.37.0 or newer
+python -m server --version    # expect: crucible 0.37.2 or newer
 hf version
 ```
 
 ## Step 4: build the engine
 
-To build from source, use the ROCm 7.2.4 compiler for now: an engine built with the ROCm 10.1 compiler does not pass our token
-gates yet. The release engine runs on ROCm 10.1 and on 7.2.4.
-
 ```sh
 make
 ```
 
-The build uses one compile job and takes about 16 minutes. More jobs (`make -j2`) need more memory; see
-[BUILD](BUILD.md).
+The build uses one compile job and takes about 16 minutes with the ROCm 7.2.4 compiler. More jobs (`make -j2`) need more
+memory; see [BUILD](BUILD.md).
+
+With a ROCm 10 compiler, `make` stops, because that engine is slower (a 32K prefill: 42% less). Use the ROCm 7.2.4
+compiler. To build with ROCm 10 all the same, run `make ALLOW_ROCM10=1`; it then builds with plain `hipcc`.
 
 Fallback: if `make` stops with `argument facts drift` (another ROCm build), run `make SPLIT=0`. It builds with plain
 `hipcc`, which takes longer. Please report the drift as an issue.

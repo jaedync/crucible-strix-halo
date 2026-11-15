@@ -238,9 +238,9 @@ class BatchFixture(unittest.TestCase):
         self.log = Path(self.dir.name) / "commands.jsonl"
 
     def tearDown(self):
-        self.dir.cleanup()
         for backend in getattr(self, "backends", []):
-            backend.close()
+            backend.close()  # the fake engine must not outlive the test (the root conftest leak check)
+        self.dir.cleanup()
 
     def start(self, **env):
         self.backends = getattr(self, "backends", [])
@@ -251,7 +251,9 @@ class BatchFixture(unittest.TestCase):
                 patch("server.backend.subprocess.Popen",
                       side_effect=lambda *args, **kwargs: popen([sys.executable, str(TESTS / "fake_batch_engine.py")],
                                                                 **kwargs)):
-            return BatchedEngineBackend("unused", "unused", **self.options)
+            backend = BatchedEngineBackend("unused", "unused", **self.options)
+        self.backends.append(backend)
+        return backend
 
     @property
     def options(self):

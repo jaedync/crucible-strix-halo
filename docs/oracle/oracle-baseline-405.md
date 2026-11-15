@@ -46,10 +46,10 @@ Use an empty dump directory.
 ```sh
 ck=~/models/exl3/Qwen3.8-Flash-Next-exl3-4.05bpw_h6_ng6
 ids=$WORK_FIB_IDS
-flock -w 900 /tmp/crucible-gpu.lock timeout 300 build/engine/crucible gen \
+flock -w 900 /tmp/crucible-gpu.lock timeout -k 10 300 build/engine/crucible gen \
   "$ck" --ids-file "$ids" --n 1 --chunk 1 --dump results/q405/q405-c1
 for layer in $(seq 0 47); do
-  OPENBLAS_NUM_THREADS=8 OMP_NUM_THREADS=8 nice -n 5 timeout 300 \
+  OPENBLAS_NUM_THREADS=8 OMP_NUM_THREADS=8 nice -n 5 timeout -k 10 300 \
     $WORK_REFENV_PYTHON ref/oracle.py \
     "$ck" results/q405/q405-c1 "$layer" --pos 0,14,23 --ids "$ids"
 done
