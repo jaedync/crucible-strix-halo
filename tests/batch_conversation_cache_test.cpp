@@ -1248,21 +1248,28 @@ static void FailedCaptureKeepsFallback() {
   assert(tail.cache.Evictions() == 0 && tail.HitTail(ids) == 21);
   assert(tail.Tail(ids, 32, true));
   assert(tail.HitTail(ids) == 32 && tail.cache.Bytes() == 64 && tail.cache.SupersededEvictions() == 1);
+}
 
+static void ReplacementKeepsSpillRoom() {
+  const auto ids = Tokens(1, 40), other = Tokens(100, 40);
   Cache disk(1, 2, true);
   disk.cache.SetSpillSlack(64);
   std::vector<uint64_t> spill_rooms;
-  disk.cache.SetSpill([&](auto, const auto&, const auto&, int, uint64_t room) {
+  disk.cache.SetSpill([&](std::span<const int> key, const auto&, const auto&, int, uint64_t room) {
+    assert(std::ranges::equal(key, std::span(other).first(16)));
     spill_rooms.push_back(room);
-    return false;
+    return room >= 64;
   });
-  assert(disk.Capture(Tokens(100, 40), 16, CacheRetention::Session));
+  assert(disk.Capture(other, 16, CacheRetention::Session));
   assert(disk.Capture(ids, 16, CacheRetention::Session));
-  attempted = false;
-  assert(!disk.cache.Capture(ids, disk.policy, {32, CacheRetention::Session}, 128, uint64_t(9) << 30, fail));
-  assert(attempted && disk.Hit(ids) == 16);
-  // While the fallback is retained it still counts against the writer's pinned-memory allowance.
-  assert(spill_rooms == std::vector<uint64_t>{0});
+  assert(disk.cache.Capture(ids, disk.policy, {32, CacheRetention::Session}, 128, uint64_t(9) << 30, [&] {
+    auto s = std::make_shared<Snapshot>();
+    s->hist.assign(ids.begin(), ids.begin() + 32);
+    s->resume = BatchFrontierResume(32, ids.size() - 1);
+    return std::shared_ptr<const Snapshot>(s);
+  }));
+  assert(disk.Hit(ids) == 32 && disk.cache.Bytes() == 128);
+  assert(spill_rooms == std::vector<uint64_t>{64});
 }
 
 static void AdvanceFrontierAtHostReserve() {
@@ -1284,6 +1291,7 @@ static void AdvanceFrontierAtHostReserve() {
 int main() {
   AdvanceFrontierAtHostReserve();
   FailedCaptureKeepsFallback();
+  ReplacementKeepsSpillRoom();
   SpanReplayTail();
   TenantsNeverShareRam();
   LocalTenantUnchanged();

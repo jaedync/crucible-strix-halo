@@ -141,7 +141,8 @@ class PrefixCache {
   }
   // a save that shares host chunks with a held snapshot needs only `host_bytes` of new host memory, and an
   // eviction frees only `freed(entry)` of host memory (its chunks that no other snapshot uses). The budget still
-  // counts every entry at its whole size. A victim can stay until Insert only when the host can hold both copies.
+  // counts every entry at its whole size. The fallback can stay until Insert only when it is the sole victim
+  // and the host can hold both copies above the reserve.
   template<class Tier, class Freed>
   bool ReserveHost(size_t bytes, size_t host_bytes, uint64_t available, uint64_t reserve, Tier tier, Freed freed,
                    DeferredEviction* deferred = nullptr) {
@@ -158,18 +159,18 @@ class PrefixCache {
       if (rank >= 0) order.emplace_back(rank, it);
     }
     std::stable_sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
-    uint64_t room = 0, host_room = 0, fallback_room = 0;
+    uint64_t room = 0, host_room = 0;
     size_t victims = 0;
     while ((room < over || host_room < short_by) && victims < order.size()) {
       const Entry& victim = *order[victims].second;
       const size_t released = freed(victim);
       room += victim.bytes;
       host_room += released;
-      if (deferred && &victim == deferred->entry) fallback_room = released;
       ++victims;
     }
     if (room < over || host_room < short_by) return false;
-    const bool keep_fallback = deferred && host_room - fallback_room >= short_by;
+    // Keeping the fallback charged would reduce the spill allowance for any other victim.
+    const bool keep_fallback = deferred && victims == 1 && !short_by;
     for (size_t i = 0; i < victims; ++i) {
       const auto [rank, victim] = order[i];
       if (keep_fallback && &*victim == deferred->entry) deferred->tier = rank;
