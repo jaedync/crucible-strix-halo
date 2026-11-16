@@ -25,7 +25,7 @@ def normalize_invoke(text):
             for p in INVOKE_PARAMETER.finditer(match.group(2))
         )
         return f"<tool_call><function={match.group(1)}>{parameters}</function></tool_call>"
-    return re.sub(r'<invoke\s+name="([^"]+)"\s*>(.*?)</invoke>', repl, text, flags=re.S)
+    return re.sub(r'<invoke\s+name="([^"]+)"\s*>((?:(?!<invoke).)*?)</invoke>', repl, text, flags=re.S)
 
 def malformed(message, code):
     """code is a fixed reason (usage tool_call_invalid); the message stays server text, never model text."""

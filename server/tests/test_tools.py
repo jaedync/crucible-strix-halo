@@ -125,7 +125,21 @@ class ToolOutputTests(unittest.TestCase):
             self.assertFalse(parser.fallback)
             self.assertEqual(len(deltas), 1)
 
-    def test_incomplete_invoke_prefix_is_content(self):
+    def test_prose_invoke_name_does_not_bind_real_call(self):
+        for prose_name in ("x", "delete_file"):
+            raw = f'See <invoke name="{prose_name}"> text.\n' + self.invoke(path="c.py")
+            for stream in (False, True):
+                parser = self.parser()
+                parser.stream = ToolCallStream(parser.request, parser.definitions) if stream else None
+                parser.feed(raw)
+                message, deltas, reason = parser.finish("stop")
+                self.assertEqual(message["content"], f'See <invoke name="{prose_name}"> text.\n')
+                self.assertEqual(len(message["tool_calls"]), 1)
+                self.assertEqual(message["tool_calls"][0]["function"]["name"], "read")
+                self.assertEqual(json.loads(message["tool_calls"][0]["function"]["arguments"])["path"], "c.py")
+                self.assertEqual(reason, "tool_calls")
+                self.assertFalse(parser.fallback)
+                self.assertEqual(len(deltas), 1)
         parser = self.parser()
         parser.feed("<invo")
         message, deltas, reason = parser.finish("stop")
