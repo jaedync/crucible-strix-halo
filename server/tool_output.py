@@ -9,8 +9,23 @@ from .tool_stream import ToolCallStream
 
 START = "<tool_call>"
 END = "</tool_call>"
+INVOKE_START = "<invoke"
+INVOKE_END = "</invoke>"
 FUNCTION = re.compile(r"<function=([^<>\r\n]+)>\s*")
 PARAMETER = re.compile(r"<parameter=([^<>\r\n]+)>")
+INVOKE_FUNCTION = re.compile(r'<invoke\s+name="([^"]+)"\s*>')
+INVOKE_PARAMETER = re.compile(r'<parameter\s+name="([^"]+)"\s*>(.*?)</parameter>', re.S)
+CALL_STARTS = (START, INVOKE_START)
+
+def normalize_invoke(text):
+    """Convert Anthropic-style <invoke> calls to the checkpoint's <tool_call> XML."""
+    def repl(match):
+        parameters = "".join(
+            f"<parameter={p.group(1)}>{p.group(2)}</parameter>"
+            for p in INVOKE_PARAMETER.finditer(match.group(2))
+        )
+        return f"<tool_call><function={match.group(1)}>{parameters}</function></tool_call>"
+    return re.sub(r'<invoke\s+name="([^"]+)"\s*>(.*?)</invoke>', repl, text, flags=re.S)
 
 def malformed(message, code):
     """code is a fixed reason (usage tool_call_invalid); the message stays server text, never model text."""
@@ -24,8 +39,6 @@ def malformed(message, code):
 UNCHECKED = ("schema_mismatch", "parameter_json", "unknown_function")
 # A passed-through name must be one that the next request can send back in its history (tool_requests.NAME).
 PASS_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
-
-
 def unchecked(soft, code, message):
     """Record a schema-only failure when the call may pass through (soft is a list), else raise it."""
     if soft is None:
@@ -117,9 +130,9 @@ class ToolOutput:
         self.deltas = []
 
     def open_call(self):
-        """True inside a <tool_call> block that the model has not closed yet. parse_calls ends a block at the first
-        </tool_call> after its start tag, whatever the arguments hold, so this walks that same structure: the start
-        tag inside an argument value (a path, a quoted template) does not open a block."""
+        """True inside an unclosed <tool_call> or <invoke> block. parse_calls ends a block at the first matching
+        end tag after its start tag, whatever the arguments hold, so the start tag inside an argument value does
+        not open a block."""
         text = self.calls_text
         if text is None:
             return False
@@ -129,13 +142,20 @@ class ToolOutput:
                 pos += 1
             if pos == len(text):
                 return False
-            if not text.startswith(START, pos):
-                # Between calls: text that is not the start tag is not a block, but the model may be writing one.
-                return START.startswith(text[pos:])
-            end = text.find(END, pos + len(START))
-            if end < 0:
-                return True
-            pos = end + len(END)
+            if text.startswith(START, pos):
+                end = text.find(END, pos + len(START))
+                if end < 0:
+                    return True
+                pos = end + len(END)
+                continue
+            if text.startswith(INVOKE_START, pos):
+                end = text.find(INVOKE_END, pos + len(INVOKE_START))
+                if end < 0:
+                    return True
+                pos = end + len(INVOKE_END)
+                continue
+            # Between calls: text that is not a start tag may still be a partial start tag.
+            return START.startswith(text[pos:]) or INVOKE_START.startswith(text[pos:])
 
     def take_deltas(self):
         """Tool-call deltas that are ready to send now (stream mode)."""
@@ -152,15 +172,15 @@ class ToolOutput:
             self.advance()
             return ""
         combined = self.pending + text
-        marker = combined.find(START)
+        marker = min((combined.find(start) for start in CALL_STARTS if combined.find(start) >= 0), default=-1)
         if marker >= 0:
             delta = combined[:marker]
             self.calls_text = combined[marker:]
             self.pending = ""
             self.advance()
         else:
-            keep = next((length for length in range(min(len(combined), len(START) - 1), 0, -1)
-                         if START.startswith(combined[-length:])), 0)
+            keep = max((length for length in range(min(len(combined), max(len(start) for start in CALL_STARTS) - 1), 0, -1)
+                        if any(start.startswith(combined[-length:]) for start in CALL_STARTS)), default=0)
             delta = combined[:-keep] if keep else combined
             self.pending = combined[-keep:] if keep else ""
         self.content += delta
@@ -226,12 +246,12 @@ class ToolOutput:
 
     def parse_calls(self):
         if self.calls_text is None:
-            if self.pending and START.startswith(self.pending) and self.pending.startswith("<tool"):
+            if self.pending and any(start.startswith(self.pending) for start in CALL_STARTS):
                 raise malformed("the tool-call start tag is incomplete.", "incomplete_call")
             self.content += self.pending
             self.pending = ""
             return []
-        calls, remaining = [], self.calls_text
+        calls, remaining = [], normalize_invoke(self.calls_text)
         budget = WorkBudget()
         while remaining.strip():
             remaining = remaining.lstrip()

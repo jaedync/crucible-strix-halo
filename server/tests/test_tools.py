@@ -80,6 +80,11 @@ class ToolOutputTests(unittest.TestCase):
                 "<parameter=offset>\n" + offset + "\n</parameter>\n<parameter=flags>\n" + flags +
                 "\n</parameter>\n</function>\n</tool_call>")
 
+    def invoke(self, path="a.py", offset="4", flags='{"full":true}'):
+        return ('<invoke name="read">\n<parameter name="path">' + path + '</parameter>\n'
+                '<parameter name="offset">' + offset + '</parameter>\n'
+                '<parameter name="flags">' + flags + '</parameter>\n</invoke>')
+
     def test_typed_values_and_openai_deltas(self):
         parser = self.parser()
         content = parser.feed("I will read it.\n" + self.block())
@@ -92,6 +97,18 @@ class ToolOutputTests(unittest.TestCase):
         self.assertEqual(deltas[0]["tool_calls"][0]["index"], 0)
         self.assertEqual(deltas[0]["tool_calls"][0]["id"], call["id"])
         self.assertEqual(finish, "tool_calls")
+
+    def test_invoke_alias(self):
+        parser = self.parser()
+        content = parser.feed("I will read it.\n" + self.invoke())
+        message, deltas, finish = parser.finish("stop")
+        self.assertEqual(content, "I will read it.\n")
+        self.assertEqual(message["content"], content)
+        call = message["tool_calls"][0]
+        self.assertEqual(json.loads(call["function"]["arguments"]),
+                         dict(path="a.py", offset=4, flags=dict(full=True)))
+        self.assertEqual(finish, "tool_calls")
+        self.assertFalse(parser.fallback)
 
     def test_all_stream_splits(self):
         raw = "Before.\n" + self.block(path="line one\n雪") + "\n" + self.block("b.py")
