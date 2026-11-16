@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from server.api import ApiError, validate_request
 from server.template import ChatTemplate
+from server.tool_stream import ToolCallStream
 
 TOOLS = [dict(type="function", function=dict(name="read", description="Read a file.", parameters=dict(
     type="object", properties=dict(path=dict(type="string"), offset=dict(type="integer"),
@@ -108,6 +109,29 @@ class ToolOutputTests(unittest.TestCase):
         self.assertEqual(json.loads(call["function"]["arguments"]),
                          dict(path="a.py", offset=4, flags=dict(full=True)))
         self.assertEqual(finish, "tool_calls")
+        self.assertFalse(parser.fallback)
+
+    def test_prose_invoke_before_real_call(self):
+        raw = 'See <invoke name="x"> text.\n' + self.block()
+        for stream in (False, True):
+            parser = self.parser()
+            parser.stream = ToolCallStream(parser.request, parser.definitions) if stream else None
+            parser.feed(raw)
+            message, deltas, reason = parser.finish("stop")
+            self.assertEqual(message["content"], 'See <invoke name="x"> text.\n')
+            self.assertEqual(len(message["tool_calls"]), 1)
+            self.assertEqual(message["tool_calls"][0]["function"]["name"], "read")
+            self.assertEqual(reason, "tool_calls")
+            self.assertFalse(parser.fallback)
+            self.assertEqual(len(deltas), 1)
+
+    def test_incomplete_invoke_prefix_is_content(self):
+        parser = self.parser()
+        parser.feed("<invo")
+        message, deltas, reason = parser.finish("stop")
+        self.assertEqual(message["content"], "<invo")
+        self.assertEqual(deltas, [])
+        self.assertEqual(reason, "stop")
         self.assertFalse(parser.fallback)
 
     def test_plain_text_with_tag_like_prefix(self):
