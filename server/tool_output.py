@@ -246,12 +246,17 @@ class ToolOutput:
 
     def parse_calls(self):
         if self.calls_text is None:
-            if self.pending and any(start.startswith(self.pending) for start in CALL_STARTS):
+            if self.pending and (self.pending.startswith("<tool") or self.pending.startswith("<invo")):
                 raise malformed("the tool-call start tag is incomplete.", "incomplete_call")
             self.content += self.pending
             self.pending = ""
             return []
         calls, remaining = [], normalize_invoke(self.calls_text)
+        if not remaining.lstrip().startswith(START):
+            # An <invoke> start without a complete block is prose, not a call.
+            self.content += self.calls_text
+            self.calls_text = None
+            return []
         budget = WorkBudget()
         while remaining.strip():
             remaining = remaining.lstrip()

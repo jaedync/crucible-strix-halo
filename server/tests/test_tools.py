@@ -110,6 +110,17 @@ class ToolOutputTests(unittest.TestCase):
         self.assertEqual(finish, "tool_calls")
         self.assertFalse(parser.fallback)
 
+    def test_plain_text_with_tag_like_prefix(self):
+        for raw in ("Use a <", "The tag starts with <i",
+                    'Claude writes <invoke name="read"> blocks; here is how they look. Done.'):
+            parser = self.parser()
+            parser.feed(raw)
+            message, deltas, reason = parser.finish("stop")
+            self.assertEqual(message["content"], raw)
+            self.assertEqual(deltas, [])
+            self.assertEqual(reason, "stop")
+            self.assertFalse(parser.fallback)
+
     def test_all_stream_splits(self):
         raw = "Before.\n" + self.block(path="line one\n雪") + "\n" + self.block("b.py")
         for split in range(len(raw) + 1):
