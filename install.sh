@@ -172,7 +172,7 @@ parse_args() {
         ;;
       --dir=*) DIR_ARG=${1#--dir=} ;;
       --tag | --version)
-        [ $# -ge 2 ] && [ -n "$2" ] || die 2 "$1 needs a release name, such as v0.37.2."
+        if [ $# -lt 2 ] || [ -z "$2" ]; then die 2 "$1 needs a release name, such as v0.37.2."; fi
         TAG_ARG=$2
         shift
         ;;
