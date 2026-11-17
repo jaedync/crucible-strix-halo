@@ -280,6 +280,9 @@ class Update:
     # entry ------------------------------------------------------------------------------------------------------
     def run(self):
         host = self.host
+        if host.uid == 0 and not self.args.check:
+            self.say("Run ./crucible without sudo. The server runs as your user.")
+            return EXIT_USAGE
         if self.box is None:
             self.say(f"{self.real} is inside a system folder. Update does not change files there. Nothing was changed.")
             return EXIT_FAILED
@@ -307,14 +310,22 @@ class Update:
 
     def _locked(self):
         try:
-            code = self.recover()
-            if code is not None:
-                return code
+            if self.args.check:
+                # Read-only, also as root (cli.py allows it): no restore of a cut update and no cleanup here.
+                if self.journal_path.exists():
+                    self.say("An earlier update was stopped before it finished. Run ./crucible update without sudo "
+                             "and without --check to put the old release back. Nothing was changed.")
+                    return EXIT_FAILED
+            else:
+                code = self.recover()
+                if code is not None:
+                    return code
             if not ((self.real / ".git").is_dir() and (self.real / "crucible").is_file()):
                 self.say(f"{self.real} is not a git checkout of Crucible. Nothing was changed. "
                          "To get a normal install, run the installer again (see the README).")
                 return EXIT_FAILED
-            self.clean_stale()
+            if not self.args.check:
+                self.clean_stale()
             return self.update()
         except CheckFailed as exc:
             self.say(f"{exc} Nothing was changed.")

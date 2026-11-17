@@ -30,7 +30,7 @@ Press Enter to take a default. It downloads the model (about 107 GB) and starts 
 folder is the folder `crucible` in your home folder, and the default port is 8790.
 
 The one command does not run `make`. It downloads the release engine (about 25 MB), checks its sha256, and puts it in
-`build/engine/`. The line `[build] done: release engine v0.37.2 (verified)` means this. So the build time of step 4
+`build/engine/`. The line `[build] done: release engine v0.37.3 (verified)` means this. So the build time of step 4
 does not apply, and no compiler is needed. In our test, with the pack already on the disk, setup took 65 seconds.
 With a new pack, the download time is added, and the first model load takes a few minutes. Add `--source-build` to
 build the engine from source instead (about 16 minutes with the ROCm 7.2.4 compiler).
@@ -121,7 +121,7 @@ same install in single steps, for a person or an agent that does not use the scr
 
 ## Step 1: ROCm, the HIP compiler and GPU access
 
-Install the current ROCm (10.1 tested). ROCm 7.2.4 is tested too: if you have it, keep it. Setup passes both with no message.
+Install ROCm 7.2.4 for a source build. The release engine runs on ROCm 7.2.4 and 10.1, and setup passes both with no message.
 The engine needs the HIP runtime. A source build (step 4) also needs the HIP compiler. It uses no ROCm libraries (no rocBLAS, no
 hipBLAS). The tested system is Arch Linux with kernel 7.2.
 
@@ -223,7 +223,7 @@ and `. .venv/bin/activate` again.
 **Check:**
 
 ```sh
-python -m server --version    # expect: crucible 0.37.2 or newer
+python -m server --version    # expect: crucible 0.37.3 or newer
 hf version
 ```
 

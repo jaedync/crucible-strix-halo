@@ -42,7 +42,7 @@ WatchdogSec=30s
 WatchdogSignal=SIGKILL
 Restart=on-failure
 RestartSec=5s
-RestartPreventExitStatus=2 78
+RestartPreventExitStatus=2 4 78
 LimitCORE=0
 LimitNOFILE=65536
 UMask=0077
@@ -341,7 +341,16 @@ def stop(host, s):
     if res.rc != 0:
         host.out(f"systemctl stop failed: {res.out.strip()}")
         return 1
-    host.out("Stopped.")
+    from .processes import remaining_server
+    if message := remaining_server(host, s):
+        host.out(message)
+        return 1
+    _, props = _show(host, UNIT)
+    if props.get("UnitFileState") in ("enabled", "enabled-runtime"):
+        host.out("Stopped. The service stays enabled and can start at boot or login. "
+                 "To keep it off, run: systemctl --user disable crucible-server.service")
+    else:
+        host.out("Stopped.")
     return 0
 
 

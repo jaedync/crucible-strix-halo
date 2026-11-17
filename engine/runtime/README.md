@@ -34,6 +34,7 @@ Rank 4 (runtime).
 
 - A request's output depends only on the request: batching, load and
   speculation do not change it.
+  Session replay is the exception (docs/SESSION_REPLAY.md).
 - Verification, never a proposal, commits tokens.
 
 ## Allowed includes

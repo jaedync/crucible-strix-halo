@@ -101,7 +101,7 @@ class ApiKeyTest(unittest.TestCase):
         """Loopback only without a key: 127/8 and ::1. Mapped, ::, 0.0.0.0, link-local and LAN need it; scope ids and names are refused."""
         for text, needs in (("127.0.0.1", False), ("127.9.9.9", False), ("::1", False), ("0:0:0:0:0:0:0:1", False),
                             ("::ffff:127.0.0.1", True), ("::127.0.0.1", True), ("0.0.0.0", True), ("::", True),
-                            ("::ffff:0.0.0.0", True), ("fe80::1", True), ("169.254.1.1", True), ("192.0.2.7", True)):
+                            ("::ffff:0.0.0.0", True), ("fe80::1", False), ("169.254.1.1", False), ("192.0.2.7", True)):
             with self.subTest(text=text):
                 self.assertEqual(bind_error(startup.listen_address(text), False, {}) is not None, needs)
         for text in ("fe80::1%lo", "::1%1", "localhost", "127.1", "0", "2130706433", "[::1]", " 127.0.0.1", "127.0.0.1\n"):

@@ -9,7 +9,7 @@ with 128 GB. Its OpenAI-compatible server gives local coding agents 4 sessions o
 <picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/decode-by-context-dark.svg"><img src="docs/img/decode-by-context-light.svg" width="412" alt="Line chart: Decode by context length, in tokens per second: 4.05 bpw from 71.7 at 32K to 62.2 at 250K; 3.05 bpw from 77.0 at 32K to 69.1 at 250K. v0.33.0, Nov 3, 2026."></picture>
 </p>
 
-<sub>One request at a time, default configuration, balanced power profile, v0.33.0 (Nov 3, 2026). No new run for v0.37.2.</sub>
+<sub>One request at a time, default configuration, balanced power profile, v0.33.0 (Nov 3, 2026). No new run for v0.37.3.</sub>
 <!-- results:end charts -->
 
 ## Install
@@ -26,7 +26,7 @@ curl -fsSL https://raw.githubusercontent.com/jaedync/crucible-strix-halo/main/in
 
 <!-- results:start clone -->
 ```sh
-git clone --branch v0.37.2 https://github.com/jaedync/crucible-strix-halo.git
+git clone --branch v0.37.3 https://github.com/jaedync/crucible-strix-halo.git
 cd crucible-strix-halo
 ./crucible setup
 ```
@@ -74,7 +74,7 @@ all three. A longer request uses YaRN. Measured in `long`:
 | Cold prompt: prefill | 1,677.6 tok/s | 1,436.2 tok/s |
 | Decode, code | 67.7 tok/s | 59.8 tok/s |
 
-<sub>v0.37.0, measured Nov 11, 2026: 1 run, balanced power profile. No new run for v0.37.2.</sub>
+<sub>v0.37.0, measured Nov 11, 2026: 1 run, balanced power profile. No new run for v0.37.3.</sub>
 <!-- results:end long -->
 
 Read more: [long context](docs/LONG_CONTEXT.md)
@@ -86,20 +86,20 @@ Read more: [long context](docs/LONG_CONTEXT.md)
 <picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/prefill-by-release-dark.svg"><img src="docs/img/prefill-by-release-light.svg" width="412" alt="Line chart: Cold prefill of a 32K prompt, by release, in tokens per second: 4.05 bpw from 1,585 at v0.22.0 to 1,831 at v0.34.0; 3.05 bpw from 1,656 at v0.22.0 to 1,877 at v0.34.0. Oct 27 to Nov 7, 2026."></picture>
 </p>
 
-<sub>Each release ran with the settings of its own time, balanced power profile. No new run for v0.37.2.</sub>
+<sub>Each release ran with the settings of its own time, balanced power profile. No new run for v0.37.3.</sub>
 <!-- results:end releases -->
 
 <!-- results:start table -->
-| v0.34.0 | 4.05 pack | 3.05 pack |
+| v0.37.3 | 4.05 pack | 3.05 pack |
 |---|---:|---:|
-| Cold 32K prompt: first token | 17.1 s | 16.6 s |
-| Cold 130K prompt: first token | 72.4 s | 71.1 s |
-| Same 32K prompt again: first token | 0.019 s | 0.015 s |
-| Decode at 32K, 1 session, code | 71.2 tok/s | 76.8 tok/s |
-| Decode at 32K, 1 session, prose | 58.4 tok/s | 60.7 tok/s |
-| Decode, 4 sessions, total | 118.3 tok/s | 129.0 tok/s |
+| Cold 32K prompt: first token | 16.3 s | 16.1 s |
+| Cold 130K prompt: first token | 69.7 s | 68.7 s |
+| Same 32K prompt again: first token | 0.018 s | 0.018 s |
+| Decode at 32K, 1 session, code | 72.1 tok/s | 77.0 tok/s |
+| Decode at 32K, 1 session, prose | 54.8 tok/s | 61.2 tok/s |
+| Decode, 4 sessions, total | 115.0 tok/s | 129.3 tok/s |
 
-<sub>v0.34.0, measured Nov 7, 2026: median of 2 runs, balanced power profile, default configuration. No new run for v0.37.2.</sub>
+<sub>v0.37.3, measured Nov 17, 2026: median of 6 texts (decode: mean, 3 runs a text), balanced power profile, default configuration.</sub>
 <!-- results:end table -->
 
 The 4-session row uses warm prompts and the all-4 window.
@@ -121,7 +121,7 @@ The 4-session row uses warm prompts and the all-4 window.
 - [Architecture](docs/ARCHITECTURE.md), [server guide](server/README.md) and [all documents](docs/README.md).
 - [Changelog](CHANGELOG.md): the changes and the known limits of each release.
 - [Security](SECURITY.md) and [remote access](docs/REMOTE_ACCESS.md). The server listens on `127.0.0.1` with no key
-  and no TLS. A key is required for an address that is not loopback, except in the Docker image.
+  and no TLS. A key is required for a public address, except in the Docker image.
 - [Updates](docs/UPDATES.md): once in 24 hours the server asks GitHub if a newer release exists.
   `--no-update-check` turns this off.
 

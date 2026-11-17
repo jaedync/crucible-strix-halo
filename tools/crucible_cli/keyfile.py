@@ -48,6 +48,17 @@ def is_loopback(text):
     return ip == ipaddress.IPv6Address("::1")
 
 
+# Keep this list in step with server/api_key.py. The launcher uses no server dependencies.
+PRIVATE_NETWORKS = tuple(ipaddress.ip_network(net) for net in
+                         ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "fc00::/7", "fe80::/10"))
+
+
+def is_private_bind(text):
+    """Loopback, RFC1918, link-local or ULA only. Wildcards and mapped IPv6 need a key."""
+    ip = address(text)
+    return is_loopback(text) or any(ip.version == net.version and ip in net for net in PRIVATE_NETWORKS)
+
+
 def ensure_key(host, path):
     """Make the key file when it does not exist. Return True when made, False when a file or link is there already.
 

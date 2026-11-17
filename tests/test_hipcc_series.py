@@ -133,11 +133,13 @@ class CliTest(unittest.TestCase):
         self.assertFalse(p.parse_args(["setup"]).allow_rocm10)
         self.assertTrue(p.parse_args(["update", "--allow-rocm10"]).allow_rocm10)
 
-    def test_the_stop_message_names_the_cli_flag(self):
+    def test_the_stop_message_leaves_the_flag_to_the_caller(self):
+        # setup and update each add their own "Run ... again with --allow-rocm10" sentence (review L2: once only).
         from crucible_cli import steps
         out = "make: ... " + hs.MARKER + " ..."
         msg = steps.rocm10_stop(out)
-        self.assertIn("--allow-rocm10", msg)
+        self.assertNotIn("--allow-rocm10", msg)
+        self.assertIn("ROCM_PATH", msg)
         self.assertIn("42%", msg)
         self.assertIsNone(steps.rocm10_stop("make: other error"))
 

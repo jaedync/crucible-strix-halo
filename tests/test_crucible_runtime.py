@@ -383,7 +383,7 @@ class SetupBase(Base):
         machine.setdefault("kfd_gfx", 110501)
         host = wire(self.t, http=FakeDownload(), prompt=FakePrompt(answers) if interactive else None, **machine)
         host.is_tty = interactive
-        base = ["--state-dir", str(self.t / "home/states")]
+        base = ["--state-dir", str(self.t / "home/states"), "--bind", "127.0.0.1"]
         if interactive:
             base += ["--pack", "4.05", "--models-dir", str(self.repo / "models"), "--port", "8790", "--service", "no"]
         code = cli.main(["setup", *base, *argv], host=host, repo=self.repo)

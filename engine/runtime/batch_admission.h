@@ -14,8 +14,14 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <stdexcept>
 
 namespace crucible {
+class AdmissionRefused : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
 inline std::optional<uint64_t> AvailableHostMemory() {
   std::ifstream file("/proc/meminfo");
   for (std::string line; std::getline(file, line);) {

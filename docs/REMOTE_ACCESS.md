@@ -107,10 +107,18 @@ curl -sS https://ai.example.org/v1/models -H "Authorization: Bearer KEY" # expec
 
 ### If you must listen on the network
 
-`./crucible setup --bind 0.0.0.0` (or `--bind ::`, or a LAN address) makes the key file and starts the server on that
-address. The server refuses to start on an address that is not loopback (127.0.0.0/8 and ::1) without a key file. It exits with code 2.
-The Docker image is the one exception (see [Docker](DOCKER.md)).
-The address `::ffff:127.0.0.1` is not loopback for this rule.
+`./crucible setup --bind 192.168.1.2 --no-api-key` starts without a key on that private address.
+Use an address assigned to this machine. Each unkeyed LAN start prints one warning.
+Any device that can reach the server can send prompts and fill its sessions. The strict Host check stays on.
+Use `./crucible setup --api-key` to turn the key on later. `--no-api-key` turns it off without deleting the file.
+Add `--yes` for scripts. The installer also accepts these flags.
+
+A key is required for a public address, except in the Docker image.
+`./crucible setup --bind 0.0.0.0 --api-key` makes the file and starts the server on all interfaces.
+The wildcards `0.0.0.0` and `::` count as public because they can expose public interfaces.
+Without a key, a public or wildcard bind exits with code 2 before the model loads.
+Private means loopback, RFC1918, IPv4 or IPv6 link-local, or IPv6 ULA (`fc00::/7`).
+Mapped IPv6 and reserved addresses still need a key. See [Docker](DOCKER.md) for its wildcard exception.
 
 The key is the only protection then, and the traffic has no TLS. Add a firewall rule for the port, and use
 `--allowed-host` to limit the `Host` names that the server accepts.

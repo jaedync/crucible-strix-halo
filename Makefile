@@ -99,7 +99,7 @@ endif
 # keeps its states over a new binary that has the same epoch. A failed stamp removes the binary, so an unstamped one
 # does not stay behind. STATE_EPOCH=0 skips the stamp (the binary then uses its own sha256 as the epoch: the old rule).
 ifneq ($(STATE_EPOCH),0)
-	@$(PYTHON) -I tools/state_epoch.py stamp $@ || { rm -f $@; exit 1; }
+	@ROCM_PATH='$(call shq,$(ROCM_PATH))' HIPCC='$(call shq,$(HIPCC))' $(PYTHON) -I tools/state_epoch.py stamp $@ || { rm -f $@; exit 1; }
 endif
 	@$(ENGINE_STAMP_END)
 

@@ -218,7 +218,7 @@ class UnitText(Base):
     def test_the_unit_follows_the_design(self):
         text = ft.render_unit(self.config())
         for line in ("Type=notify", "NotifyAccess=main", "WatchdogSec=30s", "WatchdogSignal=SIGKILL", "KillMode=control-group",
-                     "TimeoutStopSec=120s", "Restart=on-failure", "RestartPreventExitStatus=2 78", "LimitCORE=0",
+                     "TimeoutStopSec=120s", "Restart=on-failure", "RestartPreventExitStatus=2 4 78", "LimitCORE=0",
                      "StartLimitBurst=4", "StartLimitIntervalSec=15min", "UMask=0077"):
             self.assertIn(line, text)
         self.assertRegex(text, r"ExecStart=\".*ft-serve\.sh\" --systemd --watchdog-stall-seconds 50")

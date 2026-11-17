@@ -3,6 +3,70 @@
 Releases are numbered `v0.<train>.<fix>`. This file lists the newest release first.
 The same text is in the notes of each release on GitHub.
 
+## v0.37.3 (2026-11-17)
+
+Release v0.37.3 makes setup, start, stop and update safer, and a private LAN address can now start without a key. The
+engine kernels are the kernels of v0.37.2. The engine has two small changes: a memory admission refusal now exits with
+code 4, and a server option given to the engine gets a clear error.
+
+### Network access and the API key
+
+- Setup asks if other machines will use the server, and which address to listen on. On a private LAN address, the
+  question "Use an API key?" defaults to no.
+- A key is required for a public address, except in the Docker image. Private addresses need no key: loopback, RFC1918,
+  link-local and IPv6 ULA (`fc00::/7`). The wildcard addresses `0.0.0.0` and `::` need a key outside the Docker image.
+  IPv4-mapped IPv6, reserved and documentation addresses need a key, also in the Docker image.
+- A start on a private LAN address without a key prints one warning. Every device that can reach the server can then
+  use its sessions.
+- Without a key, the strict Host check stays on, also for a server that you start with `python -m server`. It accepts
+  the loopback names and the bind address. Add the name of a reverse proxy with `--allowed-host`.
+- The Docker image on `0.0.0.0` or `::` still has no default Host list, as in v0.37.2.
+- `./crucible setup --api-key` turns the key on. `./crucible setup --no-api-key` turns it off on a private address and
+  keeps the key file.
+- `./crucible stop` sends no API key when it checks for a running server. It checks only an address of this machine.
+
+### Start, stop and memory
+
+- When the engine stops, the server closes its port and exits with code 3, with or without systemd.
+- When the batch engine refuses a start because of memory admission, it exits with code 4. The user service does not
+  start again after that refusal.
+- The memory checks of the launcher warn about low host memory or busy GPU memory. They no longer stop a start. The
+  warnings name the visible memory holders and suggest a smaller pack, smaller caches or fewer sessions. The checks
+  change no setting and stop no other program. The engine still does its own memory admission check.
+- The stop commands name the visible servers that the launcher did not start. They do not stop those servers.
+- The stop messages tell you when an enabled user service can start again at boot or login.
+- The launcher refuses commands that change the install when you run them as root. `./crucible update --check` changes
+  nothing.
+- The command hints of the launcher and the installer give the full launcher path, also for a path with spaces.
+- The engine tells you when an option (`--host`, `--port`, `--api-key-file`) belongs to `python -m server`.
+- The server warns when `CRUCIBLE_PLE_HOST` does not keep the n-gram table in host memory.
+- [OpenAI clients](docs/OPENAI_CLIENTS.md) gives the request body limit: it follows `--ctx`, and the launcher sets
+  16 MiB.
+
+### Install and update
+
+- The installer accepts `--tag vX.Y.Z` and its alias `--version vX.Y.Z`. The flag overrides `CRUCIBLE_TAG`. It does not
+  pin later updates: an update without `--tag` still selects the newest release.
+- An update with `--tag` of an install that is too old to choose a release stops with a message and changes nothing.
+  Update once without `--tag`, then use `--tag`.
+- The installer prints correct commands for an install path that contains `&` with bash 5.2.
+
+### Setup and build
+
+- The state folder check of setup, doctor and uninstall resolves links as the engine does. A folder under a link that
+  points out of the home folder is refused.
+- The build stamp of the state folder finds the LLVM tools from `ROCM_PATH` and `HIPCC` before `/opt/rocm`.
+- The ROCm 10 stop of setup and update names `--allow-rocm10` once.
+- docs/ARCHITECTURE.md and docs/RESULTS.md name session replay as the exception to the rule that only the request sets
+  its output.
+
+### Known limits
+
+- The known limits of v0.37.2 stay. An engine built from source with the ROCm 10.1 compiler is slower at a 32K prefill
+  than one built with the 7.2.4 compiler. For a source build, use the 7.2.4 compiler.
+- With the disk tier (`--state-dir`) on a slow disk, a state write can wait longer than the 8 s bound of a slot handover.
+  The server then drops that state, and the next turn of that session computes again from the longest saved prefix.
+
 ## v0.37.2 (2026-11-15)
 
 Release v0.37.2 has the engine of v0.37.0, built with ROCm 7.2.4. The engine source is the source of v0.37.0. It fixes

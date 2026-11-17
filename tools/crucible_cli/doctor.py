@@ -11,6 +11,8 @@ from pathlib import Path
 
 from . import keyfile, packs, rocm, service, settings as settings_mod
 from .files import Sandbox
+from .memfit import memory_advice
+from .measured import SERVER_FLAGS
 
 GTT_PARAMS = "amdgpu.gttsize=126976 ttm.pages_limit=32505856"
 GTT_MIN_BYTES = 130_000_000_000      # the tested machine shows about 133 GB
@@ -204,8 +206,15 @@ def run_checks(host, s):
         add("memory", "System memory 120 GiB or more", "pass", f"{total / 1024 / 1024:.0f} GiB")
     else:
         got = "unknown" if total is None else f"{total / 1024 / 1024:.0f} GiB"
-        add("memory", "System memory 120 GiB or more", "fail", f"this machine has {got}",
-            "The 4.05 pack with 4 long sessions needs a 128 GB machine. Other sizes are not supported.", ("start",))
+        add("memory", "System memory 120 GiB or more", "warn", f"this machine has {got}", memory_advice(host))
+    available = _meminfo(host, "MemAvailable")
+    reserve_kb = int(SERVER_FLAGS["--host-reserve-mib"]) * 1024
+    if available is None or available < reserve_kb:
+        got = "unknown" if available is None else f"{available / 1024 / 1024:.1f} GiB"
+        add("memory-available", "Available host memory", "warn", f"{got}; the host reserve is {reserve_kb / 1024 / 1024:.0f} GiB",
+            memory_advice(host))
+    else:
+        add("memory-available", "Available host memory", "pass", f"{available / 1024 / 1024:.1f} GiB")
 
     # GPU memory limit (GTT)
     totals = [t for t in (_int(c / "mem_info_gtt_total") for c in _cards(host)) if t]
@@ -229,9 +238,7 @@ def run_checks(host, s):
     if live:
         add("gpu-free", "GPU memory is free", "pass", "in use by the Crucible server (started by this tool, or the service)")
     elif used and max(used) > GPU_BUSY_BYTES:
-        add("gpu-free", "GPU memory is free", "fail", f"{_gb(max(used))} of GPU memory is in use",
-            "The GPU memory is held by another program (for example another inference server). Stop it first. "
-            "Crucible does not start while it runs.", ("start",))
+        add("gpu-free", "GPU memory is free", "warn", f"{_gb(max(used))} of GPU memory is in use", memory_advice(host))
     else:
         add("gpu-free", "GPU memory is free", "pass", f"{_gb(max(used or [0]))} in use")
 
@@ -258,7 +265,7 @@ def run_checks(host, s):
         home = Path(os.path.abspath(host.home))
         sd = Path(os.path.abspath(s.state_dir))
         problem = settings_mod.state_dir_problem(home, s.repo, sd)
-        if sd == home or home not in sd.parents:
+        if not settings_mod.state_dir_inside(home, sd):
             add("state-dir", "State folder is inside your home folder", "fail", f"{sd} is not inside your home folder {home}",
                 "Use a new folder inside your home folder: ./crucible setup --state-dir ~/.cache/crucible/states", ("start",))
         elif problem and not (s.work / "server.pid").exists():
@@ -308,7 +315,7 @@ def _key_file_check(s, add):
     """The API key file (service design s3). Never shows the key. A bad file stops the server with exit 78."""
     title = "API key file"
     if s.api_key_file is None:
-        add("key-file", title, "skip", "no key: the server listens on loopback only (./crucible setup --bind ADDRESS adds one)")
+        add("key-file", title, "skip", "no key: private addresses only (./crucible setup --api-key adds one)")
         return
     problem = keyfile.check_key_file(s.api_key_file)
     if problem is None:
@@ -317,11 +324,11 @@ def _key_file_check(s, add):
         add("key-file", title, "skip", f"{s.api_key_file} is not made yet: ./crucible setup makes it")
     elif not os.path.lexists(s.api_key_file):
         add("key-file", title, "fail", f"{s.api_key_file} does not exist",
-            f"Make the key: ./crucible setup --bind {s.bind}" + (" --api-key" if keyfile.is_loopback(s.bind) else ""),
+            f"Make the key: ./crucible setup --bind {s.bind} --api-key",
             ("start",))
     else:
         fix = f"chmod 600 {s.api_key_file}" if "chmod 600" in problem else \
-            f"Remove the file and make a new key: rm {s.api_key_file} && ./crucible setup --bind {s.bind}"
+            f"Remove the file and make a new key: rm {s.api_key_file} && ./crucible setup --bind {s.bind} --api-key"
         add("key-file", title, "fail", problem.split(" Run:")[0], fix, ("start",))
 
 
@@ -341,7 +348,7 @@ def format_text(results):
     seen = {}
     for r in results:
         lines.append(f"{r.status.upper():<4}  {r.id:<13} {r.title}" + (f": {r.detail}" if r.detail else ""))
-        if r.status == "fail" and r.fix:
+        if r.status in ("fail", "warn") and r.fix:
             if r.fix in seen:
                 lines.append(f"      fix: the same as for {seen[r.fix]}")
                 continue
@@ -407,13 +414,16 @@ def for_start(host, s, quiet=False, as_json=False, check_file=None):
         Sandbox([path.parent]).write_json(path, record)
     except (OSError, ValueError):
         pass  # a check file that cannot be written must not hide the result
+    warnings = [r for r in run_checks(host, s) if r.status == "warn" and r.id in ("memory", "memory-available", "gpu-free")]
     if as_json:
-        host.out(json.dumps({"checks": [f.as_dict() for f in fails], "ok": not fails, "code": code}, indent=2))
+        host.out(json.dumps({"checks": [f.as_dict() for f in fails + warnings], "ok": not fails, "code": code}, indent=2))
     elif quiet:
         for f in fails:
             host.out(f"{f.id}: {f.detail}")
-    elif fails:
-        host.out(format_text(fails))
+        if warnings:
+            host.out(format_text(warnings))
+    elif fails or warnings:
+        host.out(format_text(fails + warnings))
     else:
         host.out("Ready to start.")
     return code

@@ -144,7 +144,7 @@ class UnitTextTest(Base):
         lines = text.splitlines()
         for want in ("Type=notify", "NotifyAccess=main", "WatchdogSec=30s", "WatchdogSignal=SIGKILL",
                      "TimeoutStopSec=120s", "KillMode=control-group", "Restart=on-failure", "RestartSec=5s",
-                     "RestartPreventExitStatus=2 78", "StartLimitIntervalSec=15min", "StartLimitBurst=4",
+                     "RestartPreventExitStatus=2 4 78", "StartLimitIntervalSec=15min", "StartLimitBurst=4",
                      "LimitCORE=0", "LimitNOFILE=65536", "UMask=0077", "NoNewPrivileges=yes", "SyslogIdentifier=crucible",
                      "WantedBy=default.target", "TimeoutStartSec=600s", "Environment=PYTHONUNBUFFERED=1",
                      "WorkingDirectory=/srv/u/crucible"):
@@ -220,7 +220,7 @@ class InstallTest(Base):
     def test_install_without_config_exits_2(self):
         code, host, out = self.run_cli(["service", "install"])
         self.assertEqual(code, 2)
-        self.assertIn("./crucible setup", out)
+        self.assertIn(f"{self.repo}/crucible setup", out)
         self.assertFalse(self.unit_file().exists())
 
     def test_install_without_a_user_manager_exits_3_and_changes_nothing(self):
@@ -229,7 +229,7 @@ class InstallTest(Base):
             host = self.host(runner=FakeSystemd(manager=manager))
             code, host, out = self.run_cli(["service", "install"], host=host)
             self.assertEqual(code, 3, (manager, out))
-            self.assertIn("./crucible start", out)
+            self.assertIn(f"{self.repo}/crucible start", out)
             self.assertFalse(self.unit_file().exists())
             self.assertNotIn("start", host.runner.verbs())
 
@@ -409,7 +409,7 @@ class StatusTest(Base):
     def test_not_installed_exits_4(self):
         code, host, out = self.status({"LoadState": "not-found", "ActiveState": "inactive"})
         self.assertEqual(code, 4)
-        self.assertIn("./crucible service install", out)
+        self.assertIn(f"{self.repo}/crucible service install", out)
 
     def test_running_and_healthy_exits_0(self):
         code, host, out = self.status()
@@ -420,7 +420,7 @@ class StatusTest(Base):
     def test_stopped_exits_3(self):
         code, host, out = self.status({"ActiveState": "inactive", "SubState": "dead"})
         self.assertEqual(code, 3)
-        self.assertIn("./crucible service start", out)
+        self.assertIn(f"{self.repo}/crucible service start", out)
 
     def test_active_but_health_not_200_exits_1(self):
         code, host, out = self.status(http=FakeHttp(ready_after=10 ** 9))
@@ -441,7 +441,7 @@ class StatusTest(Base):
         self.assertEqual(code, 1)
         self.assertIn("Stopped after 4 failed starts in 15 min.", out)
         self.assertIn("Last start check: the pack folder /x is missing", out)
-        self.assertIn("./crucible service start", out)
+        self.assertIn(f"{self.repo}/crucible service start", out)
 
     def test_f10_crash_loop_status_says_why_without_a_check(self):
         code, host, out = self.status({"ActiveState": "failed", "SubState": "failed", "Result": "start-limit-hit",
@@ -613,8 +613,9 @@ class StartCheckTest(Base):
         host.sleep = sleep
         code, host, out = self.doctor(["--quiet"], host=host)
         self.assertEqual(code, 0, out)
-        self.assertGreaterEqual(clock["t"], 60)
-        self.assertLess(clock["t"], 120)
+        self.assertEqual(clock["t"], 0)
+        self.assertIn("WARN", out)
+        self.assertIn("Crucible does not stop other programs.", out)
 
     def test_a1_a_port_busy_for_more_than_120_s_exits_75(self):
         self.ready_repo()
@@ -673,7 +674,7 @@ class SetupQuestionTest(Base):
         code, host, out = self.setup_cli(["--yes"])
         self.assertEqual(code, 0, out)
         self.assertEqual(host.runner.ctl, [])
-        self.assertEqual(out.count("To run it as a service: ./crucible service install"), 1)
+        self.assertEqual(out.count(f"To run it as a service: {self.repo}/crucible service install"), 1)
 
     def test_service_no_prints_no_hint_needed_and_installs_nothing(self):
         code, host, out = self.setup_cli(["--yes", "--service", "no"])
@@ -686,7 +687,7 @@ class SetupQuestionTest(Base):
         self.assertTrue(self.unit_file().exists())
         self.assertEqual(host.runner.terminated, [40001])  # the setup server gives way to the unit
         self.assertIn("start", host.runner.verbs())
-        self.assertIn("./crucible service status", out)
+        self.assertIn(f"{self.repo}/crucible service status", out)
         self.assertNotIn("To run it as a service", out)
         self.assertLess(out.index("[test]"), out.index("[service]"))
 
@@ -699,7 +700,7 @@ class SetupQuestionTest(Base):
         code, host, out = self.setup_cli(["--yes", "--service", "yes"], host=self.host(runner=FakeSystemd(manager="")))
         self.assertEqual(code, 3)
         self.assertEqual(host.runner.spawned, [])
-        self.assertIn("./crucible start", out)
+        self.assertIn(f"{self.repo}/crucible start", out)
 
     def test_a_failed_install_after_setup_exits_1_and_keeps_the_server(self):
         host = self.host(runner=FakeSystemd(start_fails=True))
@@ -737,7 +738,7 @@ class SetupQuestionTest(Base):
         code, host, out = self.setup_cli([], host=host)
         self.assertEqual(code, 0, out)
         self.assertFalse([q for q in host.prompt.asked if "service" in q.lower()])
-        self.assertIn("./crucible start", out)
+        self.assertIn(f"{self.repo}/crucible start", out)
 
     def test_a2_stdin_is_a_pipe_the_questions_come_from_the_terminal_device(self):
         host = self.host(runner=FakeSystemd())
@@ -967,7 +968,7 @@ class SetupRestartPendingTest(Base):
         # ExecStartPre runs doctor --for start while the unit is "activating"; it must still see a busy port and GPU.
         for sub in ("start-pre", "auto-restart"):
             checks = self.doctor_checks(ActiveState="activating", SubState=sub)
-            self.assertEqual(checks["gpu-free"].status, "fail", sub)
+            self.assertEqual(checks["gpu-free"].status, "warn", sub)
             self.assertEqual(checks["port"].status, "fail", sub)
 
 
@@ -981,13 +982,13 @@ class SetupHintTest(Base):
         self.assertEqual(code, 0, out)
         self.assertNotIn("To run it as a service", out)
         self.assertNotIn("server.log", out)
-        self.assertIn("./crucible service logs", out)
+        self.assertIn(f"{self.repo}/crucible service logs", out)
 
     def test_setup_still_offers_the_service_when_it_is_not_installed(self):
         self.configure()
         code, host, out = self.run_cli(["setup", "--yes"], host=self.host(runner=FakeRunner()))
         self.assertEqual(code, 0, out)
-        self.assertIn("To run it as a service: ./crucible service install", out)
+        self.assertIn(f"To run it as a service: {self.repo}/crucible service install", out)
 
     def test_a_server_from_start_gets_the_new_settings_with_a_restart(self):
         self.configure()
@@ -1032,7 +1033,7 @@ class DoctorServiceTest(Base):
     def test_a_stopped_service_does_not(self):
         checks = self.checks(active=False)
         self.assertEqual(checks["port"].status, "fail")
-        self.assertEqual(checks["gpu-free"].status, "fail")
+        self.assertEqual(checks["gpu-free"].status, "warn")
 
 
 class StopNoteTest(Base):

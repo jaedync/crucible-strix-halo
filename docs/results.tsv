@@ -250,3 +250,15 @@ ctx_decode	3.05	default	64	74.0	tok/s	v0.33.0	2026-11-03	balanced	2	4 samples	v0
 ctx_decode	3.05	default	128	73.9	tok/s	v0.33.0	2026-11-03	balanced	2	6 samples	v0.37.0:docs/RESULTS.md:207
 ctx_decode	3.05	default	192	71.2	tok/s	v0.33.0	2026-11-03	balanced	2	5 samples	v0.37.0:docs/RESULTS.md:207
 ctx_decode	3.05	default	250	69.1	tok/s	v0.33.0	2026-11-03	balanced	2	5 samples	v0.37.0:docs/RESULTS.md:207
+cold32_ttft	4.05	default		16.3	s	v0.37.3	2026-11-17	balanced	6		stand-eval:fe6f7bedd374:table/cells.json
+cold32_ttft	3.05	default		16.1	s	v0.37.3	2026-11-17	balanced	6		stand-eval:fe6f7bedd374:table/cells.json
+cold130_ttft	4.05	default		69.7	s	v0.37.3	2026-11-17	balanced	6		stand-eval:fe6f7bedd374:table/cells.json
+cold130_ttft	3.05	default		68.7	s	v0.37.3	2026-11-17	balanced	6		stand-eval:fe6f7bedd374:table/cells.json
+resend32	4.05	default		0.018	s	v0.37.3	2026-11-17	balanced	6		stand-eval:fe6f7bedd374:table/cells.json
+resend32	3.05	default		0.018	s	v0.37.3	2026-11-17	balanced	6		stand-eval:fe6f7bedd374:table/cells.json
+dec32_code	4.05	default		72.1	tok/s	v0.37.3	2026-11-17	balanced	3		stand-eval:fe6f7bedd374:table/cells.json
+dec32_code	3.05	default		77.0	tok/s	v0.37.3	2026-11-17	balanced	3		stand-eval:fe6f7bedd374:table/cells.json
+dec32_prose	4.05	default		54.8	tok/s	v0.37.3	2026-11-17	balanced	3		stand-eval:fe6f7bedd374:table/cells.json
+dec32_prose	3.05	default		61.2	tok/s	v0.37.3	2026-11-17	balanced	3		stand-eval:fe6f7bedd374:table/cells.json
+dec4	4.05	default		115.0	tok/s	v0.37.3	2026-11-17	balanced	5	5 of 6 texts gave a value	stand-eval:fe6f7bedd374:table/cells.json
+dec4	3.05	default		129.3	tok/s	v0.37.3	2026-11-17	balanced	6		stand-eval:fe6f7bedd374:table/cells.json

@@ -279,9 +279,11 @@ class OutsideEnvironmentTest(Base):
 class RollbackFlagTest(Base):
     """`--rollback` was the flag of tools/update.sh. It gets a clear answer and exit 2, not an argparse error."""
 
-    def check_message(self, text):
+    def check_message(self, text, repo=None):
         self.assertRegex(text, r"rolls? back by itself|rolled back by itself")
-        self.assertIn("./crucible update --tag vX.Y.Z", text)
+        from crucible_cli.commands import command_text
+        repo = repo if repo is not None else self.w.dir
+        self.assertIn(command_text(repo, "update --tag vX.Y.Z"), text)
 
     def test_the_flag_gives_a_message_and_exit_2_and_changes_nothing(self):
         self.world()
@@ -303,7 +305,7 @@ class RollbackFlagTest(Base):
                               text=True, timeout=60, cwd=root)
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
         self.assertNotIn("usage:", proc.stdout + proc.stderr)
-        self.check_message(proc.stdout)
+        self.check_message(proc.stdout, repo=root)
 
 
 class DowngradeTest(Base):
@@ -625,6 +627,15 @@ class SourceBuildTest(Base):
         w.machine.fail_make = True
         self.assertEqual(self.update("--yes"), 1, self.out)
         self.assertRegex(self.out, r"(?i)build")
+        self.assertUntouched()
+
+    def test_the_rocm10_stop_names_the_flag_once(self):
+        # Review L2: the stop message and the raise both gave --allow-rocm10.
+        w = self.world(release_engine=False)
+        w.machine.fail_make = "make: CRUCIBLE-ROCM10-STOP hipcc is a ROCm 10 compiler\n"
+        self.assertEqual(self.update("--yes"), 1, self.out)
+        self.assertIn("ROCm 10 compiler", self.out)
+        self.assertEqual(self.out.count("--allow-rocm10"), 1, self.out)
         self.assertUntouched()
 
     def test_source_build_flag_builds_even_for_a_release_install(self):

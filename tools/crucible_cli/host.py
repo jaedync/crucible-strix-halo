@@ -1,4 +1,5 @@
 """The machine and its services, behind one object so that tests can replace every part of it."""
+import errno
 import grp
 import os
 import shutil
@@ -23,16 +24,30 @@ def _disk_free(path):
     return shutil.disk_usage(p).free
 
 
-def _port_free(addr, port):
-    """True when a server can listen on the port. SO_REUSEADDR, as the server sets it: after a crash the server side of its
-    connections stays in TIME_WAIT for 60 s, and that must not count as "in use" (it made a restart wait 60 s)."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
+def _bind_error(addr, port):
+    """The errno of a test bind to (addr, port), or 0 when it binds. The address family follows the address (IPv6 binds
+    need AF_INET6). SO_REUSEADDR, as the server sets it: after a crash the server side of its connections stays in
+    TIME_WAIT for 60 s, and that must not count as "in use" (it made a restart wait 60 s)."""
+    family = socket.AF_INET6 if ":" in str(addr) else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind((addr, port))
-        except OSError:
-            return False
-    return True
+    except OSError as error:
+        return error.errno or -1
+    return 0
+
+
+def _port_free(addr, port):
+    """True when a server can listen on the port. False also when the address is not on this machine: the server
+    cannot bind it either."""
+    return _bind_error(addr, port) == 0
+
+
+def _port_in_use(addr, port):
+    """True only when the address is on this machine and a socket holds the port. A saved address that this machine
+    no longer owns (EADDRNOTAVAIL) is not in use here: a probe to it would reach another machine."""
+    return _bind_error(addr, port) == errno.EADDRINUSE
 
 
 def _groups():
@@ -71,6 +86,7 @@ def _tty_prompt():
 
 @dataclass
 class Host:
+    uid: int = field(default_factory=os.geteuid)
     proc: Path = Path("/proc")
     sysfs: Path = Path("/sys")
     dev: Path = Path("/dev")
@@ -85,6 +101,7 @@ class Host:
     which: Callable[[str], Any] = shutil.which
     disk_free: Callable[[Path], int] = _disk_free
     port_free: Callable[[str, int], bool] = _port_free
+    port_in_use: Callable[[str, int], bool] = _port_in_use
     groups: Callable[[], list] = _groups
     can_access: Callable[[Path, int], bool] = os.access
     runner: Any = None

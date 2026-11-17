@@ -65,9 +65,9 @@ def allowed_hosts(s):
     """The comma list for --allowed-host, or None for no list.
 
     A loopback bind gets the loopback names, the bind address and the names that the user added (a reverse proxy sends
-    its own name). A bind that is not loopback needs the API key, which a web page cannot send, so it has no list unless
-    the user added names; then the list also holds the bind address."""
-    if not keyfile.is_loopback(s.bind) and not s.allowed_hosts:
+    its own name). A keyed bind outside loopback has no list unless the user added names.
+    Without a key, keep the strict list to stop DNS rebinding."""
+    if s.api_key_file is not None and not keyfile.is_loopback(s.bind) and not s.allowed_hosts:
         return None
     names = list(LOOPBACK_HOSTS)
     ip = keyfile.address(s.bind)

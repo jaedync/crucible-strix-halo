@@ -256,6 +256,10 @@ IMAGE_FAILED = "An image of this request changed or was removed before the engin
 ENGINE_REJECTED = "The engine rejected this request. The crucible_engine_error line in the server log has the cause."
 
 
+class AdmissionRefused(RuntimeError):
+    """The engine refused memory admission before it accepted requests (exit 4, no service restart)."""
+
+
 class ProtocolError(RuntimeError):
     """A server-side failure with a fixed text that the server wrote; the worker log may show it."""
 

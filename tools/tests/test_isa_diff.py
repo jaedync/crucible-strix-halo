@@ -112,3 +112,46 @@ def test_fact_stubs_of_the_split_build_are_not_functions():
     assert "<_ZN8crucible3FooILi4EEEvPf+0x10>" in units["_ZN8crucible3FooILi4EEEvPf"]
     alone = "\n0000000000003000 <__devsplit_facts_p4>:\n\ts_endpgm // 000000003000: BFB00000\n"
     assert isa_diff.parse_disassembly(alone, STUB_SYMS) == {}
+
+
+def _tool(folder):
+    folder.mkdir(parents=True)
+    (folder / "llvm-objdump").write_text("")
+    return folder
+
+
+def test_llvm_folder_comes_from_rocm_path_first(tmp_path, monkeypatch):
+    # A ROCm prefix that is not /opt/rocm (review M4): the state_epoch stamp of a full build must find its llvm tools.
+    monkeypatch.delenv("LLVM_BIN", raising=False)
+    monkeypatch.delenv("HIPCC", raising=False)
+    monkeypatch.setattr(isa_diff, "LLVM_DIRS", (str(_tool(tmp_path / "fallback")),))
+    monkeypatch.setenv("ROCM_PATH", str(tmp_path / "rocm"))
+    want = _tool(tmp_path / "rocm" / "llvm" / "bin")
+    assert isa_diff.find_llvm() == want
+    monkeypatch.setenv("ROCM_PATH", str(tmp_path / "rocm-lib"))
+    want = _tool(tmp_path / "rocm-lib" / "lib" / "llvm" / "bin")
+    assert isa_diff.find_llvm() == want
+    monkeypatch.setenv("ROCM_PATH", str(tmp_path / "empty"))
+    assert isa_diff.find_llvm() == tmp_path / "fallback"
+
+
+def test_llvm_folder_comes_from_the_hipcc_folder(tmp_path, monkeypatch):
+    monkeypatch.delenv("LLVM_BIN", raising=False)
+    monkeypatch.delenv("ROCM_PATH", raising=False)
+    monkeypatch.setattr(isa_diff, "LLVM_DIRS", ())
+    hipcc = tmp_path / "rocm" / "bin" / "hipcc"
+    hipcc.parent.mkdir(parents=True)
+    hipcc.write_text("#!/bin/sh\n")
+    hipcc.chmod(0o755)
+    monkeypatch.setenv("HIPCC", str(hipcc))
+    want = _tool(tmp_path / "rocm" / "llvm" / "bin")
+    assert isa_diff.find_llvm() == want
+
+
+def test_makefile_gives_the_rocm_prefix_to_the_state_epoch_stamp():
+    # make ROCM_PATH=... (a make word) does not go into the environment by itself: the stamp line passes it.
+    lines = (Path(__file__).resolve().parents[2] / "Makefile").read_text().splitlines()
+    stamp = [line for line in lines if "tools/state_epoch.py stamp" in line]
+    assert stamp, "no state_epoch stamp line"
+    for line in stamp:
+        assert "ROCM_PATH='$(call shq,$(ROCM_PATH))'" in line and "HIPCC='$(call shq,$(HIPCC))'" in line, line

@@ -1,5 +1,5 @@
-// gateway-fsb: the engine's compact-state start line reports the fixed part of one slot's state
-// (SequenceState::FixedBytes) beside the logical total, so the gateway draws "KV cache" and "Recurrent state" as two bands.
+// kiln-fsb: the engine's compact-state start line reports the fixed part of one slot's state
+// (SequenceState::FixedBytes) beside the logical total, so Kiln draws "KV cache" and "Recurrent state" as two bands.
 // This pins that number for the Flash-Next config: 36 layers of GDN state, conv ring and pending rows, then the
 // PLE ring. The start-line format string and its argument are pinned in the start-line test.
 #include "../engine/model/flashnext/fixed_state.h"
@@ -22,7 +22,7 @@ struct FakeState {
 };
 
 int main() {
-  // 151770112 bytes of the slot's 6996972544 (2.2%): the gateway shows this as the "Recurrent state" band.
+  // 151770112 bytes of the slot's 6996972544 (2.2%): Kiln shows this as the "Recurrent state" band.
   static_assert(kFixedBytes == 151770112, "the fixed state size of one slot changed");
   assert(kFixedBytes == 151770112);
   // The same total through the one list (fixed_state.h), so a buffer added to the list alone is caught here too.

@@ -24,6 +24,7 @@ def failures(host, s):
     if not os.path.exists(flag): return []
     return [doctor.CheckResult("gpu-free", "GPU memory is free", "fail", "9.0 GB of GPU memory is in use", "Stop the program.", ("start",))]
 doctor.start_failures = failures
+doctor.run_checks = lambda host, s: []
 doctor.START_WAIT_SECONDS = {wait!r}
 sys.exit(doctor.for_start(Host(), None, quiet=True, check_file={check!r}))
 '''

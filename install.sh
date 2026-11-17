@@ -20,7 +20,7 @@
 # Environment (for mirrors and tests): CRUCIBLE_TAG, CRUCIBLE_RELEASE_BASE (https:// or file://), CRUCIBLE_REPO_URL,
 # CRUCIBLE_DIR, CRUCIBLE_SUMS_SHA256, CRUCIBLE_TTY, CRUCIBLE_OS_RELEASE, ROCM_PATH.
 
-PIN_TAG="v0.37.2"
+PIN_TAG="v0.37.3"
 PIN_SUMS_SHA256=""
 REPO_URL_DEFAULT="https://github.com/jaedync/crucible-strix-halo.git"
 RELEASE_BASE_DEFAULT="https://github.com/jaedync/crucible-strix-halo/releases/download"
@@ -31,6 +31,11 @@ RAW_URL="https://raw.githubusercontent.com/jaedync/crucible-strix-halo/main/inst
 PIPE_CHAR="|"
 
 usage() {
+  command_text "$(usage_text)"
+  printf '\n'
+}
+
+usage_text() {
   cat <<'EOF'
 Crucible installer
 
@@ -43,6 +48,7 @@ Usage:
 
 Options:
   --dir DIR         install folder (default $HOME/crucible)
+  --tag vX.Y.Z      install this release (alias: --version); overrides CRUCIBLE_TAG
   --source-build    do not download the engine (the manifest is still checked); ./crucible setup builds it from source (about 16 minutes with the ROCm 7.2.4 compiler)
   --dry-run         show the plan and change nothing
   --yes, -y         no questions in ./crucible setup (the sudo question is never answered for you)
@@ -66,21 +72,39 @@ log_line() {
   return 0
 }
 
+command_text() {
+  # No ${text//pat/rep}: with bash 5.2 patsub_replacement, an & in the replacement is the matched text, and that drops the
+  # backslash that %q puts before &. Cut and join the text instead.
+  local launcher rest="$*" out=""
+  printf -v launcher '%q' "${DIR:-${CRUCIBLE_DIR:-$HOME/crucible}}/crucible"
+  while [[ $rest == *./crucible* ]]; do
+    out+="${rest%%./crucible*}$launcher"
+    rest=${rest#*./crucible}
+  done
+  printf '%s' "$out$rest"
+}
+
 say() {
-  printf '%s\n' "$*"
-  log_line "$*"
+  local text
+  text=$(command_text "$*")
+  printf '%s\n' "$text"
+  log_line "$text"
 }
 
 warn() {
-  printf '%s\n' "$*" >&2
-  log_line "$*"
+  local text
+  text=$(command_text "$*")
+  printf '%s\n' "$text" >&2
+  log_line "$text"
 }
 
 die() {
   local code=$1
   shift
-  printf 'install: %s\n' "$*" >&2
-  log_line "install: $*"
+  local text
+  text=$(command_text "$*")
+  printf 'install: %s\n' "$text" >&2
+  log_line "install: $text"
   [ -n "${LOG:-}" ] && printf 'Log: %s\n' "$LOG" >&2
   exit "$code"
 }
@@ -124,6 +148,7 @@ ask_yn() {
 parse_args() {
   CMD=install
   DIR_ARG=""
+  TAG_ARG=""
   DRY_RUN=0
   SOURCE_BUILD=0
   YES=0
@@ -146,6 +171,15 @@ parse_args() {
         shift
         ;;
       --dir=*) DIR_ARG=${1#--dir=} ;;
+      --tag | --version)
+        [ $# -ge 2 ] && [ -n "$2" ] || die 2 "$1 needs a release name, such as v0.37.2."
+        TAG_ARG=$2
+        shift
+        ;;
+      --tag=* | --version=*)
+        TAG_ARG=${1#*=}
+        [ -n "$TAG_ARG" ] || die 2 "The release name must not be empty."
+        ;;
       --dry-run) DRY_RUN=1 ;;
       --source-build) SOURCE_BUILD=1 ;;
       --remove-models) REMOVE_MODELS=1 ;;
@@ -163,6 +197,9 @@ parse_args() {
     esac
     shift
   done
+  if [ "$CMD" = update ] && [ -n "$TAG_ARG" ]; then
+    PASS+=("--tag" "$TAG_ARG")
+  fi
 }
 
 # ---- the system ---------------------------------------------------------------------------------------------------
@@ -364,7 +401,7 @@ pick_python() {
 # ---- settings -----------------------------------------------------------------------------------------------------
 
 init_settings() {
-  TAG=${CRUCIBLE_TAG:-$PIN_TAG}
+  TAG=${TAG_ARG:-${CRUCIBLE_TAG:-$PIN_TAG}}
   [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die 2 "The release tag must look like v0.34.0, not '$TAG'."
   REPO_URL=${CRUCIBLE_REPO_URL:-$REPO_URL_DEFAULT}
   RELEASE_BASE=${CRUCIBLE_RELEASE_BASE:-$RELEASE_BASE_DEFAULT/$TAG}
@@ -905,6 +942,9 @@ cmd_update() {
   cd "$DIR" || return 1
   if [ -f tools/crucible_cli/update.py ]; then
     exec ./crucible update "${PASS[@]}"
+  fi
+  if [ -n "$TAG_ARG" ]; then
+    die 2 "This install is too old to choose a release: it has no tools/crucible_cli/update.py, so --tag $TAG_ARG cannot be used. Nothing was changed. Run the update without --tag first (it installs the newest release). Then run it again with --tag $TAG_ARG."
   fi
   local args=() a
   for a in "${PASS[@]}"; do [ "$a" = "--rollback" ] && args+=("$a"); done

@@ -36,6 +36,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -50,8 +51,22 @@ ADD = re.compile(r"^s_add_u32 s(\d+), s\1, (0x[0-9a-f]+|-?\d+)$")
 ADDC = re.compile(r"^s_addc_u32 s(\d+), s\1, (0x[0-9a-f]+|-?\d+)$")
 
 
+def rocm_llvm_dirs():
+    """The llvm folders of the ROCm prefix that the build uses: ROCM_PATH first, then the prefix of HIPCC (its bin folder's
+    parent). ROCm 7 has <prefix>/llvm/bin, and some packages have <prefix>/lib/llvm/bin. A full build with a prefix that is
+    not /opt/rocm then finds its tools for the state_epoch stamp."""
+    prefixes = []
+    if os.environ.get("ROCM_PATH"):
+        prefixes.append(Path(os.environ["ROCM_PATH"]))
+    hipcc = os.environ.get("HIPCC", "").strip()
+    hipcc = shutil.which(hipcc) if hipcc else None
+    if hipcc:
+        prefixes += [Path(hipcc).parent.parent, Path(os.path.realpath(hipcc)).parent.parent]
+    return [str(p / sub) for p in prefixes for sub in ("llvm/bin", "lib/llvm/bin")]
+
+
 def find_llvm(explicit=None):
-    for candidate in (explicit, os.environ.get("LLVM_BIN"), *LLVM_DIRS):
+    for candidate in (explicit, os.environ.get("LLVM_BIN"), *rocm_llvm_dirs(), *LLVM_DIRS):
         if candidate and (Path(candidate) / "llvm-objdump").exists():
             return Path(candidate)
     raise RuntimeError("no llvm-objdump found; pass --llvm DIR or set LLVM_BIN")

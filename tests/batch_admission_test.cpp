@@ -179,6 +179,11 @@ void CheckPredicate() {
 }  // namespace
 
 int main() {
+  try {
+    throw AdmissionRefused("batch memory does not fit: test");
+  } catch (const AdmissionRefused& error) {
+    assert(std::string(error.what()) == "batch memory does not fit: test");
+  }
   CheckFormat();
   CheckPredicate();
   const Pack full;

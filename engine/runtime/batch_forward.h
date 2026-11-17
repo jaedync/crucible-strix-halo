@@ -62,7 +62,7 @@
       return charge;
     };
     const auto error = BatchAdmissionError(memory, try_setting);
-    if (!error.empty()) throw std::runtime_error(error);
+    if (!error.empty()) throw crucible::AdmissionRefused(error);
     // Existing slots keep the full context; short slots are always new, so they come last.
     if (short_count && int(sequences_.size()) > count - short_count)
       throw std::logic_error("short slots must be allocated after the full-context slots");

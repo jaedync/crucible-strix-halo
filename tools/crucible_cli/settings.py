@@ -34,7 +34,7 @@ class Settings:
     state_dir: Path = None
     port: int = 8790
     bind: str = "127.0.0.1"
-    api_key_file: Path = None  # the path only; the key is never in settings. None: no key (loopback only)
+    api_key_file: Path = None  # the path only; the key is never in settings. None: no key (private addresses only)
     streams: int = measured.STREAMS
     ctx: int = measured.CTX
     layout: str = "default"   # a name of measured.LAYOUTS; it sets streams, ctx, short_streams and short_ctx
@@ -123,7 +123,7 @@ def build(repo, host, **kw):
             values["ctx"] = ctx
     elif kw.get("streams") is not None or kw.get("ctx") is not None:
         values["layout"], values["short_streams"], values["short_ctx"] = "default", 0, 0  # own sizes: no short class
-    api_key = values.pop("api_key", False)
+    api_key = values.pop("api_key", None)
     state_dir = values.pop("state_dir", UNSET)
     if state_dir is None and kw.get("state_dir") in (None, UNSET) and int(saved.get("ctx") or 0) > measured.PLAIN_CTX:
         state_dir = UNSET  # the saved "no folder" came from a YaRN layout: a plain layout gets the default folder back
@@ -135,9 +135,12 @@ def build(repo, host, **kw):
         s.models_dir = Path(s.models_dir)
     rt = rocm.detect(host, s.work)
     s.runtime_lib = rt.lib if rt.source == "private" else None   # a system runtime always wins
-    # A bind address that is not loopback needs the key (the server refuses to start without it). --api-key asks for
-    # the key on loopback too (a reverse proxy). A saved path stays when the bind goes back to loopback.
-    if s.api_key_file is None and (api_key or not keyfile.is_loopback(s.bind)):
+    # None preserves the saved choice. Public and wildcard binds still need a key.
+    if api_key is False:
+        if not keyfile.is_private_bind(s.bind):
+            raise ValueError("Without an API key, listen on a private address. Set --api-key or change --bind.")
+        s.api_key_file = None  # keep the file on disk, but stop using it
+    elif s.api_key_file is None and (api_key is True or not keyfile.is_private_bind(s.bind)):
         s.api_key_file = keyfile.default_path(host)
     if no_state:
         s.state_dir = None
@@ -182,6 +185,14 @@ def state_folder_problem(path, owned=False):
     return None
 
 
+def state_dir_inside(home, path):
+    """True when PATH is below HOME by the rule of the engine (engine/runtime/state_disk.h PrepareRoot): both paths with
+    their links resolved (weakly_canonical, here os.path.realpath), and PATH is not HOME itself. A folder under a link that
+    points out of home is outside; a folder under the real home folder is inside when HOME is a link."""
+    real_home, real_sd = Path(os.path.realpath(os.path.abspath(home))), Path(os.path.realpath(os.path.abspath(path)))
+    return real_sd != real_home and real_home in real_sd.parents
+
+
 def state_dir_problem(home, repo, path, look_inside=False):
     """The one check of the state folder (cache folder item 2): setup, doctor and uninstall use it. None when PATH may be the
     state folder, else the sentence that says why not.
@@ -189,9 +200,7 @@ def state_dir_problem(home, repo, path, look_inside=False):
     The folder must be inside the home folder (the rule of the v0.37 engine) and pass state_folder_problem. A folder that
     setup recorded as its own is accepted as it is, unless LOOK_INSIDE (uninstall: remove only what the engine writes)."""
     home, sd = Path(os.path.abspath(home)), Path(os.path.abspath(path))
-    real_home, real_sd = Path(os.path.realpath(home)), Path(os.path.realpath(sd))
-    inside = (sd != home and home in sd.parents) or (real_sd != real_home and real_home in real_sd.parents)
-    if not inside:
+    if not state_dir_inside(home, sd):
         return f"{sd} is not inside your home folder {home}."
     owned = False if look_inside else state_owned(repo, sd)
     return state_folder_problem(sd, owned=owned)

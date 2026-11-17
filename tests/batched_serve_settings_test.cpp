@@ -6,6 +6,16 @@ int main() {
   const auto parse=[](std::initializer_list<std::string_view> args) {
     const std::vector<std::string_view> values(args); return ParseBatchedServeSettings(values);
   };
+  for (const char* option : {"--host", "--port", "--api-key-file"}) {
+    bool rejected=false;
+    try { parse({option, "value"}); }
+    catch (const std::invalid_argument& error) {
+      rejected=true;
+      assert(std::string(error.what()) == std::string(option) +
+             " is an option of python -m server, not of the engine. Run the server from the install folder.");
+    }
+    assert(rejected);
+  }
   assert(parse({"--streams","2"}).prefill_rows==kServePrefillAuto);
   assert(parse({"--streams","8","--prefill","4096"}).prefill_rows==4096);
   assert(parse({"--streams","1","--prefill","1024"}).prefill_rows==1024);

@@ -10,6 +10,7 @@ import signal
 import sys
 import time
 from . import metrics, update_check
+from .engine_messages import AdmissionRefused
 from .api_key import (EXIT_BAD_KEY_FILE, KeyFileError, KeyGate, bind_error, container_open_bind, is_loopback,
                       load_digest)
 from .api import MAX_COUNT, MAX_MTP_WINDOW, MTP_WINDOW, MAX_ALL, ApiError, ServerDefaults
@@ -90,6 +91,15 @@ def conversation_cache_notice(conversation_cache_mib):
             "the whole conversation again. Add --conversation-cache-mib 9700 --host-reserve-mib 11264, as ./crucible start does.")
 
 
+def ngram_notice(environ):
+    """Warn before model loading when the table uses the engine's default GPU placement."""
+    if environ.get("CRUCIBLE_PLE_HOST") == "1":
+        return None
+    return ("WARNING: the n-gram table uses GPU memory because CRUCIBLE_PLE_HOST is not 1. "
+            "This can leave too little memory for the model and its sessions. "
+            "Set CRUCIBLE_PLE_HOST=1 before you start the server to keep the table on the host.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Temporary local Crucible server (default 127.0.0.1:8790)")
     parser.add_argument("checkpoint", type=Path)
@@ -105,8 +115,8 @@ def main():
     parser.add_argument("--model-name", default="")
     parser.add_argument("--host", type=listen_address, default="127.0.0.1", metavar="ADDRESS",
                         help="Bind address: an IPv4 or IPv6 literal (default 127.0.0.1). An address that is not "
-                             "loopback (127.0.0.0/8 and ::1) needs --api-key-file: 0.0.0.0, ::, an IPv4-mapped address "
-                             "and a LAN address let every machine that can reach it use the server. "
+                             "private needs --api-key-file, including 0.0.0.0, :: and IPv4-mapped addresses. "
+                             "A private LAN address starts without a key, with a warning. "
                              "Use --allowed-host and a firewall too.")
     parser.add_argument("--api-key-file", type=Path, default=None, metavar="PATH",
                         help="An absolute path of a file that holds the API key (one key of 32 to 256 characters). "
@@ -206,7 +216,8 @@ def main():
                              "128). max gives it all the context room after its prompt. A request count is not changed.")
     parser.add_argument("--max-body-mib", type=int, default=None, metavar="N",
                         help="Largest request body: 1..64 MiB, or 1..1024 MiB with --vision (default 256). The default "
-                             "holds 16 bytes for each --ctx token, at least 1 MiB: 1 at 32768, 4 at 262144, 8 at 524288.")
+                             "holds 16 bytes for each --ctx token, at least 1 MiB: 1 at 32768, 4 at 262144, 8 at 524288. "
+                             "./crucible passes --max-body-mib 16.")
     parser.add_argument("--vision", action="store_true",
                         help="Load the vision tower and accept image_url parts (base64 data: URLs).")
     parser.add_argument("--vision-max-pixels", type=int, default=None,
@@ -438,6 +449,13 @@ def main():
     open_in_container = container_open_bind(args.host, os.environ)
     if refusal := bind_error(args.host, args.api_key_file is not None, os.environ):
         parser.error(refusal)
+    if args.api_key_file is None and allowed_hosts is None and not open_in_container:
+        # An unkeyed server must not accept a DNS-rebinding Host, including on hand starts.
+        # The Docker image on 0.0.0.0 or :: keeps no default list, as in v0.37.2: docs/DOCKER.md warns.
+        names = ["localhost", "127.0.0.1", "[::1]"]
+        if not args.host.is_unspecified:
+            names.append(f"[{args.host}]" if args.host.version == 6 else str(args.host))
+        allowed_hosts = resolve_allowed_hosts(list(dict.fromkeys(names)), {})
     api_gate = None
     if args.api_key_file is not None:
         try:
@@ -472,6 +490,8 @@ def main():
         print(f"draft capture: {capture.mode} mode" + (", per-token draft stats on" if args.draft_stats else ""),
               file=sys.stderr, flush=True)
     if notice := conversation_cache_notice(args.conversation_cache_mib):
+        print(notice, file=sys.stderr, flush=True)
+    if notice := ngram_notice(os.environ):
         print(notice, file=sys.stderr, flush=True)
     notifier.send("STATUS=loading the model")
     if args.systemd and notifier.watchdog_seconds and args.watchdog_stall_seconds + notifier.watchdog_seconds > 90:
@@ -527,6 +547,10 @@ def main():
             print(f"WARNING: no API key, and {args.host} listens on every address of the container. A published port on "
                   "all addresses is an open server: publish only to 127.0.0.1 (-p 127.0.0.1:8790:8790), or use "
                   "--api-key-file.", file=sys.stderr, flush=True)
+        elif api_gate is None and not is_loopback(args.host):
+            address = f"[{args.host}]" if args.host.version == 6 else str(args.host)
+            print(f"WARNING: no API key on {address}:{args.port}. Every device that can reach this server can send prompts "
+                  "and fill its sessions. Add a key with: ./crucible setup --api-key", file=sys.stderr, flush=True)
         elif not is_loopback(args.host):
             print(f"WARNING: listening on {args.host}, which is not loopback. Every machine that can reach this "
                   "address can send requests, and the API key is its only protection. Use --allowed-host (strict "
@@ -539,16 +563,19 @@ def main():
         if defaults.describe():
             print("Request defaults: " + defaults.describe(), file=sys.stderr, flush=True)
         update_check.start(server_version(), disabled=args.no_update_check)
+        watchdog = Watchdog(notifier, backend, server, stall_seconds=args.watchdog_stall_seconds)
         if args.systemd:
-            watchdog = Watchdog(notifier, backend, server, stall_seconds=args.watchdog_stall_seconds)
             notifier.send("READY=1\nSTATUS=ready")
-            watchdog.start()
+        watchdog.start()
         server.serve_forever()
         if watchdog is not None and watchdog.fatal_exit:
             exit_code = EXIT_ENGINE_STOPPED
             notifier.send("STOPPING=1")
     except KeyboardInterrupt:
         notifier.send("STOPPING=1\nSTATUS=stopping: saving conversation states (85 s at most)")
+    except AdmissionRefused as error:
+        print(f"server error: {error}", file=sys.stderr, flush=True)
+        return 4
     except Exception as error:
         print(f"server error: {error}", file=sys.stderr)
         return 1

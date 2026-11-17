@@ -6,6 +6,11 @@ import struct
 import sys
 import time
 
+# FAKE_ADMISSION_REFUSED=1: a refusal before the ready event, with the real protocol and exit status.
+if os.environ.get("FAKE_ADMISSION_REFUSED") == "1":
+    print(json.dumps({"event": "admission_refused", "error": "batch memory does not fit: fake layout"}), flush=True)
+    sys.exit(4)
+
 # FAKE_PREFILL_ROWS selects the reported chunk size; prompts shorter than it finish in one command.
 rows = int(os.environ.get("FAKE_PREFILL_ROWS", "4096"))
 # FAKE_SLOT_CONTEXTS selects slot classes; opens use the engine's smallest-fitting-free-slot rule.

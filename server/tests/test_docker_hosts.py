@@ -111,11 +111,38 @@ class ImageStartPathTest(unittest.TestCase):
         self.assertIn("0.0.0.0", arguments)
 
     def test_with_no_env_the_image_accepts_any_host(self):
+        """The unkeyed image has no default Host list, as in v0.37.2.
+        The strict list with no key is for hand starts and the launcher, not the image."""
         handler, err = self.start({})
         self.assertIn("Host check: off (any Host)", err)
-        for host in ("127.0.0.1:8790", "evil.example"):
+        for host in ("127.0.0.1:8790", "192.168.1.20:8790", "evil.example"):
             with self.subTest(host=host):
                 self.assertEqual(self.status_for(handler, host), 200)
+
+    def test_with_no_env_the_image_still_prints_the_open_server_warning(self):
+        _, err = self.start({})
+        lines = [line for line in err.splitlines() if line.startswith("WARNING") and "no API key" in line]
+        self.assertEqual(len(lines), 1, err)
+        self.assertIn("open server", lines[0])
+
+    def test_outside_the_image_an_unkeyed_private_start_keeps_the_strict_list(self):
+        environ = {k: v for k, v in os.environ.items() if k not in (ALLOWED_HOSTS_ENV, SWITCH)}
+        listener = MagicMock()
+        listener.serve_forever.side_effect = KeyboardInterrupt
+        captured = []
+        backend = ScriptBackend(token_events(["hi"]))
+        backend.close = lambda: None
+        err = io.StringIO()
+        with patch.dict(os.environ, environ, clear=True), \
+                patch.object(sys, "argv", ["crucible", "/models/pack", "--host", "192.168.1.20"]), \
+                patch.object(startup.signal, "signal"), \
+                patch.object(startup, "ModelTokenizer", return_value=PiecesTokenizer(["hi"])), \
+                patch("server.batch_backend.BatchedEngineBackend", return_value=backend), \
+                patch.object(startup, "bind_server", side_effect=lambda host, port, handler: captured.append(handler) or listener), \
+                contextlib.redirect_stderr(err):
+            self.assertEqual(startup.main(), 0, err.getvalue())
+        self.assertIn("Host check: only localhost, 127.0.0.1, [::1], 192.168.1.20", err.getvalue())
+        self.assertEqual(self.status_for(captured[0], "evil.example"), 403)
 
     def test_the_documented_env_value_turns_the_host_list_on(self):
         value = documented_env_value()
@@ -160,9 +187,21 @@ class DocsTest(unittest.TestCase):
         text = (ROOT / "SECURITY.md").read_text()
         docker = text.split("## Docker", 1)[1]
         self.assertIn("no Host list", docker)
+        self.assertNotIn("default loopback Host names", docker)
         self.assertIn(ALLOWED_HOSTS_ENV, docker)
         rebinding = text.split("## Host names and DNS rebinding", 1)[1].split("\n## ", 1)[0]
         self.assertIn("Docker image", rebinding)
+
+    def test_no_guide_says_the_unkeyed_image_has_a_strict_host_list(self):
+        for name in ("SECURITY.md", "CHANGELOG.md", "docs/DOCKER.md"):
+            with self.subTest(name=name):
+                text = " ".join((ROOT / name).read_text().split())
+                self.assertNotIn("hand starts and the Docker image also use this strict list", text)
+                self.assertNotIn("including hand starts and Docker", text)
+                self.assertNotIn("the image uses a strict Host list", text)
+
+    def test_the_docker_page_says_the_image_has_no_host_list_by_default(self):
+        self.assertIn("The image has no Host list by default", " ".join(docker_page().split()))
 
     def test_the_changelog_v034_part_says_it_too(self):
         text = (ROOT / "CHANGELOG.md").read_text()

@@ -64,6 +64,39 @@ class StateFolderCheckTest(unittest.TestCase):
         link.symlink_to(sd)
         self.assertIn("link", self.doctor_row(link).detail)
 
+    def test_home_is_a_link_folder_under_the_real_home_passes(self):
+        # Review M3 probe 1: the engine (state_disk.h PrepareRoot) resolves the links in HOME and in the folder, so a folder
+        # under the real home folder is inside. Setup accepted it; doctor failed it with its own abspath test.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        t = Path(tmp.name)
+        (t / "realhome").mkdir()
+        (t / "home").symlink_to(t / "realhome")
+        repo = make_repo(t)
+        host = wire(t)
+        sd = t / "realhome" / "states"
+        self.assertIsNone(settings_mod.state_dir_problem(host.home, repo, sd))
+        s = settings_mod.build(repo, host, state_dir=sd)
+        self.assertEqual({r.id: r for r in doctor.run_checks(host, s)}["state-dir"].status, "pass")
+        self.assertTrue(cli._validate(s, host))
+
+    def test_cache_link_out_of_home_is_refused_like_the_engine(self):
+        # Review M3 probe 2: ~/.cache is a link to a folder out of home. The engine refuses ~/.cache/crucible/states at
+        # start, so setup and doctor must refuse it too.
+        outside = self.t / "elsewhere"
+        outside.mkdir()
+        (self.home / ".cache").symlink_to(outside)
+        sd = self.home / ".cache" / "crucible" / "states"
+        problem = settings_mod.state_dir_problem(self.home, self.repo, sd)
+        self.assertIsNotNone(problem)
+        self.assertIn("not inside your home folder", problem)
+        self.assertEqual(self.doctor_row(sd).status, "fail")
+        out = []
+        self.host.out = out.append
+        s = settings_mod.build(self.repo, self.host, state_dir=sd)
+        self.assertFalse(cli._validate(s, self.host))
+        self.assertIn("must be a new folder inside your home folder", " ".join(out))
+
     def test_setup_doctor_and_uninstall_call_the_one_check(self):
         calls = []
         real = settings_mod.state_dir_problem

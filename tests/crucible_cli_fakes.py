@@ -199,7 +199,7 @@ def make_machine(tmp, *, gtt=GTT_OK, gtt_used=2_000_000, vram_used=600_000_000, 
     return hostmod.Host(
         proc=m / "proc", sysfs=m / "sys", dev=m / "dev", rocm=r, etc=m / "etc", boot_dirs=(m / "boot", m / "efi"), home=home, env={"HOME": str(home), **(env or {})},
         py_version=py, platform=platform, which=lambda n: bins.get(n),
-        disk_free=lambda p: free, port_free=lambda h, p: p not in busy_ports,
+        disk_free=lambda p: free, port_free=lambda h, p: p not in busy_ports, port_in_use=lambda h, p: p in busy_ports,
         groups=lambda: list(groups), can_access=lambda p, mode: str(p) not in denied,
         runner=None, http=None, prompt=NoPrompt(), clock=lambda: 1000.0, sleep=lambda s: None, out=lambda s: None,
         is_tty=False)

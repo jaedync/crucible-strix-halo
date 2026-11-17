@@ -4,7 +4,7 @@ This server provides a small OpenAI-compatible API.
 It supports text chat and text completions with greedy or exact sampled decoding.
 It binds to `127.0.0.1` by default, on port 8790 unless `--port` selects another port.
 `--host ADDRESS` selects another bind address (see [Bind address](#bind-address)).
-It needs no key on loopback. An address that is not loopback needs an API key (see [API key](#api-key)).
+It needs no key on loopback or private LAN addresses. A public address needs an API key (see [API key](#api-key)).
 It has no TLS: use a reverse proxy for other machines (see [Remote access](../docs/REMOTE_ACCESS.md)).
 It is not a persistent service.
 
@@ -63,8 +63,8 @@ Batches are not supported.
 
 ### Behind a proxy (llama-swap)
 
-The server accepts any `Host` header. A reverse proxy such as llama-swap, nginx or LiteLLM sends the `Host` header of
-its own client, for example `myserver:8080`. The server answers it with no extra setting.
+A reverse proxy such as llama-swap, nginx or LiteLLM sends the `Host` header of its client, for example `myserver:8080`.
+Without a key, add that name with `--allowed-host myserver:8080`.
 The server binds `127.0.0.1` by default, so the proxy must run on the same machine.
 To reach it from another machine, use `--host` with an API key (see [Bind address](#bind-address) and [API key](#api-key)).
 
@@ -88,8 +88,8 @@ models:
   `PYTHONPATH`. Use absolute paths in `cmd`.
 - The `Host` rule below applies to `/health` as it does to every other path.
 
-The default accepts any `Host`, so a web page can reach the server through DNS rebinding if your browser can open it.
-To prevent this, turn on strict mode. Then the server refuses (HTTP 403) every other `Host`.
+Without a key, strict mode accepts only loopback names and the bind address. This stops DNS rebinding.
+To add a proxy name, set a strict list. The server refuses other `Host` values with HTTP 403.
 
 ```bash
 export CRUCIBLE_ALLOWED_HOSTS='127.0.0.1,localhost,[::1],myserver'
@@ -113,19 +113,26 @@ export CRUCIBLE_ALLOWED_HOSTS='127.0.0.1,localhost,[::1],myserver'
 - `--host ADDRESS` sets the bind address. The default is `127.0.0.1`, so nothing changes without the flag.
 - `ADDRESS` is an IPv4 or IPv6 literal, for example `0.0.0.0`, `::`, or `::1`. A host name or a scope id (`%eth0`) stops the start (exit 2).
 - The start line `Crucible is ready at ...` shows the real address.
-- Loopback is 127.0.0.0/8 and `::1`. Every other address needs `--api-key-file`, also `0.0.0.0`, `::` and an
-  IPv4-mapped address such as `::ffff:127.0.0.1`. Without the flag the server exits with code 2 before it loads the model.
+- Private addresses need no key: loopback (`127.0.0.0/8`, `::1`), RFC1918, link-local (`169.254/16`, `fe80::/10`) and ULA (`fc00::/7`).
+- Public addresses need `--api-key-file`. Wildcards (`0.0.0.0`, `::`), mapped IPv6 and reserved addresses also need it.
+  Without the flag, these binds exit with code 2 before the model loads.
   The one exception is the Docker image: there `0.0.0.0` and `::` start with no key (see [Docker](../docs/DOCKER.md)).
 - An address that is not loopback prints one `WARNING` line at start. With a key, the key is then the only protection.
   In the Docker image with no key, the line says that a published port on all addresses is an open server.
-- Turn on strict Host mode (`--allowed-host`, above) and use a firewall that limits the port to the clients you trust.
+- Without a key, strict Host mode stays on. It accepts loopback names and the bind address by default.
+  Add other names with `--allowed-host`. Use a firewall that limits the port to trusted clients.
 - `::` accepts IPv4 clients too: the server sets `IPV6_V6ONLY` to 0 on every host.
-- `--host` does not change the Host check rules.
+- With no key, a private bind outside loopback prints one warning. Any device that can reach it can fill its sessions.
 
 ### API key
 
-- `--api-key-file PATH` names a file that holds the key. `PATH` must be absolute. `./crucible setup --bind ADDRESS`
-  (or `--api-key`) makes the file `~/.config/crucible/api-key`. The key is never in an argument, a variable, `config.json` or a log.
+Setup asks about other machines and the listen address. Its private LAN key question defaults to no.
+Use `./crucible setup --api-key` to turn the key on later.
+Use `./crucible setup --no-api-key` to turn it off on a private address. This keeps the file on disk.
+Add `--yes` for scripts. The installer forwards these flags too.
+
+- `--api-key-file PATH` names a file that holds the key. `PATH` must be absolute. `./crucible setup --bind ADDRESS --api-key`
+  makes the file `~/.config/crucible/api-key`. The key is never in an argument, a variable, `config.json` or a log.
 - The file must be a regular file (not a link) of the user that runs the server, with mode 0600 or stricter, at most
   1024 bytes, and one key of 32 to 256 characters from `A-Z a-z 0-9 . _ ~ + / = -`. Otherwise the server exits with code 78
   and names the file and the rule, never the content. The server reads the file once at start and keeps only a sha256 digest.

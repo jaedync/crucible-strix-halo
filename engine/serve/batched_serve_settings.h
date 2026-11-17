@@ -115,6 +115,9 @@ inline BatchedServeSettings ParseBatchedServeSettings(std::span<const std::strin
       if (parsed<0 || parsed>1) throw std::invalid_argument("vision must be 0 or 1");
       result.vision=parsed!=0;
     }
+    else if (key=="--host" || key=="--port" || key=="--api-key-file")
+      throw std::invalid_argument(std::string(key) +
+          " is an option of python -m server, not of the engine. Run the server from the install folder.");
     else throw std::invalid_argument("unsupported batch option");
   }
   const RopeSetting rope=RopeSettingFromEnv();

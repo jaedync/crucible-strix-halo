@@ -19,7 +19,7 @@ Other kernels and ROCm versions are not tested.
 ## Build
 
 ```sh
-docker build -t crucible:v0.37.0 .
+docker build -t crucible:v0.37.3 .
 ```
 
 The build needs no GPU. It clones the tag in `CRUCIBLE_VERSION` and runs `make engine` for gfx1151.
@@ -27,11 +27,11 @@ These build arguments change the defaults:
 
 | Argument | Default | Content |
 |---|---|---|
-| `CRUCIBLE_VERSION` | `v0.37.0` | The release tag to build |
+| `CRUCIBLE_VERSION` | `v0.37.3` | The release tag to build |
 | `BUILD_JOBS` | `1` | Parallel HIP compiles. Each compile needs some GB of RAM. |
 | `ROCM_IMAGE` | `docker.io/rocm/dev-ubuntu-24.04:7.2.4` | The base image of the build and the run |
 
-Example: `docker build --build-arg BUILD_JOBS=2 -t crucible:v0.37.0 .`
+Example: `docker build --build-arg BUILD_JOBS=2 -t crucible:v0.37.3 .`
 
 ## Model
 
@@ -52,7 +52,7 @@ docker run --rm \
   -e CRUCIBLE_DRAFT_HEAD=q2 -e CRUCIBLE_DRAFT_CHAIN=hc8,lead -e CRUCIBLE_PF_LAUNCH_ROWS=16384+128 \
   -v "$CKPT":/models/pack:ro \
   -p 127.0.0.1:8790:8790 \
-  crucible:v0.37.0 \
+  crucible:v0.37.3 \
   /models/pack --host 0.0.0.0 --port 8790 --streams 4 --ctx 262144 --prefill 4096 \
   --conversation-cache-mib 9700 --host-reserve-mib 11264 --vision
 ```
@@ -70,11 +70,17 @@ docker run --rm \
 - `--host 0.0.0.0` is necessary in the container, because Docker forwards the port to the container address.
 - `-p 127.0.0.1:8790:8790` publishes the port to your own machine only. Keep this form.
 
+Without Docker, run the server from the install folder with `.venv/bin/python -m server`.
+Pass the model folder, `--engine build/engine/crucible`, and the server options to that command, not to the engine.
+Set `CRUCIBLE_PLE_HOST=1` first to keep the n-gram table on the host.
+Or use the launcher: `./crucible setup --bind 0.0.0.0`.
+
 ### The key rule in the image
 
-A key is required for an address that is not loopback, except in the Docker image.
+A key is required for a public address, except in the Docker image.
 The image sets `CRUCIBLE_CONTAINER_OPEN_BIND=1`. With it, the server accepts `--host 0.0.0.0` (or `--host ::`) with no key,
-so the line above works without a key file. Only these two addresses are open. Any other address needs a key file.
+so the line above works without a key file. Private addresses also need no key, as on the host.
+Public, reserved and mapped IPv6 addresses still need a key file.
 The server prints one `WARNING` line at start when it runs with no key in the container.
 The switch works only inside a container. The server checks that the file `/.dockerenv` (Docker) or
 `/run/.containerenv` (Podman) exists. On a host without one of these files, the switch does nothing, and a start on
@@ -98,6 +104,8 @@ through DNS rebinding. This is also true for `-p 127.0.0.1:8790:8790`. Choose on
 - Set the Host list. Add `-e CRUCIBLE_ALLOWED_HOSTS=localhost,127.0.0.1,[::1]` to the `docker run` line, before the
   image name. The server then refuses a request with any other `Host` name. Add the name of a reverse proxy to the list.
 
+A Host list stops browser DNS rebinding, not a client that sends an allowed Host header.
+
 A key is optional in the container. To reach the port from another machine, make a key file and mount it.
 Use the full run line above for the measured configuration. Add the key mount and options shown below:
 
@@ -113,7 +121,7 @@ docker run --rm \
   -v ~/.config/crucible/api-key:/run/crucible-api-key:ro \
   --user "$(id -u):$(id -g)" \
   -p 8790:8790 \
-  crucible:v0.37.0 \
+  crucible:v0.37.3 \
   /models/pack --host 0.0.0.0 --port 8790 --ctx 32768 --api-key-file /run/crucible-api-key
 ```
 

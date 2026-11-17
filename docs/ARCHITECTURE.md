@@ -141,7 +141,7 @@ The parts of class `Engine` and their rules: decode, verification, sampling, dra
 batch contracts and state caches.
 
 - The output of a request depends only on the request. Batches, the load and the speculation depth do
-  not change it.
+  not change it. Session replay is the exception: see [session replay](SESSION_REPLAY.md).
 
 ### serve (rank 5)
 

@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 from . import ablation, metrics, rope
-from .engine_messages import ENGINE_REJECTED, ProtocolError
+from .engine_messages import ENGINE_REJECTED, ProtocolError, AdmissionRefused
 from .api import LEGACY_MODEL, ApiError, ModelInfo, STOP_IDS
 from .hosts import ALLOWED_HOSTS_ENV
 from .request_id import CLIENT_REQUEST_ID_HEADER_ENV
@@ -190,6 +190,8 @@ class EngineBackend:
         return depth
 
     def _validate_ready(self, ready):
+        if isinstance(ready, dict) and ready.get("event") == "admission_refused" and isinstance(ready.get("error"), str):
+            raise AdmissionRefused(ready["error"])
         if not isinstance(ready, dict) or ready.get("event") != "ready" or ready.get("context") != self.context:
             raise ProtocolError("The engine did not return a valid ready event.")
         # Engines before the replay-tail guard reject the field, so it is sent only when the engine names it.

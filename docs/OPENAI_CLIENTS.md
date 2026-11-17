@@ -24,7 +24,9 @@ These tests use recorded token scripts, not model quality or GPU performance tes
 
 - Readiness: `GET /health` returns `{"status":"ok"}` when the engine is ready, and HTTP 503 after it stops.
 
-The server needs no key on loopback. With `--api-key-file` it needs the key on every route but `/health`:
+The server needs no key on loopback or a private LAN address. An unkeyed LAN start prints a warning.
+Use `./crucible setup --api-key` to require a key, or `--no-api-key` to stop using it on a private address.
+With `--api-key-file` it needs the key on every route but `/health`:
 set the key as the API key of the client (see `server/README.md`, API key).
 Keep it on loopback or behind a reverse proxy (see `docs/REMOTE_ACCESS.md`). Do not expose it to an untrusted network.
 See `server/README.md` for server startup.
@@ -97,8 +99,10 @@ Diagnostic token IDs can therefore contain text that the visible response exclud
 The server returns OpenAI error objects with `message`, `type`, `param`, and `code`.
 Unsupported request features return HTTP 400 before queue submission.
 An unknown model returns HTTP 404.
-A request body above `--max-body-mib` (default 16 bytes for each `--ctx` token and at least 1 MiB, or 256 MiB with
-`--vision`) returns HTTP 413.
+The default request body limit follows `--ctx`: 16 bytes per token, at least 1 MiB, or 4 MiB at 262,144 tokens.
+With `--vision`, the server default is 256 MiB instead.
+The launcher `./crucible` passes `--max-body-mib 16`, so its limit is 16 MiB.
+A request body above the limit returns HTTP 413.
 A client address above `--max-requests-per-client` returns HTTP 429. This limit is off by default.
 A full or failed engine queue returns HTTP 503.
 Invalid generated function calls come back as content with `usage.tool_call_fallback` (see server/README.md, "Tool calls").

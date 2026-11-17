@@ -122,6 +122,7 @@ class Watchdog:
         now = self.clock()
         backend = self.backend
         if backend.fatal:
+            self.log("The engine stopped. The server exits and frees its port. Check the server log before you start it again.")
             self.notifier.send(f"STATUS=engine stopped: {backend.fatal}")
             self.fatal_exit = True
             self.server.shutdown()

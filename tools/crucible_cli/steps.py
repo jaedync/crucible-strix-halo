@@ -30,12 +30,13 @@ ROCM10_MARKER = "CRUCIBLE-ROCM10-STOP"   # tools/hipcc_series.py MARKER: make st
 
 
 def rocm10_stop(out):
-    """The message for a make that stopped for a ROCm 10 hipcc (tools/hipcc_series.py), or None for any other output."""
+    """The message for a make that stopped for a ROCm 10 hipcc (tools/hipcc_series.py), or None for any other output. The
+    caller (setup, update) adds its own sentence with --allow-rocm10, so the message gives the flag once."""
     if ROCM10_MARKER not in (out or ""):
         return None
     return ("hipcc is a ROCm 10 compiler (AMD clang 24 or later). An engine built with it is slower: a 32K prefill gave "
             "1,091 tok/s against 1,894 tok/s with the ROCm 7.2.4 compiler (42% less, measured Nov 12 2026). Build with the "
-            "ROCm 7.2.4 compiler (set ROCM_PATH to its folder), or use --allow-rocm10 to build with this compiler.")
+            "ROCm 7.2.4 compiler (set ROCM_PATH to its folder).")
 
 
 class StepFailed(Exception):
@@ -233,6 +234,8 @@ class Setup:
         for r in results:
             if r.status in ("fail", "warn"):
                 self.say(f"  {r.status.upper()}  {r.id}: {r.detail}")
+                if r.status == "warn" and r.id in ("memory", "memory-available", "gpu-free"):
+                    self.say(f"      {r.fix}")
         return f"{len(results) - len(bad)} of {len(results)} checks without a failure" + (f"; {len(bad)} failed" if bad else "")
 
     def _venv_ready(self):
@@ -449,11 +452,19 @@ def stop_pidfile(host, s):
     try:
         pid = int((s.work / "server.pid").read_text().split()[0])
     except (OSError, ValueError, IndexError):
-        host.out("No server is recorded in .crucible/server.pid. Nothing to stop.")
+        from .processes import remaining_server
+        if message := remaining_server(host, s):
+            host.out(message)
+            return 1
+        host.out("No server is recorded in .crucible/server.pid. No other Crucible server was found for this user.")
         return 0
     if not host.runner.alive(pid):
         box.remove(s.work / "server.pid")
         host.out(f"The recorded process {pid} is not running. Removed the record.")
+        from .processes import remaining_server
+        if message := remaining_server(host, s):
+            host.out(message)
+            return 1
         return 0
     host.out(f"Stopping the server (process {pid}). " + settings_mod.stop_note(s))
     if host.runner.terminate(pid):

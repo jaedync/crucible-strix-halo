@@ -13,7 +13,7 @@
 # The script always exits 0 and prints exactly one verdict line, so the night unit reads the line and not a return
 # code: "PR5 DOCKER PASS <detail>" or "PR5 DOCKER FAIL <reason>".
 #
-# Ports 8937 (container) and 8938 (native server) are not the gateway ports (7000, 8000, 8001, 8731, 8790).
+# Ports 8937 (container) and 8938 (native server) are free test ports.
 set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")/.." && pwd)

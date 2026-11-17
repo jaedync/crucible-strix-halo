@@ -94,13 +94,13 @@ class DoctorTest(Base):
             self.assertIn(word, r.fix)
         self.assertEqual(r.blocks, ("start",))
 
-    def test_gpu_memory_in_use_by_another_program_fails(self):
+    def test_gpu_memory_in_use_by_another_program_warns(self):
         r = self.checks(gtt_used=90_000_000_000)["gpu-free"]
-        self.assertEqual(r.status, "fail")
-        self.assertIn("another program", r.fix)
+        self.assertEqual(r.status, "warn")
+        self.assertIn("Crucible does not stop other programs.", r.fix)
 
-    def test_low_total_memory_fails(self):
-        self.assertEqual(self.checks(mem_total_kb=32_000_000)["memory"].status, "fail")
+    def test_low_total_memory_warns(self):
+        self.assertEqual(self.checks(mem_total_kb=32_000_000)["memory"].status, "warn")
 
     def test_missing_build_tools_fail_one_by_one(self):
         res = self.checks(tools=("git",))
@@ -291,6 +291,15 @@ class SetupTest(Base):
         self.assertEqual(len(makes), 2)
         self.assertIn("SPLIT=0", makes[1])
 
+    def test_the_rocm10_stop_names_the_flag_once(self):
+        # Review L2: the stop message and the raise both gave --allow-rocm10.
+        host = wire(self.t, runner=FakeRunner(fail=("make",)))
+        host.runner.make_output = "make: CRUCIBLE-ROCM10-STOP hipcc is a ROCm 10 compiler\n"
+        code, host, out = self.setup(["--yes"], host=host)
+        self.assertEqual(code, 1)
+        self.assertIn("ROCm 10 compiler", out)
+        self.assertEqual(out.count("--allow-rocm10"), 1, out)
+
     def test_other_build_error_stops_with_the_log_path(self):
         host = wire(self.t, runner=FakeRunner(fail=("make",)))
         code, host, out = self.setup(["--yes"], host=host)
@@ -343,11 +352,11 @@ class SetupTest(Base):
         self.assertEqual(code, 1)
         self.assertFalse([c for c in host.runner.calls if Path(c[0]).name == "hf"])
 
-    def test_busy_gpu_stops_before_the_start(self):
+    def test_busy_gpu_warns_before_the_start(self):
         code, host, out = self.setup(["--yes"], gtt_used=90_000_000_000)
-        self.assertEqual(code, 1)
-        self.assertEqual(host.runner.spawned, [])
-        self.assertIn("another program", out)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(host.runner.spawned), 1)
+        self.assertIn("Crucible does not stop other programs.", out)
 
     def test_dry_run_prints_the_plan_and_runs_nothing(self):
         code, host, out = self.setup(["--yes", "--dry-run"])

@@ -345,7 +345,7 @@ class UpdateRunner(Runner):
         if name == "make":
             m.make_calls.append((argv, str(cwd)))
             if m.fail_make:
-                return hostmod.Result(2, "error: build failed")
+                return hostmod.Result(2, m.fail_make if isinstance(m.fail_make, str) else "error: build failed")
             exe = Path(cwd) / "build/engine/crucible"
             exe.parent.mkdir(parents=True, exist_ok=True)
             exe.write_text("#!/bin/sh\necho built\n")

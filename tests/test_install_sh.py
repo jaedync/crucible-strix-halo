@@ -175,6 +175,31 @@ class InstallTestCase(unittest.TestCase):
 
 
 class GoodDownloadTest(InstallTestCase):
+    def test_tag_flag_overrides_environment_and_is_not_passed_to_setup(self):
+        for option in ("--tag", "--version", "--tag=", "--version="):
+            args = [option + TAG] if option.endswith("=") else [option, TAG]
+            with self.subTest(option=option):
+                r = self.w.install("--yes", *args, CRUCIBLE_TAG="v8.8.8")
+                self.assertEqual(r.returncode, 0, self.out(r))
+                self.assertEqual((self.w.dir / "handover.args").read_text().strip(), "setup --yes")
+                self.assertEqual(json.loads((self.w.dir / "build/engine/release.json").read_text())["tag"], TAG)
+
+    def test_tag_flag_needs_a_release_name(self):
+        for args in (("--tag",), ("--version",), ("--tag=",), ("--tag", "latest")):
+            with self.subTest(args=args):
+                r = self.w.install(*args)
+                self.assertEqual(r.returncode, 2, self.out(r))
+                self.assertFalse(self.w.dir.exists())
+
+    def test_update_keeps_the_tag_flag_for_the_launcher(self):
+        self.assertEqual(self.w.install("--yes").returncode, 0)
+        cli = self.w.dir / "tools/crucible_cli"
+        cli.mkdir(parents=True)
+        (cli / "update.py").write_text("# use the launcher updater\n")
+        r = self.w.install("update", "--tag", TAG)
+        self.assertEqual(r.returncode, 0, self.out(r))
+        self.assertEqual((self.w.dir / "handover.args").read_text().strip(), f"update --tag {TAG}")
+
     def test_good_release_installs_and_hands_over(self):
         r = self.w.install("--yes")
         self.assertEqual(r.returncode, 0, self.out(r))
@@ -200,6 +225,8 @@ class GoodDownloadTest(InstallTestCase):
         log = self.w.home / ".state/crucible/install.log"
         self.assertTrue(log.is_file())
         self.assertIn(str(log), text)
+        self.assertIn(f"Run {self.w.dir}/crucible setup", text)
+        self.assertNotIn("./crucible", text)
 
     def test_pipe_install_gives_setup_the_terminal(self):
         r = self.w.install("--yes", via_pipe=True, answers="from-the-terminal\n")
@@ -705,6 +732,21 @@ class EntryPointsTest(InstallTestCase):
         (self.w.dir / "tools/crucible_cli/update.py").write_text("")
         self.w.install("update", "--rollback")
         self.assertEqual((self.w.dir / "handover.args").read_text().strip(), "update --rollback")
+
+    def test_update_with_a_tag_on_an_old_install_refuses_with_a_message(self):
+        """r373 secrev L3: an install with no update.py hands over to tools/update.sh, which has no --tag. The tag must not
+        be dropped with no message (the update would go to the newest release, not the asked one)."""
+        self.installed()
+        for argv in (("update", "--tag", "v0.37.2"), ("update", "--version=v0.37.2")):
+            with self.subTest(argv=argv):
+                args = self.w.dir / "update.args"
+                if args.exists():
+                    args.unlink()
+                r = self.w.install(*argv)
+                self.assertEqual(r.returncode, 2, self.out(r))
+                self.assertIn("v0.37.2", self.out(r))
+                self.assertIn("--tag", self.out(r))
+                self.assertFalse(args.exists(), "tools/update.sh ran and dropped the tag")
 
     def test_update_without_install_says_so(self):
         r = self.w.install("update")

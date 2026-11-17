@@ -425,7 +425,7 @@ class SetupBase(Base):
         host.is_tty = interactive
         if prep:
             prep(host)
-        base = ["--state-dir", str(self.t / "home/states")]
+        base = ["--state-dir", str(self.t / "home/states"), "--bind", "127.0.0.1"]
         if interactive:
             base += ["--pack", "4.05", "--models-dir", str(self.repo / "models"), "--port", "8790", "--service", "no"]
         else:
@@ -491,7 +491,7 @@ class SetupTest(SetupBase):
         self.grub_machine(host)
         host.lines = []
         cli.main(["setup", "--state-dir", str(self.t / "home/states"), "--pack", "4.05", "--models-dir", str(self.repo / "models"),
-                  "--port", "8790", "--service", "no"], host=host, repo=self.repo)
+                  "--port", "8790", "--service", "no", "--bind", "127.0.0.1"], host=host, repo=self.repo)
         self.assertEqual(host.runner.root_calls, [])
         self.assertFalse(any("yes" in q for q in host.prompt.asked))
 

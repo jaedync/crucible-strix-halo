@@ -23,7 +23,7 @@ EXIT_BAD_KEY_FILE = 78  # EX_CONFIG: a setting is wrong. The service unit does n
 AUTH_TEXT = "A valid API key is required. Send it as Authorization: Bearer <key> or x-api-key: <key>."
 DUPLICATE_TEXT = "Send each of the Authorization and x-api-key headers at most once."
 KEY_RULE = ("It must hold one key of 32 to 256 characters (A-Z a-z 0-9 . _ ~ + / = -) and a new line. "
-            "Make a new one with: ./crucible setup --bind ADDRESS")
+            "Make a new one with: ./crucible setup --api-key")
 
 
 class KeyFileError(Exception):
@@ -155,11 +155,23 @@ def container_open_bind(host, environ):
             and any(os.path.exists(marker) for marker in CONTAINER_MARKERS))
 
 
+# Explicit local networks, not ipaddress.is_private: that property includes documentation and reserved addresses.
+PRIVATE_NETWORKS = tuple(ipaddress.ip_network(net) for net in
+                         ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "fc00::/7", "fe80::/10"))
+
+
+def is_private_bind(host):
+    """Loopback, RFC1918, link-local or ULA only. Wildcards and mapped IPv6 need a key."""
+    ip = ipaddress.ip_address(host)
+    return is_loopback(ip) or any(ip.version == net.version and ip in net for net in PRIVATE_NETWORKS)
+
+
 def bind_error(host, has_key, environ=None):
     """The refusal text when this bind address needs a key and none is set, else None.
 
     environ is the environment that holds the image switch. It is not read from os.environ here."""
-    if has_key or is_loopback(host) or container_open_bind(host, environ or {}):
+    if has_key or is_private_bind(host) or container_open_bind(host, environ or {}):
         return None
-    return (f"Address {host} is not a loopback address. Add --api-key-file (./crucible setup --bind {host} makes "
-            "the key), or use 127.0.0.1 and a reverse proxy.")
+    return (f"Address {host} is not a private address. Set a key with --api-key-file "
+            f"(./crucible setup --bind {host} --api-key makes the file), or listen on a private address "
+            "such as 192.168.1.2 or 127.0.0.1.")

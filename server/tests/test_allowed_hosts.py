@@ -330,9 +330,9 @@ class StartLineTest(unittest.TestCase):
             self.assertEqual(startup.main(), 0)
         return "".join(call.args[0] for call in err.write.call_args_list)
 
-    def test_the_open_default_says_so(self):
+    def test_the_unkeyed_default_keeps_strict_host_checks(self):
         text = self.start()
-        self.assertIn("Host check: off (any Host)", text)
+        self.assertIn("Host check: only localhost, 127.0.0.1, [::1]", text)
         self.assertIn("Crucible is ready at http://127.0.0.1:8790/v1 (content special tokens: text)", text)
 
     def test_strict_mode_lists_the_hosts(self):

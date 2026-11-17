@@ -5,6 +5,7 @@ from pathlib import Path
 
 from . import doctor, keyfile, measured, packs, rocm, runtime, service, settings as settings_mod, steps, update
 from .host import Host
+from .commands import output_text
 from .settings import UNSET
 
 DESCRIPTION = """Run Crucible on a Strix Halo machine.
@@ -57,10 +58,13 @@ def _common(p):
     p.add_argument("--state-disk-gib", type=int, default=None, help="largest size of the cache on the disk (default 200)")
     p.add_argument("--port", type=int, default=None, help="server port (default 8790)")
     p.add_argument("--bind", type=_address, default=None, metavar="ADDRESS",
-                   help="address to listen on (default 127.0.0.1). An address that is not loopback "
-                        "(0.0.0.0, ::, a LAN address) makes an API key file and the server then needs the key")
-    p.add_argument("--api-key", action="store_true",
-                   help="also use an API key on 127.0.0.1 (for a reverse proxy). Setup makes the key file")
+                   help="address to listen on (default 127.0.0.1). A private address needs no key. "
+                        "A public address, 0.0.0.0 or :: makes an API key file")
+    keys = p.add_mutually_exclusive_group()
+    keys.add_argument("--api-key", dest="api_key", action="store_true", default=None,
+                      help="use an API key. Setup makes the key file; a saved choice stays until changed")
+    keys.add_argument("--no-api-key", dest="api_key", action="store_false",
+                      help="stop using the saved API key (private addresses only). Keep the file on disk")
     p.add_argument("--allowed-host", action="append", type=_host_name, default=None, metavar="NAME",
                    help="a Host name that the server accepts besides localhost, 127.0.0.1, [::1] and the bind address "
                         "(for a reverse proxy; repeat the flag for more). The names replace the saved list")
@@ -71,8 +75,9 @@ def _common(p):
                         "Above 262,144 tokens the engine uses YaRN and the conversation cache stays in memory")
 
 
-def parser():
-    ap = argparse.ArgumentParser(prog="crucible", description=DESCRIPTION, formatter_class=argparse.RawDescriptionHelpFormatter)
+def parser(repo=None):
+    repo = repo or Path(__file__).resolve().parents[2]
+    ap = argparse.ArgumentParser(prog="crucible", description=output_text(repo, DESCRIPTION), formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     st = sub.add_parser("setup", help="check, download, build, start, test")
     _common(st)
@@ -141,7 +146,7 @@ def _build_settings(args, host, repo, **extra):
         repo, host, pack=getattr(args, "pack", None), models_dir=getattr(args, "models_dir", None),
         state_dir=getattr(args, "state_dir", None) or UNSET, no_state_dir=getattr(args, "no_state_dir", False),
         state_disk_gib=getattr(args, "state_disk_gib", None), port=getattr(args, "port", None),
-        bind=getattr(args, "bind", None), api_key=getattr(args, "api_key", False),
+        bind=getattr(args, "bind", None), api_key=getattr(args, "api_key", None),
         allowed_hosts=getattr(args, "allowed_host", None),
         streams=getattr(args, "streams", None), ctx=getattr(args, "ctx", None), layout=getattr(args, "layout", None),
         jobs=getattr(args, "jobs", None), **extra)
@@ -167,6 +172,28 @@ def _ask_settings(args, host, repo):
             args.state_dir = Path(answer).expanduser()
     if args.port is None:
         args.port = int(ask("Server port", str(probe.port)))
+    if args.bind is None:
+        other = ask("Will other machines use this server?", "no").strip().lower()
+        while other not in ("yes", "y", "no", "n"):
+            other = ask("Will other machines use this server?", "no").strip().lower()
+        default = "127.0.0.1"
+        if other in ("yes", "y"):
+            # Do not guess a LAN interface or silently leave remote access on loopback.
+            default = probe.bind if not keyfile.is_loopback(probe.bind) else ""
+            host.out("Enter an address assigned to this machine, such as 192.168.1.2. All interfaces need an API key.")
+        args.bind = ask("Listen address", default).strip()
+        while True:
+            try:
+                _address(args.bind)
+                break
+            except argparse.ArgumentTypeError as error:
+                host.out(str(error))
+                args.bind = ask("Listen address", default).strip()
+    if args.api_key is None and keyfile.is_private_bind(args.bind) and not keyfile.is_loopback(args.bind):
+        answer = ask("Use an API key?", "no").strip().lower()
+        while answer not in ("yes", "y", "no", "n"):
+            answer = ask("Use an API key?", "no").strip().lower()
+        args.api_key = answer in ("yes", "y")
 
 
 def _validate(s, host):
@@ -174,7 +201,7 @@ def _validate(s, host):
         home = Path(os.path.abspath(host.home))
         sd = Path(os.path.abspath(s.state_dir))
         problem = settings_mod.state_dir_problem(home, s.repo, sd)
-        if problem and (sd == home or home not in sd.parents):
+        if problem and not settings_mod.state_dir_inside(home, sd):
             host.out(f"The state folder {sd} must be a new folder inside your home folder {home}. "
                      "Use --state-dir ~/.cache/crucible/states or --no-state-dir.")
             return False
@@ -269,9 +296,18 @@ def runtime_answer(args, host, s, repo):
 
 
 def main(argv=None, host=None, repo=None):
-    args = parser().parse_args(argv)
-    host = host or Host.real()
     repo = Path(repo) if repo else Path(__file__).resolve().parents[2]
+    args = parser(repo).parse_args(argv)
+    host = host or Host.real()
+    # Keep the caller's Host unchanged. All command hints, including JSON fixes, use this install's launcher.
+    from dataclasses import replace
+    emit = host.out
+    host = replace(host, out=lambda text: emit(output_text(repo, text)))
+    read_only = args.cmd == "doctor" or (args.cmd == "service" and args.service_cmd in ("status", "logs")) or (
+        args.cmd == "update" and args.check)
+    if host.uid == 0 and not read_only:
+        host.out("Run ./crucible without sudo. The server runs as your user.")
+        return 2
     if args.cmd == "doctor":
         if args.for_ == "start":
             return doctor.for_start(host, _settings(args, host, repo), quiet=args.quiet, as_json=args.json,
@@ -294,6 +330,9 @@ def main(argv=None, host=None, repo=None):
             return 1 if service.start(host, s) else _ready(host, s)
         run = steps.Setup(host, s, start_timeout=args.start_timeout)
         results = doctor.run_checks(host, s)
+        warnings = [r for r in results if r.status == "warn" and r.id in ("memory", "memory-available", "gpu-free")]
+        if warnings:
+            host.out(doctor.format_text(warnings))
         bad = [r for r in results if r.status == "fail" and "start" in r.blocks]
         if bad:
             for r in bad:

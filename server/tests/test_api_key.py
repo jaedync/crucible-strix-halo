@@ -483,9 +483,9 @@ class CanaryTest(unittest.TestCase):
 
 
 class BindRuleTest(unittest.TestCase):
-    """Item 9: no non-loopback address without the key, also for ::, 0.0.0.0 and IPv4-mapped IPv6."""
+    """Public, wildcard and IPv4-mapped binds need a key. Private binds do not."""
     LOOPBACK = ("127.0.0.1", "127.0.0.2", "127.255.255.254", "::1")
-    NEEDS_KEY = ("0.0.0.0", "::", "192.0.2.7", "198.51.100.9", "169.254.1.1", "2001:db8::7", "fe80::1",
+    NEEDS_KEY = ("0.0.0.0", "::", "192.0.2.7", "198.51.100.9", "2001:db8::7",
                  "::ffff:127.0.0.1", "::ffff:0.0.0.0", "::ffff:192.0.2.7", "0:0:0:0:0:ffff:7f00:1", "::2",
                  "128.0.0.1", "126.255.255.255", "224.0.0.1", "255.255.255.255", "1.1.1.1")
 
@@ -502,7 +502,7 @@ class BindRuleTest(unittest.TestCase):
                 text = bind_error(host, has_key=False)
                 self.assertIn(host, text)
                 self.assertIn("--api-key-file", text)
-                self.assertIn("reverse proxy", text)
+                self.assertIn("private address", text)
                 self.assertIsNone(bind_error(host, has_key=True))
 
     def test_item_9_the_server_refuses_to_start_with_exit_2_before_anything_loads(self):
@@ -596,8 +596,13 @@ class ContainerOpenBindTest(unittest.TestCase):
                 self.assertIn("--api-key-file", err)
                 self.assertFalse(loaded)
 
+    # The documented Docker run line (docs/DOCKER.md) sets CRUCIBLE_PLE_HOST=1, so the image prints only the bind warning.
+    # Without it the n-gram warning (server/__main__.py ngram_notice) is a second, separate line: see the test below.
+    RUN_ENV = {"CRUCIBLE_PLE_HOST": "1"}
+
     def start(self, arguments, env=None):
         environ = {key: value for key, value in os.environ.items() if key != self.NAME}
+        environ.update(self.RUN_ENV)
         environ.update(env or {})
         with patch.dict(os.environ, environ, clear=True):
             return BindRuleTest.start(arguments)
@@ -605,6 +610,7 @@ class ContainerOpenBindTest(unittest.TestCase):
     def serving_key(self, arguments, env):
         """The api_key argument that main gives to Service."""
         environ = {key: value for key, value in os.environ.items() if key != self.NAME}
+        environ.update(self.RUN_ENV)
         environ.update(env)
         listener = MagicMock()
         listener.serve_forever.side_effect = KeyboardInterrupt
@@ -699,6 +705,22 @@ class ContainerOpenBindTest(unittest.TestCase):
                 self.assertIn("--api-key-file", line)
                 self.assertNotIn(self.NAME, line)
 
+    def test_without_ple_host_the_n_gram_warning_is_the_only_extra_line(self):
+        """Both branch intents at once: one bind warning (api-key) and the n-gram warning when CRUCIBLE_PLE_HOST is not 1
+        (user-safety), each on its own line."""
+        notice = startup.ngram_notice({})
+        for host in ("0.0.0.0", "::"):
+            with self.subTest(host=host):
+                _, err, _ = self.start(["--host", host], {self.NAME: "1", "CRUCIBLE_PLE_HOST": "0"})
+                lines = [line for line in err.splitlines() if line.startswith("WARNING")]
+                self.assertEqual(len(lines), 2, err)
+                self.assertIn(notice, lines)
+                self.assertIn("no API key", [line for line in lines if line != notice][0])
+        for host in ("127.0.0.1", "::1"):
+            with self.subTest(host=host):
+                _, err, _ = self.start(["--host", host], {self.NAME: "1", "CRUCIBLE_PLE_HOST": "0"})
+                self.assertEqual([line for line in err.splitlines() if line.startswith("WARNING")], [notice])
+
     def test_the_container_start_with_a_key_keeps_the_normal_warning(self):
         with tempfile.TemporaryDirectory() as folder:
             _, err, _ = self.start(["--host", "0.0.0.0", "--api-key-file", str(key_file(folder))], {self.NAME: "1"})
@@ -726,7 +748,7 @@ class ContainerOpenBindTest(unittest.TestCase):
         for name in ("README.md", "CHANGELOG.md", "SECURITY.md", "docs/DOCKER.md"):
             with self.subTest(name=name):
                 text = " ".join((self.ROOT / name).read_text().split())
-                self.assertIn("A key is required for an address that is not loopback, except in the Docker image", text)
+                self.assertIn("A key is required for a public address, except in the Docker image", text)
         docker = (self.ROOT / "docs/DOCKER.md").read_text()
         self.assertIn("-p 127.0.0.1:8790:8790", docker)
         self.assertIn("--api-key-file", docker)

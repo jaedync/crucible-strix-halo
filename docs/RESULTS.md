@@ -456,7 +456,8 @@ tokens, 0.50 s for 300 to 1,000, 1.14 s for 1,000 to 3,000, and
   code from 4K to 100K, and one session on the 4.05 pack decodes at 58 to 65 tok/s. The rate
   changes little from 32K to 100K. The draft head predicts code better than prose, so prose decodes at
   55 to 58 tok/s on the 3.05 pack and 50 to 53 tok/s on the 4.05 pack.
-- Batching and speculation do not change the tokens of a request. Speculative decoding changes the speed, not the tokens. Some speed changes
+- Batching and speculation do not change the tokens of a request, except with session replay
+  (see [session replay](SESSION_REPLAY.md)). Speculative decoding changes the speed, not the tokens. Some speed changes
   are not bitwise equal and are on by default: see the [exactness rules](ARCHITECTURE.md#exactness-rules).
 - **Real use.** On one day of agent work (Oct 12, 2,890 turns, an older build), the median time to
   the first token was 0.52 s. One session decoded at 74.9 tok/s (median). The median

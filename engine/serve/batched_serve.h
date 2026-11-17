@@ -2079,6 +2079,11 @@ inline std::optional<int> TryBatchedServeCommand(int argc, char** argv) {
                         settings.slot_checkpoints,settings.vision,settings.host_reserve_mib,settings.state_dir,
                         settings.state_disk_gib,settings.cache_probation,settings.state_write_gib_per_day,
                         settings.cache_idle_minutes,settings.mtp_window,draft_blocks,settings.state_write_delay_ms);
+  } catch (const crucible::AdmissionRefused& error) {
+    std::fprintf(stderr, "%s\n", error.what());
+    std::printf("{\"event\":\"admission_refused\",\"error\":%s}\n", JsonQuote(error.what()).c_str());
+    std::fflush(stdout);
+    return 4;
   } catch (const std::exception& error) {
     // A memory refusal is a block of lines (engine/runtime/batch_admission.h): keep the options on their own line.
     std::fprintf(stderr, "batched serve error: %s\n  options: serve CKPT --streams 1..8 [--ctx 1..262144] [--prefill 0..4096] [--conversation-cache-mib 0..131072] [--host-reserve-mib 1024..131072] [--short-streams N --short-ctx T] [--cache-probation 0|1] [--cache-idle-minutes 1..10080] [--mtp-window 0..262144] [--draft-blocks FILE] [--state-dir DIR [--state-disk-gib 1..65536] [--state-disk-write-gib-per-day 0..65536] [--state-disk-write-delay-ms 0..60000]]\n", error.what());

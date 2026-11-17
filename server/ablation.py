@@ -9,7 +9,7 @@ disk key, stays as it is today. A stock engine refuses the ablated forms with a 
 """
 # The suffix of an ablated model name.
 ABLATED_SUFFIX = "-abliterated"
-# The client's body field (the gateway sends this one), and the engine's request field with its only accepted value.
+# The client's body field (Kiln sends this one), and the engine's request field with its only accepted value.
 REQUEST_FIELD = "crucible_ablate"
 ENGINE_FIELD = "ablate"
 ENGINE_VALUE = 1
