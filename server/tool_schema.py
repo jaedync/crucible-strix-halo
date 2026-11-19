@@ -41,7 +41,9 @@ def schema_types(schema, root, depth, budget):
         return set(choices)
     branches = schema.get("anyOf", schema.get("oneOf", []))
     if branches:
-        return set().union(*(types(branch, root, depth + 1, budget) for branch in branches))
+        # A branch without a type (true, {}, a const) takes any type: then so does the whole anyOf.
+        found = [types(branch, root, depth + 1, budget) for branch in branches]
+        return set() if any(not item for item in found) else set().union(*found)
     if "properties" in schema:
         return {"object"}
     return set()
@@ -133,6 +135,11 @@ def object_matches(value, schema, root, depth, budget, scope, path):
 def array_matches(value, schema, root, depth, budget, scope, path):
     if not schema.get("minItems", 0) <= len(value) <= schema.get("maxItems", len(value)): return False
     items = schema.get("items", True)
+    prefix = schema.get("prefixItems")
+    if isinstance(prefix, list):
+        # JSON Schema 2020-12: prefixItems checks the first items, and items checks only the items after them.
+        return all(matches(item, prefix[index] if index < len(prefix) else items, root, depth + 1, budget, scope,
+                           path + (index,)) for index, item in enumerate(value))
     if isinstance(items, list):
         return all(matches(item, items[index] if index < len(items) else schema.get("additionalItems", True),
                            root, depth + 1, budget, scope, path + (index,)) for index, item in enumerate(value))

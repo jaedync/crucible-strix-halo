@@ -1109,7 +1109,7 @@ class Engine {
 
   // The tile order GemvR reads for this group.
   bool ReadsFront(const Group& g) const { return g.d_front != nullptr; }
-  // The ring kernels hold K <= 6 only, so a wide group keeps verify passes at kMaxRows rows.
+  // The rows ring (ring_rows.h) holds K <= 6 only, so a wide group keeps verify passes at kMaxRows rows.
   bool PackedFits(const Group& g) const {
     return !g.wide && PackedGroupFits({g.jobs[0].dst != nullptr, ReadsFront(g), g.aligned_chunk});
   }
@@ -1653,11 +1653,24 @@ class Engine {
     if constexpr (R == 1) {
       // Expert jobs have no destination. Their fused schedule remains unchanged.
       const bool ring = ring_mode_ == kRingOn || (ring_mode_ == kRingFront && front);
-      if (ring && g.jobs[0].dst && !g.wide) {
-        // LinRingFlowKernel: no barrier between items and fused transforms.
+      if (ring && g.jobs[0].dst) {
+        // LinRingFlowKernel: no barrier between items and fused transforms. A wide group (K7, K8: the h6_ng8
+        // packs) takes the MaxK 8 instantiation, bitwise equal to LinPolicyKernel<1, 8> (bench/p418_dense.hip:
+        // 4.18 dense K8 front order 218 GB/s cold against 149 GB/s for LinPolicyKernel<1, 8> in engine order).
         const int grid = std::min(kRingBlocks, g.nitems), words = (int)(g.lds / 4);
-        if (front) LinRingFlowKernel<true><<<grid, 320, 2 * g.lds>>>(jobs, g.d_items, g.nitems, words, in, out);
-        else LinRingFlowKernel<false><<<grid, 320, 2 * g.lds>>>(jobs, g.d_items, g.nitems, words, in, out);
+        if (g.wide) {
+          if (front) {
+            LinRingFlowKernel<true, kMaxWideDecodeK><<<grid, 320, 2 * g.lds>>>(jobs, g.d_items, g.nitems, words, in,
+                                                                              out);
+          } else {
+            LinRingFlowKernel<false, kMaxWideDecodeK><<<grid, 320, 2 * g.lds>>>(jobs, g.d_items, g.nitems, words, in,
+                                                                               out);
+          }
+        } else if (front) {
+          LinRingFlowKernel<true><<<grid, 320, 2 * g.lds>>>(jobs, g.d_items, g.nitems, words, in, out);
+        } else {
+          LinRingFlowKernel<false><<<grid, 320, 2 * g.lds>>>(jobs, g.d_items, g.nitems, words, in, out);
+        }
         return;
       }
     }
@@ -2274,10 +2287,10 @@ class Engine {
   float *mE_, *mN_, *mhp_, *mep_;
   // The WMMA HC read (hc_wmma.h) serves decode, verify, the MTP last row and
   // chunked prefill with one arithmetic for every R. Bulk prefill (R > 8)
-  // keeps its own kernels. CRUCIBLE_HC_WMMA=0 selects the VALU kernels; 2 also
-  // loads int8 HC weights (hc_int8.h; the loader reads it, and the WMMA read
-  // takes the int8 blocks).
-  const bool hc_wmma_ = NumericsInt("CRUCIBLE_HC_WMMA", 1, 0, 2) != 0;
+  // keeps its own kernels. CRUCIBLE_HC_WMMA=0 selects the VALU kernels; 2 (the
+  // default; option A gives 1) also loads int8 HC weights (hc_int8.h; the
+  // loader reads it, and the WMMA read takes the int8 blocks).
+  const bool hc_wmma_ = NumericsDefaultInt("CRUCIBLE_HC_WMMA", 2, 1, 0, 2) != 0;
   HcWScratch hcw_{};
   unsigned hcw_epoch_ = 0;
   float *H_, *x_, *dots_, *ss_, *post_, *qkv_, *z_, *q_, *k_, *v_, *idx_, *rlog_, *wts_;

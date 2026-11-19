@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -75,6 +76,9 @@ class Env:
         self.ld_add.write_text("")
         self.os_release = self.t / "os-release"
         self.os_release.write_text('ID=ubuntu\nID_LIKE=debian\nVERSION_ID="24.04"\n')
+        self.df_avail = self.t / "df.avail"   # free KiB that the df shim reports (item 3: the disk checks)
+        self.df_avail.write_text(str(2 * 1024 ** 3))
+        self.make_machine()
         self.make_shims()
         self.make_repo()
         self.make_release()
@@ -98,9 +102,28 @@ class Env:
             p = self.shims / name
             p.write_text(body)
             p.chmod(0o755)
+        df = self.shims / "df"
+        df.write_text(f'#!/bin/sh\nprintf "Filesystem 1024-blocks Used Available Capacity Mounted on\\n"\n'
+                      f'printf "fake 9999999999 0 %s 1%% /\\n" "$(cat "{self.df_avail}")"\n')
+        df.chmod(0o755)
         ld = self.shims / "ldconfig"
         ld.write_text(f'#!/bin/sh\n"{REAL_LDCONFIG}" -p | grep -v -F -f "{self.ld_hide}"\ncat "{self.ld_add}"\n')
         ld.chmod(0o755)
+
+    def make_machine(self, mem_kb=130_000_000, gfx_version="110501", gtt=133_000_000_000, kfd=True):
+        """A Strix Halo machine for the read-only checks of install.sh (CRUCIBLE_PROC, CRUCIBLE_SYS)."""
+        self.proc = self.t / "machine/proc"
+        self.sys = self.t / "machine/sys"
+        shutil.rmtree(self.t / "machine", ignore_errors=True)
+        self.proc.mkdir(parents=True)
+        (self.proc / "meminfo").write_text(f"MemTotal:       {mem_kb} kB\nMemAvailable:   {mem_kb // 2} kB\n")
+        card = self.sys / "class/drm/card0/device"
+        card.mkdir(parents=True)
+        (card / "mem_info_gtt_total").write_text(f"{gtt}\n")
+        if kfd:
+            node = self.sys / "class/kfd/kfd/topology/nodes/1"
+            node.mkdir(parents=True)
+            (node / "properties").write_text(f"cpu_cores_count 0\ngfx_target_version {gfx_version}\n")
 
     def make_repo(self):
         self.src = self.t / "src"
@@ -147,18 +170,19 @@ class Env:
             "HOME": str(self.home), "PATH": f"{self.shims}:{os.environ['PATH']}", "SHIM_REAL_PATH": os.environ["PATH"],
             "CRUCIBLE_RELEASE_BASE": f"file://{self.release}", "CRUCIBLE_REPO_URL": self.repo_url, "CRUCIBLE_TAG": TAG,
             "CRUCIBLE_DIR": str(self.dir), "CRUCIBLE_TTY": str(self.tty), "CRUCIBLE_OS_RELEASE": str(self.os_release),
+            "CRUCIBLE_PROC": str(self.proc), "CRUCIBLE_SYS": str(self.sys),
             "XDG_STATE_HOME": str(self.home / ".state"), "TERM": "dumb", "LC_ALL": "C",
             "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null",
         }
         e.update(extra)
         return e
 
-    def install(self, *args, answers="", via_pipe=False, **extra):
+    def install(self, *args, answers="", via_pipe=False, script=INSTALL, **extra):
         self.tty.write_text(answers)
         if via_pipe:
-            return subprocess.run(["bash", "-s", "--", *args], input=INSTALL.read_text(), capture_output=True, text=True,
+            return subprocess.run(["bash", "-s", "--", *args], input=script.read_text(), capture_output=True, text=True,
                                   env=self.env(**extra), start_new_session=True, cwd=self.t, timeout=120)
-        return subprocess.run(["bash", str(INSTALL), *args], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+        return subprocess.run(["bash", str(script), *args], stdin=subprocess.DEVNULL, capture_output=True, text=True,
                               env=self.env(**extra), start_new_session=True, cwd=self.t, timeout=120)
 
     def calls(self, name=None):
@@ -185,11 +209,13 @@ class GoodDownloadTest(InstallTestCase):
                 self.assertEqual(json.loads((self.w.dir / "build/engine/release.json").read_text())["tag"], TAG)
 
     def test_tag_flag_needs_a_release_name(self):
-        for args in (("--tag",), ("--version",), ("--tag=",), ("--tag", "latest")):
+        for args in (("--tag",), ("--version",), ("--tag=",), ("--tag", "latest"), ("--tag", ""), ("--version", "")):
             with self.subTest(args=args):
                 r = self.w.install(*args)
                 self.assertEqual(r.returncode, 2, self.out(r))
                 self.assertFalse(self.w.dir.exists())
+                if args[0] in ("--tag", "--version") and args[1:] in ((), ("",)):
+                    self.assertIn(f"{args[0]} needs a release name, such as v0.37.2.", self.out(r))
 
     def test_update_keeps_the_tag_flag_for_the_launcher(self):
         self.assertEqual(self.w.install("--yes").returncode, 0)
@@ -257,6 +283,70 @@ class GoodDownloadTest(InstallTestCase):
         r = self.w.install("--yes")
         self.assertEqual(r.returncode, 0, self.out(r))
         self.assertEqual(sha256(self.w.dir / "build/engine/crucible"), self.w.engine_sha)
+
+
+class SumsPinTest(InstallTestCase):
+    """The SHA256SUMS pin: an empty pin gives a WARN line and the install goes on; a pin that is present
+    and does not match stops the install before any file runs. The built-in pin is for PIN_TAG only."""
+
+    def pinned(self, pin_tag, pin):
+        text = INSTALL.read_text()
+        text = re.sub(r'^PIN_TAG="[^"]*"', f'PIN_TAG="{pin_tag}"', text, count=1, flags=re.M)
+        text = re.sub(r'^PIN_SUMS_SHA256="[^"]*"', f'PIN_SUMS_SHA256="{pin}"', text, count=1, flags=re.M)
+        path = self.w.t / "pinned-install.sh"
+        path.write_text(text)
+        return path
+
+    def run_script(self, path, *args, **extra):
+        self.w.tty.write_text("")
+        return subprocess.run(["bash", str(path), *args], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                              env=self.w.env(**extra), start_new_session=True, cwd=self.w.t, timeout=120)
+
+    def nothing_ran(self, r):
+        self.assertNotEqual(r.returncode, 0, self.out(r))
+        self.assertFalse(self.w.dir.exists(), "no install folder after a pin mismatch")
+        self.assertFalse((self.w.home / "engine.ran").exists())
+
+    def warn_lines(self, r):
+        return [ln for ln in self.out(r).splitlines() if ln.startswith("WARN") and "SHA256SUMS" in ln]
+
+    def test_an_empty_pin_warns_once_and_installs(self):
+        r = self.w.install("--yes")
+        self.assertEqual(r.returncode, 0, self.out(r))
+        warn = self.warn_lines(r)
+        self.assertEqual(len(warn), 1, self.out(r))
+        self.assertIn("replaced", warn[0])
+
+    def test_a_built_in_pin_that_matches_installs_with_no_warning(self):
+        r = self.run_script(self.pinned(TAG, sha256(self.w.release / "SHA256SUMS")), "--yes")
+        self.assertEqual(r.returncode, 0, self.out(r))
+        self.assertEqual(self.warn_lines(r), [])
+
+    def test_a_built_in_pin_that_does_not_match_stops_before_any_file_runs(self):
+        r = self.run_script(self.pinned(TAG, "0" * 64), "--yes")
+        self.nothing_ran(r)
+        self.assertEqual(r.returncode, 4, self.out(r))
+        self.assertIn("pinned", self.out(r))
+
+    def test_the_built_in_pin_is_only_for_its_own_tag(self):
+        r = self.run_script(self.pinned("v1.2.3", "0" * 64), "--yes")
+        self.assertEqual(r.returncode, 0, self.out(r))
+        self.assertEqual(len(self.warn_lines(r)), 1, self.out(r))
+
+    def test_the_pin_of_the_environment_wins(self):
+        r = self.run_script(self.pinned(TAG, "0" * 64), "--yes", CRUCIBLE_SUMS_SHA256=sha256(self.w.release / "SHA256SUMS"))
+        self.assertEqual(r.returncode, 0, self.out(r))
+
+    def test_the_dry_run_names_the_pin_state(self):
+        r = self.w.install("--dry-run")
+        self.assertIn("SHA256SUMS pin: none", self.out(r))
+        r = self.run_script(self.pinned(TAG, "a" * 64), "--dry-run")
+        self.assertIn("SHA256SUMS pin: " + "a" * 16, self.out(r))
+
+    def test_the_scope_line_is_honest(self):
+        text = INSTALL.read_text()
+        self.assertIn("makes a replaced release file visible as a commit on main", text)
+        self.assertIn("does not protect against a person who can push to main", text)
 
 
 class BadDownloadTest(InstallTestCase):
@@ -585,7 +675,8 @@ class TargetRocmTest(InstallTestCase):
     def test_rocm_7_2_4_is_tested_and_gives_no_warning(self):
         text = self.note("7.2.4")
         self.assertIn("HIP runtime: ROCm 7.2.4 (tested)", text)
-        self.assertNotIn("warn", text.lower())
+        # the one WARN line of an empty SHA256SUMS pin (trust root Part A) is not about ROCm
+        self.assertNotIn("warn", "\n".join(ln for ln in text.lower().splitlines() if "sha256sums" not in ln))
 
     def test_the_library_name_names_the_version_when_there_is_no_version_file(self):
         self.assertIn("HIP runtime: ROCm 10.1 (current)", self.note(lib="libamdhip64.so.7.16.26385"))
@@ -644,6 +735,259 @@ class FallbackTest(InstallTestCase):
         self.assertEqual(r.returncode, 4, self.out(r))
         self.assertIn("--source-build", self.out(r))
         self.assertFalse(self.w.dir.exists())
+
+
+class MachineCheckTest(InstallTestCase):
+    """Item 3: the dry run and step 1 run the read-only checks, and a bad setup option stops before any download."""
+
+    def no_download(self, r):
+        self.assertEqual(self.w.calls("curl"), [], self.out(r))
+        self.assertEqual([c for c in self.w.calls("git") if " clone" in c], [])
+        self.assertFalse(self.w.dir.exists())
+
+    def test_dry_run_on_a_good_machine_says_it_can_run(self):
+        r = self.w.install("--dry-run")
+        self.assertEqual(r.returncode, 0, self.out(r))
+        self.assertIn("This machine can run Crucible", self.out(r))
+        for word in ("gfx1151", "memory", "disk"):
+            self.assertIn(word, self.out(r))
+        self.no_download(r)
+
+    def test_dry_run_on_a_small_machine_says_plainly_that_it_cannot_run(self):
+        self.w.make_machine(mem_kb=40_000_000)
+        r = self.w.install("--dry-run")
+        self.assertEqual(r.returncode, 6, self.out(r))
+        self.assertIn("cannot run Crucible", self.out(r))
+        self.assertIn("memory", self.out(r))
+        self.no_download(r)
+
+    def test_dry_run_without_the_gpu_or_with_another_gpu_cannot_run(self):
+        for machine in (dict(kfd=False), dict(gfx_version="110000")):
+            with self.subTest(machine=machine):
+                self.w.make_machine(**machine)
+                r = self.w.install("--dry-run")
+                self.assertEqual(r.returncode, 6, self.out(r))
+                self.assertIn("gfx1151", self.out(r))
+
+    def test_a_96_gb_machine_can_run_the_3_05_pack(self):
+        self.w.make_machine(mem_kb=97_602_320, gtt=94208 * 2 ** 20)
+        r = self.w.install("--dry-run")
+        self.assertEqual(r.returncode, 0, self.out(r))
+        self.assertIn("a 96 GB machine: the 3.05 pack with 2 sessions", self.out(r))
+        self.assertIn("This machine can run Crucible", self.out(r))
+        self.no_download(r)
+
+    def test_the_96_gb_line_names_the_start_time_fit(self):
+        # Review L2: the line does not promise 2 sessions at the bottom of the class.
+        self.w.make_machine(mem_kb=92_400_000, gtt=94208 * 2 ** 20)
+        r = self.w.install("--dry-run")
+        self.assertIn("a smaller conversation cache or fewer sessions", self.out(r))
+        self.assertNotIn("UMA frame buffer", self.out(r))
+
+    def test_the_96_gb_line_gives_the_uma_advice_when_the_vram_is_large(self):
+        # Review L1: a 128 GB machine with a 16 GiB UMA frame buffer looks like a 96 GB machine.
+        self.w.make_machine(mem_kb=114_000_000, gtt=94208 * 2 ** 20)
+        (self.w.sys / "class/drm/card0/device/mem_info_vram_total").write_text(f"{16 * 2 ** 30}\n")
+        r = self.w.install("--dry-run")
+        self.assertEqual(r.returncode, 0, self.out(r))
+        self.assertIn("16 GiB of dedicated memory (UMA frame buffer)", self.out(r))
+        self.assertIn("512 MB", self.out(r))
+
+    def test_a_96_gb_machine_refuses_the_4_05_pack(self):
+        self.w.make_machine(mem_kb=97_602_320, gtt=94208 * 2 ** 20)
+        r = self.w.install("--dry-run", "--pack", "4.05")
+        self.assertEqual(r.returncode, 6, self.out(r))
+        self.assertIn("--pack 3.05", self.out(r))
+
+    def tree_setup_script(self):
+        """install.sh with the option table of this tree's setup, as the release record writes it for a pin that has
+        the 4.18 pack. A pin before v0.38.0 has no 4.18 choice, so its option check stops a 4.18 install first."""
+        sys.path.insert(0, str(ROOT / "tools"))
+        import setup_options
+        script = self.w.t / "install-tree-options.sh"
+        table = setup_options.text(setup_options.table())
+        script.write_text(setup_options.BLOCK_RE.sub(lambda m: f'SETUP_OPTIONS="\n{table}"\n', INSTALL.read_text(),
+                                                     count=1))
+        self.assertIn("4.18", setup_options.install_table(script.read_text())["--pack"])
+        return script
+
+    def test_a_96_gb_machine_refuses_the_4_18_pack(self):
+        self.w.make_machine(mem_kb=97_602_320, gtt=94208 * 2 ** 20)
+        r = self.w.install("--dry-run", "--pack", "4.18", script=self.tree_setup_script())
+        self.assertEqual(r.returncode, 6, self.out(r))
+        self.assertIn("the 4.18 pack needs a 128 GB machine", self.out(r))
+        self.assertIn("--pack 3.05", self.out(r))
+
+    def test_a_96_gb_machine_names_its_own_gtt_value(self):
+        self.w.make_machine(mem_kb=97_602_320, gtt=48 * 2 ** 30)
+        r = self.w.install("--dry-run")
+        self.assertEqual(r.returncode, 0, self.out(r))
+        self.assertIn("94208 MiB on this 96 GB machine", self.out(r))
+        self.assertIn("kernel parameters", self.out(r))
+
+    def test_a_64_gb_machine_cannot_run(self):
+        self.w.make_machine(mem_kb=64_047_888, gtt=60 * 2 ** 30)
+        r = self.w.install("--dry-run")
+        self.assertEqual(r.returncode, 6, self.out(r))
+        self.assertIn("96 GB or 128 GB machine", self.out(r))
+        self.no_download(r)
+
+    def test_a_fixable_problem_is_a_fix_line_not_a_stop(self):
+        self.w.make_machine(gtt=60_000_000_000)
+        r = self.w.install("--dry-run")
+        self.assertEqual(r.returncode, 0, self.out(r))
+        self.assertIn("after the fixes", self.out(r))
+        self.assertIn("kernel parameters", self.out(r))
+
+    def test_small_disk_for_the_pack_is_named_with_the_size(self):
+        self.w.df_avail.write_text(str(50 * 1024 ** 2))
+        r = self.w.install("--dry-run", "--pack", "4.05")
+        self.assertIn("110 GB", self.out(r))
+        self.assertIn("--models-dir", self.out(r))
+
+    def test_the_418_pack_needs_its_own_disk_size(self):
+        # 115 GB free: enough for 4.05 (110 GB), not for 4.18 (125 GB).
+        self.w.df_avail.write_text(str(115_000_000_000 // 1024))
+        r = self.w.install("--dry-run", "--pack", "4.18", script=self.tree_setup_script())
+        self.assertIn("the 4.18 pack needs about 125 GB", self.out(r))
+
+    def test_the_real_install_stops_before_any_download_when_the_machine_cannot_run(self):
+        self.w.make_machine(mem_kb=40_000_000)
+        r = self.w.install("--yes")
+        self.assertEqual(r.returncode, 6, self.out(r))
+        self.no_download(r)
+
+    def test_bad_setup_options_stop_before_any_download(self):
+        for args, word in ((("--pack", "9.99"), "--pack"), (("--streams", "9"), "--streams"), (("--port", "x"), "--port"),
+                           (("--no-such-flag",), "--no-such-flag"), (("--service",), "--service"),
+                           (("--service=maybe",), "--service"), (("--smoke=1",), "--smoke")):
+            for mode in ((), ("--dry-run",)):
+                with self.subTest(args=args, mode=mode):
+                    r = self.w.install(*mode, *args)
+                    self.assertEqual(r.returncode, 2, self.out(r))
+                    self.assertIn(word, self.out(r))
+                    self.no_download(r)
+
+    def test_good_setup_options_pass_in_both_forms(self):
+        r = self.w.install("--dry-run", "--pack=3.05", "--streams", "2", "--service", "no", "--state-dir", "x", "--yes")
+        self.assertEqual(r.returncode, 0, self.out(r))
+        self.assertIn("setup --pack=3.05 --streams 2 --service no --state-dir x --yes", self.out(r))
+
+    def test_the_sizes_are_the_ones_of_setup(self):
+        sys.path.insert(0, str(ROOT / "tools"))
+        from crucible_cli import doctor, packs
+        text = INSTALL.read_text()
+        self.assertIn(f"PACK_DISK_GB_405={packs.PACKS['4.05'].disk_gb}\n", text)
+        self.assertIn(f"PACK_DISK_GB_305={packs.PACKS['3.05'].disk_gb}\n", text)
+        self.assertIn(f"PACK_DISK_GB_418={packs.PACKS['4.18'].disk_gb}\n", text)
+        self.assertIn(f"MEM_MIN_KB={doctor.MEM_MIN_KB}\n", text)
+        self.assertIn(f"GTT_MIN_BYTES={doctor.GTT_MIN_BYTES}\n", text)
+        from crucible_cli import machine
+        self.assertIn(f"MEM_MID_KB={machine.MID_MIN_KB}\n", text)
+
+    def test_the_option_table_is_the_setup_parser_of_the_pinned_release(self):
+        # install.sh installs PIN_TAG, so it checks the options of that setup, not the parser of this tree (an option
+        # that the pinned setup lacks would pass the check and stop the install after the downloads).
+        sys.path.insert(0, str(ROOT / "tools"))
+        import setup_options
+        text = INSTALL.read_text()
+        record = ROOT / "tests/data/setup_options" / f"{setup_options.pin_tag(text)}.txt"
+        self.assertTrue(record.is_file(), "no option table of the pinned release: run tools/setup_options.py record")
+        self.assertEqual(setup_options.install_table(text), setup_options.parse(record.read_text()))
+
+    def test_an_option_that_the_pinned_setup_lacks_stops_before_any_download(self):
+        sys.path.insert(0, str(ROOT / "tools"))
+        import setup_options
+        # A fixed older pin: install.sh with the option table of v0.37.3. After a release record, the table of the
+        # real pin can equal this tree, and the loop would check nothing.
+        old = self.w.t / "install-v0.37.3.sh"
+        older = (ROOT / "tests/data/setup_options/v0.37.3.txt").read_text()
+        old.write_text(setup_options.BLOCK_RE.sub(lambda m: f'SETUP_OPTIONS="\n{older}"\n', INSTALL.read_text(), count=1))
+        pinned = setup_options.install_table(old.read_text())
+        options = setup_options.table()
+        newer = [name for name in options if name not in pinned]
+        self.assertGreaterEqual(len(newer), 2, "the v0.37.3 table must lack options of this setup")
+        for name in newer[:2]:
+            kind = options[name]
+            args = [name] if kind == "flag" else [name, kind.split(":", 1)[1].split(",")[0].split("-")[0]] \
+                if ":" in kind else [name, "1"]
+            with self.subTest(option=name):
+                r = self.w.install("--dry-run", "--yes", *args, script=old)
+                self.assertEqual(r.returncode, 2, self.out(r))
+                self.assertIn(f"{name} is not an option of ", self.out(r))
+                self.assertIn("Nothing was downloaded.", self.out(r))
+                self.assertEqual([x for x in self.w.calls("curl")], [])
+
+class InCloneTest(InstallTestCase):
+    """Item 7c: install.sh run from inside a clone uses that clone. It never clones again."""
+
+    def clone(self, later=False):
+        c = self.w.home / "src/crucible-strix-halo"
+        c.parent.mkdir(parents=True)
+        run([REAL_GIT, "-c", "advice.detachedHead=false", "clone", "-q", "--branch", TAG, self.w.repo_url, str(c)],
+            env={**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null"})
+        if later:
+            g = [REAL_GIT, "-C", str(c), "-c", "user.email=test-user", "-c", "user.name=t"]
+            run([*g, "commit", "-q", "--allow-empty", "-m", "later"])
+        shutil.copy(INSTALL, c / "install.sh")
+        return c
+
+    def run_in(self, c, *args):
+        return subprocess.run(["bash", str(c / "install.sh"), *args], stdin=subprocess.DEVNULL, capture_output=True,
+                              text=True, env=self.w.env(CRUCIBLE_DIR=""), start_new_session=True, cwd=c, timeout=120)
+
+    def test_a_clone_at_the_tag_is_used_in_place(self):
+        c = self.clone()
+        r = self.run_in(c, "--yes")
+        self.assertEqual(r.returncode, 0, self.out(r))
+        self.assertEqual([x for x in self.w.calls("git") if " clone" in x], [])
+        self.assertFalse((self.w.home / "crucible").exists())
+        self.assertEqual((c / "handover.args").read_text().strip(), "setup --yes")
+        self.assertEqual(sha256(c / "build/engine/crucible"), self.w.engine_sha)
+        self.assertFalse((c / ".git/crucible-install").exists(), "uninstall must never remove a clone of the user")
+        self.assertIn(str(c), self.out(r))
+
+    def test_a_clone_with_source_build_downloads_no_engine(self):
+        c = self.clone()
+        r = self.run_in(c, "--yes", "--source-build")
+        self.assertEqual(r.returncode, 0, self.out(r))
+        self.assertFalse([x for x in self.w.calls("curl") if x.endswith(".gz")])
+        self.assertFalse((c / "build/engine/crucible").exists())
+        self.assertTrue((c / "handover.args").exists())
+
+    def test_a_clone_that_is_not_at_the_tag_builds_from_its_source_with_no_download(self):
+        c = self.clone(later=True)
+        r = self.run_in(c, "--yes")
+        self.assertEqual(r.returncode, 0, self.out(r))
+        self.assertEqual(self.w.calls("curl"), [])
+        self.assertEqual([x for x in self.w.calls("git") if " clone" in x], [])
+        self.assertFalse((c / "build/engine/crucible").exists())
+        self.assertTrue((c / "handover.args").exists())
+        self.assertIn("from this source", self.out(r))
+
+    def test_the_dry_run_in_a_clone_names_the_clone(self):
+        c = self.clone()
+        r = self.run_in(c, "--dry-run")
+        self.assertEqual(r.returncode, 0, self.out(r))
+        self.assertIn(f"source:         this clone ({c})", self.out(r))
+
+    def test_dir_still_wins_over_the_clone(self):
+        c = self.clone()
+        other = self.w.home / "other"
+        r = subprocess.run(["bash", str(c / "install.sh"), "--yes", "--dir", str(other)], stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, env=self.w.env(CRUCIBLE_DIR=""), start_new_session=True,
+                           cwd=c, timeout=120)
+        self.assertEqual(r.returncode, 0, self.out(r))
+        self.assertTrue((other / "handover.args").exists())
+
+    def test_a_pipe_run_inside_a_clone_folder_installs_as_before(self):
+        c = self.clone()
+        self.w.tty.write_text("")
+        r = subprocess.run(["bash", "-s", "--", "--yes"], input=INSTALL.read_text(), capture_output=True, text=True,
+                           env=self.w.env(CRUCIBLE_DIR=""), start_new_session=True, cwd=c, timeout=120)
+        self.assertEqual(r.returncode, 0, self.out(r))
+        self.assertTrue((self.w.home / "crucible/handover.args").exists())
+        self.assertFalse((c / "handover.args").exists())
 
 
 class FolderTest(InstallTestCase):
@@ -850,10 +1194,59 @@ class StaticTest(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("shellcheck"), "shellcheck is not installed (uvx shellcheck-py)")
     def test_shellcheck_is_clean(self):
+        self._assert_shellcheck_clean(["shellcheck"])
+
+    def test_shellcheck_is_clean_under_the_ci_version(self):
+        # The public CI (ubuntu-24.04 image, apt shellcheck 0.9.0-1) flags notes that 0.11.0 does not
+        # (SC2015 on install.sh, v0.37.3). Run that exact version from the uv cache, offline, when it is there.
+        cmd = ci_shellcheck()
+        if cmd is None:
+            self.skipTest(f"shellcheck {CI_SHELLCHECK} is not runnable (set CRUCIBLE_SHELLCHECK_CI, see Makefile)")
+        try:
+            r = run([*cmd, "--version"], timeout=60)
+        except OSError as e:
+            self.fail(f"CRUCIBLE_SHELLCHECK_CI does not run: {e}")
+        self.assertRegex(r.stdout, rf"(?m)^version: {re.escape(CI_SHELLCHECK)}$", r.stdout + r.stderr)
+        self._assert_shellcheck_clean(cmd)
+
+    def test_ci_shellcheck_env_var_is_used_and_never_skipped(self):
+        # make test-fast sets CRUCIBLE_SHELLCHECK_CI when the pinned binary exists: a broken path must fail, not skip.
+        with unittest.mock.patch.dict(os.environ, {"CRUCIBLE_SHELLCHECK_CI": "/nonexistent/shellcheck"}):
+            self.assertEqual(ci_shellcheck(), ["/nonexistent/shellcheck"])
+
+    def _assert_shellcheck_clean(self, cmd):
         for path in (INSTALL, ROOT / "tools/release_make.sh"):
             if path.exists():
-                r = run(["shellcheck", "-x", "-S", "style", str(path)])
-                self.assertEqual(r.returncode, 0, r.stdout)
+                with self.subTest(path=path.name):
+                    r = run([*cmd, "-x", "-S", "style", str(path)], timeout=120)
+                    self.assertEqual(r.returncode, 0, r.stdout)
+
+
+CI_SHELLCHECK = "0.9.0"
+CI_SHELLCHECK_PY = "shellcheck-py==0.9.0.6"
+
+
+def ci_shellcheck():
+    """The command that runs the CI's shellcheck version, or None. A local binary on PATH that has
+    the version wins; else uvx from its cache (no network, so the test stays fast and offline).
+    CRUCIBLE_SHELLCHECK_CI (set by make test-fast when the pinned binary exists) wins over both and is never skipped."""
+    forced = os.environ.get("CRUCIBLE_SHELLCHECK_CI")
+    if forced:
+        return [forced]
+    candidates = []
+    if shutil.which("shellcheck"):
+        candidates.append(["shellcheck"])
+    uvx = shutil.which("uvx")
+    if uvx:
+        candidates.append([uvx, "--offline", "--from", CI_SHELLCHECK_PY, "shellcheck"])
+    for cmd in candidates:
+        try:
+            r = run([*cmd, "--version"], timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if r.returncode == 0 and re.search(rf"^version: {re.escape(CI_SHELLCHECK)}$", r.stdout, re.M):
+            return cmd
+    return None
 
 
 if __name__ == "__main__":

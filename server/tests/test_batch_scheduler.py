@@ -249,6 +249,52 @@ class RestoredRemainingTest(unittest.TestCase):
         self.assertEqual([e["op"] for e in entries[-2:]], ["verify_step", "prefill"])
         self.assertEqual(entries[-1]["rows"], 8)
 
+
+class CopiedRowsTest(unittest.TestCase):
+    """A twin or header copy restores rows in a prefill command (the open said cached 0). The batch_end names them
+    (`restored`, engine/serve/batched_serve.h, the batch_end line): they are progress, but no prefill time.
+
+    Twin unit, Nov 17 (r7-p0-on): three End copies of 32K rows in about 15 ms each read as 270K rows/s, so every turn
+    aged after about 1.7 s and the scheduler ran FIFO: the 33,828-row twins prefilled cold before their 32,804-row donor.
+    """
+
+    def setUp(self):
+        self.test = RestoredRemainingTest()
+        self.backend = self.test.backend()
+        self.test.open(self.backend, 1, 0)
+
+    def test_whole_end_copy_is_progress_and_keeps_the_rate(self):
+        # TwinCopy of the whole prompt, then ResumeEnd: no row runs, so the engine names no cursor.
+        self.test.chunk(self.backend, dict(event="batch_end", op="prefill", restored=100_000, engine_s=0.01))
+        self.assertEqual(self.backend.active[1].prefilled, 100_000)
+        self.assertEqual(self.backend.prefill_rate, 1000.0)
+        self.assertEqual(self.backend.trace.since(0)[-1]["rows"], 0)
+
+    def test_partial_copy_counts_only_the_rows_that_ran(self):
+        # A copy of the donor's 99,000-row End point, then the 1,000 rows after it in the same command.
+        self.test.chunk(self.backend, dict(event="batch_end", op="prefill", cursor=100_000, restored=99_000,
+                                           engine_s=0.1))
+        self.assertEqual(self.backend.active[1].prefilled, 100_000)
+        self.assertEqual(self.backend.trace.since(0)[-1]["rows"], 1_000)
+        self.assertAlmostEqual(self.backend.prefill_rate, .7 * 1000 + .3 * 10_000)
+
+    def test_srpt_keeps_the_donor_first_after_twin_copies(self):
+        # Three whole copies, then the family burst at 8.5 s: the donor's rest (16,420 rows) goes before the
+        # earlier-admitted 33,828-row twin, as SRPT orders it.
+        for _ in range(3):
+            self.backend.active[1].prefilled = 0  # the next twin of the burst (one request stands for each)
+            self.test.chunk(self.backend, dict(event="batch_end", op="prefill", restored=100_000))
+        pending = [PendingPrefill(11, 33_828, 0.0), PendingPrefill(14, 16_420, 0.02)]
+        self.assertEqual(choose(8.5, [], pending, 0, self.backend.prefill_rate), ("prefill", 14))
+
+    def test_invalid_restored_rows_are_fatal(self):
+        for boundary in (dict(restored=0), dict(restored=-1), dict(restored=True), dict(restored="5"),
+                         dict(restored=100_001), dict(restored=99_000), dict(restored=99_000, cursor=99_000)):
+            with self.subTest(boundary=boundary):
+                self.setUp()
+                with self.assertRaises(RuntimeError):
+                    self.test.chunk(self.backend, dict(event="batch_end", op="prefill", **boundary))
+
 if __name__ == "__main__": unittest.main()
 
 

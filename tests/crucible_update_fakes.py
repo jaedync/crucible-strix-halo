@@ -99,6 +99,9 @@ def snapshot(tree):
     return out
 
 
+KILN_UNIT = "kiln-crucible.service"
+
+
 class Machine:
     """The fake systemd and the fake server. `starts` is a queue of results for the next starts (default: all good)."""
 
@@ -121,6 +124,8 @@ class Machine:
         self.fail_put_back = False
         self.old_unhealthy = False
         self.events = []
+        self.kiln_active = False      # the Kiln unit kiln-crucible.service (its file: World.kiln_unit)
+        self.kiln_calls = []          # systemctl arguments that name the Kiln unit
 
     @property
     def verbs(self):
@@ -148,6 +153,7 @@ class World:
         self.log = self.t / "stub.log"
         self.log.write_text("")
         self.unit = self.home / ".config/systemd/user/crucible-server.service"
+        self.kiln_unit = self.home / ".config/systemd/user/kiln-crucible.service"
         self.machine = Machine(self)
         self.make_source(bad_start, bad_health, bad_smoke, bad_install, new_requirements)
         self.make_release()
@@ -295,8 +301,10 @@ class UpdateRunner(Runner):
         m, w = self.m, self.world
         if name == "systemctl":
             args = argv[2:] if argv[1] == "--user" else argv[1:]
-            m.calls.append(args)
             verb = args[0]
+            if KILN_UNIT in args[1:]:
+                return self.kiln(args)
+            m.calls.append(args)
             m.events.append(("ctl", verb))
             if verb == "is-system-running":
                 return hostmod.Result(0, "running")
@@ -361,6 +369,27 @@ class UpdateRunner(Runner):
             m.live.add(40001)
         return res
 
+    def kiln(self, args):
+        """systemctl for the Kiln unit: its own state, apart from crucible-server.service."""
+        m, verb = self.m, args[0]
+        m.kiln_calls.append(args)
+        m.events.append(("kiln", verb))
+        if verb in ("start", "restart"):
+            ok = not m.marker("BAD_START")
+            m.kiln_active = ok
+            return hostmod.Result(0 if ok else 1, "" if ok else "Job for kiln-crucible.service failed.")
+        if verb == "stop":
+            m.kiln_active = False
+            return hostmod.Result(0, "")
+        if verb == "is-active":
+            return hostmod.Result(0 if m.kiln_active else 3, "active" if m.kiln_active else "inactive")
+        if verb == "show":
+            names = [args[i + 1] for i, a in enumerate(args) if a == "-p"]
+            props = {"LoadState": "loaded", "ActiveState": "active" if m.kiln_active else "inactive",
+                     "SubState": "running" if m.kiln_active else "dead", "Result": "success"}
+            return hostmod.Result(0, "\n".join(f"{n}={props.get(n, '')}" for n in names))
+        return hostmod.Result(0, "")
+
     def alive(self, pid):
         return int(pid) in self.m.live
 
@@ -379,7 +408,7 @@ class UpdateHttp:
     def get(self, url, timeout=5, key_file=None):
         self.gets.append(url)
         m = self.world.machine
-        server_up = m.active or bool(m.live)
+        server_up = m.active or bool(m.live) or m.kiln_active
         old = (self.world.dir / "VERSION").read_text() == "0.1.0\n"
         if server_up and not m.marker("BAD_HEALTH") and not (old and m.old_unhealthy):
             return 200, "ok"

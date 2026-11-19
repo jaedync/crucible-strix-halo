@@ -81,6 +81,8 @@ struct SlotCheckpoint {
   SlotFrontier frontier;  // kind Frontier only
   StateTenant tenant = kLocalTenant;  // W1: whose state it is; only that tenant's requests resume from it
   std::shared_ptr<const PromptOutputs> outputs;  // kind End only: the prompt end of fix A
+  // Twin prompts (BatchSession::TwinDonor): the state is the one that a cold prefill of these rows alone gives.
+  bool cold = false;
 };
 // Whether `point` resumes a prompt of its own length (fix A): an End point with outputs. Every other point needs the
 // last prompt row to run.

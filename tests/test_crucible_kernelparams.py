@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from crucible_cli_fakes import FakePrompt, FakeRunner, make_repo, wire
+from crucible_cli_fakes import FakePrompt, FakeRunner, ModesNo, make_repo, wire
 
 from crucible_cli import cli, doctor, kernelparams as kp, runner  # noqa: E402
 
@@ -420,8 +420,9 @@ class SetupBase(Base):
 
     def run_setup(self, argv=(), answers=(), interactive=False, prep=None, **machine):
         machine.setdefault("cmdline", "BOOT_IMAGE=/v rw quiet")
-        # the first question of an interactive run is "Download ... and build now?"; the kernel question comes after it
-        host = wire(self.t, gtt=SMALL, prompt=FakePrompt(["y", *answers]) if interactive else None, **machine)
+        # the first question of an interactive run is "Download ... and build now?"; the kernel question comes after it.
+        # The two optional modes (asked before it until the config holds them) take their default, no (ModesNo).
+        host = wire(self.t, gtt=SMALL, prompt=ModesNo(["y", *answers]) if interactive else None, **machine)
         host.is_tty = interactive
         if prep:
             prep(host)

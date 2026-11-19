@@ -7,7 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from crucible_cli_fakes import make_repo, wire
-from crucible_cli import cli, keyfile, launch, settings
+from crucible_cli import cli, keyfile, launch, options, settings
 from server import api_key
 from server.hosts import host_allowed
 
@@ -68,7 +68,7 @@ def test_flags_are_mutually_exclusive_and_noninteractive(setup):
 def test_setup_asks_network_address_and_lan_key_with_no_defaults(setup):
     repo, host = setup
     args = cli.parser().parse_args(["setup", "--pack", "4.05", "--models-dir", str(repo / "models"),
-                                    "--no-state-dir", "--port", "8790"])
+                                    "--no-state-dir", "--port", "8790", "--ngram16", "no", "--abliterated", "no"])
     seen = []
     answers = iter(("yes", "192.168.1.2", ""))
     def ask(question, default):
@@ -85,12 +85,34 @@ def test_setup_asks_network_address_and_lan_key_with_no_defaults(setup):
 def test_setup_network_no_keeps_loopback_and_asks_listen_address(setup):
     repo, host = setup
     args = cli.parser().parse_args(["setup", "--pack", "4.05", "--models-dir", str(repo / "models"),
-                                    "--no-state-dir", "--port", "8790"])
+                                    "--no-state-dir", "--port", "8790", "--ngram16", "no", "--abliterated", "no"])
     seen = []
     host.prompt = lambda question, default: seen.append((question, default)) or default
     cli._ask_settings(args, host, repo)
     assert seen == [("Will other machines use this server?", "no"), ("Listen address", "127.0.0.1")]
     assert args.bind == "127.0.0.1"
+
+
+def test_setup_asks_network_questions_then_the_setup_options(setup):
+    # Two changes edit _ask_settings. Setup asks the LAN key questions, then the
+    # ngram16 and abliterated questions, and each answer gets to the settings.
+    repo, host = setup
+    args = cli.parser().parse_args(["setup", "--pack", "4.05", "--models-dir", str(repo / "models"),
+                                    "--no-state-dir", "--port", "8790"])
+    seen = []
+    answers = iter(("yes", "192.168.1.2", "yes", "y", "n"))
+
+    def ask(question, default):
+        seen.append(question)
+        return next(answers)
+    host.prompt = ask
+    cli._ask_settings(args, host, repo)
+    assert seen == ["Will other machines use this server?", "Listen address", "Use an API key?",
+                    options.NGRAM16_QUESTION, options.ABL_QUESTION]
+    assert (args.bind, args.api_key, args.ngram16, args.abliterated) == ("192.168.1.2", True, "yes", "no")
+    s = cli._settings(args, host, repo)
+    assert s.api_key_file is not None
+    assert (s.ngram16, s.abliterated) == (True, False)
 
 
 @pytest.mark.parametrize("has_key", (False, True))
@@ -134,7 +156,7 @@ def test_installer_forwards_the_script_flags(flag):
 def test_setup_retries_an_empty_remote_address(setup):
     repo, host = setup
     args = cli.parser().parse_args(["setup", "--pack", "4.05", "--models-dir", str(repo / "models"),
-                                    "--no-state-dir", "--port", "8790"])
+                                    "--no-state-dir", "--port", "8790", "--ngram16", "no", "--abliterated", "no"])
     answers = iter(("maybe", "yes", "", "10.0.0.1", "maybe", "no"))
     host.prompt = lambda question, default: next(answers)
     cli._ask_settings(args, host, repo)

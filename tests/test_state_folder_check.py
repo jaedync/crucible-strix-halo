@@ -1,6 +1,7 @@
 """Cache folder check item 2 (owner chat via desk, Nov 13 12:29): setup, doctor and uninstall use ONE canonical check of the
-state folder (tools/crucible_cli/settings.py state_dir_problem). The v0.37.0 engine keeps the home-folder rule, so the check
-keeps it too (item 1, the engine change, is t38 work)."""
+state folder (tools/crucible_cli/settings.py state_dir_problem). The folder may be outside the home
+folder. The check follows the engine rule (engine/runtime/state_root.h; host copy tools/crucible_cli/state_root.py): a folder
+that only this user or root can change is accepted, anywhere but a system folder."""
 import os
 import sys
 import tempfile
@@ -34,8 +35,9 @@ class StateFolderCheckTest(unittest.TestCase):
     def test_the_canonical_check(self):
         p = settings_mod.state_dir_problem
         self.assertIsNone(p(self.home, self.repo, self.home / "states"))
-        self.assertIn("home", p(self.home, self.repo, Path("/var/tmp/crucible-states")))
-        self.assertIn("home", p(self.home, self.repo, self.home))
+        self.assertIsNone(p(self.home, self.repo, self.t / "fast" / "states"))
+        self.assertIn("system folder", p(self.home, self.repo, Path("/usr/crucible-states")))
+        self.assertIn("your home folder", p(self.home, self.repo, self.home))
         sd = self.home / "own"
         (sd / IDENT).mkdir(parents=True)
         (sd / "write-ledger").write_text("")
@@ -80,22 +82,69 @@ class StateFolderCheckTest(unittest.TestCase):
         self.assertEqual({r.id: r for r in doctor.run_checks(host, s)}["state-dir"].status, "pass")
         self.assertTrue(cli._validate(s, host))
 
-    def test_cache_link_out_of_home_is_refused_like_the_engine(self):
-        # Review M3 probe 2: ~/.cache is a link to a folder out of home. The engine refuses ~/.cache/crucible/states at
-        # start, so setup and doctor must refuse it too.
+    def test_cache_link_out_of_home_is_accepted_like_the_engine(self):
+        # Review M3 probe 2, with the rule of Nov 12: ~/.cache is a link to a folder out of home. The engine
+        # resolves the link and accepts the real folder (only this user can change it), so setup and doctor accept it too.
         outside = self.t / "elsewhere"
         outside.mkdir()
         (self.home / ".cache").symlink_to(outside)
         sd = self.home / ".cache" / "crucible" / "states"
-        problem = settings_mod.state_dir_problem(self.home, self.repo, sd)
-        self.assertIsNotNone(problem)
-        self.assertIn("not inside your home folder", problem)
-        self.assertEqual(self.doctor_row(sd).status, "fail")
+        self.assertIsNone(settings_mod.state_dir_problem(self.home, self.repo, sd))
+        self.assertEqual(self.doctor_row(sd).status, "pass")
+        s = settings_mod.build(self.repo, self.host, state_dir=sd)
+        self.assertTrue(cli._validate(s, self.host))
+
+    def test_a_folder_on_a_second_disk_passes_setup_and_doctor(self):
+        sd = self.t / "mnt-fast" / "crucible" / "states"
+        (self.t / "mnt-fast").mkdir()
+        self.assertIsNone(settings_mod.state_dir_problem(self.home, self.repo, sd))
+        row = self.doctor_row(sd)
+        self.assertEqual((row.status, row.title), ("pass", "State folder"))
+        s = settings_mod.build(self.repo, self.host, state_dir=sd)
+        self.assertTrue(cli._validate(s, self.host))
+
+    def test_a_folder_that_other_users_can_swap_fails_setup_and_doctor_with_the_engine_sentence(self):
+        shared = self.t / "shared"
+        shared.mkdir()
+        os.chmod(shared, 0o777)
+        self.addCleanup(os.chmod, shared, 0o700)
+        sd = shared / "states"
+        want = (f"other users can write {shared} (mode 0777, no sticky bit), so they could move or replace {sd}.")
+        self.assertEqual(settings_mod.state_dir_problem(self.home, self.repo, sd), want)
+        row = self.doctor_row(sd)
+        self.assertEqual(row.status, "fail")
+        self.assertIn(want, row.detail)
         out = []
         self.host.out = out.append
         s = settings_mod.build(self.repo, self.host, state_dir=sd)
         self.assertFalse(cli._validate(s, self.host))
-        self.assertIn("must be a new folder inside your home folder", " ".join(out))
+        self.assertIn(want, " ".join(out))
+        self.assertFalse(sd.exists())
+
+    def test_a_system_folder_fails_doctor(self):
+        row = self.doctor_row(Path("/etc/crucible-states"))
+        self.assertEqual(row.status, "fail")
+        self.assertIn("system folder", row.detail)
+
+    def test_a_parent_that_cannot_be_read_is_a_path_fault_and_fails_doctor(self):
+        # Review L4: the engine stops at start for this path, as for any other path fault. It is not a content warning.
+        locked = self.t / "locked"
+        locked.mkdir()
+        os.chmod(locked, 0)
+        self.addCleanup(os.chmod, locked, 0o700)
+        sd = locked / "a" / "states"
+        self.assertEqual(settings_mod.state_dir_verdict(self.home, self.repo, sd).code, "unreadable")
+        row = self.doctor_row(sd)
+        self.assertEqual(row.status, "fail")
+        self.assertIn("cannot be read", row.detail)
+
+    def test_a_folder_whose_list_cannot_be_read_is_a_content_warning(self):
+        sd = self.t / "states"
+        sd.mkdir()
+        os.chmod(sd, 0o300)
+        self.addCleanup(os.chmod, sd, 0o700)
+        self.assertEqual(settings_mod.state_dir_verdict(self.home, self.repo, sd).code, "contents-unreadable")
+        self.assertEqual(self.doctor_row(sd).status, "warn")
 
     def test_setup_doctor_and_uninstall_call_the_one_check(self):
         calls = []

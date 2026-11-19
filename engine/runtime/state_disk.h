@@ -11,6 +11,7 @@
 #include "snapshot_bytes.h"
 #include "state_epoch.h"
 #include "state_format.h"
+#include "state_root.h"
 #include "state_switches.h"
 #include "../switches.h"
 #include <algorithm>
@@ -153,11 +154,22 @@ struct StateDiskOptions {
   uint64_t block_head_bytes = 0, block_tail_bytes = 0;
   size_t max_states = 1024;    // state files on disk (each holds a key and logits in the index and on disk)
   size_t keep_superseded = 2;  // older states of one branch that a new state keeps (a rewind restores them)
+  // The branch ladder: Prune also keeps, as rungs, the longest older state of each
+  // aligned bucket of positions [k w, (k + 1) w). The width w comes from the state's distance d below the new state:
+  // ladder_near_band when d < ladder_near, ladder_mid_band when d < ladder_mid, else ladder_far_band. The widths must
+  // nest (each divides the next), so the set is stable as the branch grows. A rung is an old state that trunk prunes:
+  // it costs no new write. false (the default): the earlier rule (only keep_superseded older
+  // states stay) and the earlier evict line.
+  bool ladder = false;
+  size_t ladder_near = 32768, ladder_near_band = 4096;
+  size_t ladder_mid = 131072, ladder_mid_band = 16384;
+  size_t ladder_far_band = 65536;
   bool verify_digest = false;  // tests: the reader also checks each block's SHA-256
   // tests: changes the snapshot ranges of each new block's write after the hash (a wrong gather).
   std::function<void(std::vector<StreamRange>&)> write_ranges;
   std::function<void()> after_blocks;  // tests: runs on the writer thread after the new blocks, before the state file
   std::function<void()> after_ledger;  // tests: runs on an I/O thread after a file's ledger line, before the day count
+  std::function<void()> after_root_check;  // tests: runs at start after the first root check, before the folders are made
 };
 enum class StageState { None, Reading, Ready, Failed };
 struct StageStatus { StageState state = StageState::None; size_t tokens = 0; std::string reason; };
@@ -282,6 +294,10 @@ class StateDisk {
     options_.max_states = std::max<size_t>(options_.max_states, 1);
     if (!IdentityDirectory(options_.directory) || options_.identity.empty())
       throw std::invalid_argument("state disk identity is malformed");
+    if (!options_.ladder_near_band || options_.ladder_mid_band % options_.ladder_near_band ||
+        !options_.ladder_mid_band || options_.ladder_far_band % options_.ladder_mid_band || !options_.ladder_far_band ||
+        options_.ladder_mid < options_.ladder_near)
+      throw std::invalid_argument("state disk ladder widths must nest");
     PrepareRoot();
     dir_ = options_.root / options_.directory;
     MakePrivateDirectory(dir_);
@@ -338,6 +354,32 @@ class StateDisk {
   std::string Spill(std::span<const int> key, const ConversationPolicy& policy, bool compact, bool shared, bool guarded,
                     std::shared_ptr<const void> keep, const Snapshot& snapshot, bool flush = false,
                     uint64_t room = UINT64_MAX, bool queue_limit = true) {
+    return Queue(key, policy, compact, shared, guarded, std::move(keep), snapshot, flush, room, queue_limit, {});
+  }
+  // A fork point: a state whose trunk blocks [0, base_blocks) are the blocks of the
+  // longer state `base_key` of its branch (the tail that the slot released just before). The writer takes their names
+  // and digests from the base and never reads those bytes of `snapshot`, so the caller copies only the rest to the host.
+  // Refused ("policy") when `key` is not a shorter prefix of `base_key` or the point has fewer full blocks; "mtp" when the
+  // point has MTP rows (v1). The writer refuses it ("reason=base") when the base is not on disk then. A queued base
+  // job is written first (the writer is FIFO).
+  std::string SpillDerived(std::span<const int> key, const ConversationPolicy& policy, bool compact, bool guarded,
+                           std::shared_ptr<const void> keep, const Snapshot& snapshot, std::span<const int> base_key,
+                           uint64_t base_blocks, uint64_t room = UINT64_MAX) {
+    if (!enabled_) return "off";
+    if (base_key.size() <= key.size() || !std::equal(key.begin(), key.end(), base_key.begin()) || !base_blocks ||
+        base_blocks * options_.block_rows > key.size())
+      return "policy";
+    if (snapshot.resume.mpos > 0) return "mtp";
+    return Queue(key, policy, compact, false, guarded, std::move(keep), snapshot, false, room, true,
+                 {Name(policy, compact, base_key), base_blocks});
+  }
+
+ private:
+  // A derived spill's base: the name of the state whose trunk blocks [0, blocks) it lists (empty: a full spill).
+  struct Derive { std::string base; uint64_t blocks = 0; };
+  std::string Queue(std::span<const int> key, const ConversationPolicy& policy, bool compact, bool shared, bool guarded,
+                    std::shared_ptr<const void> keep, const Snapshot& snapshot, bool flush, uint64_t room,
+                    bool queue_limit, Derive derive) {
     if (!enabled_) return "off";
     if (key.size() < options_.min_tokens) return "short";
     if (snapshot.hist.size() != key.size()) return "policy";
@@ -357,7 +399,7 @@ class StateDisk {
     {
       std::lock_guard lock(mutex_);
       RollDay();
-      meta.file_bytes = QueueEstimate(meta, snapshot, plan);
+      meta.file_bytes = QueueEstimate(meta, snapshot, plan, derive.blocks);
       if (const auto found = index_.find(meta.name); found != index_.end()) {
         found->second.used = ++tick_;
         ++stats_.present;
@@ -375,7 +417,9 @@ class StateDisk {
         queued_file_bytes_ += FileEstimate(meta);
         queued_bytes_ += held;
         queued_names_.insert(meta.name);
-        Job job{std::move(meta), std::move(keep), &snapshot, std::move(plan), Now(), held, LazyHeld(snapshot)};
+        // A derived spill's device ranges are never read (SpillDerived): it is not a lazy job.
+        const uint64_t lazy = derive.base.empty() ? LazyHeld(snapshot) : 0;
+        Job job{std::move(meta), std::move(keep), &snapshot, std::move(plan), Now(), held, lazy, std::move(derive)};
         jobs_.insert(jobs_.begin() + std::ptrdiff_t(std::min(place, jobs_.size())), std::move(job));
       }
     }
@@ -393,6 +437,8 @@ class StateDisk {
     work_.notify_all();
     return {};
   }
+
+ public:
   // The longest state on disk whose key starts `key`, with the same policy (so the same tenant) and storage mode,
   // that `accept` takes.
   template<class Accept>
@@ -604,6 +650,7 @@ class StateDisk {
     double queued_at = 0;  // Now() at the queue (Pending)
     uint64_t held = 0;     // host bytes that the job pins (a lazy snapshot holds less than meta.payload)
     uint64_t lazy = 0;     // bytes that the writer reads from the device
+    Derive derive;         // a fork point's base (SpillDerived)
   };
   // The host bytes that a snapshot pins. A lazy snapshot keeps part of its rows on the device until the writer
   // reads them, so the queue, the room and the limits count the host bytes only. meta.payload stays the file size.
@@ -671,14 +718,7 @@ class StateDisk {
   struct BlockMeta { uint64_t payload = 0, file_bytes = 0; uint32_t refs = 0, pins = 0; bool bad = false; };
   struct RebuildCounts { size_t orphans = 0, broken = 0; };
   // Three groups of 16 lower-case hex digits joined by '-' (StateDiskIdentity::directory).
-  static bool IdentityDirectory(const std::string& name) {
-    if (name.size() != 50) return false;
-    for (size_t i = 0; i < name.size(); ++i) {
-      const char c = name[i];
-      if (i % 17 == 16 ? c != '-' : !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
-    }
-    return true;
-  }
+  static bool IdentityDirectory(const std::string& name) { return StateIdentityDirectoryName(name); }
   static double Now() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
   }
@@ -709,13 +749,15 @@ class StateDisk {
   // Holds mutex_. The bytes that a spill will write, before the hash: the state file, and the blocks
   // above the rows of the longest state on disk that this one extends (those blocks hold the same bytes in most
   // cases). An estimate only: the writer charges what it writes.
-  uint64_t QueueEstimate(const StateMeta& meta, const Snapshot& snapshot, const BlockPlan& plan) const {
+  // A derived spill lists its first `derived` trunk blocks from its base: they cost nothing.
+  uint64_t QueueEstimate(const StateMeta& meta, const Snapshot& snapshot, const BlockPlan& plan, uint64_t derived) const {
     size_t covered = 0;
     for (const auto& [name, other] : index_)
       if (other.key.size() > covered && Extends(meta, other)) covered = other.key.size();
     uint64_t bytes = HeaderEstimate(meta, snapshot, plan) + StateRoundUp(RangeBytes(plan.rest));
     for (const auto& block : plan.blocks)
-      if ((block.index + 1) * options_.block_rows > covered) bytes += BlockFileEstimate(RangeBytes(block.ranges));
+      if ((block.index + 1) * options_.block_rows > covered && !(block.lane == 0 && block.index < derived))
+        bytes += BlockFileEstimate(RangeBytes(block.ranges));
     return bytes;
   }
   // A queued job's estimate (StateMeta::file_bytes holds it until the write).
@@ -774,43 +816,48 @@ class StateDisk {
   std::string BlockName(const StateTenant& tenant, const StateDigest& digest, uint64_t bytes) const {
     return BlockFileNameFor(options_.identity, tenant, digest, bytes);
   }
-  // The root must sit inside the user's home. Components that this call creates get mode 0700.
+  // The root may be any folder that only this user (or root) can change (state_root.h; Nov 12: a
+  // second disk). Components that this call creates get mode 0700. An existing root must be the tier's own folder
+  // (empty, or only the tier's files), so a chmod never changes a shared folder such as ~/.cache.
   void PrepareRoot() {
     const char* home = crucible::SwitchText("HOME");
-    if (!home || !*home || !options_.root.is_absolute()) throw std::invalid_argument("state disk needs HOME and an absolute directory");
-    const auto base = std::filesystem::weakly_canonical(home);
-    const auto root = std::filesystem::weakly_canonical(options_.root);
-    const auto relative = root.lexically_relative(base);
-    if (relative.empty() || relative == "." || *relative.begin() == "..")
-      throw std::invalid_argument("the state directory must be inside the home directory");
-    std::filesystem::path path = base;
-    bool created = false;
-    for (const auto& part : relative) {
-      path /= part;
-      created = ::mkdir(path.c_str(), 0700) == 0;
-      if (!created && errno != EEXIST) throw std::runtime_error("cannot create the state directory");
-    }
-    // The root holds the ledger and every identity directory: this user's own directory, no symlink, mode 0700. An
-    // existing root must be the tier's own folder (empty, or only the tier's files), so a chmod never changes a
-    // shared folder such as ~/.cache.
-    if (!created) {
-      std::error_code error;
-      for (const auto& item : std::filesystem::directory_iterator(root, error)) {
-        const std::string name = item.path().filename();
-        if (name != "write-ledger" && !(IdentityDirectory(name) && item.is_directory(error)))
-          throw std::invalid_argument("the state directory must be a folder of its own (it holds other files)");
-      }
-      if (error) throw std::runtime_error("cannot read the state directory");
-    }
+    const auto verdict = CheckStateRoot(options_.root, home, ::geteuid(), ::getegid());
+    if (!verdict.Accepted()) throw std::invalid_argument("the state directory is not accepted: " + verdict.message);
+    const auto& root = verdict.path;
+    if (options_.after_root_check) options_.after_root_check();
+    if (!verdict.exists) MakeParents(root);
     MakePrivateDirectory(root);
-    options_.root = root;
+    // Again after the mode change: a file that came before it (from another user, when the folder was open) stops the
+    // start, as it does at the next start.
+    // The root is the path of this second check: a missing parent that came between the checks (a link that another user
+    // made) resolves to another path here, and that stops the start (review M1).
+    const auto again = CheckStateRoot(root, home, ::geteuid(), ::getegid());
+    if (!again.Accepted()) throw std::invalid_argument("the state directory is not accepted: " + again.message);
+    if (again.path != root)
+      throw std::invalid_argument("the state directory is not accepted: " + root.string() +
+                                  " changed while the engine made it (now " + again.path.string() + ").");
+    options_.root = again.path;
   }
+  // The missing folders above the root, each mode 0700. The rule has checked every folder that is there.
+  static void MakeParents(const std::filesystem::path& root) {
+    std::filesystem::path path;
+    for (const auto& part : root.parent_path()) {
+      path /= part;
+      if (::mkdir(path.c_str(), 0700) != 0 && errno != EEXIST)
+        throw std::runtime_error("cannot create the state directory " + path.string() + ": " + std::strerror(errno));
+    }
+  }
+  // The folder with no link in its last name (O_NOFOLLOW): this user's own, mode 0700.
   static void MakePrivateDirectory(const std::filesystem::path& path) {
-    if (::mkdir(path.c_str(), 0700) != 0 && errno != EEXIST) throw std::runtime_error("cannot create the state directory");
+    if (::mkdir(path.c_str(), 0700) != 0 && errno != EEXIST)
+      throw std::runtime_error("cannot create the state directory " + path.string() + ": " + std::strerror(errno));
+    const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) throw std::runtime_error("the state directory is not a private directory of this user");
+    struct Close { int fd; ~Close() { ::close(fd); } } closer{fd};
     struct stat info{};
-    if (::lstat(path.c_str(), &info) != 0 || !S_ISDIR(info.st_mode) || info.st_uid != ::geteuid())
+    if (::fstat(fd, &info) != 0 || !S_ISDIR(info.st_mode) || info.st_uid != ::geteuid())
       throw std::runtime_error("the state directory is not a private directory of this user");
-    if ((info.st_mode & 0777) != 0700 && ::chmod(path.c_str(), 0700) != 0)
+    if ((info.st_mode & 07777) != 0700 && ::fchmod(fd, 0700) != 0)
       throw std::runtime_error("cannot set the state directory mode");
   }
   // Every name that this tier writes. Train 22 matches the same names, so a rollback to it
@@ -982,6 +1029,7 @@ class StateDisk {
         StateMeta meta = header.meta;
         meta.name = name;
         meta.blocks = BlockNames(header);
+        for (const auto& block : header.blocks) meta.digests.push_back(block.digest);
         for (size_t i = 0; i < meta.blocks.size(); ++i) {
           const auto found = blocks_.find(meta.blocks[i]);
           if (found == blocks_.end() || found->second.payload != header.blocks[i].bytes)
@@ -1004,6 +1052,9 @@ class StateDisk {
     }
     std::sort(order.begin(), order.end());
     for (const auto& [time, name] : order) index_[name].used = ++tick_;
+    // The rung marks live in memory only: each branch tip marks its rungs again before the start evicts.
+    for (const auto& [name, meta] : index_)
+      if (!meta.superseded) MarkRungs(meta, OlderOf(meta, false), false);
     MakeRoom(0, nullptr);
     return counts;
   }
@@ -1032,7 +1083,7 @@ class StateDisk {
     return std::min(Evictable(incoming), bytes_ + file_bytes - options_.budget);
   }
   // Disk eviction: a state that a longer state of its own branch extends leaves first (it cannot be the best
-  // match any more, unless it is a shared frontier), then the least recently used. A state's blocks leave with it
+  // match any more, unless it is a shared frontier), a rung of the branch ladder next, then the least recently used. A state's blocks leave with it
   // when no other state lists them and no read pins them. `incoming`: the state that needs the room (it counts as a
   // longer state, and as one more state file). The superseded marks are kept up to date on each insert and removal
   // (Insert, Remove), so a choice is one pass. Holds mutex_.
@@ -1041,17 +1092,20 @@ class StateDisk {
       return bytes_ + need > options_.budget || index_.size() + (incoming ? 1 : 0) > options_.max_states;
     };
     while (over()) {
+      // Class 0: superseded, not a rung; class 1: a superseded rung; class 2: all others (live and shared states).
       const StateMeta* victim = nullptr;
-      bool victim_superseded = false;
+      int victim_class = 3;
       for (const auto& [name, meta] : index_) {
         if (incoming && name == incoming->name) continue;
         const bool superseded = !meta.shared && (meta.superseded || (incoming && Extends(*incoming, meta)));
-        if (!victim || superseded > victim_superseded || (superseded == victim_superseded && meta.used < victim->used))
-          victim = &meta, victim_superseded = superseded;
+        const int victim_of = !superseded ? 2 : meta.rung ? 1 : 0;
+        if (!victim || victim_of < victim_class || (victim_of == victim_class && meta.used < victim->used))
+          victim = &meta, victim_class = victim_of;
       }
       if (!victim) return false;
       Log("state_disk evict tokens=" + std::to_string(victim->key.size()) + " bytes=" + std::to_string(victim->file_bytes) +
-          " superseded=" + (victim_superseded ? "1" : "0"));
+          " superseded=" + (victim_class < 2 ? "1" : "0") +
+          (options_.ladder ? std::string(" rung=") + (victim_class == 1 ? "1" : "0") : std::string()));
       Remove(victim->name);
       ++stats_.evicted;
     }
@@ -1132,17 +1186,52 @@ class StateDisk {
   // Holds mutex_. The older states of `meta`'s branch: the newest `keep_superseded` stay (a rewind
   // restores them); the others cost only their state files, because their blocks belong to `meta` too. A shared
   // state and a staged state (a read in progress or a ready copy) stay.
+  // With the ladder, the rungs of the branch stay too (MarkRungs).
   size_t Prune(const StateMeta& meta) {
-    std::vector<const StateMeta*> older;
-    for (const auto& [name, other] : index_)
-      if (name != meta.name && !other.shared && !staged_.contains(name) && Extends(meta, other)) older.push_back(&other);
+    std::vector<StateMeta*> older = OlderOf(meta, true);
+    const std::vector<bool> rung = MarkRungs(meta, older, true);
     if (older.size() <= options_.keep_superseded) return 0;
-    std::sort(older.begin(), older.end(), [](const StateMeta* a, const StateMeta* b) { return a->used > b->used; });
+    std::vector<size_t> order(older.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return older[a]->used > older[b]->used; });
     std::vector<std::string> names;
-    for (size_t i = options_.keep_superseded; i < older.size(); ++i) names.push_back(older[i]->name);
+    for (size_t i = options_.keep_superseded; i < order.size(); ++i)
+      if (!rung[order[i]]) names.push_back(older[order[i]]->name);
     for (const auto& name : names) Remove(name);
     stats_.pruned += names.size();
     return names.size();
+  }
+  // Holds mutex_. The older states of `tip`'s branch that a prune may remove: not shared and (with `skip_staged`) not
+  // staged.
+  std::vector<StateMeta*> OlderOf(const StateMeta& tip, bool skip_staged) {
+    std::vector<StateMeta*> older;
+    for (auto& [name, other] : index_)
+      if (name != tip.name && !other.shared && !(skip_staged && staged_.contains(name)) && Extends(tip, other))
+        older.push_back(&other);
+    return older;
+  }
+  // The ladder bucket of an older state of `rows` tokens, `distance` rows below its branch tip: its width and index.
+  std::pair<size_t, size_t> LadderBucket(size_t rows, size_t distance) const {
+    const size_t width = distance < options_.ladder_near ? options_.ladder_near_band :
+                         distance < options_.ladder_mid ? options_.ladder_mid_band : options_.ladder_far_band;
+    return {width, rows / width};
+  }
+  // Holds mutex_. The rungs among `older` (the older states of `tip`'s branch): the longest state of each ladder
+  // bucket. Sets their marks and returns them; `clear` also clears the marks of the others (a prune). Without the
+  // ladder, no state is a rung.
+  std::vector<bool> MarkRungs(const StateMeta& tip, const std::vector<StateMeta*>& older, bool clear) {
+    std::vector<bool> rung(older.size(), false);
+    if (!options_.ladder) return rung;
+    std::map<std::pair<size_t, size_t>, size_t> longest;  // bucket -> entry of `older`
+    for (size_t i = 0; i < older.size(); ++i) {
+      const size_t rows = older[i]->key.size();
+      const auto [at, fresh] = longest.try_emplace(LadderBucket(rows, tip.key.size() - rows), i);
+      if (!fresh && rows > older[at->second]->key.size()) at->second = i;
+    }
+    for (const auto& [bucket, i] : longest) rung[i] = true;
+    for (size_t i = 0; i < older.size(); ++i)
+      if (rung[i] || clear) older[i]->rung = rung[i];
+    return rung;
   }
   void Unlink() {
     std::vector<std::filesystem::path> doomed;
@@ -1318,6 +1407,27 @@ class StateDisk {
   void SyncDirectory() const {
     if (const int dir = ::open(dir_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC); dir >= 0) { ::fsync(dir); ::close(dir); }
   }
+  // A derived spill (SpillDerived): the digests of its trunk blocks [0, derive.blocks) from the base state on disk. The
+  // base must have the same policy and storage mode, list those blocks, and each must have the size of the point's block
+  // (block b of both holds rows [b block_rows, (b + 1) block_rows) of the same spans). False: the base is not there.
+  bool DeriveDigests(const Job& job, std::vector<StateDigest>& digests, std::vector<bool>& derived) {
+    std::lock_guard lock(mutex_);
+    const auto base = index_.find(job.derive.base);
+    if (base == index_.end() || !(base->second.policy == job.meta.policy) || base->second.compact != job.meta.compact ||
+        base->second.digests.size() != base->second.blocks.size())
+      return false;
+    // The base's trunk blocks come first in its list (PlanBlocks: lane 0, then the MTP lane), in index order.
+    for (size_t i = 0; i < job.plan.blocks.size(); ++i) {
+      const auto& block = job.plan.blocks[i];
+      if (block.lane != 0 || block.index >= job.derive.blocks) continue;
+      if (block.index >= base->second.blocks.size()) return false;
+      const auto found = blocks_.find(base->second.blocks[block.index]);
+      if (found == blocks_.end() || found->second.payload != RangeBytes(block.ranges)) return false;
+      digests[i] = base->second.digests[block.index];
+      derived[i] = true;
+    }
+    return std::count(derived.begin(), derived.end(), true) == std::ptrdiff_t(job.derive.blocks);
+  }
   // Returns "ms=<T> result=written ..." or "result=refused reason=<why>".
   std::string Write(const Job& job) {
     const double start = Now();
@@ -1325,8 +1435,11 @@ class StateDisk {
     const BlockPlan& plan = job.plan;
     // Step 2: the digests, without mutex_, from host memory (a composed snapshot gives the digest of its flat copy).
     std::vector<StateDigest> digests(plan.blocks.size());
+    // A derived spill: its first trunk blocks are the base's blocks (same rows, same bytes), not hashed here.
+    std::vector<bool> derived(plan.blocks.size(), false);
+    if (!job.derive.base.empty() && !DeriveDigests(job, digests, derived)) return "result=refused reason=base";
     const std::string unhashed = StateParallel(plan.blocks.size(), options_.io_threads, [&](size_t index, StateBounce&) -> std::string {
-      digests[index] = DigestRanges(snapshot.bytes, plan.blocks[index].ranges);
+      if (!derived[index]) digests[index] = DigestRanges(snapshot.bytes, plan.blocks[index].ranges);
       return "";
     });
     if (!unhashed.empty()) return "result=refused reason=" + unhashed;  // memory, or lost
@@ -1334,6 +1447,7 @@ class StateDisk {
     StateMeta meta = job.meta;
     std::vector<StateBlockEntry> entries;
     meta.blocks.clear();
+    meta.digests = digests;
     for (size_t i = 0; i < plan.blocks.size(); ++i) {
       entries.push_back({digests[i], RangeBytes(plan.blocks[i].ranges), plan.blocks[i].ranges});
       meta.blocks.push_back(BlockName(meta.policy.tenant, digests[i], entries.back().bytes));
@@ -1356,6 +1470,7 @@ class StateDisk {
       for (size_t i = 0; i < entries.size(); ++i) {
         if (!seen.insert(meta.blocks[i]).second) continue;
         const auto found = blocks_.find(meta.blocks[i]);
+        if (found == blocks_.end() && derived[i]) return "result=refused reason=base";  // the base left meanwhile
         if (found == blocks_.end()) {
           fresh.push_back(i);
           write_bytes += BlockFileBytes(meta.policy.tenant, entries[i].digest, entries[i].bytes);
@@ -1450,6 +1565,8 @@ class StateDisk {
                   "hash_ms=%.1f pruned=%zu", (Now() - start) * 1e3, plan.whole ? "whole" : "blocks", entries.size(),
                   fresh.size(), entries.size() - fresh.size(),
                   static_cast<unsigned long long>(write_bytes), hash_ms, pruned);
+    if (!job.derive.base.empty())
+      return text + std::string(" derived=") + std::to_string(std::count(derived.begin(), derived.end(), true));
     return text;
   }
 

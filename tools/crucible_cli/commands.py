@@ -25,4 +25,6 @@ def output_text(repo, text):
         value = json.loads(text)
     except (ValueError, TypeError):
         return replace(text)
-    return json.dumps(replace(value))
+    if not isinstance(value, (dict, list)):
+        return replace(text)  # a plain line that is also a JSON scalar ("1", "null"): keep it as it is
+    return json.dumps(replace(value), indent=2 if "\n" in text else None, sort_keys=False)

@@ -4,7 +4,11 @@
 //   1. DecodeLane: every weight of every tile, bitwise, K2..K8 and K3.5.
 //   2. Decode GEMV: LinGemvKernel and LinPolicyKernel with MaxK 8 (K7, K8, and K3/K6 through the
 //      MaxK 8 dispatch), R 1/2/4/8, split S 1/2, cache policy 0/4; fp64 reference.
-//   3. Prefill dense GEMM: PrefillWideBody K7/K8, RM 2/4/8; fp64 reference.
+//   2b. Front order (p418-kernel; 4.18 loads its K8 dense groups in front order): LinPolicyKernel<R, 8, true>
+//      R 1/4 and the wide ring LinRingFlowKernel<Front, 8> (R 1, both tile orders, grids 3 and 80) bitwise equal
+//      to LinPolicyKernel<R, 8> on the engine-order tiles of the same matrix, K3/K6/K7/K8, split S 1/2.
+//   3. Prefill dense GEMM: PrefillWideBody K7/K8, RM 2/4/8; fp64 reference. 3b: PrefillGemmOutWideKernel
+//      with FRONT bitwise equal to the engine-order kernel, K7/K8, RM 2/4/8, S 1/2.
 //   4. Prefill MoE GEMM: PrefillMoeGemmKernel<RM, packed, KMAX 7|8> with K4, K5 and KMAX jobs in one
 //      launch (4.18: routed K4/K5 with a K8 shared expert), and KMAX kPrefillMoeK7Half with K3, K3.5
 //      and K7 jobs (3.18, 3.68); fp64 reference. The fp16 form (HALF) bit-equal to the fp16 of the
@@ -17,6 +21,8 @@
 #include "../bench/prefill_common.h"
 #include "../engine/layers/prefill_moe.h"
 #include "../engine/layers/moe_rows.h"
+#include "../engine/exl3/exl3_ring.h"
+#include "../engine/exl3/front_order.h"
 
 #include <cmath>
 #include <cstdio>
@@ -182,6 +188,79 @@ void GemvCases(int K) {
     }
 }
 
+// ---- 2b. Front order and the wide ring ----------------------------------------------------------------
+
+// The tiles of m in front order for split S (the loader's Trellis rule: tile (a, b) moves to FrontTile).
+std::vector<uint32_t> FrontTiles(const Mat& m, int S) {
+  const int A = m.I / 16, B = m.O / 16, T = TileDwords(m.K);
+  std::vector<uint32_t> f(m.tiles.size());
+  for (int b = 0; b < B; ++b)
+    for (int a = 0; a < A; ++a)
+      std::memcpy(&f[FrontTile(b, a, A, B, S) * T], &m.tiles[((size_t)b * A + a) * T], T * 4);
+  return f;
+}
+
+// form 0: LinPolicyKernel<R, 8> engine order (the reference); 1: LinPolicyKernel<R, 8, true> front order;
+// 2, 3: LinRingFlowKernel<false | true, 8> (R 1). The split partials as raw bits.
+template <int R>
+std::vector<uint32_t> GemvForm(const Mat& m, const std::vector<__half>& x, int S, int cache, int form, int grid) {
+  const bool front = form == 1 || form == 3;
+  Buffer<uint32_t> dt(front ? FrontTiles(m, S) : m.tiles);
+  Buffer<__half> dx(x);
+  Buffer<float> partial((size_t)S * R * m.O);
+  partial.Nan();
+  LinJob j{};
+  j.tiles = dt.p;
+  j.xh = dx.p;
+  j.partial = partial.p;
+  j.cache_policy = cache;
+  j.I = m.I; j.O = m.O; j.K = m.K; j.S = S; j.R = R;
+  Buffer<LinJob> dj(std::vector<LinJob>{j});
+  std::vector<GemvItem> items;
+  for (int s = 0; s < S; ++s)
+    for (int b = 0; b < m.O / 16; b += 8) items.push_back({0, s, b, 8});
+  Buffer<GemvItem> di(items);
+  const int n = (int)items.size(), words = (int)(m.I / 16 / S * 8);
+  const size_t lds = (size_t)R * (m.I / 16 / S) * 32;
+  if (form == 0) LinPolicyKernel<R, kMaxWideDecodeK><<<n, 256, lds>>>(dj.p, di.p, n, false, false);
+  else if (form == 1) LinPolicyKernel<R, kMaxWideDecodeK, true><<<n, 256, lds>>>(dj.p, di.p, n, false, false);
+  else if constexpr (R == 1) {
+    if (form == 2)
+      LinRingFlowKernel<false, kMaxWideDecodeK><<<std::min(grid, n), 320, 2 * lds>>>(dj.p, di.p, n, words, false, false);
+    else
+      LinRingFlowKernel<true, kMaxWideDecodeK><<<std::min(grid, n), 320, 2 * lds>>>(dj.p, di.p, n, words, false, false);
+  }
+  CheckLaunch();
+  const auto raw = partial.Get();
+  std::vector<uint32_t> bits(raw.size());
+  std::memcpy(bits.data(), raw.data(), raw.size() * 4);
+  return bits;
+}
+
+void FrontGemvCases(int K) {
+  const Mat m = RandomMat(512, 256, K, 400 + K);
+  static const char* names[] = {"", "gemv-policy-front", "gemv-ring8-engine", "gemv-ring8-front"};
+  for (const int S : {1, 2})
+    for (const int cache : {0, 4}) {
+      const auto x1 = Half(Random((size_t)m.I, .1f, 31 + S)), x4 = Half(Random((size_t)4 * m.I, .1f, 41 + S));
+      const auto ref1 = GemvForm<1>(m, x1, S, cache, 0, 0), ref4 = GemvForm<4>(m, x4, S, cache, 0, 0);
+      for (const int form : {1, 2, 3})
+        for (const int grid : {3, 80}) {
+          if (form == 1 && grid != 80) continue;
+          const bool same = GemvForm<1>(m, x1, S, cache, form, grid) == ref1;
+          Report(same, names[form], K, 1, S, cache * 100 + grid, same ? 0. : 1.);
+        }
+      const bool same4 = GemvForm<4>(m, x4, S, cache, 1, 0) == ref4;
+      Report(same4, names[1], K, 4, S, cache, same4 ? 0. : 1.);
+    }
+  // A mutant (one flipped tile word in the front copy) must differ: the check reads the tiles it compares.
+  const auto x = Half(Random((size_t)m.I, .1f, 77));
+  Mat bad = m;
+  bad.tiles[5] ^= 0x10000u;
+  const bool differs = GemvForm<1>(bad, x, 1, 0, 3, 80) != GemvForm<1>(m, x, 1, 0, 0, 0);
+  Report(differs, "gemv-ring8-front mutant differs", K, 1, 1, 0, differs ? 0. : 1.);
+}
+
 // ---- 3. Prefill dense GEMM ---------------------------------------------------------------------------
 
 std::vector<__half> PackX(const std::vector<__half>& x, int M, int I) {
@@ -216,6 +295,43 @@ void PrefillCase(const Mat& m, int M) {
   Report(e < 1e-5, "prefill-dense", K, RM, M, 0, e);
 }
 
+// PrefillGemmOutWideKernel (the engine's fused K7/K8 output GEMM, kEpiStore) in engine order, or in front
+// order for split S; the output rows as raw bits.
+template <int K, int RM, bool FRONT>
+std::vector<uint32_t> PrefillOutWide(const Mat& m, const std::vector<__half>& x, int M, int S) {
+  Buffer<uint32_t> dt(FRONT ? FrontTiles(m, S) : m.tiles);
+  Buffer<__half> dx(PackX(x, M, m.I));
+  Buffer<__half> svh(Half(Random((size_t)m.O, 1.f, 61)));
+  Buffer<float> y((size_t)M * m.O);
+  y.Nan();
+  LinJob L{};
+  L.svh = svh.p;
+  L.dst = y.p;
+  L.ldd = m.O;
+  L.epi = kEpiStore;
+  L.I = m.I; L.O = m.O; L.K = K; L.R = M; L.S = 1;
+  Buffer<LinJob> dl(std::vector<LinJob>{L});
+  Buffer<Exl3GemmJob> dj(std::vector<Exl3GemmJob>{{dt.p, dx.p, nullptr, nullptr, m.I, m.O, M, 1, K, M, FRONT ? S : 0}});
+  std::vector<Exl3GemmItem> items;
+  for (int r = 0; r < M; r += 16 * RM)
+    for (int b = 0; b < m.O / 16; b += kFusedWaves) items.push_back({0, 0, r, b});
+  Buffer<Exl3GemmItem> di(items);
+  PrefillGemmOutWideKernel<RM, 2, true, K, FRONT><<<items.size(), 32 * kFusedWaves / 2>>>(dl.p, dj.p, di.p,
+                                                                                       (int)items.size());
+  CheckLaunch();
+  const auto raw = y.Get();
+  std::vector<uint32_t> bits(raw.size());
+  std::memcpy(bits.data(), raw.data(), raw.size() * 4);
+  return bits;
+}
+
+template <int K, int RM>
+void PrefillFrontCase(const Mat& m, int M, int S) {
+  const auto x = Half(Random((size_t)M * m.I, .1f, 23 + M));
+  const bool same = PrefillOutWide<K, RM, true>(m, x, M, S) == PrefillOutWide<K, RM, false>(m, x, M, S);
+  Report(same, "prefill-out-wide-front", K, RM, M, S, same ? 0. : 1.);
+}
+
 template <int K>
 void PrefillCases() {
   const Mat m = RandomMat(256, 128, K, 300 + K);
@@ -223,6 +339,11 @@ void PrefillCases() {
     PrefillCase<K, 2>(m, M);
     PrefillCase<K, 4>(m, M);
     PrefillCase<K, 8>(m, M);
+    for (const int S : {1, 2}) {
+      PrefillFrontCase<K, 2>(m, M, S);
+      PrefillFrontCase<K, 4>(m, M, S);
+      PrefillFrontCase<K, 8>(m, M, S);
+    }
   }
 }
 
@@ -419,6 +540,7 @@ int main() {
   DecodeCase<2>(); DecodeCase<3>(); DecodeCase<4>(); DecodeCase<5>();
   DecodeCase<6>(); DecodeCase<7>(); DecodeCase<8>(); DecodeCase<35>();
   for (const int K : {3, 6, 7, 8}) GemvCases(K);
+  for (const int K : {3, 6, 7, 8}) FrontGemvCases(K);
   PrefillCases<7>();
   PrefillCases<8>();
   MoeCases<7>();

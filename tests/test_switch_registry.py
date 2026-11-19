@@ -10,7 +10,7 @@ import switch_registry as reg
 
 REGISTRY = 'engine/switches.h'
 # Every function that takes a SwitchName. A literal name passed to one of them is a read of that switch.
-READERS = r'\b(?:SwitchText|RowPolicyInt|EnvOn|Numerics(?:Env|Int|On|DefaultOn))\(\s*"([A-Z0-9_]+)"'
+READERS = r'\b(?:SwitchText|RowPolicyInt|EnvOn|Numerics(?:Env|Int|On|DefaultOn|DefaultInt))\(\s*"([A-Z0-9_]+)"'
 
 
 def sources():
@@ -72,7 +72,7 @@ class RegistryTests(unittest.TestCase):
         # Cheap partial check: integer fallbacks of RowPolicyInt/NumericsInt, and opt-ins read by NumericsOn/EnvOn.
         text = '\n'.join(body for _, body in sources())
         checked = 0
-        for name, value in re.findall(r'\b(?:RowPolicyInt|NumericsInt)\(\s*"(CRUCIBLE_[A-Z0-9_]+)",\s*(-?\d+)\s*,', text):
+        for name, value in re.findall(r'\b(?:RowPolicyInt|NumericsInt|NumericsDefaultInt)\(\s*"(CRUCIBLE_[A-Z0-9_]+)",\s*(-?\d+)\s*,', text):
             if self.by_name[name].default.lstrip('-').isdigit():
                 self.assertEqual(self.by_name[name].default, value, name)
                 checked += 1

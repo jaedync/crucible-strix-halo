@@ -3,6 +3,7 @@
 Notifier sends text datagrams to NOTIFY_SOCKET. Watchdog is a thread that feeds the systemd watchdog only while the
 engine and the HTTP loop make progress, and that ends the server when the engine has stopped (exit code 3)."""
 import os
+import signal
 import socket
 import sys
 import threading
@@ -88,6 +89,44 @@ def proc_state(pid):
         return None
 
 
+GENERIC_FATAL = "The engine stopped. Check its stderr log."  # backend.py: the engine closed its output
+
+
+def _exit_code(process, seconds=2.0):
+    """The exit code of the engine process: it closed its output, so it exits now. None when it still runs."""
+    if process is None:
+        return None
+    try:
+        return process.wait(timeout=seconds)
+    except Exception:   # still running (TimeoutExpired), or a stand-in without wait
+        return process.poll() if hasattr(process, "poll") else None
+
+
+def engine_stopped_line(backend, port, systemd=False):
+    """The one log line of an engine death (E3). It names the exit code, or the signal of a killed engine: the kernel
+    out-of-memory killer sends SIGKILL, and the engine then writes nothing itself."""
+    why = []
+    fatal = getattr(backend, "fatal", None)
+    if isinstance(fatal, str) and fatal and fatal != GENERIC_FATAL:
+        why.append(fatal.rstrip("."))
+    code = _exit_code(getattr(backend, "process", None))
+    if isinstance(code, int) and code < 0:
+        try:
+            name = signal.Signals(-code).name
+        except ValueError:
+            name = "unknown"
+        why.append(f"killed by signal {-code}, {name}")
+        if -code == signal.SIGKILL:
+            why.append("the kernel out-of-memory killer sends this signal: see journalctl -k | grep -i 'out of memory'")
+    elif isinstance(code, int):
+        why.append(f"exit code {code}")
+    then = ("systemd starts it again. To keep it stopped, use the stop command of the launcher; do not kill the engine."
+            if systemd else "Check the server log before you start it again.")
+    where = f" frees port {port}" if port else " frees its port"
+    return (f"The engine stopped ({'; '.join(why) or 'no reason given'}). The server exits with code 3 and{where}. "
+            f"The engine lines above give the cause. {then}")
+
+
 class Watchdog:
     """Feeds WATCHDOG=1 each watchdog_seconds / 3 while the engine and the HTTP loop make progress.
 
@@ -122,7 +161,8 @@ class Watchdog:
         now = self.clock()
         backend = self.backend
         if backend.fatal:
-            self.log("The engine stopped. The server exits and frees its port. Check the server log before you start it again.")
+            self.log(engine_stopped_line(backend, getattr(self.server, "server_port", None),
+                                         getattr(self.notifier, "enabled", False)))
             self.notifier.send(f"STATUS=engine stopped: {backend.fatal}")
             self.fatal_exit = True
             self.server.shutdown()

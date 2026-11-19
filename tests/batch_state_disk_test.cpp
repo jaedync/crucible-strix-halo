@@ -468,6 +468,40 @@ void ReadQueueRule() {
   assert(queue.Missed(idle) == std::make_pair(uint64_t(2), size_t(16)) && queue.Missed(idle).first == 0);
 }
 
+// Start plan B3 (L4; the fuzz seed L4 of tests/state_machine_fuzz_test.cpp): with the disk tier, the next turn's read may
+// take the live host point of any session that is not in a slot, not only of a session that waits behind it. The point
+// goes to the disk (or is there already), so its own turn reads it back in about a second; the read is a cold prefill
+// of 100K tokens or more otherwise. The rules that stay: only the next turn (position 0) takes a point, never a prefix
+// of its own prompt, and a point whose spill the disk refuses stays (MakeRoom "spill").
+void ReadMayTakeAnIdlePoint() {
+  BatchReadQueue queue;
+  const auto shared = Tokens(1, 8);
+  auto with = [&](int first) { auto key = shared; for (int i = 0; i < 12; ++i) key.push_back(first + i); return key; };
+  const auto reader = with(100), idle = with(400);
+  const auto point = [](const std::vector<int>& key) { return std::span<const int>(key).first(16); };
+  queue.Saw(reader, 0, 10);
+  assert(!queue.Behind(point(idle), reader, 0, 20));      // the old rule: an idle session's point stays
+  assert(queue.MayTake(point(idle), reader, 0));          // B3: it may go to the disk for the read
+  assert(!queue.MayTake(point(idle), reader, 1));         // a reader that is not next takes nothing
+  assert(!queue.MayTake(point(reader), reader, 0));       // the reader's own state
+  assert(!queue.MayTake(shared, reader, 0));              // a prefix that the reader shares
+}
+
+// b3-fix (soak spb3d-n6b, Nov 10: 5 lost turns): the host point of a session in a slot (the restore source of a
+// running turn, or a point below a slot's idle tail) may leave for a read through the disk, if the disk can hold it
+// (min_tokens or more). The old rule kept every in-slot point, and two of them filled the host entry budget.
+void ReadTakesAPointInASlotThroughTheDisk() {
+  BatchReadQueue queue;
+  constexpr size_t kMin = 16384;
+  const std::vector<int> reader = Tokens(1, kMin + 64), slot = Tokens(5000000, kMin + 64);
+  const std::span<const int> point(slot);
+  assert(queue.MayTakeFor(point.first(kMin), reader, 0, true, kMin));       // in a slot, long enough: it may leave
+  assert(!queue.MayTakeFor(point.first(kMin - 1), reader, 0, true, kMin));  // below the disk minimum: it stays
+  assert(queue.MayTakeFor(point.first(kMin - 1), reader, 0, false, kMin));  // not in a slot: MayTake decides
+  assert(!queue.MayTakeFor(std::span<const int>(reader).first(kMin), reader, 0, true, kMin));  // the reader's prefix
+  assert(!queue.MayTakeFor(point.first(kMin), reader, 1, true, kMin));      // a reader that is not next takes nothing
+}
+
 // Fix 2 (cause.md items 1, 2, 5): the turn of a session whose slot state went straight to disk a moment before (the
 // daily slot-3 turn of Oct 21, request 832; the same-second case) finds that state while it waits for the writer or
 // while the writer writes it: Stage says Reading "writing", and the poll after the write reads the bytes that Save
@@ -604,6 +638,69 @@ void ReadVictimSkipsQueueLimit() {
   assert(!tier.Spill(ds->hist, Policy(), d_entry, 1, true) && tier.LastSpill() == "memory");
   release.set_value();
   assert(tier.Drain(30) && tier.Disk().Present(cs->hist, Policy(), false));
+}
+
+// Start plan B3 (a load test: `host_evict ... disk=refused spill=memory kept=1`, then `stage ... reason=room`, then
+// a cold 125K prefill). A read's victim is in host memory already, and the read waits until the writer frees it
+// (ReadRoom Wait). So the victim's room is the memory above the reserve with the victim's own bytes; the read's bytes
+// do not cut it. On the base the hook got available - reserve (32 of the victim's 64): the spill was refused for
+// memory, the point stayed (kept=1) and the read was refused.
+void ReadVictimRoomLeavesOutTheRead() {
+  const auto a = Tokens(4001, 20), b = Tokens(4101, 20);
+  constexpr uint64_t reserve = 1000;
+  Cache cache(64 * 2, {}, 2, reserve, false);
+  std::vector<uint64_t> rooms;
+  cache.SetSpill([&](std::span<const int>, const ConversationPolicy&, const std::shared_ptr<const Cache::Entry>& entry,
+                     int, uint64_t room) {
+    rooms.push_back(room);
+    return room >= 64;  // the disk rule (StateDisk::Spill): the held bytes must fit the room
+  });
+  assert(Capture(cache, a, 16) && Capture(cache, b, 16));
+  const auto only_b = [&](std::span<const int> key) { return std::equal(key.begin(), key.end(), b.begin()); };
+  const auto report = [](std::span<const int>, size_t, bool spilled) { return spilled; };
+  // MemAvailable is 32 bytes above the reserve: the read of 64 needs b's 64 bytes, which the writer frees.
+  assert(cache.MakeRoom(64, reserve + 32, only_b, report));
+  assert((rooms == std::vector<uint64_t>{32 + 64}));
+  assert(!cache.Find(b, Policy(), 19, 19, 8) && cache.Find(a, Policy(), 19, 19, 8));
+  // MemAvailable below the reserve: the eviction cannot give the read its room, and nothing leaves.
+  assert(Capture(cache, b, 16));
+  rooms.clear();
+  assert(!cache.MakeRoom(64, reserve - 16, only_b, report) && rooms.empty());
+  assert(cache.Find(b, Policy(), 19, 19, 8));
+}
+
+// Start plan B3 (a load test: `stage ... reason=protected` for 9 to 10 polls, then a cold 124K prefill): a live
+// resume point whose state is on the disk already may leave for a read. Its eviction loses nothing (its own turn reads
+// it back), and no write is needed. A live point with no disk copy stays protected, and a save never takes either.
+void ReadTakesAProtectedPointOnDisk() {
+  const auto a = Tokens(4301, 20), b = Tokens(4401, 20), c = Tokens(4501, 20);
+  Cache cache(64 * 2, {}, 2, 0, false);  // two live resume points fill the budget; no probation
+  std::vector<size_t> spilled;
+  cache.SetSpill([&](std::span<const int> key, const ConversationPolicy&, const std::shared_ptr<const Cache::Entry>&, int,
+                     uint64_t) {
+    spilled.push_back(key.size());
+    return false;  // "present": the disk holds the state, nothing is queued
+  });
+  const auto is_b = [&](std::span<const int> key) { return std::equal(key.begin(), key.end(), b.begin()); };
+  bool b_on_disk = false;
+  cache.SetDurable([&](std::span<const int> key, const ConversationPolicy&) { return is_b(key) && b_on_disk ? 1 : -1; });
+  assert(Capture(cache, a, 16) && Capture(cache, b, 16));
+  const uint64_t memory = uint64_t(64) << 30;
+  const auto nobody = [](std::span<const int>) { return false; };  // no session waits behind the reader
+  std::vector<std::pair<size_t, bool>> taken;
+  const auto report = [&](std::span<const int> key, size_t, bool queued) {
+    taken.emplace_back(key.size(), queued);
+    return queued || (is_b(key) && b_on_disk);  // batched_serve.h Stage: out = spilled || disk Holds
+  };
+  // No disk copy: both points are protected, as on the base.
+  assert(!cache.MakeRoom(64, memory, nobody, report) && std::string_view(cache.LastRefusal()) == "protected");
+  assert(taken.empty() && cache.Find(a, Policy(), 19, 19, 8) && cache.Find(b, Policy(), 19, 19, 8));
+  // b's state is on the disk: b's point leaves for the read, a stays.
+  b_on_disk = true;
+  assert(!Capture(cache, c, 16) && std::string_view(cache.LastRefusal()) == "protected");  // a save never takes it
+  assert(cache.MakeRoom(64, memory, nobody, report));
+  assert((taken == std::vector<std::pair<size_t, bool>>{{16, false}}));
+  assert(!cache.Find(b, Policy(), 19, 19, 8) && cache.Find(a, Policy(), 19, 19, 8));
 }
 
 // Fix 2 (cause.md item 6; GPU test 217): while an open holds its prompt, the entries that its restore may use never
@@ -807,7 +904,44 @@ void HandoverDrainBound() {
   }
 }
 
+// Part B: the tier's checks before the device copy of a fork point. No copy when the tail
+// that the point derives from is neither on disk nor queued ("base"), when the point is on disk, or when it is too
+// short. The fork floor is the longest written or queued state that the key starts.
+void ForkPointChecks() {
+  auto options = Options();
+  options.root = Home() / "states-fork";
+  Tier tier(options, false);
+  const auto ids = Tokens(1001, 60);
+  const std::span<const int> tail(ids.data(), 50), point(ids.data(), 30);
+  int saves = 0;
+  const auto save = [&] { ++saves; return Make(point, true, 0); };
+  assert(tier.SpillFork(point, Policy(), false, tail, true, 1, 100, UINT64_MAX, save) == "base" && saves == 0);
+  assert(tier.SpillFork(std::span<const int>(ids.data(), 8), Policy(), false, tail, true, 1, 100, UINT64_MAX, save) == "short");
+  assert(tier.ForkFloor(point, Policy()) == 0);
+  const auto low = Make(std::span<const int>(ids.data(), 20), true, 0), base = Make(tail, true, 0);
+  assert(tier.Disk().Spill(low->hist, Policy(), false, false, false, low, *low).empty() && tier.Drain(30));
+  assert(tier.ForkFloor(point, Policy()) == 20 && tier.ForkFloor(tail, Policy()) == 20);
+  assert(tier.Disk().Spill(base->hist, Policy(), false, false, false, base, *base).empty() && tier.Drain(30));
+  assert(tier.ForkFloor(point, Policy()) == 20);
+  // M1: a tail that is on disk but that this release did not queue may hold the bytes of another
+  // computation of the same tokens (a retry after another restore point). The fork point must not derive from it.
+  const size_t entries = tier.Disk().Entries();
+  assert(tier.SpillFork(point, Policy(), false, tail, false, 1, 100, UINT64_MAX, save) == "base" && saves == 0);
+  assert(tier.Drain(30) && tier.Disk().Entries() == entries && !tier.Disk().Present(point, Policy(), false));
+  // M2: a copy that throws (SaveDerived and SplitAtSources throw logic_error) loses the point; it does not throw.
+  const auto broken = [&]() -> std::shared_ptr<const Snapshot> { ++saves; throw std::logic_error("fork copy"); };
+  assert(tier.SpillFork(point, Policy(), false, tail, true, 1, 100, UINT64_MAX, broken) == "fault" && saves == 1);
+  saves = 0;
+  // The tail is on disk: the checks pass and the copy runs (this test geometry has no full block: SpillDerived refuses).
+  assert(tier.SpillFork(point, Policy(), false, tail, true, 1, 100, 99, save) == "memory" && saves == 0);
+  assert(tier.SpillFork(point, Policy(), false, tail, true, 1, 100, UINT64_MAX, save) == "policy" && saves == 1);
+  const auto whole = Make(point, true, 0);
+  assert(tier.Disk().Spill(whole->hist, Policy(), false, false, false, whole, *whole).empty() && tier.Drain(30));
+  assert(tier.SpillFork(point, Policy(), false, tail, true, 1, 100, UINT64_MAX, save) == "present" && saves == 1);
+}
+
 int main() {
+  ForkPointChecks();
   HandoverDrainBound();
   const auto x = Tokens(1, 40), y = Tokens(101, 40), z = Tokens(201, 40), w = Tokens(301, 40);
   std::shared_ptr<const Snapshot> x_tail;
@@ -890,10 +1024,14 @@ int main() {
   MakeRoomForRead();
   MakeRoomKeepsFree();
   ReadQueueRule();
+  ReadMayTakeAnIdlePoint();
+  ReadTakesAPointInASlotThroughTheDisk();
   StageWaitsForWriter();
   WriteDelay();
   ReadAheadKeptOnRefusal();
   ReadVictimSkipsQueueLimit();
+  ReadVictimRoomLeavesOutTheRead();
+  ReadTakesAProtectedPointOnDisk();
   HoldKeepsPromptEntries();
   HoldSendsReleasedTailToDisk();
   TailTakesPrefixQueuePlace();

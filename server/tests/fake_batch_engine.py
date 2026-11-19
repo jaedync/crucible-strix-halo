@@ -24,9 +24,27 @@ if os.environ.get("FAKE_IGNORE_TERM") == "1":
     import signal
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 disk_file = os.environ.get("FAKE_DISK_FILE")
+# FAKE_PID_FILE: the engine writes its process ID there (a test watches or stops the engine itself).
+if os.environ.get("FAKE_PID_FILE"):
+    with open(os.environ["FAKE_PID_FILE"], "w") as pid_file: pid_file.write(str(os.getpid()))
 ready = dict(event="ready", context=contexts[0], streams=len(contexts), prefill_rows=rows, slot_contexts=contexts,
              protocol="batch-v1", cache_tail=True, model=dict(arch="qwen4_exp", vocab=248320, eos=248044, layers=48, hidden=2560))
 if state_disk: ready["state_disk"] = True
+# FAKE_FIT=STEP (cache, streams or context): the engine's start-time memory fit changed the layout (memory stage 2,
+# engine/serve/batched_serve.h BatchFitJson). The requested values come from the arguments; FAKE_SLOT_CONTEXTS is the
+# fitted layout and FAKE_FIT_CACHE_MIB the fitted cache budget. FAKE_FIT_REQUESTED=JSON replaces the requested object.
+# FAKE_ARGV_LOG=FILE: the engine writes its arguments there (the server's engine command line).
+if os.environ.get("FAKE_ARGV_LOG"):
+    with open(os.environ["FAKE_ARGV_LOG"], "w") as argv_log: json.dump(sys.argv[1:], argv_log)
+if os.environ.get("FAKE_FIT"):
+    def argument(name, default):
+        return int(sys.argv[sys.argv.index(name) + 1]) if name in sys.argv else default
+    requested = dict(streams=argument("--streams", 1), context=argument("--ctx", 32768),
+                     cache_mib=argument("--conversation-cache-mib", 0))
+    if os.environ.get("FAKE_FIT_REQUESTED"): requested = json.loads(os.environ["FAKE_FIT_REQUESTED"])
+    ready["fit"] = dict(step=os.environ["FAKE_FIT"], requested=requested,
+                        cache_mib=int(os.environ.get("FAKE_FIT_CACHE_MIB", requested["cache_mib"])),
+                        free_bytes=70 << 30, need_bytes=80 << 30)
 # FAKE_ABLATE_REQUEST=1: the engine was started in request mode (CRUCIBLE_ABLATE_MODE=request).
 if os.environ.get("FAKE_ABLATE_REQUEST") == "1": ready["ablate_request"] = 1
 line_limit = int(os.environ.get("FAKE_LINE_LIMIT", "0"))
@@ -50,6 +68,7 @@ command_seconds = float(os.environ.get("FAKE_COMMAND_SECONDS", "0"))
 stage_full = os.environ.get("FAKE_STAGE_FULL") == "1"
 disk = json.load(open(disk_file)) if state_disk and disk_file and os.path.exists(disk_file) else []
 stage_polls = {}
+pending_opens = {}
 staged = {}
 finished_prompts = []
 active = {}
@@ -170,6 +189,31 @@ def step_counts(state, proposed, accepted):
     return dict(zip(("draft_proposed", "draft_accepted", "spec_steps"), counts)) if live_drafts else {}
 
 
+# FAKE_DEAD_END=T: a request whose prompt ends on token T has no legal token once FAKE_DEAD_END_AFTER (default 1) of
+# its tokens are out, in a command of kind FAKE_DEAD_END_OP (step, verify_step, spec_step, prefill or part, the
+# decode pass of an interleaved prefill; default any). As engine/serve/batch_session.h EndDeadEnd: one recoverable
+# error event in place of the next token, no done event, and the slot is free; the peers of the command go on.
+DEAD_END = "constraint_dead_end: the grammar has no legal token"
+dead_token = int(os.environ.get("FAKE_DEAD_END", "-1"))
+dead_after = int(os.environ.get("FAKE_DEAD_END_AFTER", "1"))
+dead_op = os.environ.get("FAKE_DEAD_END_OP", "")
+# FAKE_DEAD_END_MODE sends the dead end outside the protocol: "output-after" (a token of the request after its error),
+# "generation" (a stale slot generation).
+dead_mode = os.environ.get("FAKE_DEAD_END_MODE", "")
+
+
+def dead_end(id, state, where):
+    """The events of a request that reached its dead end (FAKE_DEAD_END) in a command of kind `where`, else None."""
+    if state["request"]["ids"][-1] != dead_token or state["count"] < dead_after or dead_op not in ("", where):
+        return None
+    del active[id]
+    generation = state["generation"] + (dead_mode == "generation")
+    failed = [dict(event="error", request_id=id, slot_generation=generation, error=DEAD_END, recoverable=True)]
+    if dead_mode == "output-after":
+        failed.append(dict(event="token", request_id=id, slot_generation=state["generation"], id=state["token"] + 1))
+    return failed
+
+
 def done_event(id, state):
     if state_disk: finished_prompts.append(list(state["request"]["ids"]))
     event = dict(event="done", request_id=id, slot_generation=state["generation"],
@@ -245,6 +289,16 @@ for line in sys.stdin:
     rejected = int(os.environ.get("FAKE_REJECT_TOKEN", "-1"))
     has_rejected = command["request"]["ids"][-1] == rejected if op == "open" else any(
         id in active and active[id]["request"]["ids"][-1] == rejected for id in selected)
+    # FAKE_PENDING_TOKEN: an open whose prompt ends on this token is refused as constraint_pending (the grammar is
+    # still compiling, engine/runtime/constraint_vocab.h ServeConstraintFactory) FAKE_PENDING_OPENS times, then opens.
+    if op == "open" and command["request"]["ids"][-1] == int(os.environ.get("FAKE_PENDING_TOKEN", "-1")):
+        key = tuple(command["request"]["ids"])
+        pending_opens[key] = pending_opens.get(key, 0) + 1
+        if pending_opens[key] <= int(os.environ.get("FAKE_PENDING_OPENS", "3")):
+            print(json.dumps(dict(event="error", error="constraint_pending: the grammar is not compiled yet",
+                                  recoverable=True)), flush=True)
+            print(json.dumps(dict(event="batch_end", op=op)), flush=True)
+            continue
     if op == error_op and has_rejected:
         error = dict(event="error", error=os.environ.get("FAKE_REJECT_TEXT", "fixture request rejected"))
         if rejection_mode != "missing-field":
@@ -285,6 +339,10 @@ for line in sys.stdin:
             part = []
             for id in list(live):
                 decoder = active[id]
+                if failed := dead_end(id, decoder, "part"):
+                    part.extend(failed)
+                    live.remove(id)
+                    continue
                 decoder["token"] += 1
                 decoder["count"] += 1
                 part.append(dict(event="token", request_id=id, slot_generation=decoder["generation"], id=decoder["token"]))
@@ -337,6 +395,9 @@ for line in sys.stdin:
         state = active[id]
         counts = step_counts(state, 3, 2)
         for _ in range(3):
+            if failed := dead_end(id, state, op):
+                events.extend(failed)
+                break
             state["token"] += 1
             state["count"] += 1
             events.append(dict(event="token", request_id=id, slot_generation=state["generation"], id=state["token"]) |
@@ -393,6 +454,9 @@ for line in sys.stdin:
             speculative = op == "verify_step" and state["request"]["spec"] > 0 and state["request"]["max_tokens"] > 1
             counts = step_counts(state, 2, 1) if speculative else {}
             for _ in range(2 if speculative else 1):
+                if failed := dead_end(id, state, op):
+                    events.extend(failed)
+                    break
                 state["token"] += 1
                 state["count"] += 1
                 events.append(dict(event="token", request_id=id, slot_generation=state["generation"], id=state["token"]) |

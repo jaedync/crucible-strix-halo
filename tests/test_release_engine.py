@@ -17,6 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
+import release_engine  # noqa: E402
 from crucible_cli import release  # noqa: E402
 
 TOOL = ROOT / "tools/release_engine.py"
@@ -51,9 +52,7 @@ class Fixture(unittest.TestCase):
         binary = Path(binary)
         if binary.exists():
             sha = sha or sha256_file(binary)
-            values = {"gpu_arch": "gfx1151", "hipflags": "-O3", "cppflags": "", "ldflags": "", "ldlibs": "-pthread",
-                      "rocm_path": "/opt/rocm", "hipcc_compile_flags_append": "", "hipcc_link_flags_append": "",
-                      "hip_clang_path": "", "hip_device_lib_path": "", "hipcc_version": "HIP version: 7.2.0", **(flags or {})}
+            values = {**release_engine.DEFAULT_FLAGS, "hipcc_version": "HIP version: 7.2.0", **(flags or {})}
             lines = [f"commit {commit}", f"dirty {dirty}", f"binary_sha256 {sha}"] + [f"{k} {v}" for k, v in values.items() if k not in drop]
             Path(str(binary) + ".build-info").write_text("\n".join(lines) + "\n")
 
@@ -217,6 +216,25 @@ class LibraryListTest(Fixture):
             self.assertEqual(self.tool(*self.release_args(binary, d, "--rocm-path", str(rocm))).returncode, 0)
         self.assertEqual((a / "SHA256SUMS").read_text(), (b / "SHA256SUMS").read_text())
 
+    def strix_machine(self):
+        """The read-only machine checks of install.sh see a Strix Halo machine with a free disk, not the test host
+        (the test machine and CI have no gfx1151 GPU, less memory and a small /tmp)."""
+        proc, sys_dir, shims = self.t / "machine/proc", self.t / "machine/sys", self.t / "shims"
+        proc.mkdir(parents=True)
+        (proc / "meminfo").write_text("MemTotal:       130000000 kB\nMemAvailable:   65000000 kB\n")
+        card = sys_dir / "class/drm/card0/device"
+        card.mkdir(parents=True)
+        (card / "mem_info_gtt_total").write_text("133000000000\n")
+        node = sys_dir / "class/kfd/kfd/topology/nodes/1"
+        node.mkdir(parents=True)
+        (node / "properties").write_text("cpu_cores_count 0\ngfx_target_version 110501\n")
+        shims.mkdir()
+        df = shims / "df"
+        df.write_text('#!/bin/sh\nprintf "Filesystem 1024-blocks Used Available Capacity Mounted on\\n"\n'
+                      'printf "fake 9999999999 0 999999999 1%% /\\n"\n')
+        df.chmod(0o755)
+        return proc, sys_dir, shims
+
     def test_the_release_files_install_with_install_sh(self):
         binary, rocm = self.world()
         out = self.t / "dist"
@@ -243,10 +261,12 @@ class LibraryListTest(Fixture):
         home.mkdir()
         tty = self.t / "tty"
         tty.write_text("")
+        proc, sys_dir, shims = self.strix_machine()
         r = sh(["bash", str(ROOT / "install.sh"), "--yes"], stdin=subprocess.DEVNULL, start_new_session=True, env={
-            "HOME": str(home), "PATH": os.environ["PATH"], "CRUCIBLE_RELEASE_BASE": f"file://{out2}",
+            "HOME": str(home), "PATH": f"{shims}:{os.environ['PATH']}", "CRUCIBLE_RELEASE_BASE": f"file://{out2}",
             "CRUCIBLE_REPO_URL": f"file://{src}", "CRUCIBLE_TAG": TAG, "CRUCIBLE_DIR": str(home / "c"),
-            "CRUCIBLE_TTY": str(tty), "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"})
+            "CRUCIBLE_TTY": str(tty), "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null",
+            "CRUCIBLE_PROC": str(proc), "CRUCIBLE_SYS": str(sys_dir)})
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(sha256_file(home / "c/build/engine/crucible"), sha256_file(binary))
         self.assertIn("Libraries: all", r.stdout)
@@ -329,7 +349,9 @@ class BuildInfoTest(Fixture):
     def test_an_engine_built_with_other_flags_is_refused(self):
         for name, value, shown in (("hipflags", "-O0 -DLOCAL_EXPERIMENT", "HIPFLAGS"), ("cppflags", "-DX=1", "CPPFLAGS"),
                                    ("ldflags", "-L/tmp/x", "LDFLAGS"), ("ldlibs", "-pthread -lfoo", "LDLIBS"),
-                                   ("gpu_arch", "gfx1100", "GPU_ARCH")):
+                                   ("gpu_arch", "gfx1100", "GPU_ARCH"), ("cxx", "clang++", "CXX"),
+                                   ("xgr_defines", "-DXGRAMMAR_ENABLE_CPPTRACE=1 -DXGRAMMAR_LOG_CUSTOMIZE=1", "XGR_DEFINES"),
+                                   ("xgr_includes", "-I/tmp/other/include", "XGR_INCLUDES")):
             with self.subTest(name=name):
                 args = self.release_args(self.binary, self.t / "dist")
                 self.stamp(self.binary, flags={name: value})
@@ -339,7 +361,7 @@ class BuildInfoTest(Fixture):
                 self.assertFalse((self.t / "dist").exists())
 
     def test_an_engine_with_no_compile_settings_in_the_build_info_is_refused(self):
-        for drop in (("hipflags",), ("cppflags",), ("hipcc_version",)):
+        for drop in (("hipflags",), ("cppflags",), ("hipcc_version",), ("cxx",), ("xgr_defines",), ("xgr_includes",)):
             with self.subTest(drop=drop):
                 args = self.release_args(self.binary, self.t / "dist")
                 self.stamp(self.binary, drop=drop)
@@ -407,6 +429,27 @@ class StampTest(Fixture):
         text = Path(str(self.binary) + ".build-info").read_text()
         self.assertIn("hip_clang_path /tmp/other/clang\n", text)
         self.assertIn("hip_device_lib_path /tmp/other/lib\n", text)
+
+    def test_end_with_the_host_compiler_records_its_path_version_and_the_library_settings(self):
+        fake = self.t / "g++"
+        fake.write_text('#!/bin/sh\n[ "$1" = "--version" ] && echo "g++ (GCC) 15.2.1-fake"; echo "more"\n')
+        fake.chmod(0o755)
+        self.stamp("begin")
+        self.binary.write_bytes(b"engine")
+        r = self.tool("stamp", "end", "--binary", str(self.binary), "--repo", str(self.repo), "--hipcc", "/no/such/hipcc",
+                      "--cxx=g++", "--xgr-defines=-DA=0  -DB=1", "--xgr-includes=-Iinc -isystem x",
+                      env={**os.environ, "PATH": f"{self.t}{os.pathsep}{os.environ.get('PATH', '')}"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        info = self.info()
+        self.assertEqual((info["cxx"], info["cxx_path"], info["cxx_version"]), ("g++", str(fake), "g++ (GCC) 15.2.1-fake"))
+        self.assertEqual((info["xgr_defines"], info["xgr_includes"]), ("-DA=0 -DB=1", "-Iinc -isystem x"))
+
+    def test_a_host_compiler_that_cannot_run_gives_unknown(self):
+        self.stamp("begin")
+        self.binary.write_bytes(b"engine")
+        self.tool("stamp", "end", "--binary", str(self.binary), "--repo", str(self.repo), "--hipcc", "/no/such/hipcc", "--cxx=/no/such/g++")
+        info = self.info()
+        self.assertEqual((info["cxx_path"], info["cxx_version"]), ("unknown", "unknown"))
 
     def test_a_compiler_that_cannot_run_gives_unknown(self):
         self.stamp("begin")

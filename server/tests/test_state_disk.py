@@ -528,6 +528,34 @@ class StateDiskTest(unittest.TestCase):
         self.assertLessEqual(opened[0], 2 * batch_backend.STAGE_WAIT_SECONDS + 1)
         self.assertGreater(opened[0], batch_backend.STAGE_WAIT_SECONDS - 1)
 
+    def test_a_long_read_waits_up_to_its_cold_prefill_time(self):
+        """Start plan B3 (L15; Nov 2: waits of 40.7 to 114.3 s, then cold prefills of 76 to 91 s for prompts whose disk
+        states held 95% to 99% of them): a turn with a free slot waits for a read in progress as long as a cold prefill
+        of the read's tokens would take (STAGE_COLD_TOKENS_PER_S), never less than 2 * STAGE_WAIT_SECONDS and never more
+        than STAGE_WAIT_CAP_SECONDS. A wait longer than the cold prefill can never be better than the prefill."""
+        tokens = 150000
+        bound = tokens / batch_backend.STAGE_COLD_TOKENS_PER_S
+        self.assertGreater(bound, 2 * batch_backend.STAGE_WAIT_SECONDS)
+        self.assertLess(bound, batch_backend.STAGE_WAIT_CAP_SECONDS)
+        for done_at, opens_ready in ((bound - 5, True), (None, False)):
+            clock = [0.0]
+
+            def state(payload=None, done_at=done_at):
+                ready = done_at is not None and clock[0] >= done_at
+                return batch_backend.StageReply("ready" if ready else "reading", "-", tokens)
+
+            backend, job, opened = self.waiting_backend(state, clock)
+            backend._stage = lambda payload, *args: state(payload)
+            backend.free_contexts.append(200000)
+            with patch.object(batch_backend.time, "monotonic", side_effect=lambda: clock[0]):
+                while not opened and clock[0] < 500:
+                    backend._admit()
+                    clock[0] += 0.25
+            self.assertTrue(opened)
+            self.assertEqual(job.turn["state_disk"] == "ready", opens_ready)
+            if opens_ready: self.assertLess(opened[0], bound)
+            else: self.assertTrue(bound < opened[0] <= bound + 1, (opened, bound))
+
     def test_stop_fits_the_service_stop_time(self):
         """A service unit stops with TimeoutStopSec=120. The engine flushes for at most 75 s, the server
         waits a little longer, then kills it (a tier engine waits after SIGTERM)."""

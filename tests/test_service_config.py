@@ -159,6 +159,15 @@ class UserEnvWinsTest(unittest.TestCase):
         for key, value in self.USER.items():
             self.assertEqual(got[key], value, key)
 
+    def test_the_lenient_fields_word_of_the_caller_reaches_the_server(self):
+        # CHANGELOG and docs/OPENAI_CLIENTS.md: the launcher has no lenient option, so the word of the caller (a shell
+        # for ./crucible start, a unit drop-in for serve.sh) must reach the server on both paths.
+        env, argv = launch.server_command(self.settings(), "py")
+        self.assertNotIn("--lenient-fields", argv)
+        self.assertNotIn("CRUCIBLE_LENIENT_FIELDS", env)
+        self.assertEqual(launch.process_env({"CRUCIBLE_LENIENT_FIELDS": "1"}, env)["CRUCIBLE_LENIENT_FIELDS"], "1")
+        self.assertEqual(self.run_script({"CRUCIBLE_LENIENT_FIELDS": "1"})["CRUCIBLE_LENIENT_FIELDS"], "1")
+
     def test_serve_script_sets_the_measured_words_when_unset(self):
         got = self.run_script({})
         for key, value in README_ENV.items():

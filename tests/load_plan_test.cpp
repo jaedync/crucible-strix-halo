@@ -3,7 +3,7 @@
 // tools/packs/plan_fixture.py; its per-layer "moe" lines are for moe_widths_test). For 3.05 and
 // 4.05 the plan must equal the trunk decisions (Legacy* below: front order from d36be2a6, widths from
 // e80d21cc model.h) line for line, with pinned digests. 4.18, 3.18 and
-// 3.68 must load; 3.18 and 3.68 hold K3.5 routed experts.
+// 3.68 must load with every dense group in front order; 3.18 and 3.68 hold K3.5 routed experts.
 #include "../engine/model/flashnext/load_plan.h"
 #include "../engine/model/flashnext/geometry.h"
 #include "../engine/exl3/kernels/lane_window.h"
@@ -165,6 +165,9 @@ int main() {
   // from 877fc0f3ad5d9126 at e80d21cc: 5cb41d21 loads its mixed K6/K4 QSA input group in front order.
   const std::map<std::string, uint64_t> pinned = {
       {"3.05bpw_h5_ng5", 0xd96c0ac32fc15987ull}, {"4.05bpw_h6_ng6", 0x2072807c5d48a836ull}};
+  // Every matrix of a front group: the h6_ng8 packs load K7/K8 in front order since p418-kernel (wide ring).
+  int dense = 0;
+  for (const auto& group : FrontGroups()) dense += (int)group.size();
   for (const std::string name : {"3.05bpw_h5_ng5", "4.05bpw_h6_ng6", "3.18bpw_h6_ng8", "3.68bpw_h6_ng8", "4.18bpw_h6_ng8"}) {
     const Pack p = Read("tests/data/packs/" + name + ".lin");
     const Plan legacy = Decide(p, LegacyFrontSplits, LegacyTrellisK, LegacyPleRowK);
@@ -182,11 +185,11 @@ int main() {
     } else if (name == "4.18bpw_h6_ng8") {
       Expect(!legacy.reject.empty(), name + " did not load at e80d21cc");
       Expect(now.reject.empty(), name + " loads");
-      Expect(fronts == 1, name + ": only lm_head (K6) in front order");
+      Expect(fronts == dense, name + ": every dense group (K8, lm_head K6) in front order");
     } else {
       Expect(!legacy.reject.empty(), name + " did not load at e80d21cc");
       Expect(now.reject.empty(), name + " loads");
-      Expect(fronts == 1, name + ": only lm_head (K6) in front order");
+      Expect(fronts == dense, name + ": every dense group (K7/K8 and K6) in front order");
       bool half = false;
       for (const auto& line : now.lines) half = half || line.rfind("experts K35 count ", 0) == 0;
       Expect(half, name + " has K3.5 (code 35) routed experts");

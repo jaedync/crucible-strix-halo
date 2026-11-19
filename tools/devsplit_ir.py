@@ -21,6 +21,28 @@ def split_head(text):
 
 
 REF = re.compile(r'@((?:[\w.$-]+|"[^"]*"))')
+GLOBAL_COMDAT = re.compile(r", (comdat(?:\(\$[^)]*\))?)(?=,|$)")
+DEFINE_COMDAT = re.compile(r" (comdat(?:\(\$[^)]*\))?)(?= |$)")
+
+
+def put_comdat(line, word):
+    """`line` (a define line or a global definition) with its comdat word back, when the line has none.
+
+    Why: opt's internalize pass (the extraction of the new offload driver, devsplit.extract_cmd) drops the comdat
+    of a symbol that is alone in its comdat. The plain build keeps it, and the optimizer treats a comdat member
+    differently (it is deleted only with its whole group)."""
+    if line.startswith("define "):
+        if DEFINE_COMDAT.search(line, line.rindex(")")):
+            return line
+        attrs = list(re.finditer(r" #\d+", line))
+        pos = max(line.rindex(")") + 1, attrs[-1].end() if attrs else 0)
+        pos = re.compile(r'(?: section "[^"]*")?(?: partition "[^"]*")?').match(line, pos).end()
+        return f"{line[:pos]} {word}{line[pos:]}"
+    if GLOBAL_COMDAT.search(line):
+        return line
+    m = re.search(r", align \d+|, !", line)
+    pos = m.start() if m else len(line)
+    return f"{line[:pos]}, {word}{line[pos:]}"
 
 
 class Module:
@@ -34,10 +56,18 @@ class Module:
         self.order = {}  # global variable name -> position in the module
         self.lds = {}  # shared-memory (addrspace 3) variable name -> its definition line as the front end wrote it
         self.reached = {}  # memo of reach()
+        self.comdat = {}  # name -> its comdat word ("comdat" or "comdat($c)"), for put_comdat
+        self.exported = []  # functions that a -shared link exports and no kernel uses (default visibility, not local)
+        self.used_lines = []  # the @llvm.used and @llvm.compiler.used lines
         for line in chunks[0].split("\n"):
+            if line.startswith(("@llvm.used = ", "@llvm.compiler.used = ")):
+                self.used_lines.append(line)
             if line.startswith("@") and " = " in line:
                 name, rest = line[1:].split(" = ", 1)
                 words, tail = split_head(rest)
+                m = GLOBAL_COMDAT.search(tail)
+                if m:
+                    self.comdat[name] = m.group(1)
                 self.head[name] = words
                 self.order[name] = len(self.order)
                 if " addrspace(3) " in rest and not rest.startswith("external "):
@@ -54,8 +84,13 @@ class Module:
             self.head[name] = words
             if {"internal", "private"} & set(words):
                 self.local.add(name)
+            m = DEFINE_COMDAT.search(header, header.rindex(")") if ")" in header else at)
+            if m:
+                self.comdat[name] = m.group(1)
             if "amdgpu_kernel" in header[:at]:
                 self.kernels.add(name)
+            elif not ({"internal", "private", "hidden"} & set(words)):
+                self.exported.append(name)
             body = body.split("\n}\n", 1)[0]
             self.size[name] = body.count("\n")
             self.refs[name] = frozenset(REF.findall(body))
@@ -167,6 +202,13 @@ def pack(groups, nparts):
     return [sorted(p) for p in parts if p], load
 
 
+def scalar_type(tail):
+    """True when the global of this definition text (after the linkage words) has a scalar type (iN or ptr)."""
+    kind = "constant" if " constant " in f" {tail} " else "global"
+    typ = tail.partition(f" {kind} ")[2].split(" ", 1)[0].rstrip(",")
+    return typ == "ptr" or (typ[:1] == "i" and typ[1:].isdigit())
+
+
 def scalar_declaration(name, words, tail):
     """The declaration line of a strong global, from its definition. Only scalar types: the initializer is cut."""
     kind = "constant" if " constant " in f" {tail} " else "global"
@@ -189,8 +231,15 @@ def mentioned(lines, strong):
     return seen
 
 
-def restore(lines, head, strong, owned, order, lds):
-    """The part text with original linkage words, and with each strong global defined only in the part that owns it."""
+def comdat_name(name, word):
+    """The comdat that `word` names: comdat($c) names c, a bare comdat names the symbol."""
+    return word[len("comdat($"):-1] if word.startswith("comdat(") else name
+
+
+def restore(lines, head, strong, owned, order, lds, comdat=None):
+    """The part text with original linkage words, and with each strong global defined only in the part that owns it.
+
+    comdat ({name: comdat word}, Module.comdat): also put back the comdats that the extraction dropped."""
     out, comdats = [], set()
     for line in lines:
         if line.startswith("define "):
@@ -198,6 +247,9 @@ def restore(lines, head, strong, owned, order, lds):
             _, rest = split_head(line[7:])
             if name in head:
                 line = "define " + " ".join([*head[name], rest])
+            if comdat and name in comdat:
+                line = put_comdat(line, comdat[name])
+                comdats.add(comdat_name(name, comdat[name]))
         elif line.startswith("@") and " = " in line:
             name, rest = line[1:].split(" = ", 1)
             if name in lds and rest.startswith("external "):
@@ -208,10 +260,21 @@ def restore(lines, head, strong, owned, order, lds):
                     comdats.add(name)
             elif name in strong:
                 words, tail = strong[name]
-                line = f"@{name} = {' '.join([*words, tail])}" if name in owned else scalar_declaration(name, words, tail)
+                if name in owned:
+                    line = f"@{name} = {' '.join([*words, tail])}"
+                elif comdat is not None and " constant " in f" {tail} " and not scalar_type(tail):
+                    # new driver: a constant that is not a scalar (HIP 7.16 warpSize, an undef struct) gets an
+                    # ODR copy. The device link takes the owner's definition; the optimizer still sees the value.
+                    keep = [w for w in words if w in ("protected", "hidden", "default", "unnamed_addr", "local_unnamed_addr")]
+                    line = f"@{name} = " + " ".join(["linkonce_odr", *keep, tail])
+                else:
+                    line = scalar_declaration(name, words, tail)
             elif name in head and not rest.startswith("external "):
                 _, tail = split_head(rest)
                 line = f"@{name} = " + " ".join([*head[name], tail])
+            if comdat and name in comdat and not line[len(name) + 4:].startswith("external "):
+                line = put_comdat(line, comdat[name])
+                comdats.add(comdat_name(name, comdat[name]))
         out.append(line)
     # llvm-extract writes the globals in the order it found them. The LDS layout pass breaks ties between
     # equal variables by module order, so the original order has to come back or kernel LDS offsets move.
@@ -301,6 +364,18 @@ def define_lines(text):
     return out
 
 
+USED_MARK = ";used="  # devsplit.ipsccp_defines(lto=True) ends a define line with the arguments that the body uses
+
+
+def used_args(line):
+    """The argument indexes that a marked define line's body uses, or None when the line has no mark."""
+    at = line.rfind(USED_MARK)
+    if at < 0:
+        return None
+    tail = line[at + len(USED_MARK):].strip()
+    return {int(x) for x in tail.split(",") if x}
+
+
 def derive_facts(module_defs, part_defs):
     """{function: {argument index: module fact}} where a part's IPSCCP result differs from the module's.
 
@@ -308,7 +383,8 @@ def derive_facts(module_defs, part_defs):
     range ('BITS:LO:HI') or 'any' (the module knows nothing). A part that has no range where the module has one
     holds a constant (fewer call sites); a part with a range where the module has none is narrower.
     """
-    mono = {n: argument_ranges(l) for n, l in define_lines(module_defs).items()}
+    mono_lines = define_lines(module_defs)
+    mono = {n: argument_ranges(l) for n, l in mono_lines.items()}
     facts = {}
     for text in part_defs:
         for name, line in define_lines(text).items():
@@ -317,6 +393,10 @@ def derive_facts(module_defs, part_defs):
             part = argument_ranges(line)
             if len(part) != len(mono[name]):
                 continue
+            mono_used, part_used = used_args(mono_lines[name]), used_args(line)
+            if mono_used is not None and part_used is not None:
+                # an argument that the module's body uses and the part's does not is a constant in the part
+                part = [p if i not in mono_used - part_used else "const" for i, p in enumerate(part)]
             if mono[name] != part:
                 # The other arguments keep the module's range: the stub passes a value in it, because poison
                 # would make the range "may be undef", and IPSCCP then drops the attribute.
@@ -382,6 +462,10 @@ def fact_stub(name, lines, facts, wanted):
         words, rest = split_head(prefix[len("define "):].strip())
         rest = re.sub(r"\b(range|nofpclass|dereferenceable|dereferenceable_or_null)\([^)]*\)|\balign \d+", "", rest)
         rtype = " ".join(w for w in rest.split() if w not in ("noundef", "zeroext", "signext", "inreg", "noalias", "nonnull"))
+        cc = ""
+        if rtype.startswith("fastcc "):
+            # the prelink pipeline gives internal functions fastcc; the LTO stub (devsplit.add_lto_stub) calls them so
+            cc, rtype = "fastcc ", rtype[len("fastcc "):]
         if not rtype or rtype.split()[0].endswith("cc") or rtype.split()[0].startswith("amdgpu_"):
             continue
         k = len(used)
@@ -404,9 +488,9 @@ def fact_stub(name, lines, facts, wanted):
                     value = f"%a{k}.{i}.r"
             args.append(f"{t} {value}")
         if rtype == "void":
-            body.append(f"  call void @{fn}({', '.join(args)}) alwaysinline")
+            body.append(f"  call {cc}void @{fn}({', '.join(args)}) alwaysinline")
         else:
-            body.append(f"  %c{k} = call {rtype} @{fn}({', '.join(args)}) alwaysinline")
+            body.append(f"  %c{k} = call {cc}{rtype} @{fn}({', '.join(args)}) alwaysinline")
             body.append(f"  store volatile {rtype} %c{k}, ptr addrspace(1) %p, align 1")
         body.append("  br label %done")
         used.append(fn)

@@ -28,7 +28,7 @@ CPU_TESTS += build/bench/static_layout build/bench/test_migration_wait
 # headers as prerequisites: one header edit would rebuild every program (34 min to 3 h).
 DEPFILES := $(addsuffix .d,$(HIP_BINARIES) $(PINNED_HC_BINARIES) $(CPU_BINARIES))
 
-.PHONY: update rollback isa-check split-groups split-facts all engine binaries benchmarks cpu-tests gpu-tests test test-fast release-engine test-server test-service test-cpu test-reference test-gpu help
+.PHONY: FORCE install-hooks update rollback isa-check kernel-regs split-groups split-facts all engine binaries benchmarks cpu-tests gpu-tests test test-fast release-engine test-server test-service test-cpu test-reference test-gpu help
 all: engine
 engine: build/engine/crucible
 binaries: $(HIP_BINARIES) $(CPU_BINARIES)
@@ -65,6 +65,76 @@ SPLIT_FACTS ?= tools/devsplit_facts.tsv
 SPLIT_CHECK ?= 1
 SPLIT_WORK ?= build/engine/split
 STATE_EPOCH ?= 1
+# Structured output: xgrammar 0.2.9 (third_party/xgrammar, Apache-2.0, pinned tag v0.2.9)
+# and the one file that includes it (engine/runtime/constraint_xgr.cc), as one host static library. Built with the host
+# compiler, -O2, no -Werror and no LTO (the library's own CMake flags), so the hipcc link takes it as plain objects.
+# Only the engine and the constraint tests link it; the other programs never reference it.
+XGR_DIR := third_party/xgrammar
+XGR_SOURCES := $(sort $(wildcard $(XGR_DIR)/cpp/*.cc $(XGR_DIR)/cpp/support/*.cc $(XGR_DIR)/cpp/converter_ext/*.cc))
+# A literal -I path: tests/test_quoted_includes.py reads the repo include dirs from this file.
+XGR_INCLUDES := -Ithird_party/xgrammar/include -isystem $(XGR_DIR)/3rdparty/picojson -isystem $(XGR_DIR)/3rdparty/dlpack/include
+XGR_DEFINES := -DXGRAMMAR_ENABLE_CPPTRACE=0 -DXGRAMMAR_LOG_CUSTOMIZE=1
+CONSTRAINT_LIB := build/third_party/libcrucible_constraint.a
+# The settings of the library: the compiler that CXX runs, its version, XGR_DEFINES and XGR_INCLUDES. tools/release_engine.py
+# lib-settings writes this file again only when its text changes. Every library object depends on it, so a build with other
+# settings compiles the library again and does not link the objects of an older build. The engine build-info names the same values.
+CONSTRAINT_SETTINGS := $(CONSTRAINT_LIB).settings
+# The grammar compile helper (engine/runtime/constraint_helper.h): a host program from
+# the library objects that the library then holds as bytes (constraint_helper_image.S), so the engine and the tests
+# start it from memory and need no install step.
+CONSTRAINT_CORE := $(patsubst %.cc,build/%.o,$(XGR_SOURCES)) build/engine/runtime/constraint_xgr.o
+CONSTRAINT_HELPER := build/engine/crucible-grammar-helper
+CONSTRAINT_OBJECTS := $(CONSTRAINT_CORE) build/engine/runtime/constraint_helper_image.o build/engine/runtime/constraint_helper_image_data.o
+DEPFILES_CONSTRAINT := $(addsuffix .d,$(CONSTRAINT_OBJECTS))
+# The tree keeps each upstream file as it is (the leak guard pins it). A local patch is a file under
+# third_party/patches/ that tools/vendor_patch.py applies to a copy under build/patched/ (exact context, no fuzz). The
+# copy compiles with the include dir of its upstream folder and the upstream path in __FILE__, so its object is the object
+# of the patched file in place.
+XGR_PATCHED := $(XGR_DIR)/cpp/json_schema_converter.cc
+XGR_PATCH_json_schema_converter := third_party/patches/xgrammar/0001-bounded-string-control-characters.patch
+$(patsubst %.cc,build/%.o,$(filter-out $(XGR_PATCHED),$(XGR_SOURCES))): build/%.o: %.cc Makefile
+	@mkdir -p $(@D)
+	$(CXX) -std=c++17 -O2 -fPIC $(XGR_DEFINES) $(XGR_INCLUDES) -MMD -MP -MF $@.d -c $< -o $@
+build/patched/$(XGR_DIR)/cpp/json_schema_converter.cc: $(XGR_DIR)/cpp/json_schema_converter.cc $(XGR_PATCH_json_schema_converter) tools/vendor_patch.py
+	python3 -I tools/vendor_patch.py $< $(XGR_PATCH_json_schema_converter) $@ --path $<
+build/$(XGR_DIR)/cpp/json_schema_converter.o: build/patched/$(XGR_DIR)/cpp/json_schema_converter.cc Makefile
+	@mkdir -p $(@D)
+	$(CXX) -std=c++17 -O2 -fPIC $(XGR_DEFINES) -iquote $(XGR_DIR)/cpp -fmacro-prefix-map=build/patched/= $(XGR_INCLUDES) -MMD -MP -MF $@.d -c $< -o $@
+# -isystem: the codec reads the mask cache of a compiled grammar (third_party/xgrammar/cpp/compiled_grammar_impl.h).
+build/engine/runtime/constraint_xgr.o: engine/runtime/constraint_xgr.cc Makefile
+	@mkdir -p $(@D)
+	$(CXX) -std=c++20 -O2 -g -fPIC $(XGR_DEFINES) -isystem $(XGR_DIR)/cpp $(XGR_INCLUDES) -MMD -MP -MF $@.d -c $< -o $@
+$(CONSTRAINT_HELPER): engine/runtime/constraint_helper_main.cc $(CONSTRAINT_CORE) Makefile
+	@mkdir -p $(@D)
+	$(CXX) -std=c++20 -O2 -s -MMD -MP -MF $@.d $< $(CONSTRAINT_CORE) -pthread -o $@
+build/engine/runtime/constraint_helper_image.o: engine/runtime/constraint_helper_image.cc Makefile
+	@mkdir -p $(@D)
+	$(CXX) -std=c++20 -O2 -fPIC -MMD -MP -MF $@.d -c $< -o $@
+build/engine/runtime/constraint_helper_image_data.o: engine/runtime/constraint_helper_image.S $(CONSTRAINT_HELPER) Makefile
+	@mkdir -p $(@D)
+	$(CXX) -c -DGRAMMAR_HELPER_PATH='"$(CONSTRAINT_HELPER)"' $< -o $@
+$(CONSTRAINT_LIB): $(CONSTRAINT_OBJECTS)
+	@mkdir -p $(@D)
+	rm -f $@ && ar rcs $@ $^
+FORCE:
+$(CONSTRAINT_SETTINGS): FORCE
+	@$(PYTHON) -I tools/release_engine.py lib-settings --out $@ --cxx='$(call shq,$(CXX))' --xgr-defines='$(call shq,$(XGR_DEFINES))' --xgr-includes='$(call shq,$(XGR_INCLUDES))'
+$(CONSTRAINT_OBJECTS) $(CONSTRAINT_HELPER): $(CONSTRAINT_SETTINGS)
+CONSTRAINT_TESTS := build/tests/constraint_test build/tests/constraint_property_test build/tests/constraint_session_test build/tests/constraint_guard_test build/tests/constraint_hostile_test build/tests/constraint_fuzz_runner build/tests/constraint_text_check
+# The guard test compares the helper's grammars with an in-process compile, so it includes the library headers.
+build/tests/constraint_guard_test build/tests/constraint_fuzz_runner: CPPFLAGS += $(XGR_DEFINES) $(XGR_INCLUDES)
+$(CONSTRAINT_TESTS): $(CONSTRAINT_LIB)
+# A host-linker option, not the archive path or a plain -l: hipcc compiles every input file after its -x hip as
+# device source, and it unbundles a -l archive for the device link (tools/devsplit.py does not run that step).
+CONSTRAINT_LDLIBS := -Wl,-L$(dir $(CONSTRAINT_LIB)),-lcrucible_constraint
+$(CONSTRAINT_TESTS): LDLIBS += $(CONSTRAINT_LDLIBS)
+# The stub trees of the build-recipe tests (tests/test_hipcc_series.py, test_hipcc_checked.py, test_sec_server.py) hold
+# no constraint source, so they build no library. A real tree always holds it: engine.hip does not link without it.
+ifneq ($(wildcard engine/runtime/constraint_xgr.cc),)
+build/engine/crucible build/engine/crucible.mono: $(CONSTRAINT_LIB)
+build/engine/crucible build/engine/crucible.mono: LDLIBS += $(CONSTRAINT_LDLIBS)
+endif
+
 ENGINE_FLAGS = $(CPPFLAGS) $(HIPFLAGS) -std=c++20 --offload-arch=$(GPU_ARCH) --rocm-path=$(ROCM_PATH) -I$(ROCM_PATH)/include -MMD -MP -MF $@.d $< $(LDFLAGS) $(LDLIBS)
 # Every hipcc recipe runs through tools/hipcc_checked.sh: hipcc exits 0 when its clang child is killed (out of memory),
 # so the helper removes the old output first and fails when the compiler leaves none.
@@ -72,23 +142,29 @@ HIPCC_CHECKED = bash tools/hipcc_checked.sh $@
 ENGINE_HIPCC = $(HIPCC_CHECKED) $(HIPCC) $(ENGINE_FLAGS)
 # The engine recipe also writes build/engine/crucible.build-info (commit, clean tree, hash of the binary); release-engine reads it.
 ENGINE_STAMP = $(PYTHON) -I tools/release_engine.py stamp
-# The end of the stamp also records the compiler, its version, the compile settings and ROCM_PATH; it reads the hipcc environment
+# The end of the stamp also records the compiler, its version, the compile settings, ROCM_PATH and the settings of the constraint
+# library (CXX, its path and version, XGR_DEFINES, XGR_INCLUDES: the values of CONSTRAINT_SETTINGS); it reads the hipcc environment
 # variables (HIPCC_COMPILE_FLAGS_APPEND, HIP_CLANG_PATH and the like) itself. A release refuses non-default values and an unknown compiler version.
 shq = $(subst ','\'',$(1))
-ENGINE_STAMP_END = $(ENGINE_STAMP) end --binary $@ --hipcc='$(call shq,$(HIPCC))' --gpu-arch='$(call shq,$(GPU_ARCH))' --hipflags='$(call shq,$(HIPFLAGS))' --cppflags='$(call shq,$(CPPFLAGS))' --ldflags='$(call shq,$(LDFLAGS))' --ldlibs='$(call shq,$(LDLIBS))' --rocm-path='$(call shq,$(ROCM_PATH))'
-# A ROCm 10.x hipcc (AMD clang 24) builds a slower engine (tools/hipcc_series.py): the build stops with a warning unless
-# ALLOW_ROCM10=1 (make word or environment; setup and update --allow-rocm10 set it). The split build cannot plan the clang 24
-# driver, so with that compiler make uses plain hipcc (SPLIT=0).
+ENGINE_STAMP_END = $(ENGINE_STAMP) end --binary $@ --hipcc='$(call shq,$(HIPCC))' --gpu-arch='$(call shq,$(GPU_ARCH))' --hipflags='$(call shq,$(HIPFLAGS))' --cppflags='$(call shq,$(CPPFLAGS))' --ldflags='$(call shq,$(LDFLAGS))' --ldlibs='$(call shq,$(LDLIBS))' --rocm-path='$(call shq,$(ROCM_PATH))' \
+	--cxx='$(call shq,$(CXX))' --xgr-defines='$(call shq,$(XGR_DEFINES))' --xgr-includes='$(call shq,$(XGR_INCLUDES))'
+# ALLOW_ROCM10=1 has no effect. v0.37.2 stopped a ROCm 10.x build without it (the v0.37.0 engine spilled on clang 24); the
+# source fix cb97f418 removed that spill, and the v0.37.2 CHANGELOG still names the word, so make accepts it.
 ALLOW_ROCM10 ?= 0
+# With clang 24 (ROCm 10.x) the engine recipe builds plain hipcc (SPLIT=0): the gated 10.1 binary is that build, and the
+# clang 24 split build gives other ISA in 92 functions. The split tables below stay for that gate.
 HIPCC_SERIES = $(PYTHON) -I tools/hipcc_series.py
-HIPCC_SERIES_CHECK = $(HIPCC_SERIES) check --hipcc='$(call shq,$(HIPCC))' $(if $(filter 1,$(ALLOW_ROCM10)),--allow)
-build/engine/crucible: engine/engine.hip Makefile tools/devsplit.py tools/devsplit_ir.py tools/devsplit_groups.tsv tools/devsplit_facts.tsv tools/hipcc_series.py
+# ROCm 10.1 (AMD clang 24, the new offload driver): devsplit runs the prelink cc1 and the LTO link of each part, and
+# reads two tables next to SPLIT_FACTS that carry the compiler's name (tools/devsplit_facts.clang-24.tsv for the
+# prelink, .clang-24.lto.tsv for the LTO pipeline). `make split-facts` with that compiler writes both (about 15 min
+# on the test machine: one whole-module prelink). SPLIT_CHECK checks the prelink facts only; the LTO facts are checked by
+# `make isa-check`.
+build/engine/crucible: engine/engine.hip Makefile tools/devsplit.py tools/devsplit_ir.py tools/devsplit_groups.tsv tools/devsplit_facts.tsv $(wildcard tools/devsplit_facts.*.tsv) tools/hipcc_series.py
 	@mkdir -p $(@D)
 	@rm -f $@
-	@$(HIPCC_SERIES_CHECK)
 	@$(ENGINE_STAMP) begin --binary $@
 ifeq ($(SPLIT),1)
-	@if $(HIPCC_SERIES) clang24 --hipcc='$(call shq,$(HIPCC))'; then echo "hipcc is clang 24 (ROCm 10.x): the split build cannot plan it, using plain hipcc (SPLIT=0)"; \
+	@if $(HIPCC_SERIES) clang24 --hipcc='$(call shq,$(HIPCC))'; then echo "hipcc is clang 24 (ROCm 10.x): the gated build is plain hipcc, using it (SPLIT=0)"; \
 	$(ENGINE_HIPCC) -o $@; else \
 	$(PYTHON) -I tools/devsplit.py --out $@ --work $(SPLIT_WORK) --parts $(SPLIT_PARTS) -j $(SPLIT_JOBS) --groups $(SPLIT_GROUPS) --facts $(SPLIT_FACTS) $(if $(filter 1,$(SPLIT_CHECK)),--check) --hipcc $(HIPCC) -- $(ENGINE_FLAGS); \
 	rc=$$?; if [ $$rc -eq 2 ]; then echo "devsplit could not plan the build, using hipcc"; $(ENGINE_HIPCC) -o $@; else exit $$rc; fi; fi
@@ -156,11 +232,15 @@ test: test-cpu
 TEST_JOBS ?= 8
 # The server tests that are cheap (under a second) and check a documented line: part of test-fast. The rest is make test-server.
 SERVER_FAST_TESTS = server/tests/test_docker_hosts.py
+# The public CI's shellcheck (ubuntu-24.04 apt 0.9.0) flags notes that newer versions do not. When the pinned release binary
+# is installed (koalaman v0.9.0 linux.x86_64, tarball sha256 700324c6...), tests/test_install_sh.py must run it, not skip.
+SHELLCHECK_CI ?= $(wildcard $(HOME)/.local/share/shellcheck-0.9.0/shellcheck)
 test-fast:
 	$(MAKE) -j$(TEST_JOBS) cpu-tests
 	tools/run_cpu_tests.sh $(TEST_JOBS) $(CPU_TESTS)
 	build/tests/draft_vocab_test tests/data/draft/blocks65536.txt
-	CXX="$(CXX)" $(PYTHON) -m pytest -q -p no:cacheprovider -n $(TEST_JOBS) tests $(ABAB_TESTS) $(SERVER_FAST_TESTS)
+	CRUCIBLE_SHELLCHECK_CI="$(SHELLCHECK_CI)" CXX="$(CXX)" $(PYTHON) -m pytest -q -rs -p no:cacheprovider -n $(TEST_JOBS) tests $(SERVER_FAST_TESTS)
+
 
 test-server:
 	$(PYTHON) -m pytest -q -p no:cacheprovider -n $(TEST_JOBS) server/tests

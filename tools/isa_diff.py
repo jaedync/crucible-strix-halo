@@ -47,8 +47,9 @@ HEADER = re.compile(r"^([0-9a-f]+) <(.+)>:$")
 # The split build (tools/devsplit.py) adds stub kernels that only carry argument facts; they are not compared.
 STUB = "__devsplit_facts_"
 GETPC = re.compile(r"^s_getpc_b64 s\[(\d+):\d+\]$")
-ADD = re.compile(r"^s_add_u32 s(\d+), s\1, (0x[0-9a-f]+|-?\d+)$")
-ADDC = re.compile(r"^s_addc_u32 s(\d+), s\1, (0x[0-9a-f]+|-?\d+)$")
+# The ROCm 10.1 llvm-objdump (clang 24) prints some 32-bit literals as lit(0x...).
+ADD = re.compile(r"^s_add_u32 s(\d+), s\1, (?:lit\()?(0x[0-9a-f]+|-?\d+)\)?$")
+ADDC = re.compile(r"^s_addc_u32 s(\d+), s\1, (?:lit\()?(0x[0-9a-f]+|-?\d+)\)?$")
 
 
 def rocm_llvm_dirs():

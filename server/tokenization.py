@@ -31,7 +31,8 @@ class ModelTokenizer:
         """(rendered text, {sentinel: special-token string}). The table is empty, and the text is the old render,
         unless client content holds a special-token string (RA-8)."""
         messages = request.messages if messages is None else messages
-        tools, restore = request.tools, {}
+        rendered = getattr(request, "render_tools", None)
+        tools, restore = (request.tools if rendered is None else rendered), {}
         if getattr(self, "content", None) is not None:
             (messages, tools), restore = self.content.escape(messages, tools)
         preserve = getattr(request, "preserve_thinking", None)
@@ -95,6 +96,11 @@ class ModelTokenizer:
         prefix = self.encode_prompt(text[:end], restore)
         # Only an exact token prefix of this prompt is useful; the engine also matches cached tokens.
         return len(prefix) if ids[:len(prefix)] == prefix else 0
+
+    def prefix_marks(self, request, ids, system_end=0):
+        """Privacy-safe hashes and token ends of the reasoning line and tools block (server/prefix_marks.py)."""
+        from .prefix_marks import prefix_marks
+        return prefix_marks(self, request, ids, system_end)
 
     def think_close_ids(self):
         """The forced close of a think block (see think_budget), tokenized once."""

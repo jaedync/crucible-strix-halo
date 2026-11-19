@@ -70,16 +70,27 @@ def run(cmd, what, stdin=None, out=None):
     return dt, r.stdout
 
 
-def driver_plan(hipcc, flags, out, probe_dir):
-    """The five driver commands (device cc1, lld, bundler, host cc1, host link) of `hipcc flags -###`."""
-    r = subprocess.run([hipcc, *flags, "-###", "-o", str(out)], capture_output=True, text=True, cwd=probe_dir)
+def commands(text):
+    """The command lines that a driver prints with -### (or a wrapper with --dry-run): lines that start ` \"`."""
+    return [shlex.split(line) for line in text.splitlines() if line.startswith(' "')]
+
+
+def tool_stderr(cmd, what, cwd):
+    r = subprocess.run([str(c) for c in cmd], capture_output=True, text=True, cwd=cwd)
     if r.returncode:
-        raise RuntimeError(f"hipcc -### failed:\n{r.stderr}")
-    plan = {}
-    for line in r.stderr.splitlines():
-        if not line.startswith(' "'):
-            continue
-        cmd = shlex.split(line)
+        raise RuntimeError(f"{what} failed:\n{r.stderr}")
+    return r.stderr
+
+
+def driver_plan(hipcc, flags, out, probe_dir):
+    """The five driver commands (device cc1, lld, bundler, host cc1, host link) of `hipcc flags -###`.
+
+    The old offload driver (AMD clang 22, ROCm 7.2) prints all five. The new one (AMD clang 24, ROCm 10.1) prints
+    the device cc1 (LTO bitcode), llvm-offload-binary, `clang-linker-wrapper --emit-fatbin-only`, the host cc1 and
+    the host link (clang-linker-wrapper). The device link and the bundler run inside the first wrapper:
+    new_driver_steps asks for them. plan["driver"] is "old" or "new"."""
+    plan = {"driver": "old"}
+    for cmd in commands(tool_stderr([hipcc, *flags, "-###", "-o", str(out)], "hipcc -###", probe_dir)):
         name = Path(cmd[0]).name
         if "-cc1" in cmd:
             plan["device" if "-fcuda-is-device" in cmd else "host"] = cmd
@@ -87,12 +98,51 @@ def driver_plan(hipcc, flags, out, probe_dir):
             plan["lld"] = cmd
         elif name.startswith("clang-offload-bundler"):
             plan["bundler"] = cmd
+        elif name == "llvm-offload-binary":
+            plan["packager"] = cmd
+        elif name == "clang-linker-wrapper":
+            plan["fatbin" if "--emit-fatbin-only" in cmd else "link"] = cmd
         elif name.startswith("ld"):
             plan["link"] = cmd
+    if "fatbin" in plan and "packager" in plan and "device" in plan:
+        plan["driver"] = "new"
+        plan.update(new_driver_steps(plan, Path(probe_dir)))
     missing = {"device", "lld", "bundler", "host", "link"} - set(plan)
     if missing:
-        raise RuntimeError(f"driver plan lacks {sorted(missing)}; got {sorted(plan)}")
+        raise RuntimeError(f"driver plan lacks {sorted(missing)}; got {sorted(set(plan) - {'driver'})}")
     return plan
+
+
+def new_driver_steps(plan, probe_dir):
+    """{lld, bundler} of the new offload driver: the commands that `clang-linker-wrapper --emit-fatbin-only` runs.
+
+    A dry run of the wrapper over a probe offload binary (the image spec of the plan's llvm-offload-binary, with an
+    empty file) prints the device clang command and the bundler command; `-###` of that clang command gives the
+    ld.lld line (full LTO: -plugin-opt=mcpu, -plugin-opt=O3, --lto-CGO3). No step compiles anything."""
+    probe_dir = probe_dir / ".devsplit-probe"
+    probe_dir.mkdir(parents=True, exist_ok=True)
+    image = next(t for t in plan["packager"] if t.startswith("--image="))
+    spec = dict(kv.split("=", 1) for kv in image[len("--image="):].split(","))
+    (probe_dir / "probe.o").write_bytes(b"")
+    spec["file"] = "probe.o"
+    tool_stderr([plan["packager"][0], "-o", "probe.out", "--image=" + ",".join(f"{k}={v}" for k, v in spec.items())],
+                "llvm-offload-binary probe", probe_dir)
+    wrapper = strip_opts(plan["fatbin"], ("-o",))
+    wrapper = [t for t in wrapper if not t.endswith(".out")]
+    dry = commands(tool_stderr([*wrapper, "-o", "probe.hipfb", "probe.out", "--dry-run", "--wrapper-verbose"],
+                               "clang-linker-wrapper --dry-run", probe_dir))
+    steps = {}
+    for cmd in dry:
+        name = Path(cmd[0]).name
+        if name.startswith("clang-offload-bundler"):
+            steps["bundler"] = cmd
+        elif name.startswith("clang") and "-cc1" not in cmd:
+            # the image path of the dry run does not exist: -### needs an input file
+            clang = ["probe.o" if t.endswith(".o") and not t.startswith("-") else t for t in cmd]
+            for line in commands(tool_stderr([*clang, "-###"], "device clang -###", probe_dir)):
+                if Path(line[0]).name in ("ld.lld", "lld"):
+                    steps["lld"] = line
+    return steps
 
 
 def strip_opts(cmd, with_arg=(), alone=()):
@@ -135,6 +185,43 @@ def device_back_end(cmd, part, out_obj, trace):
     return [*opts, *(["-ftime-trace"] if trace else []), "-o", out_obj, "-x", "ir", part]
 
 
+def lto_steps(plan, pre_bc, opt_bc, obj):
+    """The two ld.lld steps that turn one part's prelinked bitcode into an object, for the new offload driver.
+
+    The plain build runs one full-LTO ld.lld over the whole module (internalize, the LTO O3 pipeline, code
+    generation) and writes the final code object. A part must give a relocatable object that the device link
+    joins with the other parts. Step 1 is the plain command with -plugin-opt=emit-llvm: the same symbol
+    resolution (so the same internalization) and the same LTO pipeline, but it writes the optimized bitcode.
+    --no-undefined goes, because a part declares the strong globals that another part defines. Step 2 (-r, LTO
+    pipeline at O0, code generation at the plain command's --lto-CGO level) only generates the code."""
+    lld = [t for t in strip_opts(plan["lld"], ("-o",)) if t.startswith("-") or not t.endswith(".o")]
+    shared = [t for t in lld if t != "--no-undefined"]
+    step1 = [*shared, "-plugin-opt=emit-llvm", pre_bc, "-o", opt_bc]
+    keep = [re.sub(r"^-plugin-opt=O\d$", "-plugin-opt=O0", t) for t in lld[1:]
+            if t not in ("--no-undefined", "-shared") and not t.startswith("-L")]
+    step2 = [lld[0], "-r", *keep, opt_bc, "-o", obj]
+    return step1, step2
+
+
+def extract_by_opt(llvm):
+    """True when the compiler tree has no llvm-extract but has opt (the ROCm 10.1 wheels)."""
+    return not (llvm / "llvm-extract").exists() and (llvm / "opt").exists()
+
+
+def extract_cmd(llvm, funcs, globs, bc, out):
+    """The command that cuts one part (the kernels `funcs` and all that they use) out of the module `bc`.
+
+    llvm-extract --recursive where the compiler tree has it (ROCm 7.2). The ROCm 10.1 wheels ship no
+    llvm-extract: there, opt internalizes every symbol but the part's kernels and drops what they do not use.
+    restore() puts the linkage words of the module back on what is left, as it does for llvm-extract."""
+    if not extract_by_opt(llvm):
+        return [llvm / "llvm-extract", "--recursive", "--keep-const-init", *[f"--func={k}" for k in funcs],
+                *[f"--glob={x}" for x in globs], bc, "-o", out]
+    keep = Path(out).with_suffix(".keep")
+    keep.write_text("".join(f"{n}\n" for n in [*funcs, *globs]))
+    return [llvm / "opt", "-passes=internalize,globaldce", f"-internalize-public-api-file={keep}", bc, "-o", out]
+
+
 def sha_file(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -143,13 +230,18 @@ def sha_file(path):
     return h.hexdigest()
 
 
-def part_key(part, cmd):
-    """Cache key: the part bytes, the compiler binary, and the command line without the file names."""
+def part_key(part, cmd, more=()):
+    """Cache key: the part bytes, the compiler binary, and the command line without the file names.
+
+    `more`: the later commands of the part (the ld.lld steps of the new driver), each with its tool binary."""
     h = hashlib.sha256()
     h.update(sha_file(part).encode())
     h.update(sha_file(cmd[0]).encode())
     keep = [str(t) for t in cmd[1:] if str(t) != str(part) and not str(t).endswith((".o", ".json")) and "-dumpdir" not in str(t)]
     h.update("\0".join(keep).encode())
+    for step in more:
+        h.update(sha_file(step[0]).encode())
+        h.update("\0".join(str(t) for t in step[1:] if not str(t).endswith((".o", ".bc"))).encode())
     return h.hexdigest()[:40]
 
 
@@ -178,10 +270,25 @@ def extract_parts(llvm, bc, mod, groups, globs, outs, pool, facts=None):
     With `facts` (devsplit_ir.read_facts), each part also gets a stub kernel that passes the one-module build's
     argument facts to the functions that kernels of other parts call too (see devsplit_ir.fact_stub).
     -> (number of strong globals, number of stub calls)."""
-    ext = [str(llvm / "llvm-extract"), "--recursive", "--keep-const-init"]
     raw = [o.with_suffix(".raw.bc") for o in outs]
-    futures = [pool.submit(run, [*ext, *[f"--func={k}" for k in g], *[f"--glob={x}" for x in (globs if i == 0 else [])],
-                                 bc, "-o", raw[i]], f"llvm-extract {outs[i].name}") for i, g in enumerate(groups)]
+    by_opt = extract_by_opt(llvm)
+    keep_used = []
+    if by_opt:
+        # a -shared link exports the functions of default visibility (__cxa_pure_virtual): part 0 keeps them
+        globs = [*globs, *mod.exported]
+        # internalize keeps what @llvm.compiler.used names, in every part. Parts are cut from the module without
+        # it; part 0 gets the line back with its members, as llvm-extract gives it the cuid.
+        keep_used = list(mod.used_lines)
+        if keep_used:
+            globs = [*globs, *(n for line in keep_used for n in ir.REF.findall(line.split(" = ", 1)[1]) if n not in globs)]
+            _, text = run([llvm / "llvm-dis", bc, "-o", "-"], f"llvm-dis {Path(bc).name}")
+            drop = set(keep_used)
+            bc = Path(outs[0]).parent / "module-unused.bc"
+            run([llvm / "llvm-as", "-o", bc], "llvm-as module-unused.bc",
+                stdin="\n".join(line for line in text.split("\n") if line not in drop))
+            del text
+    futures = [pool.submit(run, extract_cmd(llvm, g, globs if i == 0 else [], bc, raw[i]), f"extract {outs[i].name}")
+               for i, g in enumerate(groups)]
     for f in futures:
         f.result()
     head, strong = mod.head, mod.strong
@@ -197,7 +304,9 @@ def extract_parts(llvm, bc, mod, groups, globs, outs, pool, facts=None):
 
     def finish(i):
         owned = {n for n, o in owner.items() if o == i}
-        text = ir.restore(texts[i], head, strong, owned, mod.order, mod.lds)
+        text = ir.restore(texts[i], head, strong, owned, mod.order, mod.lds, mod.comdat if by_opt else None)
+        if i == 0 and keep_used:
+            text += "\n" + "\n".join(keep_used) + "\n"
         calls = 0
         if facts:
             mine = set(groups[i])
@@ -213,14 +322,20 @@ def extract_parts(llvm, bc, mod, groups, globs, outs, pool, facts=None):
     return len(strong), calls
 
 
-def ipsccp_defines(back_end):
+ARG_REF = re.compile(r"%(\d+)\b")
+
+
+def ipsccp_defines(back_end, lto=False):
     """The define lines of the module after IPSCCP: the back-end command runs until that pass, then it is stopped.
 
     The argument ranges in these lines are the facts that tools/devsplit_facts.tsv pins (devsplit_ir.derive_facts).
+    lto: back_end is the first ld.lld step of the new driver (lto_steps), and the dump is of the LTO pipeline's IPSCCP.
     """
     cmd = ["-emit-llvm-bc" if str(t) == "-emit-obj" else str(t) for t in back_end]
-    cmd = cmd[:2] + ["-mllvm", "-print-after=ipsccp", "-mllvm", "-print-module-scope"] + cmd[2:]
+    at = 1 if lto else 2
+    cmd = cmd[:at] + ["-mllvm", "-print-after=ipsccp", "-mllvm", "-print-module-scope"] + cmd[at:]
     out, started, complete, tail = [], False, False, collections.deque(maxlen=20)
+    nargs, used = 0, set()
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, errors="replace")
     try:
         for line in proc.stderr:
@@ -233,6 +348,15 @@ def ipsccp_defines(back_end):
                 started = True
             elif started and line.startswith("define "):
                 out.append(line.rstrip("\n"))
+                if lto:
+                    nargs, used = len(ir.define_params(line)[2]), set()
+            elif lto and started and out and line.startswith("}"):
+                # LTO: the prelink left range attributes on the arguments, so a constant that IPSCCP finds in a
+                # part does not show in the define line. Mark the arguments that the body still uses.
+                out[-1] += f" {ir.USED_MARK}{','.join(map(str, sorted(used)))}"
+                nargs = 0
+            elif lto and nargs and "%" in line:
+                used.update(k for k in map(int, ARG_REF.findall(line)) if k < nargs)
             elif started and line.startswith("attributes #"):
                 complete = True
                 break
@@ -262,6 +386,47 @@ def check_facts(module_defs, part_defs, facts):
                            f"run make isa-check, and report it")
 
 
+def facts_tables(path, plan):
+    """(prelink table, LTO table) of the --facts value.
+
+    The old offload driver has one IPSCCP run per part (the cc1 back end): the table is `path`, and there is no LTO
+    table. The new driver has two: the prelink cc1 and the LTO pipeline of ld.lld, where the hidden functions are
+    internal. Its tables carry the compiler's name, because another compiler finds other facts:
+    tools/devsplit_facts.tsv -> tools/devsplit_facts.clang-24.tsv and tools/devsplit_facts.clang-24.lto.tsv."""
+    if plan["driver"] != "new":
+        return path, None
+    if path == "none":
+        return "none", "none"
+    p, tag = Path(path), Path(plan["device"][0]).name
+    return str(p.with_name(f"{p.stem}.{tag}{p.suffix}")), str(p.with_name(f"{p.stem}.{tag}.lto{p.suffix}"))
+
+
+def add_lto_stub(llvm, pre, name, facts, wanted):
+    """Append a fact stub kernel (devsplit_ir.fact_stub) to one part's prelinked bitcode, for the LTO pipeline.
+
+    Why: the prelink stub calls are inlined in the prelink pipeline, so the LTO pipeline's IPSCCP sees only the
+    part's own call sites of an internalized function. This stub passes the module's LTO facts there.
+    Only a part with wanted functions is rewritten. -> seconds."""
+    if not wanted:
+        return 0.0
+    t0 = time.monotonic()
+    _, text = run([llvm / "llvm-dis", pre, "-o", "-"], f"llvm-dis {Path(pre).name}")
+    # The prelink writes a module summary (lines that start with ^); llvm-as wants the stub in it, and the
+    # full-LTO link does not use it.
+    lines = [line for line in text.split("\n") if not line.startswith("^")]
+    stub, used = ir.fact_stub(name, lines, facts, wanted)
+    text = "\n".join(lines)
+    if used:
+        run([llvm / "llvm-as", "-o", pre], f"llvm-as {Path(pre).name}", stdin=text + "\n" + "\n".join(stub) + "\n")
+    return time.monotonic() - t0
+
+
+def stub_wanted(mod, facts, group):
+    """The functions of `facts` that kernels outside `group` also reach, and that reach no shared memory."""
+    users, lds, mine = mod.users(), set(mod.lds), set(group)
+    return {f for f in facts if users.get(f, set()) - mine and not mod.reach(f) & lds}
+
+
 def facts_of(plan, bcs, work, pool):
     """[define lines after IPSCCP] of each bitcode file, in parallel."""
     def one(i):
@@ -269,12 +434,15 @@ def facts_of(plan, bcs, work, pool):
     return list(pool.map(one, range(len(bcs))))
 
 
-def shared_symbols(llvm_nm, bcs):
-    """Strong data symbols that more than one part defines: lld would see them twice. -> {symbol: [part index]}."""
+def shared_symbols(llvm_nm, bcs, kinds="DBRTSGC"):
+    """Strong data symbols that more than one part defines: lld would see them twice. -> {symbol: [part index]}.
+
+    The new offload driver passes kinds without T: its LTO step internalizes the hidden functions that several
+    parts copy, and the device link stops on a function that two parts export."""
     seen = {}
     for i, bc in enumerate(bcs):
         for typ, name in nm_defined(llvm_nm, bc):
-            if typ in "DBRTSGC":  # uppercase: strong, external
+            if typ in kinds:  # uppercase: strong, external
                 seen.setdefault(name, []).append(i)
     return {n: ix for n, ix in seen.items() if len(ix) > 1}
 
@@ -354,6 +522,10 @@ def build(args, plan, llvm, work, t_all):
         return 0
     if args.derive_facts:
         return derive_facts(args, plan, llvm, mod, bc, cuid, work, pool)
+    args.facts, lto_table = facts_tables(args.facts, plan)
+    lto_facts = {} if lto_table in (None, "none") else ir.read_facts(Path(lto_table))
+    if lto_table not in (None, "none") and not Path(lto_table).exists():
+        log(f"warning: no LTO facts file {lto_table}: the ISA can differ from plain hipcc (run `make split-facts`)")
     if args.facts != "none" and not Path(args.facts).exists():
         log(f"warning: no facts file {args.facts}: no fact stubs, the ISA can differ from plain hipcc "
             f"(run `make split-facts`)")
@@ -371,7 +543,7 @@ def build(args, plan, llvm, work, t_all):
     bcs = [parts_dir / f"p{i}.bc" for i in range(len(groups))]
     t0 = time.monotonic()
     nstrong, ncalls = extract_parts(llvm, bc, mod, groups, cuid, bcs, pool, facts)
-    dup = shared_symbols(nm, bcs)
+    dup = shared_symbols(nm, bcs, "DBRSGC" if plan["driver"] == "new" else "DBRTSGC")
     if dup:
         raise RuntimeError(f"parts define the same strong symbol twice: {dup}")
     log(f"{len(kernels)} kernels in {len(groups)} parts ({nstrong} strong globals, {ncalls} fact stub calls), extract {time.monotonic() - t0:.1f}s")
@@ -382,15 +554,34 @@ def build(args, plan, llvm, work, t_all):
     jobs = []
     for i, part in enumerate(bcs):
         obj = parts_dir / f"p{i}.o"
-        cmd = device_back_end(plan["device"], part, obj, args.trace)
-        jobs.append((part, obj, cmd, work / "cache" / (part_key(part, cmd) + ".o")))
+        salt = ""
+        if plan["driver"] == "new":
+            # new driver: the cc1 back end writes prelinked LTO bitcode, the LTO fact stub goes in, then the two
+            # ld.lld steps (lto_steps)
+            pre = parts_dir / f"p{i}.pre.bc"
+            wanted = stub_wanted(mod, lto_facts, groups[i]) if lto_facts else set()
+            salt = repr(sorted((f, sorted(lto_facts[f].items())) for f in wanted))
+            stub = (lambda pre=pre, i=i, wanted=wanted:
+                    add_lto_stub(llvm, pre, f"{ir.STUB_PREFIX}lto_{i}", lto_facts, wanted))
+            steps = [device_back_end(plan["device"], part, pre, args.trace), stub,
+                     *lto_steps(plan, pre, parts_dir / f"p{i}.opt.bc", obj)]
+        else:
+            steps = [device_back_end(plan["device"], part, obj, args.trace)]
+        cmds = [c for c in steps if not callable(c)]
+        key = part_key(part, cmds[0], cmds[1:]) if not salt else \
+            hashlib.sha256((part_key(part, cmds[0], cmds[1:]) + salt).encode()).hexdigest()[:40]
+        jobs.append((part, obj, steps, work / "cache" / (key + ".o")))
     todo = [j for j in jobs if not j[3].exists()]
     log(f"{len(jobs) - len(todo)} parts cached, {len(todo)} to compile")
 
     def compile_part(job):
-        part, obj, cmd, cached = job
-        dt, _ = run(cmd, f"back end of {part.name}", out=obj)
+        part, obj, steps, cached = job
+        # the last step writes the part object: run() removes an old one first and fails when the step leaves none
+        dt = sum(cmd() if callable(cmd) else run(cmd, f"back end of {part.name}", out=obj if cmd is steps[-1] else None)[0]
+                 for cmd in steps)
         os.replace(obj, cached)
+        for tmp in (part.with_suffix(".pre.bc"), part.with_suffix(".opt.bc")):
+            tmp.unlink(missing_ok=True)
         return part.name, dt
 
     todo.sort(key=lambda j: -j[0].stat().st_size)
@@ -427,9 +618,30 @@ def build(args, plan, llvm, work, t_all):
 
 def derive_facts(args, plan, llvm, mod, bc, cuid, work, pool):
     """--derive-facts: every kernel alone in a part (the fewest call sites, so the narrowest facts), IPSCCP on each
-    part and on the whole module; every argument whose fact differs gets the module's fact in --facts."""
+    part and on the whole module; every argument whose fact differs gets the module's fact in --facts.
+
+    New offload driver: also the LTO table (facts_tables). The parts get the prelink stubs of the new prelink
+    table, every part and the whole module go through the prelink cc1, and the facts come from the IPSCCP of the
+    first ld.lld step. The whole-module prelink is the long step (about 11 min on the test machine)."""
     t0 = time.monotonic()
+    prelink_table, lto_table = facts_tables(args.facts, plan)
+    new = lto_table not in (None, "none")
     mono = pool.submit(ipsccp_defines, device_back_end(plan["device"], bc, work / "ipsccp-module.bc", False))
+    mono_pre = work / "module.pre.bc"
+    if new:
+        # the whole-module prelink is kept with the key of its input and command: a second derive reuses it
+        prelink = device_back_end(plan["device"], bc, mono_pre, False)
+        key, key_file = part_key(bc, prelink), work / "module.pre.key"
+        if mono_pre.exists() and key_file.exists() and key_file.read_text() == key:
+            log("module prelink: reused")
+            mono_prelink = pool.submit(lambda: None)
+        else:
+            key_file.unlink(missing_ok=True)
+
+            def module_prelink():
+                run(prelink, "module prelink")
+                key_file.write_text(key)
+            mono_prelink = pool.submit(module_prelink)
     alone = sorted(mod.kernels)
     fdir = work / "facts"
     shutil.rmtree(fdir, ignore_errors=True)
@@ -438,11 +650,27 @@ def derive_facts(args, plan, llvm, mod, bc, cuid, work, pool):
     extract_parts(llvm, bc, mod, [[k] for k in alone], cuid, bcs, pool)
     log(f"{len(alone)} one-kernel parts, extract {time.monotonic() - t0:.1f}s")
     facts = ir.derive_facts(mono.result(), facts_of(plan, bcs, fdir, pool))
-    ir.write_facts(Path(args.facts), facts)
-    log(f"{sum(len(v) for v in facts.values())} argument facts of {len(facts)} functions -> {args.facts} ({time.monotonic() - t0:.1f}s)")
+    ir.write_facts(Path(prelink_table), facts)
+    log(f"{sum(len(v) for v in facts.values())} argument facts of {len(facts)} functions -> {prelink_table} ({time.monotonic() - t0:.1f}s)")
+    if new:
+        extract_parts(llvm, bc, mod, [[k] for k in alone], cuid, bcs, pool, facts)
+
+        def lto_dump(i):
+            pre = bcs[i].with_suffix(".pre.bc")
+            run(device_back_end(plan["device"], bcs[i], pre, False), f"prelink {bcs[i].name}")
+            step1, _ = lto_steps(plan, pre, bcs[i].with_suffix(".opt.bc"), bcs[i].with_suffix(".o"))
+            out = ipsccp_defines(step1, lto=True)
+            pre.unlink()
+            return out
+        parts = list(pool.map(lto_dump, range(len(bcs))))
+        log(f"LTO IPSCCP of {len(bcs)} parts ({time.monotonic() - t0:.1f}s); waiting for the module prelink")
+        mono_prelink.result()
+        step1, _ = lto_steps(plan, mono_pre, work / "module.opt.bc", work / "module.o")
+        lto = ir.derive_facts(ipsccp_defines(step1, lto=True), parts)
+        ir.write_facts(Path(lto_table), lto)
+        log(f"{sum(len(v) for v in lto.values())} LTO argument facts of {len(lto)} functions -> {lto_table} ({time.monotonic() - t0:.1f}s)")
     shutil.rmtree(fdir, ignore_errors=True)
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

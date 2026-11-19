@@ -51,6 +51,7 @@ inline constexpr StateSwitchRule kStateSwitchRules[] = {
   {"CRUCIBLE_STATE_CACHE", false, "row policy state cache level; schedule only"},
   {"CRUCIBLE_STATIC_CACHE", false, "row policy static cache level; schedule only"},
   {"CRUCIBLE_TUNE_ROWS", false, "switches the tuned row policy; schedule only"},
+  {"CRUCIBLE_TWIN", true, "twin prompts copy another slot's End or Pre point; the rule takes only cold states, but no state-equality gate has shown equal bytes yet, so it stays (the safe side)"},
   {"CRUCIBLE_VERIFY_QSA_CHECK", false, "kill check counts; it reads and synchronizes"},
   {"CRUCIBLE_WARMUP", false, "startup buffer warm-up; no state is written by it"},
 };

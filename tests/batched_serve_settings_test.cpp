@@ -58,6 +58,15 @@ int main() {
     try { parse({"--streams","4","--mtp-window",bad}); } catch (const std::exception&) { threw=true; }
     assert(threw);
   }
+  // Memory stage 2: the start-time fit is on unless --fit off; any other word is refused.
+  assert(parse({"--streams","4"}).fit && parse({"--streams","4","--fit","auto"}).fit);
+  assert(!parse({"--streams","4","--fit","off"}).fit);
+  for (const char* bad : {"on","0","","OFF"}) {
+    bool threw=false;
+    try { parse({"--streams","4","--fit",bad}); }
+    catch (const std::invalid_argument& error) { threw=std::string(error.what())=="fit must be auto or off"; }
+    assert(threw);
+  }
   // Cache probation (batch_conversation_cache.h): on unless turned off.
   assert(parse({"--streams","4"}).cache_probation && !parse({"--streams","4","--cache-probation","0"}).cache_probation);
   assert(parse({"--streams","4"}).cache_idle_minutes==30 &&
@@ -79,6 +88,17 @@ int main() {
   assert(parse({"--streams","4","--conversation-cache-mib","64","--session-replay","1","--state-dir","/x"}).state_write_delay_ms==0);
   assert(parse({"--streams","4","--conversation-cache-mib","64","--session-replay","1","--state-dir","/x",
                 "--state-disk-write-delay-ms","3000"}).state_write_delay_ms==3000);
+  // The branch ladder: off by default (the default path
+  // equals the earlier one); 1 turns it on.
+  assert(!parse({"--streams","4","--conversation-cache-mib","64","--session-replay","1","--state-dir","/x"}).state_disk_ladder);
+  assert(parse({"--streams","4","--conversation-cache-mib","64","--session-replay","1","--state-dir","/x",
+                "--state-disk-ladder","1"}).state_disk_ladder);
+  assert(!parse({"--streams","4","--conversation-cache-mib","64","--session-replay","1","--state-dir","/x",
+                 "--state-disk-ladder","0"}).state_disk_ladder);
+  // The fork point (Part B): off by default.
+  assert(!parse({"--streams","4","--conversation-cache-mib","64","--session-replay","1","--state-dir","/x"}).state_disk_fork);
+  assert(parse({"--streams","4","--conversation-cache-mib","64","--session-replay","1","--state-dir","/x",
+                "--state-disk-fork","1"}).state_disk_fork);
   for (const auto args:std::vector<std::vector<std::string_view>>{
       {"--streams","4","--state-dir","/x"},
       {"--streams","4","--conversation-cache-mib","64","--state-dir","/x"},
@@ -90,6 +110,12 @@ int main() {
       {"--streams","4","--conversation-cache-mib","64","--session-replay","1","--state-disk-gib","10"},
       {"--streams","4","--conversation-cache-mib","64","--session-replay","1","--state-disk-write-gib-per-day","10"},
       {"--streams","4","--conversation-cache-mib","64","--session-replay","1","--state-disk-write-delay-ms","10"},
+      {"--streams","4","--conversation-cache-mib","64","--session-replay","1","--state-disk-ladder","1"},
+      {"--streams","4","--conversation-cache-mib","64","--session-replay","1","--state-disk-fork","1"},
+      {"--streams","4","--conversation-cache-mib","64","--session-replay","1","--state-dir","/x",
+       "--state-disk-fork","2"},
+      {"--streams","4","--conversation-cache-mib","64","--session-replay","1","--state-dir","/x",
+       "--state-disk-ladder","2"},
       {"--streams","4","--conversation-cache-mib","64","--session-replay","1","--state-dir","/x",
        "--state-disk-write-delay-ms","60001"},
       {"--streams","4","--conversation-cache-mib","64","--session-replay","1","--state-dir","/x",

@@ -882,9 +882,25 @@ __global__ void __launch_bounds__(256) GdnLanesGateKernel(GdnPrefill a) {
 // oz is a zero the compiler cannot see, so that it does not keep the gamma and suh values and the
 // addresses in VGPRs across the scan loop of GdnScanGateKernel (fewer VGPRs, 10 waves per SIMD).
 // gam: gamma; hs: the head's 128 suh_out values as fp32 (both in LDS in the fused kernel).
+// GdnLaneZero: on ROCm 10.1 (clang 23 and later) a zero the compiler cannot see, else 0. With it the
+// lane terms of the gate (the 5 Wht128 signs, the xh_out column address) and of the final state
+// store are made where they are used: 10.1 hoisted them out of the scan loop and spilled 92 to 96
+// bytes per lane to scratch. 7.2.4 keeps the old instructions (the opaque lane changes its VOPD
+// pairs in the scan steps: 117 to 89 dual FMAs).
+#if defined(__clang_major__) && __clang_major__ >= 23
+constexpr bool kGdnLaneOpaque = true;
+#else
+constexpr bool kGdnLaneOpaque = false;
+#endif
+__device__ __forceinline__ int GdnLaneZero() {
+  if constexpr (!kGdnLaneOpaque) return 0;
+  int z;
+  asm volatile("s_mov_b32 %0, 0" : "=s"(z));
+  return z;
+}
 __device__ __forceinline__ void GdnGateRow(const GdnPrefill& a, int r, int h, float4 yv, float4 zv,
                                            const float* gam, const float* hs) {
-  const int lane = threadIdx.x & 31, j = lane * 4;
+  const int lane = (threadIdx.x & 31) + GdnLaneZero(), j = lane * 4;
   const float y[4] = {yv.x, yv.y, yv.z, yv.w};
   // WaveSum and Wht128 with DPP moves: the same sums in the same order (bitwise equal values).
   float ss = y[0]*y[0] + y[1]*y[1] + y[2]*y[2] + y[3]*y[3];
@@ -899,7 +915,8 @@ __device__ __forceinline__ void GdnGateRow(const GdnPrefill& a, int r, int h, fl
     const float o = y[i] * inv * gam[j + i] * Sigmoid(z[i]);
     v[i] = RoundH(RoundH(o) * hs[j + i]);
   }
-  Wht128Dpp(v);
+  if constexpr (kGdnLaneOpaque) Wht128DppLane(v, lane);
+  else Wht128Dpp(v);  // the 7.2.4 instructions of before (Wht128DppLane gives 7.2.4 other VGPRs)
   union { __half h[4]; uint2 u; } out;
 #pragma unroll
   for (int i = 0; i < 4; ++i) out.h[i] = __float2half(v[i] * kHadNorm);
@@ -1091,6 +1108,8 @@ __global__ void __launch_bounds__(128, 10) GdnScanGateKernel(GdnPrefill a, const
 #pragma unroll
     for (int i=0;i<32;++i) S[i]*=scale;
   }
+  if constexpr (kGdnLaneOpaque)  // the state address again: 10.1 kept the lane term in a VGPR across the loop
+    dst=a.input.state+(size_t)h*128*128+(size_t)sub*32*128+(hb*32+((threadIdx.x+GdnLaneZero())&31));
 #pragma unroll
   for (int i=0;i<32;++i) dst[i*128]=S[i];
   if (a.anchor && (blockIdx.x&3)==0 && threadIdx.x==0) a.carry[h]=anchored ? 1.f : scale;

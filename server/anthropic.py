@@ -13,6 +13,11 @@ IGNORED = {"max_tokens", "stream", "temperature", "top_p", "top_k", "stop_sequen
 FIELDS = IGNORED | {"model", "messages", "system", "tools", "tool_choice", "thinking", "output_config"}
 # cache_control and citations are client hints with no prompt text.
 BLOCK_HINTS = {"cache_control", "citations"}
+# output_config.format maps to the chat field response_format (server/structured.py); its errors name this place.
+FORMAT_FIELD = "output_config.format"
+# The template never renders a tool's strict flag (api.validate_request render_strict), also on an engine with no
+# structured output: an Anthropic tool never had the flag in its prompt.
+RENDER_STRICT = False
 
 
 def fail(message, param="messages"):
@@ -157,7 +162,8 @@ def chat_tools(value):
         fail("tools must be a list.", "tools")
     tools = []
     for tool in value:
-        if (not isinstance(tool, dict) or set(tool) - {"name", "description", "input_schema", "type", "cache_control"}
+        if (not isinstance(tool, dict) or set(tool) - {"name", "description", "input_schema", "type", "cache_control",
+                                                       "strict"}
                 or tool.get("type", "custom") != "custom"):
             fail("Each tool needs name, description, and input_schema. Server tools are not supported.", "tools")
         # The template renders each tool as JSON, so the keys keep the usual OpenAI order: name, description, parameters.
@@ -165,6 +171,12 @@ def chat_tools(value):
         if "description" in tool:
             function["description"] = tool["description"]
         function["parameters"] = tool.get("input_schema", dict(type="object", properties={}))
+        # strict: true is the strict call grammar of a chat function tool (server/structured.py); null is absent.
+        # The template never renders the flag (RENDER_STRICT, Request.render_tools).
+        if tool.get("strict") is not None:
+            if type(tool["strict"]) is not bool:
+                fail("A tool's strict must be true or false.", "tools")
+            function["strict"] = tool["strict"]
         tools.append(dict(type="function", function=function))
     return tools
 
@@ -212,8 +224,22 @@ def chat_body(body):
         thinking_switch(body["thinking"], result)
     config = body.get("output_config")
     if config is not None:
-        if not isinstance(config, dict) or set(config) - {"effort"}:
-            fail("output_config supports effort only.", "output_config")
+        if not isinstance(config, dict) or set(config) - {"effort", "format"}:
+            fail("output_config supports effort and format only.", "output_config")
         if "effort" in config:
             result["reasoning_effort"] = config["effort"]  # validate_request maps the level (server/api.py EFFORTS)
+        if config.get("format") is not None:
+            result["response_format"] = output_format(config["format"])
     return result
+
+
+def output_format(value):
+    """output_config.format -> the chat response_format. The chat path checks the schema (server/structured.py
+    response_format), so the grammar, the refused keywords and the limits are the same."""
+    if not isinstance(value, dict) or value.get("type") != "json_schema":
+        fail(f"{FORMAT_FIELD} type must be json_schema.", FORMAT_FIELD)
+    if not isinstance(value.get("schema"), dict):
+        fail(f"{FORMAT_FIELD} json_schema needs a schema object.", FORMAT_FIELD)
+    if set(value) != {"type", "schema"}:
+        fail(f"{FORMAT_FIELD} json_schema supports type and schema only.", FORMAT_FIELD)
+    return dict(type="json_schema", json_schema=dict(schema=value["schema"]))

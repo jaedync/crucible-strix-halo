@@ -83,6 +83,9 @@ bool ParseGenOptions(int argc, char** argv, int first, GenOptions& o) {
     else if (k == "--top-p") o.sampling.top_p = GenNumber<double>(v);
     else if (k == "--min-p") o.sampling.min_p = GenNumber<double>(v);
     else if (k == "--seed") o.sampling.seed = GenNumber<uint64_t>(v);
+    else if (k == "--presence-penalty") o.sampling.presence_penalty = GenNumber<double>(v);
+    else if (k == "--frequency-penalty") o.sampling.frequency_penalty = GenNumber<double>(v);
+    else if (k == "--repetition-penalty") o.sampling.repetition_penalty = GenNumber<double>(v);
     else return false;
   }
   } catch (const std::exception&) { return false; }
@@ -96,11 +99,11 @@ int CheckGenOptions(const GenOptions& o, std::vector<int>& blocks) {
     std::fprintf(stderr, "invalid sampling: %s\n", error.c_str());
     return 2;
   }
-  if (o.sampling.temperature > 0 && o.overlap) {
+  if (o.sampling.HostDraw() && o.overlap) {
     std::fprintf(stderr, "sampling does not support --draft-overlap; use --draft-overlap 0\n");
     return 2;
   }
-  if (o.sampling.temperature > 0 && o.head_auto) {
+  if (o.sampling.HostDraw() && o.head_auto) {
     std::fprintf(stderr, "sampling does not support the online draft head; use --draft-head-auto 0\n");
     return 2;
   }
@@ -229,7 +232,8 @@ GenResult RunGen(Engine& eng, const GenOptions& o, const std::vector<int>& block
   if (!o.debug_schedule.empty()) return RunDebugSchedule(eng, o);
 #endif
   const std::vector<int> selected = ResolveDraftBlocks(o, blocks);
-  if (o.sampling.temperature > 0) return RunSampledGen(eng, o, selected);
+  // A penalized greedy request takes the host path too: its token comes from the penalized logits row.
+  if (o.sampling.HostDraw()) return RunSampledGen(eng, o, selected);
   const std::vector<int>& ids = o.ids;
   const int n = o.n, ctx = o.ctx, spec = o.n == 1 ? 0 : o.spec, lookup = o.lookup, chunk = o.chunk;
   const int prefill_rows = eng.PrefillRows();
@@ -567,6 +571,7 @@ int ENGINE_CLI_ENTRY(int argc, char** argv) {
                  "[--ctx N] [--draft-blocks F | --draft-tokens F] [--draft-margin M] [--lookup D] "
                  "[--draft-last-head 0|1] [--draft-overlap 0|1] [--draft-q Q] [--steps 0|1] "
                  "[--temperature T] [--top-k K] [--top-p P] [--min-p P] [--seed S] "
+                 "[--presence-penalty P] [--frequency-penalty F] [--repetition-penalty R] "
                  "[--draft-head-auto 0|1] [--draft-head full|64k] [--mtp-prefix N]\n"
                  "       (default: --spec 7 --draft-q 0.3 --draft-head 64k --mtp-prefix 256;\n"
                  "       --spec 0 is serial, --draft-head full uses the full head, --mtp-prefix 0 is full warmup)\n"

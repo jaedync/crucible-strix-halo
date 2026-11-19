@@ -44,6 +44,25 @@ int main() {
   Rejected(R"({"ids":[1],"top_k":248321})", "top_k");
   Rejected(R"({"ids":[1],"top_p":1.01})", "top_p");
   Rejected(R"({"ids":[1],"min_p":-0.1})", "min_p");
+  // Penalties: no field keeps the neutral values, so the request is today's.
+  const auto plain = ParseServeRequest(R"({"ids":[1,2],"max_tokens":2})", 32);
+  assert(!plain.sampling.Penalized() && plain.sampling.penalty_prompt == -1);
+  const auto penalized = ParseServeRequest(
+      R"({"ids":[1,2,3],"max_tokens":2,"presence_penalty":-1.5,"frequency_penalty":0.25,"repetition_penalty":1.1,)"
+      R"("penalty_prompt":2})", 32);
+  assert(penalized.sampling.presence_penalty == -1.5 && penalized.sampling.frequency_penalty == 0.25);
+  assert(penalized.sampling.repetition_penalty == 1.1 && penalized.sampling.penalty_prompt == 2);
+  assert(penalized.sampling.Penalized() && penalized.sampling.HostDraw());
+  Rejected(R"({"ids":[1],"presence_penalty":2.5})", "presence_penalty must be in [-2, 2]");
+  Rejected(R"({"ids":[1],"frequency_penalty":-3})", "frequency_penalty must be in [-2, 2]");
+  Rejected(R"({"ids":[1],"repetition_penalty":0})", "repetition_penalty must be in [0.01, 2]");
+  Rejected(R"({"ids":[1],"repetition_penalty":1e-50})", "repetition_penalty must be in [0.01, 2]");
+  Rejected(R"({"ids":[1],"repetition_penalty":2.5})", "repetition_penalty must be in [0.01, 2]");
+  Rejected(R"({"ids":[1,2],"repetition_penalty":1.1,"penalty_prompt":3})", "penalty_prompt");
+  Rejected(R"({"ids":[1,2],"repetition_penalty":1.1,"penalty_prompt":-2})", "penalty_prompt");
+  // Scoring keeps the raw log-probabilities; the token is the penalized greedy one, so a penalty may come with it.
+  assert(ParseServeRequest(R"({"ids":[1],"max_tokens":1,"top_logprobs":3,"repetition_penalty":1.1})", 32)
+             .top_logprobs == 3);
   Rejected("{\"ids\":[1", "expected");
   Rejected(R"({"ids":[-1]})", "token IDs");
   Rejected(R"({"ids":[248320]})", "token IDs");

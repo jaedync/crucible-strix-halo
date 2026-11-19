@@ -15,7 +15,7 @@ Rank 4 (runtime).
 - Small helpers: `dump_io.h` (checked residual dump output), `device_zero.h`
   (zero-span check for `gen --jobs` state).
 - Decode, verification and sampling: `generation.h`, `spec_steps.h`,
-  `sampling.h`, `sampling_generation.h`.
+  `sampling.h`, `sampling_penalty.h`, `sampling_generation.h`.
 - Drafts: `draft_*.h` (`draft_accept.h`: the acceptance prior), `mtp_bulk.h`.
 - Generation options: `gen_options.h` (`GenOptions`, `CliGenOptions`
   and the draft selection rules). The CLI parses them. Serve reads them.
@@ -26,7 +26,8 @@ Rank 4 (runtime).
   `batch_inputs.h`, `batch_spec_contract.h`, `packed_rows_option.h`,
   `pass_rows.h`.
 - State caches: `conversation_*.h`, `slot_checkpoints.h`,
-  `snapshot_bytes.h`, `state_disk.h`.
+  `snapshot_bytes.h`, `state_disk.h`, `state_root.h` (where the state folder
+  can be).
 - `sha256.h`: a leaf. Any module may include it. It includes only the
   standard library.
 

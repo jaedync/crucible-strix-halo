@@ -54,6 +54,7 @@ inline int Serve(const std::string& ckpt, const ServeSettings& settings) {
     try {
       if (oversized) throw std::runtime_error("request exceeds the serve JSON-line limit");
       const ServeRequest request = ParseServeRequest(line, ctx, settings.policy);
+      if (request.constraint) throw std::runtime_error("constraint_unsupported: structured output needs the batch worker");
       if (!request.images.empty() && !eng.HasVision())
         throw std::runtime_error("this engine runs without the vision tower; start serve with --vision 1");
       // The request's mode; serial serve runs on the selected stream.
@@ -75,7 +76,7 @@ inline int Serve(const std::string& ckpt, const ServeSettings& settings) {
       const auto draft_selection = ResolveDraftBlocks(options, {});
       const int effective_spec = options.n == 1 ? 0 : options.spec;
       const ConversationPolicy policy{effective_spec, options.chunk, eng.PrefillRows(),
-          options.lookup, options.lookup_min, options.sampling.temperature > 0,
+          options.lookup, options.lookup_min, options.sampling.HostDraw(),
           options.draft_dense, AdaptiveDraft(options), options.last_head != 0, options.overlap != 0,
           std::bit_cast<uint32_t>(options.draft_margin), std::bit_cast<uint32_t>(options.draft_q), draft_selection,
           options.head_auto != 0, options.mtp_prefix, request.tenant};

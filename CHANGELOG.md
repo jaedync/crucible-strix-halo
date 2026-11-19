@@ -3,6 +3,178 @@
 Releases are numbered `v0.<train>.<fix>`. This file lists the newest release first.
 The same text is in the notes of each release on GitHub.
 
+## v0.38.0 (2026-11-19)
+
+Release v0.38.0 adds the OpenAI Responses API, the Anthropic Messages API and structured output with a grammar. The
+engine has new kernels: the HC weights are int8 by default, and the two kernels that made a ROCm 10.1 build slow no
+longer spill registers. Setup gets new options, and start, stop and the memory checks are safer.
+
+### New APIs
+
+- `POST /v1/responses` takes an OpenAI Responses body on the chat path: the same prompt as the equal chat request. A
+  function tool without `strict` is the one exception for the grammar (see "Structured output"). The server keeps no
+  state: send the whole conversation in `input`. See docs/OPENAI_CLIENTS.md.
+- `POST /v1/messages` takes an Anthropic Messages body on the chat path, with `thinking`, `text` and `tool_use` blocks,
+  the Anthropic stream events and the Anthropic error shape. Generation no longer needs a Chat Completions client.
+- A malformed field on `/v1/responses` or `/v1/messages` is an HTTP 400 in the error shape of that API. The error names
+  the place and the supported values. It never repeats the value that the client sent.
+- Chat and completion replies have a `timings` object with the OpenAI-compatible field names (in a stream, the last chunk).
+  Benchmark tools read the prompt and decode speeds from it.
+
+### Structured output
+
+- Chat Completions accepts `response_format` `text`, `json_object` and `json_schema`. A grammar holds the answer to
+  the schema while the model writes it. A tool with `strict: true` gets a grammar for its arguments.
+- With `tool_choice` `required` or a named function, the grammar makes the model write a call.
+- Responses `text.format` and Anthropic `output_config.format` map to `response_format`: the same grammar, schema
+  checks and limits. An error names the field of that API, for example `text.format`.
+- An Anthropic tool with `strict: true` gets the strict call grammar on `/v1/messages` and
+  `/v1/messages/count_tokens`. The prompt never holds the `strict` flag.
+- On `/v1/responses`, a function tool without `strict` (or with `null`) gets the strict call grammar when the strict
+  checks accept its schema, as in the OpenAI Responses API. Else it gets no grammar, and the reply's `tools` show
+  `strict: false`. Chat Completions do not change. The prompt never holds a `strict` flag that the server set.
+- One keyword allow-list covers schemas and strict tools. A keyword that the grammar cannot enforce is an HTTP 400
+  `constraint_keyword` with the keyword and its JSON pointer. A schema that no value can match is
+  `constraint_impossible`.
+- The server refuses a schema or a pattern above the grammar limits (size, depth, repeat bounds up to 128,
+  alternatives, formats) with an HTTP 400 that names the limit.
+- The grammar compiles in a helper process with a 5 s deadline and memory limits. A crash or a timeout fails only that
+  request. A busy compiler gives HTTP 503 (`constraint_busy`).
+- A grammar with no legal next token ends only that request with HTTP 503 (a stream gets an error event). The other
+  sessions go on, and the session state stays good.
+- An engine without structured output returns HTTP 400 for a JSON format. A strict tool then runs with no grammar.
+- The grammars of structured output for the string formats `date`, `time`, `date-time`, `ipv4`, `ipv6`, `hostname`,
+  `relative-json-pointer` and `uri-template` take only valid values. Before, the model could write `2027-02-30`,
+  the second `60` or `010.0.4.17`, and the reply failed its own schema. Replies to schemas with these formats can
+  have other tokens.
+- In structured output, a `pattern` grammar takes only the ASCII strings that the pattern matches. Outside ASCII,
+  `\D`, `\W` and `\S` take characters that Python's `re` refuses (docs/OPENAI_CLIENTS.md).
+- Before, the engine took more for some patterns: `^[A-Z]{2}(-[0-9]+)?$` took `AB1`, `(ab+|c){1,}` took `ccb`, and
+  `a{1,2}|a` took `aaa`. The cause is three faults in the regex automaton of xgrammar 0.2.9. The server now gives the
+  engine an equal form of each pattern. Only replies that the old grammar let go wrong can change.
+- A `pattern` part that the engine cannot read as written now returns HTTP 400 `constraint_keyword`: a lookahead or
+  lookbehind, an atomic group, a group flag other than a leading `(?i)`, a quantifier after a quantifier (for example
+  `a++`), a `{` that is not a repetition, and an anchor `^` or `$` that is not at an end of the pattern.
+- Before, the engine ignored a lookahead or an inner anchor, so the grammar took strings that the pattern refuses. An
+  anchor `^` or `$` inside a group is served when no group around it has a quantifier, and only anchors of its kind
+  come before `^` or after `$`, for example `(^\d{5}$)|(^\d{5}-\d{4}$)`.
+- The grammars of `enum`, `const`, `anyOf` and string lengths still go through the state merge of xgrammar 0.2.9 that
+  made some patterns looser. A test of 6,300 random schemas and 2,919,383 values found no value that the schema refuses.
+
+### Tool calls and request fields
+
+- The tool call parser also reads the Anthropic form `<invoke name="...">` with `<parameter name="...">` tags
+  (thanks @dineshr93). It gets the same checks as a `<tool_call>`. Prose that names the tag stays content.
+- `<invoke>` text inside a `<tool_call>` argument stays argument text. A strict argument can hold `</tool_call>`
+  and `</parameter>`: the server reads a strict call by its structure.
+- Lenient request fields are on by default: the server accepts requests with the extra fields of other servers. It
+  ignores an allow-list of fields that cannot change the tokens, for example `user` and `cache_prompt`.
+- In the lenient mode, a sampling field of another server is accepted only at its neutral value. Every other unknown
+  field, for example `guided_regex` or `allowed_token_ids`, is an HTTP 400 that names it.
+- `--lenient-fields off` (a server flag) or `CRUCIBLE_LENIENT_FIELDS=0` gives the strict mode: every unknown field is an
+  HTTP 400, as in v0.37.3. The launcher has no option for the mode. Without the user service, use
+  `CRUCIBLE_LENIENT_FIELDS=0 ./crucible start`.
+- The user service does not get your shell environment: add `Environment=CRUCIBLE_LENIENT_FIELDS=0` under `[Service]`
+  with `systemctl --user edit crucible-server.service`, then run `./crucible service restart`.
+- `presence_penalty` and `frequency_penalty` (from `-2` to `2`) and `repetition_penalty` (from `0.01` to `2`) now
+  change the tokens. v0.37.3 refused a value that was not neutral with HTTP 400. A value outside the range is an HTTP
+  400 that names the field. `repetition_penalty` counts the prompt and the reply, with no window (server/README.md).
+- In the lenient mode, `repeat_last_n` must be null when a penalty is not neutral, because the penalties have no
+  window. Another value is an HTTP 400 that names the field.
+- With session replay, after a turn with tool calls, the server prefills the reply while the client runs its tools.
+  The next request that sends the reply back then resumes at or near the end of the reply (`--extend-tool-tails`,
+  default 1 with session replay).
+- A request that comes while that prefill runs waits for it, at most 120 s, and a stream gets no byte during the wait.
+  A proxy with a shorter idle timeout can close the connection. `--extend-tool-tails 0` turns off the prefill and the
+  wait.
+
+### Engine and build
+
+- The decode path reads the HC weights (`fn`, `up`) as int8 with fp16 group scales by default. A decode token reads
+  about 11% fewer bytes. The tokens can differ from v0.37.3. `CRUCIBLE_HC_WMMA=1` or `CRUCIBLE_EXACT=1` selects fp16.
+- The fat gate/up kernel and the GDN scan gate kernel no longer spill registers with the ROCm 10.1 compiler
+  (thanks @TheBeaninator). Their output bytes do not change.
+- `make`, `./crucible setup` and `./crucible update` no longer stop for a ROCm 10 compiler. `ALLOW_ROCM10=1` and
+  `--allow-rocm10` are still accepted and have no effect. With that compiler, `make` builds with plain `hipcc`.
+- The prefill kernels use DPP moves for more Hadamard transforms, and the MoE tile kernels decode their weights in
+  fewer steps. The speed table in the README gives the measured numbers of this release.
+- When host memory is low, the conversation cache keeps the resume point that a new snapshot replaces until the new
+  one is saved. A refused save no longer loses the saved prefix of the session (thanks @mikenavi).
+- With the disk tier (`--state-dir`), a turn waits for the read of its saved state up to the time of a cold prefill of
+  those tokens, and the read can make room in host memory. Fewer long turns compute again from the start.
+- A build from a commit that is not a release names its commit and the release that it is based on.
+- The engine `build-info` also records the settings of the structured-output library in the engine: `CXX`, the path
+  and version of that compiler, `XGR_DEFINES` and `XGR_INCLUDES`. `make release-engine` refuses other values than the
+  defaults. A build with another compiler, compiler version or library setting compiles the library again.
+
+### Setup and install
+
+- `./crucible setup --ngram16 yes` builds the 16-bit n-gram table after a disk check (docs/NGRAM16.md). Start and the
+  service then use it.
+- `./crucible setup --abliterated yes` also serves the abliterated mode (docs/ABLITERATED.md). Setup checks the sha256
+  of the sidecar and keeps its LICENSE. The stock model stays the default of every request.
+- `--state-write-gib-day N` sets the SSD wear guard: the GiB that the conversation cache may write in one day (default
+  300; 0: read only). `./crucible status` shows the writes of today against that limit.
+- Setup and doctor measure the disk of the state folder one time (a 2 GiB write and read) and warn about a slow disk.
+  `--no-disk-check` skips the measure.
+- Setup stops before the pack download when a machine check fails. `--download-anyway` downloads the pack anyway,
+  for example before the restart for the kernel parameters.
+- The installer checks the machine (read only) in its dry run and in its first step. It checks the setup options
+  before any download.
+- The installer run from a clone uses that clone. A clone that is not at the tag builds the engine from its source.
+- The setup build line names the compile jobs, the measured build time and the memory rule.
+- The installer checks the sha256 of SHA256SUMS against the pin in install.sh. A wrong pin stops the install. An empty
+  pin gives a warning.
+- `./crucible setup --pack 4.18` installs the 4.18 pack (`4.18bpw_h6_ng8`, a 122 GB download, a 125 GB disk check). It
+  has the quality of the 4.05 pack and needs a 128 GB machine. The pack question of setup offers it.
+- Setup fits its defaults to the machine memory. A 96 GB machine (88 GiB to 120 GiB) gets the 3.05 pack, 2 sessions of
+  262,144 tokens, a 4,096 MiB conversation cache and GPU memory kernel parameters for its size. Doctor and the
+  installer fail a machine below 88 GiB, with the reason.
+- The public tree no longer has six tools in `tools/`: `ab_order.py`, `hc8_speed.py`, `ids_compare.py`,
+  `lease_holder_check.py`, `ple_abab.py` and `tail_cost.py`, and `abab.sh` and `abab_report.py` in `training/mtp_tune/`.
+  They did not work: they needed a library that is not in the public tree.
+
+### Start, stop and memory
+
+- The `crucible_turn` log line has `prefix_*` fields: keyed hashes of the reasoning line, the tools block and each tool
+  definition, and the token ends of the tools and system blocks. They show why two new sessions share only a short
+  prefix. The line never holds the text, and the cache of recent heads keeps only hashes and counts
+.
+- The memory checks stop a start again, as before v0.37.3: a machine below 88 GiB, the 4.05 or 4.18 pack below 120 GiB,
+  and GPU memory that another program holds. A new check warns when the available host memory is below the host
+  reserve. Each memory message names the memory holders of your user and suggests a smaller pack, smaller caches or
+  fewer sessions.
+- When the requested layout does not fit the free memory at start, the engine starts a smaller one: a smaller
+  conversation cache, then fewer sessions, then a shorter `--ctx`. The server prints one line with the cause and the
+  memory holders. A YaRN `--ctx` stays above 262,144. `--fit off` keeps the refusal (exit 4).
+- `GET /health` gives the real session count and `--ctx`: `{"status":"ok","sessions":N,"context":C}`.
+- When the engine stops, the server log line names the engine exit code, or the signal of a killed engine (SIGKILL: see
+  the kernel log for an out-of-memory kill). `./crucible status` and `./crucible start` show that cause from
+  `.crucible/server.log`.
+- After the first SIGTERM or SIGINT, the server ignores more stop signals until its engine has saved and exited.
+  `./crucible stop` waits for the engine process too, so a start right after a stop finds the memory free.
+- The stop messages tell you when an enabled user service starts again: at boot with linger, else at the next login.
+  The new command `./crucible service disable` stops the service and keeps it off. The unit file stays.
+- docs/DOCKER.md names the container (`--name crucible`) and gives the stop rules: `docker stop -t 130 crucible`, and
+  `docker ps` for a container that still runs. The image sets `CRUCIBLE_PLE_HOST=1`, as the documented run line does.
+- `./crucible stop` names the server on the configured port and its PID. A server of another install does not fail a
+  stop, an update or an uninstall.
+- The server no longer stops with a pipe error when the engine exits first.
+- The JSON output of the launcher keeps its indented layout.
+- The state folder (`--state-dir`) can be outside the home folder, for example on a second disk. The engine, setup,
+  doctor and uninstall use one rule: a folder that only you or root can change
+  ([conversation cache](docs/CONVERSATION_CACHE.md)).
+- The engine now also refuses some rare state folders inside the home folder: a parent folder that other users can
+  write (with no sticky bit), a parent folder of another user or of a group other than your main group, a link as the
+  last name, a state folder with the sticky bit, and an identity folder that is a link or belongs to another user.
+
+### Known limits
+
+- A source build with the ROCm 10.1 compiler is about 1.5% slower at a 32K prefill than a build with the 7.2.4
+  compiler (two measurements). In v0.37.1 to v0.37.3 it was about 42% slower.
+- With the disk tier (`--state-dir`) on a slow disk, a state write can wait longer than the 8 s bound of a slot handover.
+  The server then drops that state, and the next turn of that session computes again from the longest saved prefix.
+
 ## v0.37.3 (2026-11-17)
 
 Release v0.37.3 makes setup, start, stop and update safer, and a private LAN address can now start without a key. The

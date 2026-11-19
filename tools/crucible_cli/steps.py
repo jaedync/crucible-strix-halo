@@ -3,17 +3,21 @@ import json
 import time
 from pathlib import Path
 
-from . import doctor, kernelparams, keyfile, launch, packs, rocm, runtime as runtime_mod, service, settings as settings_mod
+from . import doctor, kernelparams, keyfile, launch, logcause, options, packs, rocm, runtime as runtime_mod, service, settings as settings_mod
 from .files import Sandbox
 from .launch import process_env
 
 ORDER = ("check", "venv", "download", "build", "config", "start", "test")
-NEEDS = {"download": ("venv",), "start": ("venv", "download", "build", "config"), "test": ("start",), "service": ("test",)}
+NEEDS = {"download": ("venv",), "ngram16": ("venv",), "abliterated": ("venv",),
+         "start": ("venv", "download", "ngram16", "abliterated", "build", "config"),
+         "test": ("start",), "service": ("test",)}
 WHAT = {
     "runtime": "download the private ROCm runtime into .crucible (no root, no system change)",
     "check": "check the machine",
     "venv": "make the Python environment in .venv",
     "download": "download the pack",
+    "ngram16": "download the source and build the 16-bit n-gram table (--ngram16)",
+    "abliterated": "download the pinned sidecar of the abliterated mode (--abliterated)",
     "build": "get the engine (the release engine, or a build with make)",
     "config": "write the configuration in .crucible",
     "start": "start the server",
@@ -25,18 +29,16 @@ IMPORTS = "import numpy, tokenizers, huggingface_hub, jinja2, PIL"
 
 HINT = "To run it as a service: ./crucible service install"
 
+# Item 10: a failed machine check stops the pack download (about 100 GB) before it starts. These checks do not stop it: a busy
+# GPU or port passes when the other program stops, setup makes the key file itself, and the disk check blocks the download already.
+DOWNLOAD_GOES_ON = frozenset({"gpu-free", "port", "key-file", "disk-models", "pack"})
+ANYWAY_QUESTION = "These checks failed, so the server cannot start yet. Download the pack anyway? (y/N)"
 
-ROCM10_MARKER = "CRUCIBLE-ROCM10-STOP"   # tools/hipcc_series.py MARKER: make stopped for a ROCm 10 hipcc
 
-
-def rocm10_stop(out):
-    """The message for a make that stopped for a ROCm 10 hipcc (tools/hipcc_series.py), or None for any other output. The
-    caller (setup, update) adds its own sentence with --allow-rocm10, so the message gives the flag once."""
-    if ROCM10_MARKER not in (out or ""):
-        return None
-    return ("hipcc is a ROCm 10 compiler (AMD clang 24 or later). An engine built with it is slower: a 32K prefill gave "
-            "1,091 tok/s against 1,894 tok/s with the ROCm 7.2.4 compiler (42% less, measured Nov 12 2026). Build with the "
-            "ROCm 7.2.4 compiler (set ROCM_PATH to its folder).")
+def download_stoppers(results):
+    """The failed checks that stop the pack download: each one blocks the start or the build."""
+    return [r for r in results if r.status == "fail" and r.id not in DOWNLOAD_GOES_ON
+            and ({"start", "build"} & set(r.blocks))]
 
 
 class StepFailed(Exception):
@@ -45,8 +47,9 @@ class StepFailed(Exception):
 
 class Setup:
     def __init__(self, host, s, smoke=False, start_timeout=3600, service="no", hint=False, runtime="", kernel_ask=None,
-                 allow_rocm10=False):
-        self.allow_rocm10 = allow_rocm10  # --allow-rocm10: make builds also with a ROCm 10 compiler (ALLOW_ROCM10=1)
+                 download_anyway=False, measure_disk=False):
+        self.measure_disk = measure_disk  # item 8: the check step measures the disk of the state folder one time
+        self.download_anyway = download_anyway  # --download-anyway: a failed machine check does not stop the pack download
         self.config_changed = False  # step_config sets it: the settings on the disk differ from the ones of the last run
         self.host, self.s, self.smoke, self.start_timeout = host, s, smoke, start_timeout
         self.service, self.hint = service, hint
@@ -55,6 +58,8 @@ class Setup:
         roots = [s.work, s.models_dir] + ([s.state_dir] if s.state_dir else [])
         if s.api_key_file is not None:
             roots.append(s.api_key_file.parent)  # the folder of the key file, and nothing else outside the repo
+        if getattr(s, "abliterated", False) and s.ablation_dir is not None:
+            roots.append(s.ablation_dir)  # the sidecar of the abliterated mode
         self.box = Sandbox(roots)
         self.state_file = s.work / "setup-state.json"
         self.state = self._load()
@@ -84,7 +89,10 @@ class Setup:
     # driver -----------------------------------------------------------------------------------------
     @property
     def order(self):
-        return ORDER + (("service",) if self.service == "yes" else ())
+        order = ORDER + (("service",) if self.service == "yes" else ())
+        extra = tuple(name for name in ("ngram16", "abliterated") if getattr(self.s, name, False))
+        i = order.index("download") + 1
+        return order[:i] + extra + order[i:]
 
     def plan(self):
         self.say("Setup plan:")
@@ -100,6 +108,8 @@ class Setup:
         if done_before:
             self.say("Resuming: " + ", ".join(done_before) + " finished in an earlier run; each is checked again and skipped when complete.")
         self.say(f"Pack {s.pack} ({s.spec.revision}), server on {s.base_url}, work folder {s.work}")
+        if s.state_dir is not None:
+            self.say(settings_mod.write_limit_line(s))
         results = []
         failed = []
         if self.runtime == "yes":
@@ -130,6 +140,7 @@ class Setup:
             if step == "check":
                 self._block(results)
                 self._kernel_step(results)
+                self._download_gate(results)
         total = h.clock() - t_all
         if failed:
             self._report_failures(results, failed)
@@ -181,6 +192,22 @@ class Setup:
         except OSError as exc:
             self.say(f"[kernel] FAILED: {exc}")
 
+    def _download_gate(self, results):
+        """Item 10: stop the pack download when a machine check failed, or ask on a terminal (Enter means no)."""
+        bad = download_stoppers(results)
+        if not bad or "download" in self.blocked or self.download_anyway or packs.verify(self.s.ckpt)[0] == "ok":
+            return
+        ids = ", ".join(r.id for r in bad)
+        self.say(f"[check] {len(bad)} check(s) failed before the download of about {self.s.spec.download_gb} GB: {ids}.")
+        if self.kernel_ask is not None:
+            answer = self.kernel_ask(ANYWAY_QUESTION, "n")
+            if answer.strip().lower() in ("y", "yes"):
+                return
+        why = (f"check failed: {ids}. Fix it, then run setup again; or add --download-anyway to download first")
+        self.blocked["download"] = why
+        if getattr(self.s, "ngram16", False) and not settings_mod.ngram16_ready(self.s):
+            self.blocked.setdefault("ngram16", why)
+
     def _block(self, results):
         steps = {}
         for r in results:
@@ -215,6 +242,8 @@ class Setup:
         self.say("Crucible is ready.")
         self.say(f"  Base URL: {s.base_url}/v1")
         self.say(f'  {keyfile.client_words(s)}')
+        if getattr(s, "abliterated", False):
+            self.say("  Abliterated mode: " + options.ABL_SELECT)
         service_step = self.state["steps"].get("service", {}).get("status") == "done"
         if service_step or service.installed(self.host):
             self.say("  Service: ./crucible service status     Logs: ./crucible service logs -f")
@@ -229,7 +258,7 @@ class Setup:
 
     # steps ------------------------------------------------------------------------------------------
     def step_check(self, results):
-        results.extend(doctor.run_checks(self.host, self.s))
+        results.extend(doctor.run_checks(self.host, self.s, measure=self.measure_disk))
         bad = [r for r in results if r.status == "fail"]
         for r in results:
             if r.status in ("fail", "warn"):
@@ -279,6 +308,72 @@ class Setup:
             raise StepFailed(detail + ". Run setup again: it continues.")
         return "downloaded"
 
+    def step_ngram16(self, results):
+        """--ngram16: tools/ngram16/fetch.py downloads the source (each file checked by sha256), builds the table, checks
+        it, and deletes the download. A stopped run continues. The disk check (disk-ngram16) ran before this step."""
+        h, s = self.host, self.s
+        if settings_mod.ngram16_ready(s):
+            note = "already built"
+        else:
+            if doctor._server_alive(h, s):
+                raise StepFailed("the server runs, and the build needs about 16 GB of free memory. Stop it with "
+                                 "./crucible stop, then run setup again.")
+            self.box.mkdir(s.ngram16_dir)
+            self.say(f"  Building the 16-bit n-gram table in {s.ngram16_dir} (a download of 104.3 GB, then the build). "
+                     "A stopped run continues when you run setup again.")
+            argv = [str(s.venv_python), str(s.repo / "tools/ngram16/fetch.py"), "--out", str(s.ngram16_dir), "--delete-source"]
+            res = h.runner.run(argv, cwd=s.repo, log=self._log("ngram16.log"), echo=True)
+            if res.rc != 0 or not settings_mod.ngram16_ready(s):
+                raise StepFailed(f"the 16-bit n-gram table is not built (log: {s.work / 'ngram16.log'}). Run setup again "
+                                 "to continue, or use --ngram16 no. " + res.out[-300:])
+            note = f"built {s.ngram16_file}"
+        results[:] = [r for r in results if r.id != "ngram16"] + doctor.ngram16_results(s)
+        self._block(results)
+        return note
+
+    def step_abliterated(self, results):
+        """--abliterated: the pinned public sidecar (docs/ABLITERATED.md), checked by sha256; for the 4.05 pack the copy
+        of tools/ablation_pack.py repackage. The engine checks the sha256 again at its start (kAblationPins)."""
+        h, s = self.host, self.s
+        if settings_mod.ablation_ready(s):
+            note = f"in place: {s.ablation_file}"
+        else:
+            src_dir = s.ablation_dir / options.ABL_SOURCE_FOLDER
+            src = src_dir / options.ABL_FILE
+            if not settings_mod.ablation_ready(s, src, "3.05"):
+                self.box.mkdir(src_dir)
+                argv = [str(s.venv / "bin" / "hf"), "download", options.ABL_REPO, options.ABL_FILE,
+                        options.ABL_LICENSE_FILE, "--revision", options.ABL_REVISION, "--local-dir", str(src_dir)]
+                res = h.runner.run(argv, cwd=s.repo, log=self._log("abliterated.log"))
+                if res.rc != 0:
+                    raise StepFailed(f"the download of the sidecar stopped (log: {s.work / 'abliterated.log'}). "
+                                     "Run setup again, or use --abliterated no. " + res.out[-200:])
+                if not settings_mod.ablation_ready(s, src, "3.05"):
+                    if src.exists() and not src.is_symlink():
+                        self.box.remove(src)
+                    raise StepFailed(f"the sidecar from {options.ABL_REPO} does not have the pinned sha256 "
+                                     f"{options.ABL_SHA256['3.05'][:16]}... The file was removed. Use --abliterated no.")
+            lic = src_dir / options.ABL_LICENSE_FILE
+            if not _sha_ok(lic, options.ABL_LICENSE_SHA256):
+                if lic.exists() and not lic.is_symlink():
+                    self.box.remove(lic)
+                raise StepFailed(f"the LICENSE file of {options.ABL_REPO} is missing or does not have the pinned sha256 "
+                                 f"{options.ABL_LICENSE_SHA256[:16]}... (the {options.ABL_LICENSE}). Use --abliterated no.")
+            if s.pack == "4.05":
+                out = s.ablation_file.parent
+                self.box.mkdir(out)
+                argv = [str(s.venv_python), str(s.repo / "tools/ablation_pack.py"), "repackage", str(src), str(out),
+                        "--pack", "405"]
+                res = h.runner.run(argv, cwd=s.repo, log=self._log("abliterated.log"))
+                if res.rc != 0 or not settings_mod.ablation_ready(s):
+                    raise StepFailed(f"the copy for the 4.05 pack failed (log: {s.work / 'abliterated.log'}). "
+                                     + res.out[-200:])
+                self.box.copyfile(lic, out / options.ABL_LICENSE_FILE)
+            note = f"checked by sha256: {s.ablation_file}"
+        results[:] = [r for r in results if r.id != "abliterated"] + doctor.ablation_results(s)
+        self._block(results)
+        return note
+
     def step_build(self, results):
         h, s = self.host, self.s
         if s.engine.exists() and self.state["steps"].get("build", {}).get("status") == "done":
@@ -288,19 +383,20 @@ class Setup:
             return f"release engine {rel['tag']} (verified)"
         make = h.which("make") or "make"
         env = {"ROCM_PATH": h.env["ROCM_PATH"]} if h.env.get("ROCM_PATH") else {}
-        if self.allow_rocm10:
-            env["ALLOW_ROCM10"] = "1"
         env = process_env(h.env, env) if env else None
         log = self._log("build.log")
-        self.say(f"  Building with one compile job; this takes about 16 minutes with the ROCm 7.2.4 compiler. Log: {s.work / 'build.log'}")
+        if s.jobs <= 1:
+            self.say("  Building with 1 compile job; this takes about 16 minutes with the ROCm 7.2.4 compiler on our machine. "
+                     f"More jobs are faster: --jobs N (each job needs its own memory). Log: {s.work / 'build.log'}")
+        else:
+            self.say(f"  Building with {s.jobs} compile jobs; with 8 jobs a first build took 4 to 6 minutes on our "
+                     f"build machine. Each job needs its own memory: lower --jobs if the machine runs out of memory. "
+                     f"Log: {s.work / 'build.log'}")
         argv = [make, f"-j{s.jobs}"]
         res = h.runner.run(argv, cwd=s.repo, env=env, log=log)
         if res.rc != 0 and "argument facts drift" in res.out:
             self.say("  The build stopped with 'argument facts drift' (another ROCm build). Building again with SPLIT=0 (slower).")
             res = h.runner.run(argv + ["SPLIT=0"], cwd=s.repo, env=env, log=log)
-        stop = rocm10_stop(res.out) if res.rc != 0 else None
-        if stop:
-            raise StepFailed(stop + " Run setup again with --allow-rocm10 to build with this compiler all the same.")
         if res.rc != 0 or not s.engine.exists():
             raise StepFailed(f"make failed (log: {s.work / 'build.log'}). Last lines: " + res.out[-400:])
         return "built build/engine/crucible"
@@ -359,6 +455,10 @@ class Setup:
 
     def step_start(self, results):
         h, s = self.host, self.s
+        if service.active(h, service.KILN_UNIT):
+            raise StepFailed(f"Kiln runs this engine in {service.KILN_UNIT}, so setup starts no second server (the GPU "
+                             "memory holds one). Stop it with: kiln stop, then run setup again; or let Kiln start it: "
+                             "kiln switch crucible")
         if service.installed(h):
             pending = self.config_changed or bool(self.state.get(service.PENDING_KEY))
             restart = pending and service.up(h)
@@ -383,6 +483,11 @@ class Setup:
         if pid is not None and h.runner.alive(pid):
             self.say(f"  The server from an earlier run is still running (process {pid}).")
         else:
+            causes = logcause.last_stop(s.work / "server.log")
+            if causes:
+                self.say(f"  The last server stopped. From {s.work / 'server.log'}:")
+                for line in causes:
+                    self.say("    " + line)
             env, argv = launch.server_command(s, s.venv_python)
             proc = h.runner.spawn(argv, cwd=s.repo, env=process_env(h.env, env), log=self._log("server.log"))
             pid = proc.pid
@@ -439,6 +544,14 @@ class Setup:
                 h.runner.terminate(pid)
                 self.box.remove(s.work / "server.pid")
         return note
+
+
+def _sha_ok(path, want):
+    """True when PATH is a plain file with the sha256 WANT."""
+    try:
+        return not path.is_symlink() and path.is_file() and settings_mod.file_sha256(path) == want
+    except OSError:
+        return False
 
 
 def stop(host, s):

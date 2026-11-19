@@ -68,7 +68,63 @@ struct Engine {
   }
 };
 
+// Penalized requests: the reference applies the formula to the fake target rows serially.
+static std::vector<int> PenaltyReference(const std::vector<int>& prompt, const sampling::Options& o, int n) {
+  std::vector<int> out, count(3, 0);
+  int last = prompt.back();
+  for (int i = 0; i < n; ++i) {
+    const auto raw = Engine::Logits(last, false);
+    std::vector<float> row(raw.begin(), raw.end());
+    for (int t = 0; t < 3; ++t) {
+      const bool in_prompt = std::find(prompt.begin(), prompt.end(), t) != prompt.end();
+      float v = row[size_t(t)];
+      if (in_prompt || count[size_t(t)]) v = v > 0 ? v / float(o.repetition_penalty) : v * float(o.repetition_penalty);
+      if (count[size_t(t)]) { v -= float(o.frequency_penalty) * float(count[size_t(t)]); v -= float(o.presence_penalty); }
+      row[size_t(t)] = v;
+    }
+    sampling::Options plain;
+    plain.temperature = o.temperature; plain.seed = o.seed;
+    last = sampling::FromLogits(row, plain).KeyedSample(plain.seed, prompt.size() + out.size());
+    out.push_back(last);
+    ++count[size_t(last)];
+  }
+  return out;
+}
+
+static void PenalizedRuns() {
+  Engine engine;
+  Metrics metrics;
+  std::vector<float> stacks((kMaxRows + 1) * kWide), carry(kWide);
+  const auto copy = [](float* dst, const float* src, size_t n) { std::memcpy(dst, src, n * sizeof(float)); };
+  const std::vector<int> prompt{0, 1, 0, 1};
+  for (const double temperature : {0.0, 0.7}) {
+    SampledGenerationOptions options;
+    options.sampling.temperature = temperature;
+    options.sampling.seed = 5150;
+    options.sampling.repetition_penalty = 1.3;
+    options.sampling.presence_penalty = 0.4;
+    options.sampling.frequency_penalty = 0.2;
+    options.n = 20; options.chunk = 2; options.draft_q = 0.3;
+    const auto expected = PenaltyReference(prompt, options.sampling, options.n);
+    // Without penalties the fake model gives other IDs, so the penalties take effect.
+    sampling::Options neutral;
+    neutral.temperature = temperature; neutral.seed = options.sampling.seed;
+    assert(PenaltyReference(prompt, neutral, options.n) != expected);
+    // The draft depth, the draft head subset and prompt lookup change only speed, never the IDs.
+    for (int spec : {0, 1, 2, 7}) {
+      for (bool sparse : {false, true}) {
+        for (int lookup : {0, 7}) {
+          engine.sparse = sparse; options.spec = spec; options.lookup = lookup; options.lookup_min = 1;
+          const auto run = GenerateSampled(engine, prompt, options, stacks.data(), carry.data(), copy, [](int) {}, metrics);
+          assert(run.ids == expected);
+        }
+      }
+    }
+  }
+}
+
 int main() {
+  PenalizedRuns();
   assert(SampledRawMargin(std::array<float, 3>{2, 2, -1}) == 0);
   assert(SampledRawMargin(std::array<float, 3>{-INFINITY, 2, -1}) == 3);
   assert(std::isinf(SampledRawMargin(std::array<float, 1>{2})));

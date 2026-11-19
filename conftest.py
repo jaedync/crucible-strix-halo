@@ -4,8 +4,9 @@
   A test of the check itself passes its own environment.
 - A per-test safety net (Nov 11: a test made pytest deaf to SIGTERM and spun 30 h; a test left a server alive 5 days):
   (a) the SIGTERM, SIGINT and SIGHUP handlers come back to what they were before the test;
-  (b) a per-test limit that needs no signal: after TESTGUARD_LIMIT_S (default 900 s) a timer thread kills the test's
-      processes (the scan of (c)) and ends pytest; faulthandler ends it 60 s later if the thread cannot run;
+  (b) a per-test limit that needs no signal: after TESTGUARD_LIMIT_S (default 900 s; the marker testguard_limit(s) sets
+      it for one known slow test) a timer thread kills the test's processes (the scan of (c)), prints the test id to the
+      real stderr and ends pytest; faulthandler ends it 60 s later if the thread cannot run;
   (c) no process that the test started may outlive it. Each pytest process adds its pid to TESTGUARD_SESSION, so every
       child inherits the marker, and pytest puts the test id in PYTEST_CURRENT_TEST. After the test, an own-uid process with
       both is killed (its process group) and the test fails. A multiprocessing helper of pytest itself (resource_tracker,
@@ -15,6 +16,7 @@ server/backend.py removes them from the engine environment, so an engine that a 
 """
 import contextlib
 import faulthandler
+import math
 import os
 import signal
 import sys
@@ -29,6 +31,7 @@ MARK = "TESTGUARD_SESSION"
 TOKEN = str(os.getpid())
 os.environ[MARK] = " ".join(filter(None, (os.environ.get(MARK, ""), TOKEN)))  # a nested pytest adds its own pid
 LIMIT_S = float(os.environ.get("TESTGUARD_LIMIT_S", "900"))
+MARK_MAX_S = 3600.0  # the gate --limit: a testguard_limit marker above it would never fire inside a gate
 BACKSTOP_S = 60.0  # faulthandler ends pytest this long after the limit when the timer thread cannot run (a C call holds the GIL)
 HELPERS = (b"from multiprocessing.resource_tracker import main", b"from multiprocessing.forkserver import main")
 SIGNALS = tuple(getattr(signal, n) for n in ("SIGTERM", "SIGINT", "SIGHUP") if hasattr(signal, n))
@@ -125,14 +128,44 @@ def leaked(nodeid, phases):
     return found
 
 
-def _limit_hit(nodeid):
-    """The per-test limit: kill the test's processes first (they would outlive pytest), then end pytest."""
+def pytest_configure(config):
+    config.addinivalue_line("markers", "testguard_limit(seconds): the per-test limit of this test, in place of "
+                                       "TESTGUARD_LIMIT_S (a known slow test only, for example the whole-repository scan)")
+
+
+def limit_of(node):
+    """The per-test limit in seconds: the testguard_limit marker of the test (testguard_limit(N) or
+    testguard_limit(seconds=N)), else TESTGUARD_LIMIT_S. A marker value must be finite, above 0 and at most
+    MARK_MAX_S: 0, a negative value or NaN skipped the timer, and 1e9 removed the limit in practice (review gate-oom M1)."""
+    mark = node.get_closest_marker("testguard_limit")
+    if mark is None or (not mark.args and not mark.kwargs):
+        return LIMIT_S
+    if len(mark.args) + len(mark.kwargs) != 1 or set(mark.kwargs) - {"seconds"}:
+        raise pytest.UsageError(f"{node.nodeid}: use testguard_limit(N) or testguard_limit(seconds=N), "
+                                f"not args={mark.args!r} kwargs={mark.kwargs!r}")
+    value = mark.args[0] if mark.args else mark.kwargs["seconds"]
+    try:
+        limit = float(value)
+    except (TypeError, ValueError):
+        limit = math.nan
+    if not (0 < limit <= MARK_MAX_S):
+        raise pytest.UsageError(f"{node.nodeid}: testguard_limit must be a number above 0 and at most {MARK_MAX_S:g} s "
+                                f"(the gate --limit), not {value!r}")
+    return limit
+
+
+def _limit_hit(nodeid, limit, capman):
+    """The per-test limit: kill the test's processes first (they would outlive pytest), then end pytest. The message
+    and the traceback go to the real stderr: under the fd capture they were lost, and an xdist gate showed only
+    "node down: Not properly terminated" (Nov 17)."""
+    with contextlib.suppress(Exception):
+        capman.suspend(in_=False)
+    with contextlib.suppress(Exception):
+        print(f"\n{nodeid}: the test ran longer than {limit:g} s; the guard kills its processes and ends pytest",
+              file=sys.stderr, flush=True)
     with contextlib.suppress(Exception):
         faulthandler.dump_traceback(all_threads=True)
     kill_groups(marked())
-    with contextlib.suppress(Exception):
-        print(f"\n{nodeid}: the test ran longer than {LIMIT_S:g} s; the guard killed its processes and ends pytest",
-              file=sys.stderr, flush=True)
     os._exit(1)
 
 
@@ -141,11 +174,13 @@ def _crucible_test_guard(request):
     main = threading.current_thread() is threading.main_thread()
     handlers = {s: signal.getsignal(s) for s in SIGNALS} if main else {}
     timer = None
-    if LIMIT_S > 0:
-        timer = threading.Timer(LIMIT_S, _limit_hit, (request.node.nodeid,))
+    limit = limit_of(request.node)
+    if limit > 0:
+        capman = request.config.pluginmanager.getplugin("capturemanager")
+        timer = threading.Timer(limit, _limit_hit, (request.node.nodeid, limit, capman))
         timer.daemon = True
         timer.start()
-        faulthandler.dump_traceback_later(LIMIT_S + BACKSTOP_S, exit=True)
+        faulthandler.dump_traceback_later(limit + BACKSTOP_S, exit=True)
     try:
         yield
     finally:

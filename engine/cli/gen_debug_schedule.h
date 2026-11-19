@@ -95,7 +95,7 @@ template <class E> void DebugRestore(E& eng, const GenOptions& o, size_t positio
 }
 
 template <class E> GenResult RunDebugSchedule(E& eng, const GenOptions& o) {
-  if (o.sampling.temperature > 0 || (o.spec > 0 && o.n > 1) || o.conversation)
+  if (o.sampling.HostDraw() || (o.spec > 0 && o.n > 1) || o.conversation)
     throw std::invalid_argument("--debug-schedule needs greedy spec 0 without a conversation");
   const std::vector<DebugChunk> chunks = ParseDebugSchedule(o.debug_schedule);
   size_t total = 0;

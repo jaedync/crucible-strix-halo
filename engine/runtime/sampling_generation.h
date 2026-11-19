@@ -2,6 +2,7 @@
 #pragma once
 #include "generation.h"
 #include "sampling.h"
+#include "sampling_penalty.h"
 #include "draft_policy.h"
 #include <optional>
 #include "conversation_resume.h"
@@ -56,6 +57,7 @@ class SampledGeneration {
 
   SampledGenerationResult Run() {
     Validate();
+    penalties_ = sampling::RequestPenalties(ids_, o_.sampling, eng_.Vocabulary());
     const double prefill_start = GenerationNow();
     if (o_.conversation && o_.conversation->restore) resume_ = o_.conversation->restore(stk_, carry_);
     else eng_.Reset();
@@ -73,7 +75,7 @@ class SampledGeneration {
     mpos_ = resume_.mpos; replay_ = resume_.replay;
     if (resume_.length == ids_.size()) {
       tail_logits_ = resume_.logits;
-      first_ = sampling::FromLogits(tail_logits_, o_.sampling);
+      first_ = FirstDraw();
     }
     Prefill();
     eng_.Synchronize();
@@ -81,7 +83,7 @@ class SampledGeneration {
     eng_.ClearExpertCounts();
     if (o_.profile) eng_.EnableProfile();
     const double decode_start = GenerationNow();
-    Push(Draw(*first_, Next()));
+    Push(*first_);
     FlushDeferredPrompt(o_.conversation, stk_, carry_);
     Trace(tail_logits_);
     if (o_.spec > 0) {
@@ -126,7 +128,7 @@ class SampledGeneration {
         !RequestFitsContext(ids_.size(), o_.n, eng_.Context()) || o_.chunk < 1 || o_.chunk > kMaxRows ||
         o_.spec < 0 || o_.spec >= kMaxRows || o_.lookup < 0 || o_.lookup >= kMaxRows ||
         o_.lookup_min < 1 || o_.lookup_min > 32 || o_.mtp_prefix < 0 || o_.mtp_prefix > 262144 ||
-        o_.sampling.temperature <= 0 ||
+        !o_.sampling.HostDraw() ||
         !o_.sampling.Error(kVocab).empty() || !std::isfinite(o_.draft_margin) || o_.draft_margin < 0 ||
         !std::isfinite(o_.draft_q) || o_.draft_q < 0 || o_.draft_q > 1)
       throw std::runtime_error("invalid sampled generation request; check sampling, IDs, lengths, and context");
@@ -144,7 +146,7 @@ class SampledGeneration {
         },
         [&](int row) {
           tail_logits_ = eng_.CopyLogits(1, row);
-          first_ = sampling::FromLogits(tail_logits_, o_.sampling);
+          first_ = FirstDraw();
         }, o_.mtp_prefix, resume_, o_.conversation);
     if (resume_.length < ids_.size()) replay_ = 0;
   }
@@ -156,9 +158,12 @@ class SampledGeneration {
   int Draw(const sampling::Distribution& distribution, uint64_t position) const {
     return distribution.KeyedSample(o_.sampling.seed, position);
   }
+  // The target's own draw of the prompt's next token, from the prompt's last logits row.
+  int FirstDraw() const { return sampling::Draw(tail_logits_, o_.sampling, penalties_, ids_.size()); }
   void Push(int token) {
     if (Done()) return;
     result_.ids.push_back(token);
+    if (penalties_.Active()) penalties_.Add(token);
     if (o_.lookup > 0) history_.Append(std::span<const int>(&token, 1));
     eng_.ObserveDraft(&token, 1);
     result_.stopped = std::find(o_.stop_ids.begin(), o_.stop_ids.end(), token) != o_.stop_ids.end();
@@ -181,7 +186,7 @@ class SampledGeneration {
     }
     if (o_.spec) valid_mtp_tail_ = catchup;
     metrics_.End(Metrics::kVerify, 1);
-    Push(Draw(sampling::FromLogits(logits, o_.sampling), Next()));
+    Push(sampling::Draw(logits, o_.sampling, penalties_, Next()));
     if (catchup) ctoks_ = {result_.ids.back()};
     Trace(logits);
     replay_ = 0;
@@ -191,7 +196,8 @@ class SampledGeneration {
 
   std::pair<sampling::Distribution, float> DraftDistribution(int rows) {
     const auto [logits, mapping] = eng_.DraftLogits(rows);
-    auto distribution = sampling::FromLogits(logits, o_.sampling, mapping);
+    // A penalized draft sees the emitted tokens and the drafts before it (Drafts adds them for the chain).
+    auto distribution = sampling::PenalizedDistribution(logits, o_.sampling, penalties_, mapping);
     // Greedy head scoring can leave DraftMargin stale in a sampled request.
     return {std::move(distribution), SampledRawMargin(logits)};
   }
@@ -225,6 +231,7 @@ class SampledGeneration {
     metrics_.Margin(0, margin);
     out.probabilities.push_back(std::move(first_distribution));
     out.ids.push_back(Draw(out.probabilities.back(), Next()));
+    sampling::ProvisionalTokens chain(penalties_);
     float confidence = SampledDepthConfidence(margin);
     for (int k = 1; k < std::min(o_.spec, limit) && ChainMayGrow(out.ids, o_.stop_ids, limit); ++k) {
       if (o_.draft_q > 0 ? confidence * 0.75f < o_.draft_q : margin < o_.draft_margin) break;
@@ -232,6 +239,7 @@ class SampledGeneration {
       Rows(stk_, kMaxRows, k == 1 ? rows - 1 : 0, 1);
       eng_.Mtp(stk_ + size_t(kMaxRows) * kWide, &out.ids.back(), 1, mpos_ + k - 1);
       metrics_.End(Metrics::kMtpChain, 1);
+      chain.Add(out.ids.back());
       auto [next_distribution, next_margin] = DraftDistribution(1);
       margin = next_margin;
       confidence *= SampledDepthConfidence(margin);
@@ -254,16 +262,12 @@ class SampledGeneration {
     eng_.Forward(input.data(), depth + 1, replay_, 1);
     const auto logits = eng_.CopyLogits(depth + 1);
     metrics_.End(Metrics::kVerify, depth + 1);
-    std::vector<int> verified;
-    int accepted = 0;
-    for (int row = 0; row <= depth; ++row) {
-      const auto p = sampling::FromLogits(std::span(logits).subspan(size_t(row) * eng_.Vocabulary(), eng_.Vocabulary()), o_.sampling);
-      // Match acceptance: every emitted token is the target's own keyed draw at its position.
-      const int target = Draw(p, next + row);
-      verified.push_back(target);
-      if (row == depth || target != proposals.ids[row]) break;
-      ++accepted;
-    }
+    // Match acceptance: every emitted token is the target's own keyed draw at its position.
+    const std::vector<int> verified = sampling::MatchAccept(proposals.ids, &penalties_, [&](size_t row) {
+      const auto row_logits = std::span(logits).subspan(row * size_t(eng_.Vocabulary()), eng_.Vocabulary());
+      return sampling::Draw(row_logits, o_.sampling, penalties_, next + row);
+    });
+    const int accepted = int(verified.size()) - 1;
     tail_logits_.assign(logits.begin() + size_t(accepted) * eng_.Vocabulary(),
                         logits.begin() + size_t(accepted + 1) * eng_.Vocabulary());
     eng_.Truncate(base + accepted + 1);
@@ -290,7 +294,8 @@ class SampledGeneration {
   Copy copy_;
   Emit emit_;
   Metrics& metrics_;
-  std::optional<sampling::Distribution> first_;
+  std::optional<int> first_;  // the first token, drawn when the prompt's last row is on the host
+  sampling::PenaltyHistory penalties_;  // inactive for neutral options
   LookupIndex history_;
   std::vector<int> ctoks_;
   std::vector<float> tail_logits_;

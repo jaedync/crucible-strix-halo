@@ -132,19 +132,166 @@ inline int LargestAdmissionStreams(const AdmissionMemory& memory, const Admissio
   return 0;
 }
 
-// The largest context on the admission grain below the request that the check accepts at the requested stream count,
-// or 0 for none. The scan is exact; it does not assume that the charge grows with the context.
-inline int LargestAdmissionContext(const AdmissionMemory& memory, const AdmissionTry& try_setting) {
+// The largest context on the admission grain below the request and above `floor_context` that the check accepts at
+// the requested stream count, or 0 for none. The scan is exact; it does not assume that the charge grows with the
+// context.
+inline int LargestAdmissionContext(const AdmissionMemory& memory, const AdmissionTry& try_setting,
+                                   int floor_context = 0) {
   const uint64_t available = std::min(memory.host_free, memory.device_free);
   if (memory.streams < 1 || memory.context <= kAdmissionContextGrain) return 0;
   for (int context = (memory.context - 1) / kAdmissionContextGrain * kAdmissionContextGrain;
-       context >= kAdmissionContextGrain; context -= kAdmissionContextGrain) {
+       context >= kAdmissionContextGrain && context > floor_context; context -= kAdmissionContextGrain) {
     const AdmissionCharge charge = try_setting(memory.streams, context);
     if (!charge.allowed) continue;
     const uint64_t at = AdmissionAvailableAt(available, memory.first_slot_bytes, charge.first_slot_bytes);
     if (AdmissionFits(at, charge.new_states_bytes, memory.cache_budget)) return context;
   }
   return 0;
+}
+
+// Memory stage 2, the start-time fit ("Memory fit at start"). A setting that does not fit the
+// free memory becomes the largest one that does, in this order, and every other option stays:
+// 1. the conversation cache budget, in whole MiB, down to min(budget, kFitCacheFloor);
+// 2. the slot count at the same --ctx (the budget then takes the largest value that fits, up to the request);
+// 3. --ctx in steps of kAdmissionContextGrain at the smallest slot count, only when no slot count fits.
+// A setting that fits keeps every value. Each step only changes how many requests run at once, how much the cache
+// keeps, or (step 3) which prompts the server accepts: no request's tokens depend on them (batching and cache
+// invariance). The fit never changes the pack, the tokenizer, the sampling or the RoPE mode.
+inline constexpr uint64_t kFitCacheFloor = 2048ull << 20;
+// A fitted layout keeps this much free beyond the check. The engine measures the free memory again in
+// ConfigureServeStreams, and after the --ctx step it frees, allocates and warms slot 0 between the two measures; an
+// allocator rounding, a GPU page pool or another program can take some MiB there. Only a fitted layout pays it: a
+// layout that fits keeps the exact check of the requested layout.
+inline constexpr uint64_t kFitMargin = 256ull << 20;
+// The native RoPE positions. A --ctx above it is a YaRN layout (the server sets the YaRN word from --ctx), so the fit
+// keeps --ctx above it: a lower --ctx would turn YaRN off without a word.
+inline constexpr int kFitPlainContext = 262144;
+
+enum class FitStep : uint8_t { kRequested, kCache, kStreams, kContext, kRefused };
+inline const char* FitStepName(FitStep step) {
+  switch (step) {
+    case FitStep::kRequested: return "requested";
+    case FitStep::kCache: return "cache";
+    case FitStep::kStreams: return "streams";
+    case FitStep::kContext: return "context";
+    case FitStep::kRefused: return "refused";
+  }
+  return "refused";
+}
+struct FitLimits {
+  int min_streams = 1;    // the smallest slot count that the other options allow (--short-streams plus one)
+  int floor_context = 0;  // the fit keeps --ctx above this value (kFitPlainContext for a YaRN layout)
+};
+struct FitLayout {
+  FitStep step = FitStep::kRequested;
+  int streams = 0, context = 0;
+  uint64_t cache_budget = 0;
+  uint64_t free_bytes = 0;  // the free memory at the check (the smaller of host and device)
+  uint64_t need_bytes = 0;  // what the requested layout needs free: the reserve, its new state and its cache budget
+  std::string reason;       // kRefused only: why no smaller layout fits
+};
+
+// The largest cache budget, at most `requested`, that the check accepts beside `new_states`; whole MiB when it is
+// below the request. nullopt when the state alone does not fit.
+inline std::optional<uint64_t> LargestAdmissionCache(uint64_t available, uint64_t new_states, uint64_t requested) {
+  if (available <= kAdmissionReserve) return std::nullopt;
+  const uint64_t room = available - kAdmissionReserve;
+  if (new_states > room) return std::nullopt;
+  const uint64_t free = room - new_states;
+  return requested <= free ? requested : free / (1ull << 20) * (1ull << 20);
+}
+
+// Steps 1 to 3 on the free memory less kFitMargin. `layout` holds the requested values and the measures.
+inline FitLayout FitWithMargin(const AdmissionMemory& requested, const AdmissionTry& try_setting, const FitLimits& limits,
+                               FitLayout layout) {
+  AdmissionMemory memory = requested;
+  memory.host_free = memory.host_free > kFitMargin ? memory.host_free - kFitMargin : 0;
+  memory.device_free = memory.device_free > kFitMargin ? memory.device_free - kFitMargin : 0;
+  const uint64_t available = std::min(memory.host_free, memory.device_free);
+  const uint64_t floor = std::min(memory.cache_budget, kFitCacheFloor);
+  // 1. The cache budget.
+  if (const auto cache = LargestAdmissionCache(available, memory.new_states_bytes, memory.cache_budget);
+      cache && *cache >= floor) {
+    layout.step = FitStep::kCache;
+    layout.cache_budget = *cache;
+    return layout;
+  }
+  // 2. Fewer slots at the same --ctx. The context does not change, so the free memory at the check does not either.
+  AdmissionMemory at_floor = memory;
+  at_floor.cache_budget = floor;
+  if (const int streams = LargestAdmissionStreams(at_floor, try_setting); streams >= limits.min_streams) {
+    const AdmissionCharge charge = try_setting(streams, memory.context);
+    layout.step = FitStep::kStreams;
+    layout.streams = streams;
+    layout.cache_budget = LargestAdmissionCache(available, charge.new_states_bytes, memory.cache_budget).value_or(floor);
+    return layout;
+  }
+  // 3. A lower --ctx at the smallest slot count. A lower --ctx frees the difference of slot 0 (AdmissionAvailableAt).
+  AdmissionMemory smallest = at_floor;
+  smallest.streams = limits.min_streams;
+  if (const int context = LargestAdmissionContext(smallest, try_setting, limits.floor_context)) {
+    const AdmissionCharge charge = try_setting(smallest.streams, context);
+    const uint64_t at = AdmissionAvailableAt(available, memory.first_slot_bytes, charge.first_slot_bytes);
+    layout.step = FitStep::kContext;
+    layout.streams = smallest.streams;
+    layout.context = context;
+    layout.cache_budget = LargestAdmissionCache(at, charge.new_states_bytes, memory.cache_budget).value_or(floor);
+    return layout;
+  }
+  layout.step = FitStep::kRefused;
+  const std::string slots = std::to_string(smallest.streams) + (smallest.streams == 1 ? " slot" : " slots");
+  if (limits.floor_context && LargestAdmissionContext(smallest, try_setting))
+    layout.reason = "The memory fit stopped: " + slots + " fit only at a --ctx of " +
+                    GroupDigits(uint64_t(limits.floor_context)) + " or less, and that turns YaRN off. The fit does not "
+                    "change a YaRN layout to a plain one. Start with --ctx " +
+                    GroupDigits(uint64_t(limits.floor_context)) + " or less to run without YaRN, or free memory.";
+  else
+    layout.reason = "The memory fit stopped: no smaller layout fits (" + slots + ", --ctx " +
+                    GroupDigits(uint64_t(kAdmissionContextGrain)) + " or more, cache budget " +
+                    std::to_string(floor >> 20) + " MiB). Free memory, or use a smaller pack.";
+  return layout;
+}
+
+inline FitLayout FitServeLayout(const AdmissionMemory& memory, const AdmissionTry& try_setting, const FitLimits& limits) {
+  FitLayout layout;
+  layout.streams = memory.streams;
+  layout.context = memory.context;
+  layout.cache_budget = memory.cache_budget;
+  const uint64_t available = std::min(memory.host_free, memory.device_free);
+  layout.free_bytes = available;
+  layout.need_bytes = SaturatedSum(SaturatedSum(kAdmissionReserve, memory.new_states_bytes), memory.cache_budget);
+  if (AdmissionFits(available, memory.new_states_bytes, memory.cache_budget)) return layout;
+  return FitWithMargin(memory, try_setting, limits, layout);
+}
+
+// After the --ctx step the engine measures again (the fit used a formula for the memory that a smaller slot 0 frees).
+// The budget follows the measure, up to the request, with kFitMargin kept free. nullopt when the measure cannot hold
+// min(request, kFitCacheFloor): the engine then keeps the fitted budget, and the check in ConfigureServeStreams decides.
+inline std::optional<uint64_t> FitCacheAgain(uint64_t available, uint64_t new_states, uint64_t requested_cache) {
+  const uint64_t floor = std::min(requested_cache, kFitCacheFloor);
+  const auto cache = LargestAdmissionCache(available > kFitMargin ? available - kFitMargin : 0, new_states,
+                                           requested_cache);
+  if (cache && *cache >= floor) return cache;
+  return std::nullopt;
+}
+
+// "4 streams at 262,144 context with a 9,700 MiB conversation cache"
+inline std::string FitLayoutText(int streams, int context, uint64_t cache_budget) {
+  std::string text = std::to_string(streams) + (streams == 1 ? " stream at " : " streams at ") +
+                     GroupDigits(uint64_t(context)) + " context";
+  if (cache_budget) text += " with a " + GroupDigits(cache_budget >> 20) + " MiB conversation cache";
+  return text;
+}
+// The first line of a refusal at the second check after a fit: the refusal text below it names the fitted layout, so
+// this line names the fit and the request. `measure_short`: after the --ctx step the new measure could not hold the
+// fitted layout (FitCacheAgain gave nullopt), so the cause can be the fit's estimate, not a drop of free memory.
+inline std::string FitRefusalNote(const FitLayout& layout, int streams, int context, uint64_t cache_budget,
+                                  bool measure_short = false) {
+  return std::string("The memory fit ran (step ") + FitStepName(layout.step) + "): the request was " +
+         FitLayoutText(streams, context, cache_budget) + ", and the fit chose " +
+         FitLayoutText(layout.streams, layout.context, layout.cache_budget) +
+         (measure_short ? ". The measure after the fit did not fit that layout.\n"
+                        : ". The free memory fell before the slots were allocated.\n");
 }
 
 // "Largest --ctx at --streams S: c." with "none" when no value fits.

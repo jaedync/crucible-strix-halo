@@ -9,6 +9,7 @@ page holds the run of the date in its row.
 
 | Release | Measured | Cold 32K prompt: first token (s) | Cold 32K prompt: prefill (tok/s) | Cold 130K prompt: first token (s) | Cold 130K prompt: prefill (tok/s) | Same 32K prompt again: first token (s) | Decode at 32K, 1 session, code (tok/s) | Decode at 32K, 1 session, prose (tok/s) | Decode, 4 sessions, total (tok/s) | Serial decode, no speculation (tok/s) |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| v0.38.0 | Nov 19, 2026 | 16.2 |  | 69.3 |  | 0.017 | 72.9 | 58.3 | 112.8 ¹ |  |
 | v0.37.3 | Nov 17, 2026 | 16.3 |  | 69.7 |  | 0.018 | 72.1 | 54.8 | 115.0 ¹ |  |
 | v0.34.0 | Nov 7, 2026 | 17.1 | 1,831 | 72.4 | 1,782 | 0.019 | 71.2 | 58.4 | 118.3 | 34.2 |
 | v0.33.0 | Nov 3, 2026 | 16.9 | 1,851 | 72.1 | 1,789 | 0.020 | 71.7 ¹ | 56.3 | 113.8 | 34.1 |
@@ -22,6 +23,7 @@ page holds the run of the date in its row.
 
 | Release | Measured | Cold 32K prompt: first token (s) | Cold 32K prompt: prefill (tok/s) | Cold 130K prompt: first token (s) | Cold 130K prompt: prefill (tok/s) | Same 32K prompt again: first token (s) | Decode at 32K, 1 session, code (tok/s) | Decode at 32K, 1 session, prose (tok/s) | Decode, 4 sessions, total (tok/s) | Serial decode, no speculation (tok/s) |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| v0.38.0 | Nov 19, 2026 | 16.2 |  | 69.3 |  | 0.017 | 79.1 | 63.4 | 127.9 |  |
 | v0.37.3 | Nov 17, 2026 | 16.1 |  | 68.7 |  | 0.018 | 77.0 | 61.2 | 129.3 |  |
 | v0.34.0 | Nov 7, 2026 | 16.6 | 1,877 | 71.1 | 1,814 | 0.015 | 76.8 | 60.7 | 129.0 | 39.1 |
 | v0.33.0 | Nov 3, 2026 | 16.7 | 1,870 | 71.3 | 1,809 | 0.020 | 73.9 | 60.3 | 118.3 | 39.3 |
@@ -156,3 +158,4 @@ page holds the run of the date in its row.
 - v0.33.0, 3.05 pack, Decode by context length, 192K: 5 samples
 - v0.33.0, 3.05 pack, Decode by context length, 250K: 5 samples
 - v0.37.3, 4.05 pack, Decode, 4 sessions, total: 5 of 6 texts gave a value
+- v0.38.0, 4.05 pack, Decode, 4 sessions, total: 5 of 6 texts gave a value

@@ -2,6 +2,8 @@
 import json
 import re
 import subprocess
+
+import pytest
 from pathlib import Path
 
 from server import version as v
@@ -101,3 +103,74 @@ def test_the_version_files_and_the_installer_pin_name_one_release():
     assert f'#define ENGINE_BUILD_VERSION "{number}"' in header
     assert f'PIN_TAG="v{number}"' in (ROOT / "install.sh").read_text()
     assert f"ARG CRUCIBLE_VERSION=v{number}" in (ROOT / "Dockerfile").read_text()
+GIT_ENV = dict(GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t",
+               PATH="/usr/bin:/bin", GIT_CONFIG_NOSYSTEM="1")
+
+
+def git(root, *args):
+    return subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True, text=True,
+                          env=GIT_ENV | dict(HOME=str(root))).stdout.strip()
+
+
+def checkout(tmp_path, version="0.22.2"):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "VERSION").write_text(version + "\n")
+    git(tmp_path, "init", "-q")
+    git(tmp_path, "add", "VERSION")
+    git(tmp_path, "commit", "-q", "-m", "x")
+    return tmp_path
+
+
+def test_a_tree_without_git_is_the_release_of_its_version_file(tmp_path):
+    # The release tarball and the Docker image (it removes .git) print their tag, as before.
+    (tmp_path / "VERSION").write_text("0.22.2\n")
+    assert v.build_label(tmp_path) == "v0.22.2"
+
+
+@pytest.mark.parametrize("annotated", [False, True])
+def test_a_checkout_of_the_release_tag_is_the_release(tmp_path, annotated):
+    root = checkout(tmp_path)
+    git(root, "tag", *(["-a", "-m", "v0.22.2"] if annotated else []), "v0.22.2")
+    assert v.build_label(root) == "v0.22.2"
+
+
+def test_a_checkout_that_is_not_the_release_tag_is_a_development_build(tmp_path):
+    root = checkout(tmp_path)
+    assert v.build_label(root) == f"development build {v.git_commit(root)}, based on v0.22.2"
+    git(root, "tag", "v0.22.2")
+    git(root, "commit", "-q", "--allow-empty", "-m", "after the release")
+    assert v.build_label(root) == f"development build {v.git_commit(root)}, based on v0.22.2"
+
+
+def test_a_tag_of_another_version_does_not_make_a_release(tmp_path):
+    root = checkout(tmp_path)
+    git(root, "tag", "v0.22.1")
+    assert v.build_label(root).startswith("development build ")
+
+
+def test_the_startup_line_of_a_release_and_of_a_development_build(tmp_path):
+    (tmp_path / "VERSION").write_text("0.22.2\n")
+    assert v.startup_line(tmp_path) == "Crucible v0.22.2"
+    root = checkout(tmp_path / "c")
+    git(root, "tag", "v0.22.2")
+    assert v.startup_line(root) == f"Crucible v0.22.2 ({v.git_commit(root)})"
+    git(root, "commit", "-q", "--allow-empty", "-m", "after the release")
+    assert v.startup_line(root) == f"Crucible development build {v.git_commit(root)}, based on v0.22.2"
+
+
+def test_the_version_file_is_not_older_than_the_newest_release_tag():
+    # Drift guard: a release bumps VERSION in the public tree. Trunk must take the same bump, or a development
+    # build says that it is based on an old release. Tags that are not in this checkout cannot be checked.
+    if v.git_commit(ROOT) is None:
+        pytest.skip("not a git checkout")
+    tags = subprocess.run(["git", "-C", str(ROOT), "tag", "--list", "v*"], capture_output=True,
+                          text=True).stdout.split()
+    releases = [tuple(map(int, t[1:].split("."))) for t in tags if re.fullmatch(r"v\d+\.\d+\.\d+", t)]
+    if not releases:
+        pytest.skip("no release tags in this checkout")
+    if subprocess.run(["git", "-C", str(ROOT), "tag", "--points-at", "HEAD", "--list", "v*"],
+                      capture_output=True, text=True).stdout.strip():
+        pytest.skip("a release checkout")
+    newest = max(releases)
+    assert tuple(map(int, v.read_version().split("."))) >= newest, \
+        f"VERSION is {v.read_version()}, the newest release is v{'.'.join(map(str, newest))}"

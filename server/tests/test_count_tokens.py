@@ -36,8 +36,11 @@ class TemplateTokenizer:
 
     def render_chat(self, request, add_generation_prompt=True):
         preserve = {} if request.preserve_thinking is None else dict(preserve_thinking=request.preserve_thinking)
+        # The tools that the template renders, as in ModelTokenizer.render_prompt (server/tokenization.py).
+        rendered = getattr(request, "render_tools", None)
+        tools = request.tools if rendered is None else rendered
         return self.template.render(request.messages, request.enable_thinking, request.reasoning_effort,
-                                    request.tools, request.tool_choice, add_generation_prompt=add_generation_prompt,
+                                    tools, request.tool_choice, add_generation_prompt=add_generation_prompt,
                                     **preserve)
 
     def encode(self, request):

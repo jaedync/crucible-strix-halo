@@ -1,68 +1,11 @@
 // Included inside Engine. Independent rows share projections, never temporal state.
  public:
   void ConfigureServeStreams(int count, uint64_t unused_cache_budget = 0, int short_count = 0, int short_ctx = 0) {
-    if (count < 1 || count > kMaxRows) throw std::invalid_argument("batch streams must be in [1,8]");
-    if (short_count < 0 || short_count >= count || (short_count && (short_ctx < 1 || short_ctx >= ctx_)))
-      throw std::invalid_argument("short streams need 1..streams-1 slots and a short context below --ctx");
-    const auto host_available = AvailableHostMemory();
-    if (!host_available) throw std::runtime_error("cannot read available host memory; batch admission is disabled");
-    size_t device_free, device_total;
-    HIP_OK(hipMemGetInfo(&device_free, &device_total));
-    uint64_t added = 0, slots_state = 0, allocated = 0, first_slot = 0;
-    std::vector<int> contexts;
-    for (int slot = 0; slot < count; ++slot) contexts.push_back(SlotContext(slot, count, short_count, short_ctx));
-    for (int slot = 0; slot < count; ++slot) {
-      const uint64_t bytes = SequenceState::ServeBytes(contexts[size_t(slot)], compact_state_, mtp_rows_);
-      slots_state += bytes;
-      if (slot < int(sequences_.size())) {
-        // An existing compact slot may still lack its MTP cache, so it holds less than its whole state.
-        const auto& state = *sequences_[size_t(slot)];
-        const uint64_t missing =
-            MissingMtpCacheBytes(state.mtp_capacity, state.compact_state, state.qc.contains(kLayers));
-        allocated += bytes - missing;
-        first_slot = bytes - missing;  // every existing slot is slot 0 here: ConfigureServeStreams runs once
-        added += missing;
-      } else {
-        added += bytes;
-      }
-    }
-    added += VisionReserveBytes(contexts);  // zero without --vision
-    AdmissionMemory memory;
-    memory.host_free = *host_available;
-    memory.device_free = device_free;
-    memory.states_bytes = slots_state;
-    memory.allocated_bytes = allocated;
-    memory.first_slot_bytes = first_slot;
-    memory.new_states_bytes = added;
-    memory.cache_budget = unused_cache_budget;
-    memory.streams = count;
-    memory.context = ctx_;
-    // A fresh start at a suggested setting, charged by the same code: slot 0 before the check, the other slots, the
-    // vision reserve and slot 0's missing MTP cache after it. The user keeps every other option, so a candidate must
-    // satisfy the server's rule for short streams (0 < --short-ctx < --ctx and --short-streams below --streams); a
-    // short slot keeps kMaxRows rows above --short-ctx, which can be more than the candidate's full context.
-    const auto try_setting = [this, short_count, short_ctx](int streams, int context) -> AdmissionCharge {
-      AdmissionCharge charge;
-      if (streams < 1 || (short_count > 0 && (short_count >= streams || short_ctx < 1 || short_ctx >= context))) {
-        charge.allowed = false;
-        return charge;
-      }
-      std::vector<int> slot_contexts;
-      for (int slot = 0; slot < streams; ++slot)
-        slot_contexts.push_back(slot < streams - short_count ? context : short_ctx + kMaxRows);
-      for (const int slot_context : slot_contexts)
-        charge.states_bytes += SequenceState::ServeBytes(slot_context, compact_state_, mtp_rows_);
-      charge.first_slot_bytes = SequenceState::ServeBytes(slot_contexts[0], compact_state_, mtp_rows_) -
-          MissingMtpCacheBytes(SequenceState::MtpCapacity(slot_contexts[0], mtp_rows_), compact_state_, false);
-      for (size_t slot = 1; slot < slot_contexts.size(); ++slot)
-        charge.new_states_bytes += SequenceState::ServeBytes(slot_contexts[slot], compact_state_, mtp_rows_);
-      charge.new_states_bytes += MissingMtpCacheBytes(
-          SequenceState::MtpCapacity(slot_contexts[0], mtp_rows_), compact_state_, false);
-      charge.new_states_bytes += VisionReserveBytes(slot_contexts);
-      return charge;
-    };
+    CheckServeStreams(count, short_count, short_ctx);
+    const AdmissionMemory memory = ServeAdmission(count, unused_cache_budget, short_count, short_ctx);
+    const auto try_setting = ServeTrial(short_count, short_ctx);
     const auto error = BatchAdmissionError(memory, try_setting);
-    if (!error.empty()) throw crucible::AdmissionRefused(error);
+    if (!error.empty()) throw crucible::AdmissionRefused(serve_fit_note_ + error);
     // Existing slots keep the full context; short slots are always new, so they come last.
     if (short_count && int(sequences_.size()) > count - short_count)
       throw std::logic_error("short slots must be allocated after the full-context slots");
@@ -76,6 +19,61 @@
     const char* warmup = crucible::SwitchText("CRUCIBLE_WARMUP");
     if (!spans.empty() && (!warmup || std::string(warmup) != "0")) WarmDeviceBuffers(spans);
   }
+
+  // Memory stage 2 (batch_admission.h FitServeLayout): the layout that fits the free memory now. It runs once, after
+  // the weights and slot 0 exist and before ConfigureServeStreams, which then checks the fitted layout again. A
+  // layout that cannot be fitted is the refusal of the requested one, with the reason of the fit.
+  crucible::FitLayout FitServeLayout(int count, uint64_t cache_budget, int short_count, int short_ctx) {
+    CheckServeStreams(count, short_count, short_ctx);
+    if (sequences_.size() != 1) throw std::logic_error("the memory fit runs before the serve slots exist");
+    const AdmissionMemory memory = ServeAdmission(count, cache_budget, short_count, short_ctx);
+    const auto try_setting = ServeTrial(short_count, short_ctx);
+    crucible::FitLimits limits;
+    limits.min_streams = short_count + 1;
+    limits.floor_context = ctx_ > crucible::kFitPlainContext ? crucible::kFitPlainContext : 0;
+    crucible::FitLayout layout = crucible::FitServeLayout(memory, try_setting, limits);
+    if (layout.step == crucible::FitStep::kRefused)
+      throw crucible::AdmissionRefused(BatchAdmissionError(memory, try_setting) + "\n" + layout.reason);
+    return layout;
+  }
+
+  // The fit's step 3: slot 0 again at a lower --ctx, as the constructor allocates it for that --ctx. The new slot 0 is
+  // all zeros, as a slot that no request has used (slots 1 to N-1 of a fresh start). It is not the slot that the
+  // warm-up left (SequenceState::Reset keeps its KV rows), which has no token effect under the batching invariance.
+  // State that keeps the old --ctx, with no token effect: the QSA score scratch (its row stride follows ctx_ at each
+  // call, QArgs), the prefill QSA selection scratch (used only above kQsaCandidates blocks) and the stderr lines of the
+  // constructor. A new allocation of them would take memory exactly when memory is short.
+  void FitContext(int context, int mtp_rows) {
+    if (sequences_.size() != 1 || sequence_ != sequences_[0].get() || !sequence_->hist.empty() || context < 1 ||
+        context >= ctx_)
+      throw std::logic_error("the memory fit lowers --ctx only before the serve slots exist");
+    CheckRopeContext(context, rope_, "context");
+    const auto old_spans = sequence_->Spans();
+    std::erase_if(buffers_, [&](const DeviceSpan& span) {
+      return std::any_of(old_spans.begin(), old_spans.end(),
+                         [&](const DeviceSpan& old) { return old.pointer == span.pointer; });
+    });
+    sequence_ = nullptr;
+    sequences_.clear();
+    ctx_ = context;
+    mtp_rows_ = mtp_rows;
+    AddSequence();
+    sequence_ = sequences_[0].get();
+    const char* warmup = crucible::SwitchText("CRUCIBLE_WARMUP");
+    if (!warmup || std::string(warmup) != "0") WarmDeviceBuffers(sequence_->Spans());
+  }
+
+  // After FitContext: the fit's free memory for the --ctx step was a formula. Measure again and give the cache budget
+  // what the measure holds, with kFitMargin kept free (batch_admission.h FitCacheAgain). nullopt: the measure cannot
+  // hold the fitted layout; the caller keeps the fitted budget and the check decides.
+  std::optional<uint64_t> FitCacheAfterContext(int count, uint64_t requested_cache, uint64_t fitted_cache,
+                                               int short_count, int short_ctx) {
+    const AdmissionMemory memory = ServeAdmission(count, fitted_cache, short_count, short_ctx);
+    return crucible::FitCacheAgain(std::min(memory.host_free, memory.device_free), memory.new_states_bytes,
+                                   requested_cache);
+  }
+  // The first line of a refusal in ConfigureServeStreams after a fit (FitRefusalNote); empty without a fit.
+  void SetServeFitNote(std::string note) { serve_fit_note_ = std::move(note); }
 
   // Batch serve allocates every compact MTP cache at startup, inside the admitted budget.
   // A lazy promotion at the first speculative request could fail on memory, so that
@@ -164,6 +162,75 @@
   }
 
  private:
+  std::string serve_fit_note_;
+  void CheckServeStreams(int count, int short_count, int short_ctx) const {
+    if (count < 1 || count > kMaxRows) throw std::invalid_argument("batch streams must be in [1,8]");
+    if (short_count < 0 || short_count >= count || (short_count && (short_ctx < 1 || short_ctx >= ctx_)))
+      throw std::invalid_argument("short streams need 1..streams-1 slots and a short context below --ctx");
+  }
+  // The admission inputs of a setting, measured now: free host and device memory, and the state of each slot.
+  AdmissionMemory ServeAdmission(int count, uint64_t unused_cache_budget, int short_count, int short_ctx) {
+    const auto host_available = AvailableHostMemory();
+    if (!host_available) throw std::runtime_error("cannot read available host memory; batch admission is disabled");
+    size_t device_free, device_total;
+    HIP_OK(hipMemGetInfo(&device_free, &device_total));
+    uint64_t added = 0, slots_state = 0, allocated = 0, first_slot = 0;
+    std::vector<int> contexts;
+    for (int slot = 0; slot < count; ++slot) contexts.push_back(SlotContext(slot, count, short_count, short_ctx));
+    for (int slot = 0; slot < count; ++slot) {
+      const uint64_t bytes = SequenceState::ServeBytes(contexts[size_t(slot)], compact_state_, mtp_rows_);
+      slots_state += bytes;
+      if (slot < int(sequences_.size())) {
+        // An existing compact slot may still lack its MTP cache, so it holds less than its whole state.
+        const auto& state = *sequences_[size_t(slot)];
+        const uint64_t missing =
+            MissingMtpCacheBytes(state.mtp_capacity, state.compact_state, state.qc.contains(kLayers));
+        allocated += bytes - missing;
+        first_slot = bytes - missing;  // every existing slot is slot 0 here: ConfigureServeStreams runs once
+        added += missing;
+      } else {
+        added += bytes;
+      }
+    }
+    added += VisionReserveBytes(contexts);  // zero without --vision
+    AdmissionMemory memory;
+    memory.host_free = *host_available;
+    memory.device_free = device_free;
+    memory.states_bytes = slots_state;
+    memory.allocated_bytes = allocated;
+    memory.first_slot_bytes = first_slot;
+    memory.new_states_bytes = added;
+    memory.cache_budget = unused_cache_budget;
+    memory.streams = count;
+    memory.context = ctx_;
+    return memory;
+  }
+  // A fresh start at a suggested setting, charged by the same code: slot 0 before the check, the other slots, the
+  // vision reserve and slot 0's missing MTP cache after it. The user keeps every other option, so a candidate must
+  // satisfy the server's rule for short streams (0 < --short-ctx < --ctx and --short-streams below --streams); a
+  // short slot keeps kMaxRows rows above --short-ctx, which can be more than the candidate's full context.
+  AdmissionTry ServeTrial(int short_count, int short_ctx) {
+    return [this, short_count, short_ctx](int streams, int context) -> AdmissionCharge {
+      AdmissionCharge charge;
+      if (streams < 1 || (short_count > 0 && (short_count >= streams || short_ctx < 1 || short_ctx >= context))) {
+        charge.allowed = false;
+        return charge;
+      }
+      std::vector<int> slot_contexts;
+      for (int slot = 0; slot < streams; ++slot)
+        slot_contexts.push_back(slot < streams - short_count ? context : short_ctx + kMaxRows);
+      for (const int slot_context : slot_contexts)
+        charge.states_bytes += SequenceState::ServeBytes(slot_context, compact_state_, mtp_rows_);
+      charge.first_slot_bytes = SequenceState::ServeBytes(slot_contexts[0], compact_state_, mtp_rows_) -
+          MissingMtpCacheBytes(SequenceState::MtpCapacity(slot_contexts[0], mtp_rows_), compact_state_, false);
+      for (size_t slot = 1; slot < slot_contexts.size(); ++slot)
+        charge.new_states_bytes += SequenceState::ServeBytes(slot_contexts[slot], compact_state_, mtp_rows_);
+      charge.new_states_bytes += MissingMtpCacheBytes(
+          SequenceState::MtpCapacity(slot_contexts[0], mtp_rows_), compact_state_, false);
+      charge.new_states_bytes += VisionReserveBytes(slot_contexts);
+      return charge;
+    };
+  }
   void CheckBatch(const std::vector<int>& tokens, const std::vector<int>& streams) const {
     std::vector<size_t> lengths;
     std::vector<int> capacities;

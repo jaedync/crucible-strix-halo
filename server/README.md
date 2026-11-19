@@ -11,7 +11,9 @@ It is not a persistent service.
 ## Agent clients
 
 See [OpenAI and Pi connections](../docs/OPENAI_CLIENTS.md) for client settings and CPU compatibility checks.
-Use Chat Completions with text input, streamed usage, and validated function calls.
+Use Chat Completions with text input, streamed usage, and validated function calls, or the Responses API
+(`POST /v1/responses`) or the Anthropic Messages API
+(`POST /v1/messages`) on the same chat code.
 
 ## Run a local server
 
@@ -53,11 +55,15 @@ Use `GET /v1/crucible/version` to get the Crucible version and the git commit. `
 `crucible_version`.
 The server tells you at start when a newer release exists (one request a day to GitHub). Turn it off with
 `--no-update-check` or `CRUCIBLE_NO_UPDATE_CHECK=1`.
-Use `GET /health` for a readiness check: it answers `{"status":"ok"}` (HTTP 503 if the engine has stopped).
+Use `GET /health` for a readiness check: it answers `{"status":"ok","sessions":N,"context":C}` with the real slot count
+and `--ctx` (HTTP 503 if the engine has stopped). The memory fit at start can make them smaller than the request
+(`--fit`).
 Use `/v1/completions` with a `prompt` string for plain text.
 A completion can return the log-probabilities of its one next token. Set `logprobs` to true or `top_logprobs` to an
 integer from 0 to 20, with `max_tokens` 1, `temperature` 0 and `stream` false. The reply has `token_id`, `logprob` and
 the top candidates in `choices[0].logprobs.content`. A request that breaks one of these limits gets HTTP 400.
+The log-probabilities are the raw model values, also with a penalty. A penalty can choose a token that is not in the
+raw top list. Then the token's `logprob` is `null`.
 A completion prompt can also contain one list of token IDs.
 Batches are not supported.
 
@@ -82,7 +88,7 @@ models:
       --engine /path/to/crucible-strix-halo/build/engine/crucible --port ${PORT}
 ```
 
-- llama-swap polls `checkEndpoint` (default `/health`) for HTTP 200. `GET /health` answers `{"status":"ok"}` once the
+- llama-swap polls `checkEndpoint` (default `/health`) for HTTP 200. `GET /health` answers `{"status":"ok",...}` once the
   engine is ready. The server binds its port only after that. `checkEndpoint: /v1/models` works too.
 - llama-swap has no working-directory setting, so `python -m server` finds the `server` package through
   `PYTHONPATH`. Use absolute paths in `cmd`.
@@ -180,11 +186,12 @@ The request body is an Anthropic Messages body. `server/anthropic.py` maps it to
 | assistant `text` blocks | `content` (joined) |
 | assistant `thinking` blocks | `reasoning_content` (joined); `redacted_thinking` is ignored |
 | assistant `tool_use` blocks | `tool_calls` (`id`, `name`, `arguments` = JSON of `input`) |
-| `tools` (`name`, `description`, `input_schema`) | function tools with `parameters` = `input_schema`; server tools are refused |
+| `tools` (`name`, `description`, `input_schema`, `strict`) | function tools with `parameters` = `input_schema` and the same `strict` (the template does not render it); server tools are refused |
 | `tool_choice` `auto`, `none`, `any`, `{"type":"tool","name":...}` | `auto`, `none`, `required`, the named function |
 | `disable_parallel_tool_use: true` | `parallel_tool_calls: false` |
 | `thinking` `{"type":"disabled"}`; `enabled` or `adaptive` | thinking off; thinking on (`budget_tokens` does not change the prompt) |
 | `output_config.effort` `low`, `medium`, `high`, `max` | `reasoning_effort` with the same name: template levels `low`, `medium`, `xhigh`, `xhigh` |
+| `output_config.format` `{"type":"json_schema","schema":...}` | `response_format` `json_schema` with that `schema` (no prompt text) |
 | no `thinking` and no effort | the server default (`--default-thinking`) |
 | `max_tokens`, `stream`, `temperature`, `top_p`, `top_k`, `stop_sequences`, `metadata`, `service_tier`, `context_management`, `cache_control`, `container` | ignored (another unknown field gets HTTP 400, because it could change the prompt) |
 | `cache_control` and `citations` on blocks and tools | ignored |
@@ -233,9 +240,17 @@ The server protects itself against a bad client:
   A field in the request always wins over the server default. See [Server defaults](#server-defaults).
 - `seed`: an unsigned 64-bit integer. An omitted or null seed uses fresh system entropy.
   Every response and stream chunk reports the selected value as `seed`.
-- `presence_penalty`, `frequency_penalty`, `repetition_penalty`: the server accepts `presence_penalty` and
-  `frequency_penalty` only when they are `0` or null, and `repetition_penalty` only when it is `1` or null. They have
-  no effect, because the engine has no penalty sampler. Any other value gets HTTP 400.
+- `presence_penalty`, `frequency_penalty`: finite numbers from `-2` through `2`, default `0` (the OpenAI range).
+  For each token that the reply already holds `c` times (`c > 0`), the engine subtracts `frequency_penalty * c`
+  and then `presence_penalty` from its logit. Prompt tokens do not count.
+- `repetition_penalty`: a finite number from `0.01` through `2`, default `1`. For each token in the prompt or in
+  the reply, the engine divides a positive logit by the value and multiplies any other logit by it.
+  The prompt is the whole rendered prompt, with the template's special tokens. There is no window.
+  The engine applies `repetition_penalty` first, then the other two.
+  The penalties apply to greedy and sampled requests, before `temperature`, `top_k`, `top_p` and `min_p`.
+  Null is the default value. A value outside the range gets HTTP 400 that names the field.
+  A request with the default values gives the same tokens as a request without the fields.
+  With speculation on, a penalized request gives the same tokens as with `spec` 0. Logprobs stay the raw model values.
 - `max_tokens` or `max_completion_tokens`: a positive integer. The default is 128 when the request has neither field.
   The flag `--default-max-tokens N|max` changes the default (see [Server defaults](#server-defaults)).
   With thinking on, the server keeps room for the answer (see below). A thinking request with a `max_tokens` below 1280
@@ -377,7 +392,9 @@ The server renders the checkpoint's real chat template.
 It accepts system, user, assistant, and tool messages.
 It also accepts text content blocks, assistant `reasoning_content` (or `reasoning`, its alias), and assistant `tool_calls`.
 With `--vision`, it also accepts image content parts. See [Image input](#image-input).
-It rejects video, unsupported sampling controls, and unknown fields.
+It rejects video, unsupported sampling controls, and unknown fields. By default (`--lenient-fields on`), it ignores an
+allow-list of fields that cannot change the tokens and refuses all other unknown fields (see `docs/OPENAI_CLIENTS.md`,
+"Lenient request fields"). `--lenient-fields off` (or `CRUCIBLE_LENIENT_FIELDS=0`) refuses every unknown field.
 
 Generation stops at `<|im_end|>` (`248046`) or `<|endoftext|>` (`248044`).
 The response omits these markers from text.
@@ -403,6 +420,7 @@ It processes one request at a time. The remaining requests wait in a queue.
 The batch worker refuses `draft_head` `full`, `draft_adapt` 1 and `draft_q` 0 with HTTP 400. Only `--serial` accepts them.
 A full queue returns HTTP 503.
 A streamed request gets its HTTP 200 headers when the server accepts it, before the prefill starts.
+A request that waits for a tool-tail extension (`--extend-tool-tails`, at most 120 seconds) gets them after that wait.
 While no token comes, the server sends the SSE comment `: keepalive` every 10 seconds.
 SSE clients ignore comments, and the comments keep body timers (for example undici's 300 s timer) from firing.
 An error after the headers ends the stream with an error chunk and `data: [DONE]`.
@@ -415,6 +433,8 @@ This keeps the engine protocol synchronized.
 Without `--conversation-cache-mib`, each request resets the sequence state and the server keeps no conversation state.
 With it, the server keeps prompt snapshots in host memory, and session replay is on by default
 ([session replay](../docs/SESSION_REPLAY.md)). A restart clears the cache.
+With `--state-dir`, states also go to the disk and stay over a restart
+([conversation cache](../docs/CONVERSATION_CACHE.md): what is written, when, and the SSD wear guard).
 
 ### Server defaults
 
@@ -454,7 +474,7 @@ A field in the request always wins over a server default.
 Qwen recommends sampling for thinking mode: `temperature=1.0`, `top_p=0.95`, `top_k=20`, `min_p=0.0`
 (model card of Qwen3.8-Flash-Next, section "Best Practices"). For non-thinking mode, Qwen recommends
 `temperature=0.7`, `top_p=0.8`, `top_k=20`, `min_p=0.0`.
-The card also warns of endless repetition and suggests `presence_penalty`, which this server accepts only at `0`.
+The card also warns of endless repetition and suggests `presence_penalty` (from `0` to `2`), which this server applies.
 Qwen recommends sampling, not greedy decoding (the Crucible default), for thinking mode.
 Example for thinking mode, with all the context room for the output:
 
@@ -518,6 +538,14 @@ Other parameters go out when they close and pass validation.
 The closing `}` goes out when the whole call passes validation.
 For a valid call, the joined argument text is byte-equal to the non-streamed `arguments`.
 Use `--stream-tool-calls off` to send each call whole when the output ends.
+The server also reads a call in the Anthropic form (`<invoke name="read">`, then `<parameter name="path">a.py</parameter>`
+tags, then `</invoke>`), as some agent clients and models write it (contributed by dineshr93).
+It gets the same checks as a checkpoint call and goes out whole when the output ends, in both stream modes.
+Prose that names the tag (the start tag and then text that is not a parameter tag) stays content.
+A block that leaves the form after its first parameter tag is a malformed call (`parameter_tag`).
+`<invoke>` text inside a `<tool_call>` argument stays argument text. In auto mode the strict call grammar takes the
+text before the first `<tool_call>` as free text. So a fault in that text (or a policy fault that counts a call from it)
+is not logged as `constraint_violation`. A fault in a `<tool_call>`, or `<invoke>` text after one, is logged.
 A complete, well-formed call that fails only the schema goes out as a normal tool call with `finish_reason`
 `tool_calls` (design decision, Oct 8). Examples: an unknown or missing property, a wrong type or enum value, a value
 that is not JSON for its type (it goes out as the raw string), or a function that is not in `tools` (if its name
@@ -550,7 +578,8 @@ The server never executes a function.
 
 Arguments must be finite JSON objects with unique keys.
 The parser validates common types, required fields, bounds, and local schema references.
-It does not implement complete JSON Schema or constrained decoding.
+It does not implement complete JSON Schema. Structured output (`response_format` and tools with `strict: true`)
+constrains the decoding with a grammar (see `docs/OPENAI_CLIENTS.md`).
 It does not execute untrusted schema regular expressions.
 Schema processing has a shared limit of 16,384 traversal steps per request or output.
 Input schemas share limits of 4,096 JSON nodes, 128 KiB of compact UTF-8 JSON, and 512 reference entries.
@@ -655,7 +684,8 @@ It records readiness, time to first token, and decode speed under `results/`.
   `BatchedEngineBackend` talk to the engine's JSON-line protocol
   (`engine/serve/serve_protocol.h`, `engine/serve/batched_serve_protocol.h`).
 - **Invariants:** binds to `127.0.0.1` unless `--host` says otherwise. A request's output depends only
-  on the request. The serial backend is behind `--serial`.
+  on the request, except with session replay ([session replay](../docs/SESSION_REPLAY.md)). The serial backend is
+  behind `--serial`.
 - **Allowed dependencies:** `requirements-cpu.txt` and the engine binary.
   Model metadata comes from the engine's `ready` event, not from new
   literals.

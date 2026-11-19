@@ -43,6 +43,7 @@ class StopSequences:
         self.counts = (0,) * len(sequences)
         self.pending = ""
         self.stopped = False
+        self.matched = None  # the sequence that stopped the text (the one that starts first)
 
     def feed(self, text):
         if self.stopped:
@@ -59,7 +60,10 @@ class StopSequences:
             if starts:
                 self.stopped = True
                 self.pending = ""
-                return value[:min(starts)]
+                first = min(starts)
+                self.matched = next(pattern for (pattern, _), count in zip(self.patterns, self.counts)
+                                    if count == len(pattern) and index + 1 - len(pattern) == first)
+                return value[:first]
         held = max(self.counts, default=0)
         self.pending = value[-held:] if held else ""
         return value[:-held] if held else value

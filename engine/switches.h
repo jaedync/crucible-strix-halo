@@ -56,7 +56,7 @@ inline constexpr SwitchInfo kSwitches[] = {
   {"CRUCIBLE_FUSE", K::kExactSpeed, "tuned", "runtime", 0, 20, SR, "row policy fuse level 0..3"},
   {"CRUCIBLE_GDN_VERIFY", K::kExactSpeed, "0", "layers", 0, 20, SR, "GDN verify core in one launch (gdn_verify.h): N = 1..8 runs GdnVerifyKernel for forwards and packed passes of N or more rows, 0 (default) GdnKernel; bitwise equal"},
   {"CRUCIBLE_GDN_VSCAN_MUTANT", K::kBuild, "unset", "layers", 69, 0, N, "compile-time macro (bench/gdn_vscan.hip mutant: other conv tap order)"},
-  {"CRUCIBLE_HC_WMMA", K::kNumerics, "1", "layers", 0, 0, SR, "0: VALU HC kernels; 2: WMMA with int8 HC weights (hc_int8.h, a quality change)"},
+  {"CRUCIBLE_HC_WMMA", K::kNumerics, "2", "layers", 0, 0, SR, "2 (default): WMMA with int8 HC weights (hc_int8.h, a quality change; CRUCIBLE_EXACT=1 gives 1); 1: WMMA with fp16 HC weights; 0: VALU HC kernels"},
   {"CRUCIBLE_INTERLEAVE_CHECK", K::kDiagnostic, "unset", "runtime", 0, 0, N, "appends verified rows' token IDs and prompt hashes to a file"},
   {"CRUCIBLE_LAZY_SHADOW", K::kDiagnostic, "off", "serve", 578, 0, S, "1: a lazy direct spill also keeps the eager copy of its device rows, compares each piece that the disk writer reads, and refuses the write on a difference (memory use as before the lazy spill; soak correctness check)"},
   {"CRUCIBLE_LOOKAHEAD", K::kExactSpeed, "tuned", "runtime", 0, 20, SR, "row policy prefetch blocks 0..8"},
@@ -104,6 +104,7 @@ inline constexpr SwitchInfo kSwitches[] = {
   {"CRUCIBLE_STATE_CACHE", K::kExactSpeed, "tuned", "runtime", 0, 20, SR, "row policy state cache 0..6"},
   {"CRUCIBLE_STATIC_CACHE", K::kExactSpeed, "tuned", "runtime", 0, 20, SR, "row policy static cache 0..4"},
   {"CRUCIBLE_TUNE_ROWS", K::kExactSpeed, "1", "runtime", 0, 20, SR, "0: untuned row policy"},
+  {"CRUCIBLE_TWIN", K::kExactSpeed, "0", "serve", 0, 20, SR, "1 (needs CRUCIBLE_EXACT_RESUME=1): twin prompts: the first prefill command of a cold request copies the End or Pre point of another slot's prompt that it resumes exactly (a cold state, PointFits), device to device, and prefills only the rest; 4 identical new prompts then prefill once"},
   {"CRUCIBLE_VERIFY_QSA_CHECK", K::kDiagnostic, "off", "serve", 0, 0, S, "kill check counts; synchronizes"},
   {"CRUCIBLE_WARMUP", K::kExactSpeed, "on", "runtime", 0, 20, SR, "0: no startup buffer warm-up"},
 };

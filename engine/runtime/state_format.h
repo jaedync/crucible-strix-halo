@@ -186,7 +186,9 @@ struct StateMeta {
   uint64_t payload = 0, file_bytes = 0, used = 0;  // file_bytes: the state file only (each block counts once)
   std::string name;
   std::vector<std::string> blocks;  // block file names, in the state file's order
+  std::vector<StateDigest> digests;  // index only: the digests of `blocks` (a derived spill takes them, state_disk.h)
   bool superseded = false;  // index only: a longer state on disk extends this one (its own branch moved on)
+  bool rung = false;        // index only: the branch ladder keeps this older state (state_disk.h Prune)
 };
 // One block of a state file's list: its digest, its size and the snapshot ranges that it fills.
 struct StateBlockEntry {

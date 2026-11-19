@@ -497,8 +497,9 @@ def test_the_update_service_runs_crucible_update_in_the_checkout():
     # `make update` is the old script path: the unit runs the new command,
     # which takes a lock, keeps a journal, restarts the service itself and rolls back by itself.
     service = (UNITS / "crucible-update.service").read_text()
-    assert "ExecStart=@CHECKOUT@/crucible update --yes" in service
-    assert "make update" not in service.replace("(./crucible update --yes)", "")
+    # --unattended: next to Kiln's unit the timer skips the update; only an update by hand restarts the Kiln unit.
+    assert "ExecStart=@CHECKOUT@/crucible update --yes --unattended" in service
+    assert "make update" not in service.replace("(./crucible update --yes --unattended)", "")
     assert "WorkingDirectory=@CHECKOUT@" in service
     assert "CKPT" not in service  # the timer never loads the model
 

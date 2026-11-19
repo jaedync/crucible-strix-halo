@@ -4,6 +4,8 @@ import tempfile
 import unittest
 from server.api import ApiError, validate_request
 from server.template import ChatTemplate
+from server.tests.serve_fixtures import joined_calls
+from server.tool_stream import ToolCallStream
 
 TOOLS = [dict(type="function", function=dict(name="read", description="Read a file.", parameters=dict(
     type="object", properties=dict(path=dict(type="string"), offset=dict(type="integer"),
@@ -80,6 +82,11 @@ class ToolOutputTests(unittest.TestCase):
                 "<parameter=offset>\n" + offset + "\n</parameter>\n<parameter=flags>\n" + flags +
                 "\n</parameter>\n</function>\n</tool_call>")
 
+    def invoke(self, path="a.py", offset="4", flags='{"full":true}'):
+        return ('<invoke name="read">\n<parameter name="path">' + path + '</parameter>\n'
+                '<parameter name="offset">' + offset + '</parameter>\n'
+                '<parameter name="flags">' + flags + '</parameter>\n</invoke>')
+
     def test_typed_values_and_openai_deltas(self):
         parser = self.parser()
         content = parser.feed("I will read it.\n" + self.block())
@@ -92,6 +99,70 @@ class ToolOutputTests(unittest.TestCase):
         self.assertEqual(deltas[0]["tool_calls"][0]["index"], 0)
         self.assertEqual(deltas[0]["tool_calls"][0]["id"], call["id"])
         self.assertEqual(finish, "tool_calls")
+
+    def test_invoke_alias(self):
+        parser = self.parser()
+        content = parser.feed("I will read it.\n" + self.invoke())
+        message, deltas, finish = parser.finish("stop")
+        self.assertEqual(content, "I will read it.\n")
+        self.assertEqual(message["content"], content)
+        call = message["tool_calls"][0]
+        self.assertEqual(json.loads(call["function"]["arguments"]),
+                         dict(path="a.py", offset=4, flags=dict(full=True)))
+        self.assertEqual(finish, "tool_calls")
+        self.assertFalse(parser.fallback)
+
+    def test_prose_invoke_before_real_call(self):
+        raw = 'See <invoke name="x"> text.\n' + self.block()
+        for stream in (False, True):
+            parser = self.parser()
+            parser.stream = ToolCallStream(parser.request, parser.definitions) if stream else None
+            parser.feed(raw)
+            message, deltas, reason = parser.finish("stop")
+            self.assertEqual(message["content"], 'See <invoke name="x"> text.\n')
+            self.assertEqual(len(message["tool_calls"]), 1)
+            self.assertEqual(message["tool_calls"][0]["function"]["name"], "read")
+            self.assertEqual(reason, "tool_calls")
+            self.assertFalse(parser.fallback)
+            # The prose goes to the content while the model writes, so in stream mode the call streams in parts.
+            joined = joined_calls([call for delta in deltas for call in delta["tool_calls"]])
+            self.assertEqual([(c["id"], c["function"]["arguments"]) for c in joined],
+                             [(c["id"], c["function"]["arguments"]) for c in message["tool_calls"]])
+            self.assertEqual(len(deltas) > 1, stream)
+
+    def test_prose_invoke_name_does_not_bind_real_call(self):
+        for prose_name in ("x", "delete_file"):
+            raw = f'See <invoke name="{prose_name}"> text.\n' + self.invoke(path="c.py")
+            for stream in (False, True):
+                parser = self.parser()
+                parser.stream = ToolCallStream(parser.request, parser.definitions) if stream else None
+                parser.feed(raw)
+                message, deltas, reason = parser.finish("stop")
+                self.assertEqual(message["content"], f'See <invoke name="{prose_name}"> text.\n')
+                self.assertEqual(len(message["tool_calls"]), 1)
+                self.assertEqual(message["tool_calls"][0]["function"]["name"], "read")
+                self.assertEqual(json.loads(message["tool_calls"][0]["function"]["arguments"])["path"], "c.py")
+                self.assertEqual(reason, "tool_calls")
+                self.assertFalse(parser.fallback)
+                self.assertEqual(len(deltas), 1)
+        parser = self.parser()
+        parser.feed("<invo")
+        message, deltas, reason = parser.finish("stop")
+        self.assertEqual(message["content"], "<invo")
+        self.assertEqual(deltas, [])
+        self.assertEqual(reason, "stop")
+        self.assertFalse(parser.fallback)
+
+    def test_plain_text_with_tag_like_prefix(self):
+        for raw in ("Use a <", "The tag starts with <i",
+                    'Claude writes <invoke name="read"> blocks; here is how they look. Done.'):
+            parser = self.parser()
+            parser.feed(raw)
+            message, deltas, reason = parser.finish("stop")
+            self.assertEqual(message["content"], raw)
+            self.assertEqual(deltas, [])
+            self.assertEqual(reason, "stop")
+            self.assertFalse(parser.fallback)
 
     def test_all_stream_splits(self):
         raw = "Before.\n" + self.block(path="line one\n雪") + "\n" + self.block("b.py")

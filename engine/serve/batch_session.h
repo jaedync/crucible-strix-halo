@@ -1,6 +1,8 @@
 // One caller owns the engine. The frontend selects ready requests without blocking peers.
 #pragma once
 #include "../runtime/slot_checkpoints.h"
+#include "../runtime/fork_point.h"
+#include <cstdio>
 #include "serve_protocol.h"
 #include "draft_tally.h"
 #include "../runtime/batch_spec_contract.h"
@@ -11,6 +13,7 @@
 #include "../runtime/draft_warmup.h"
 #include "../runtime/packed_rows_option.h"
 #include "../runtime/spec_span.h"
+#include "../runtime/sampling_penalty.h"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -102,7 +105,17 @@ struct BatchEvent {
   std::optional<BatchDraftStats> draft;  // done events of speculative requests, when the spec hooks report them
   std::optional<BatchDraftCounts> step_draft;  // token events: the counts after this step (BatchDraftCounts)
   std::vector<TokenLogprob> logprobs;  // the first token's top-N, only when the request asked
+  std::optional<ConstraintCounts> constraint;  // done events of constrained requests (structured output)
 };
+
+// The done event's structured-output counters (numbers only); empty for a request with no constraint, so its done
+// line stays byte-identical.
+inline std::string BatchConstraintFields(const BatchEvent& event) {
+  if (!event.done || !event.constraint) return {};
+  return ",\"constraint\":" + ConstraintCountsJson(*event.constraint);
+}
+// The ready event's field: this engine takes the constraint and constraint_from request keys.
+inline std::string BatchReadyConstraintField() { return ",\"constraint\":1"; }
 
 // The done event's draft counters (JSON members with a leading comma); empty for a request without speculation, so
 // its done line stays byte-identical.
@@ -248,7 +261,8 @@ struct BatchStage {
 };
 // An earlier change: where a staging turn waits. `position`: its place among the server's waiting long turns (0: next in
 // line); `read`: false for a turn behind the first, which only says that it waits and reports a read that it holds.
-// `in_slot(key)`: `key` is a prefix of a state that a slot holds or runs (that session's points never leave for a read).
+// `in_slot(key)`: `key` is a prefix of a state that a slot holds or runs (that session's points leave for a read only
+// through the disk, BatchReadQueue::MayTakeFor).
 struct BatchStageQueue {
   size_t position = 0;
   bool read = true;
@@ -327,6 +341,12 @@ struct BatchCacheHooks {
   std::function<bool(const ServeRequest&, const SlotCheckpoint&)> frontier_fits;
   // `handover`: copies Frontier point (slot, index) to the host. Runs on the selected slot before an open writes it.
   std::function<void(int slot, int index, const SlotCheckpoint&)> handover;
+  // Optional, both with the checkpoint hooks: the fork point. `fork_floor` gives the
+  // length of the longest disk state of `tenant` whose key `key` starts (0: none). `fork_point` writes slot point
+  // (slot, index) to disk beside the tail `tail` that `release` just gave up (a derived state: the tail's blocks). Runs
+  // on the selected slot after `release` and before any write; at most once for each open (fork_point.h picks it).
+  std::function<size_t(std::span<const int> key, const StateTenant& tenant)> fork_floor;
+  std::function<void(int slot, int index, const SlotCheckpoint& point, std::span<const int> tail)> fork_point;
   // `drop`: the open resumes from the slot's own Frontier point, so the tail that the slot holds leaves unsaved.
   std::function<void(int slot)> drop;
   // `resume_host`: with `resume`, whether it would restore a host tail instead of the slot's tail (HostTailFirst).
@@ -361,6 +381,9 @@ struct BatchCacheHooks {
   std::function<size_t(const ServeRequest&, int from, int index, const SlotCheckpoint&)> point_copy;
   // Optional, log line only (header-point): the first prefill command of a request copied the header point.
   std::function<void(int slot, int from, size_t tokens)> header_copied;
+  // Optional, log line only (twin prompts): the first prefill command of a cold request copied the End or Pre point
+  // (`kind`, `tokens` rows) of slot `from` (TwinCopy).
+  std::function<void(int slot, int from, size_t tokens, CheckpointKind kind)> twin_copied;
   // Optional: totals and the latest save try. A capture or tail hook that tried a save raises `attempts`.
   std::function<BatchCacheStatus()> status;
   // Optional: a slot resume or a slot checkpoint served `tokens` (0: the slot held nothing for the
@@ -491,6 +514,8 @@ class BatchSession {
     }
   }
   void SetSpecHooks(BatchSpecHooks hooks) { spec_ = std::move(hooks); }
+  // Structured output: builds the grammar of a request with a constraint (none: such a request is refused).
+  void SetConstraintFactory(ConstraintFactory factory) { constraint_factory_ = std::move(factory); }
   // Re-send fix A (always on with slot checkpoints): End points keep the prompt outputs; an identical prompt resumes
   // at its End point with no prompt row.
   // Re-send fix B: a prompt of at least `min_tokens` tokens ends a chunk at its final chunk's
@@ -513,6 +538,11 @@ class BatchSession {
   // (PreEndPoint), and BestPoint refuses an End or Pre point that does not fit, unless the new prompt repeats it
   // whole. Costs at most 20 rows of prefill, one small launch per prompt and no device memory.
   void SetExactResume(bool on) { exact_resume_ = on; }
+  // Part B: which slot point may go to disk beside a released tail (fork_point.h). Tests use
+  // smaller values for their short prompts.
+  void SetForkRule(ForkRule rule) { fork_rule_ = rule; }
+  // Twin prompts (CRUCIBLE_TWIN; exact resume only): see TwinCopy.
+  void SetTwin(bool on) { twin_ = on; }
   // Save points (exact resume only): the Pre point's distance from the prompt end (at most 9: the nearest multiple of
   // 4 that leaves more than 8 rows) and the shortest shared header that gets a point (0: no header point). The
   // defaults are kPreEndMargin and kHeaderMinRows; tests use smaller values for their short prompts.
@@ -526,11 +556,18 @@ class BatchSession {
   // The prompt cursor after the last Prefill. The frontend ranks waiting turns by the rows that remain (SRPT).
   // An encoder slice moves no prompt row, so it leaves no cursor.
   std::optional<size_t> PrefillCursor() const { return prefill_cursor_; }
+  // The prompt rows that the last Prefill copied from another slot before it ran a row (a twin or header copy in a
+  // request's first command), or 0. The open reported them as not cached, so the frontend counts them as restored
+  // progress, not as rows that ran in the command's time (twin unit, Nov 17: copies of 32K rows in about 15 ms raised
+  // the server's prefill-rate estimate, every turn aged, and FIFO order prefilled the twins before their donor).
+  size_t PrefillRestored() const { return prefill_restored_; }
   bool Poisoned() const { return poisoned_; }
 
   std::vector<BatchEvent> Open(uint64_t id, const ServeRequest& request, bool deferred = false) {
     SettlePrompt();
     ValidateOpen(id, request);
+    // Before the slot lease: a constraint that does not compile or replay refuses only this open.
+    auto grammar = OpenConstraint(request);
     const int slot = FreeSlot(request);
     // Y2: a slot that last ran the other RoPE mode holds no state that this request may resume (a state keeps its
     // mode from token 0): the open resets it, sets the mode, then restores or prefills (Way A).
@@ -538,7 +575,8 @@ class BatchSession {
     const size_t plain_tokens = request.rope == RopeMode::Plain ? 0 : PlainStateTokens(request);
     if (generations_[slot] == std::numeric_limits<uint64_t>::max())
       throw std::overflow_error("sequence slot generation limit reached; restart the worker");
-    auto state = std::make_unique<Request>(id, slot, ++generations_[slot], request);
+    auto state = std::make_unique<Request>(id, slot, ++generations_[slot], request, std::move(grammar));
+    state->cold_plan = request.images.empty();
     std::optional<BatchResident> resident;
     const bool held = resident_[size_t(slot)].has_value();
     const std::vector<int> key = Key(request, request.ids);
@@ -583,6 +621,9 @@ class BatchSession {
       }
     }
     const int slots_durable = cache_.durable ? SlotsDurable() : -1;
+    // Part B (kv-fork): the tail that the release gives up, for the fork point after it.
+    std::optional<Resident> released;
+    if (held && cache_.fork_point && cache_.fork_floor) released = resident_[size_t(slot)];
     resident_[size_t(slot)].reset();  // this request writes the slot
     DeviceUpdate([&] {
       engine_.SelectStream(slot);
@@ -600,7 +641,10 @@ class BatchSession {
       GuardFrontiers(slot, request, resident, point);
       // HIGH-2: a resume from the slot's own Frontier point leaves the slot's tail, which the prompt does not repeat.
       if (held && from_frontier && cache_.drop) cache_.drop(slot);
-      else if (held && cache_.release) cache_.release(slot, resident.has_value());
+      else if (held && cache_.release) {
+        cache_.release(slot, resident.has_value());
+        if (released) GuardForkPoint(slot, request, resident, point, *released);
+      }
       if (!resident && !point) {
         if (cache_.overwrite) cache_.overwrite(slot);
         engine_.Reset();
@@ -651,6 +695,16 @@ class BatchSession {
         // Only a slot or checkpoint resume keeps the slot's rows (below the restored length).
         checkpoints_.Keep(slot, hit.slot || point ? hit.tokens : 0);
         owned.from_checkpoint = point.has_value();
+        // Twin prompts: a cold open or a frontier restore (host, disk, slot point or copy) of a text prompt runs the
+        // cold plan from here, and so does a resume from an End or Pre point that holds a cold state (as a core point,
+        // or as the whole prompt). A tail, a Start or Grid point does not count.
+        if (point && checkpoints_.At(slot, *point).kind != CheckpointKind::Frontier) {
+          const SlotCheckpoint& saved = checkpoints_.At(slot, *point);
+          owned.cold_plan = owned.cold_plan && saved.cold && saved.replay == 0 &&
+                            (owned.core_point || owned.end_outputs != nullptr);
+        } else {
+          owned.cold_plan = owned.cold_plan && !hit.tail && hit.replay == 0;
+        }
         if (left && left->second > hit.tokens && cache_.diverged)
           cache_.diverged(owned.options.ids.size(), hit.tokens, left->first, left->second);
         owned.cached = owned.cursor = hit.tokens;
@@ -783,6 +837,7 @@ class BatchSession {
     // The next image's pixels are read and checked on the host before any device work, outside DeviceUpdate: a file
     // that changed after the open ends only this request, and the session stays healthy (review F1).
     prefill_cursor_.reset();  // a command that ends early (below) names no cursor
+    prefill_restored_ = 0;
     if constexpr (requires { engine_.PrepareVisionPixels(engine_.ActiveSequence()); }) {
       const Request& waiting = *active_.at(id);
       engine_.SelectStream(waiting.slot);
@@ -812,11 +867,16 @@ class BatchSession {
     Request& state = *active_.at(id);
     engine_.SelectStream(state.slot);
     prefill_cursor_.reset();
+    prefill_restored_ = 0;
     if (state.end_outputs) return ResumeEnd(state);
     // Header point: a cold request takes the shared header from the slot that holds it, before its first launch.
+    // Twin prompts first: the End or Pre point of another slot's prompt with the same first rows (TwinCopy).
     if (!state.header_tried && state.cursor == 0) {
       state.header_tried = true;
-      if (state.cached == 0) HeaderCopy(state);
+      const size_t before = state.cached;
+      if (state.cached == 0 && !TwinCopy(state)) HeaderCopy(state);
+      prefill_restored_ = state.cached - before;
+      if (state.end_outputs) return ResumeEnd(state);
     }
     const int prefill = engine_.PrefillRows();
     const int step = prefill > 0 ? prefill : kMaxRows;
@@ -1282,6 +1342,19 @@ class BatchSession {
   }
 
  private:
+  // A request whose grammar has no legal token (constraint.h DeadEndToken): one error event in place of the stop
+  // sentinel, then the slot is free, as Close. Its tokens so far are published; no done event, no tail is saved.
+  std::vector<BatchEvent> EndDeadEnd(uint64_t id) {
+    const Request& state = *active_.at(id);
+    BatchEvent failed{id, state.generation};
+    failed.error = kConstraintDeadEndMessage;
+    if (cache_.expect) cache_.expect(state.options, state.slot, 0);
+    slot_used_[size_t(state.slot)] = ++resident_tick_;
+    const bool spec = state.spec;
+    active_.erase(id);
+    if (spec) spec_.close(id);
+    return {failed};
+  }
   // Ends a request before any device work of its command: one error event, then the slot is free.
   std::vector<BatchEvent> FailRequest(uint64_t id, const char* message) {
     BatchEvent failed{id, active_.at(id)->generation};
@@ -1302,6 +1375,9 @@ class BatchSession {
     bool core_point = false;  // resumed from an End or Pre checkpoint on a core-part cut, no pending rows
     bool pre_done = false;    // a Pre or header cut was taken: the request takes no other Pre point (save points)
     bool header_tried = false;  // the first prefill command looked for a header point on another slot (header-point)
+    // Twin prompts: the prompt state below the cursor is the cold plan's (TwinDonor), and the request took a twin copy.
+    bool cold_plan = true;
+    bool twin = false;
     std::shared_ptr<const PromptOutputs> end_outputs;  // fix A: the End point's outputs; set until the first token
     std::shared_ptr<const PromptOutputs> outputs;      // fix A: this prompt's outputs, for its End point
     bool end_resumed = false;  // fix A: the open restored the whole prompt (the event's end_resume)
@@ -1323,9 +1399,18 @@ class BatchSession {
     const bool spec;
     double prefill = 0, decode = 0, restore = 0, capture = 0, vision = 0;
     int vision_slices = 0;
-    Request(uint64_t id, int slot, uint64_t generation, const ServeRequest& options)
-        : id(id), slot(slot), generation(generation), options(options),
-          spec(options.spec > 0 && options.max_tokens > 1) {}
+    // The prompt and the published tokens of a penalized request (sampling_penalty.h); inactive for neutral ones.
+    sampling::PenaltyHistory penalties;
+    Request(uint64_t id, int slot, uint64_t generation, const ServeRequest& options,
+            std::shared_ptr<Constraint> grammar = nullptr)
+        : id(id), slot(slot), generation(generation), options(WithGrammar(options, std::move(grammar))),
+          spec(options.spec > 0 && options.max_tokens > 1),
+          penalties(sampling::RequestPenalties(options.ids, options.sampling, kVocab)) {}
+    static ServeRequest WithGrammar(const ServeRequest& options, std::shared_ptr<Constraint> grammar) {
+      ServeRequest copy = options;
+      copy.grammar = std::move(grammar);
+      return copy;
+    }
   };
   // A published first token whose prompt end waits for SettlePrompt; `start`: the final chunk's first row.
   struct PromptEnd { uint64_t id; size_t start; int rows; bool bulk; int token; };
@@ -1345,6 +1430,8 @@ class BatchSession {
     if constexpr (requires { engine_.ReleaseImageRows(engine_.ActiveSequence(), size_t{0}); })
       engine_.ReleaseImageRows(engine_.ActiveSequence(), state.cursor);
     const int token = Sample(state, outputs->greedy, 0, outputs->logits);
+    // Twin prompts: the slot holds no End point of this prompt yet, so its End point keeps the copied outputs.
+    if (state.twin) state.outputs = outputs;
     FinishPrompt(state, token);
     state.prefill += Clock() - start;
     return Publish(state.id, token);
@@ -1449,6 +1536,7 @@ class BatchSession {
     if (!tokens) return;
     if (tokens != point.hist.size()) throw std::logic_error("a header copy must restore the donor point");
     state.cached = state.cursor = tokens;
+    state.cold_plan = false;
     state.from_checkpoint = true;
     state.from_tail = true;
     state.core_point = BulkResumes(tokens, state.options.ids.size());
@@ -1459,6 +1547,65 @@ class BatchSession {
     if (cache_.header_copied) cache_.header_copied(state.slot, from, tokens);
     // The draft state of the open assumed a cold start; a restored prefix starts a fresh MTP warm-up (Open's rule).
     if (state.spec) spec_.open(state.id, state.slot, state.options, state.cached);
+  }
+  // Twin prompts (CRUCIBLE_TWIN): the End or Pre point of another slot
+  // that is a prefix of `state`'s prompt and that it resumes from as from its own slot's point (PointFits; an End point
+  // of the whole prompt needs its outputs). The point must hold a cold state (SlotCheckpoint::cold: its request ran the
+  // cold plan), so the copy is the cold state of those rows. The donor slot may be busy: the rows below a point never
+  // change while it runs. The longest wins, the lowest slot on a tie.
+  std::optional<std::pair<int, int>> TwinDonor(const Request& state) const {
+    const ServeRequest& request = state.options;
+    if (!twin_ || !exact_resume_ || !cache_.point_copy || !cache_.checkpoint_save || request.cache_control != "auto" ||
+        !request.images.empty())
+      return std::nullopt;
+    const std::vector<int> key = Key(request, request.ids);
+    std::optional<std::pair<int, int>> donor;
+    size_t longest = 0;
+    for (int from = 0; from < slots_; ++from) {
+      if (from == state.slot) continue;
+      const auto best = checkpoints_.Best(from, key, request.tenant, [&](const SlotCheckpoint& point) {
+        return point.cold && (point.kind == CheckpointKind::End || point.kind == CheckpointKind::Pre) &&
+               point.replay == 0 && PointFits(request, key, point);
+      });
+      if (best && checkpoints_.At(from, *best).hist.size() > longest)
+        donor = {from, *best}, longest = checkpoints_.At(from, *best).hist.size();
+    }
+    return donor;
+  }
+  // Runs in the first prefill command of a cold request, on its selected slot (no prompt row ran). The request then
+  // starts as an open that loaded the point from its own slot does (Open: core point, tail start, an End resume with
+  // the point's outputs), so its plan and its bits are the same. Returns whether it copied a point.
+  bool TwinCopy(Request& state) {
+    const auto donor = TwinDonor(state);
+    if (!donor) return false;
+    const auto [from, index] = *donor;
+    const SlotCheckpoint& point = checkpoints_.At(from, index);
+    const size_t length = state.options.ids.size();
+    const double start = Clock();
+    if (cache_.request) cache_.request(state.id);  // the log tag of the copy and end_resume lines
+    const size_t tokens = cache_.point_copy(state.options, from, index, point);
+    engine_.SelectStream(state.slot);
+    if (!tokens) return false;
+    if (tokens != point.hist.size() || (tokens == length && !ResumesWhole(point)))
+      throw std::logic_error("a twin copy must restore the donor point");
+    state.cached = state.cursor = tokens;
+    state.from_checkpoint = true;
+    state.from_tail = true;
+    state.twin = true;
+    state.core_point = BulkResumes(tokens, length);
+    if (tokens == length) {
+      state.end_outputs = point.outputs;
+      state.end_resumed = true;
+    }
+    state.diag.miss = "none";
+    if (state.ledger_set)
+      state.ledger = LedgerVerdict(state.ledger_tiers, length, tokens, "point", CheckpointKindWord(point.kind));
+    state.restore += Clock() - start;
+    if (cache_.twin_copied) cache_.twin_copied(state.slot, from, tokens, point.kind);
+    if (state.end_resumed && cache_.end_resumed) cache_.end_resumed(state.slot, tokens);
+    // The draft state of the open assumed a cold start; a restored prefix starts a fresh MTP warm-up (Open's rule).
+    if (state.spec) spec_.open(state.id, state.slot, state.options, state.cached);
+    return true;
   }
   // b-cut lever 1 (exact resume): an End point on the tile grid whose last chunk piece has more than 8 rows (or is a
   // whole chunk) is exact for any extension of more than 8 rows (BestPoint), so the Pre launch of 9 to 12 rows is not
@@ -1908,6 +2055,22 @@ class BatchSession {
     for (const int index : checkpoints_.Frontiers(slot))
       if (checkpoints_.At(slot, index).hist.size() > keep) cache_.handover(slot, index, checkpoints_.At(slot, index));
   }
+  // Part B: the open drops the slot's points above what it keeps (GuardFrontiers' rule). The
+  // longest End, Pre or Grid point below the released tail `tail` that gains enough over the disk goes to disk. A fork
+  // point is speed only: a fault in it (review M2) loses the point and must not poison the batch (DeviceUpdate).
+  void GuardForkPoint(int slot, const ServeRequest& request, const std::optional<BatchResident>& resident,
+                      std::optional<int> point, const Resident& tail) {
+    size_t keep = 0;
+    if (resident) keep = cache_.resume_host && cache_.resume_host(request, *resident) ? 0 : SIZE_MAX;
+    else if (point) keep = checkpoints_.At(slot, *point).hist.size();
+    const auto floor = [&](size_t rows) { return cache_.fork_floor(std::span<const int>(tail.key.data(), rows), tail.tenant); };
+    try {
+      if (const auto index = PickForkPoint(checkpoints_, slot, tail.key, tail.tenant, keep, floor, fork_rule_))
+        cache_.fork_point(slot, *index, checkpoints_.At(slot, *index), tail.key);
+    } catch (const std::exception& error) {
+      std::fprintf(stderr, "batch fork_point lost slot=%d tokens=%zu error=%s\n", slot, tail.key.size(), error.what());
+    }
+  }
   // Returns whether it saved a point (false: no checkpoints, a bypass request, or the slot holds that state).
   // `cut`: the point is the cut buffer's state at that position (cut_save), not the slot's state at the cursor.
   bool SaveCheckpoint(Request& state, CheckpointKind kind, int replay, bool guarded,
@@ -1921,13 +2084,14 @@ class BatchSession {
     else cache_.checkpoint_save(state.slot, *victim);
     checkpoints_.Store(state.slot, *victim, {std::vector<int>(below.begin(), below.end()), std::move(key),
                                              replay, guarded, kind, state.id, {}, state.options.tenant,
-                                             std::move(outputs)});
+                                             std::move(outputs), state.cold_plan && replay == 0});
     return true;
   }
   // `saved`: the row's logits, copied already (fix A); else they are copied from the engine's row `row`. An End
   // resume runs no row, so the engine's buffer then holds a later step's logits: the saved row is the only source.
   int Sample(Request& state, int greedy, int row, const std::shared_ptr<const std::vector<float>>& saved = nullptr) {
-    if (state.options.sampling.temperature == 0) {
+    if (state.options.grammar) return ConstrainedSample(state, greedy, row, saved);
+    if (!state.options.sampling.HostDraw()) {
       if (greedy < 0 || greedy >= kVocab) throw std::runtime_error("engine returned an invalid token ID");
       if (state.options.top_logprobs) {
         // The row the sampler would copy. The token stays the device's greedy ID; the event carries both.
@@ -1936,9 +2100,51 @@ class BatchSession {
       return greedy;
     }
     const auto logits = saved ? *saved : engine_.CopyLogits(1, row);
-    // Keyed law: the draw depends only on (seed, absolute position, token), as in serial generation.
-    return sampling::FromLogits(logits, state.options.sampling)
-        .KeyedSample(state.options.sampling.seed, state.options.ids.size() + state.count);
+    // A penalized scoring request: raw log-probabilities (as other engines's default), the penalized greedy token.
+    if (state.options.top_logprobs) state.top = TopLogprobs(logits, state.options.top_logprobs);
+    // Keyed law: the draw depends only on (seed, absolute position, token), as in serial generation. The penalties
+    // see the prompt and the published tokens only, so the draw depends on the request alone.
+    return sampling::Draw(logits, state.options.sampling, state.penalties,
+                          state.options.ids.size() + state.count);
+  }
+  // Structured output: the masked target (constraint.h), committed to the request's grammar.
+  int ConstrainedSample(Request& state, int greedy, int row, const std::shared_ptr<const std::vector<float>>& saved) {
+    Constraint& grammar = *state.options.grammar;
+    const auto copy = [&] { return saved ? *saved : engine_.CopyLogits(1, row); };
+    // Penalized: the penalties first, then the grammar's choice (ChoosePenalized); neutral requests skip this.
+    if (state.penalties.Active())
+      return ChoosePenalized(grammar, copy(), state.options.sampling, state.penalties,
+                             state.options.ids.size() + state.count);
+    if (state.options.sampling.temperature == 0) {
+      if (greedy < 0 || greedy >= kVocab) throw std::runtime_error("engine returned an invalid token ID");
+      return ChooseGreedy(grammar, greedy, copy);
+    }
+    const auto logits = copy();
+    return ChooseKeyed(grammar, logits, state.options.sampling, state.options.sampling.seed,
+                       state.options.ids.size() + state.count);
+  }
+  // The open's grammar: compiled (or cached), then the output so far (constraint_from) replayed through it.
+  std::shared_ptr<Constraint> OpenConstraint(const ServeRequest& request) const {
+    if (!request.constraint) return nullptr;
+    if (!constraint_factory_) throw RecoverableOpenError("constraint_unsupported: this engine has no structured output");
+    if (request.top_logprobs) throw RecoverableOpenError("constraint_scoring: a constrained request has no top_logprobs");
+    std::shared_ptr<Constraint> grammar;
+    try {
+      grammar = constraint_factory_(*request.constraint);
+    } catch (const ConstraintError& error) {
+      throw RecoverableOpenError(error.what());
+    }
+    if (!grammar) throw RecoverableOpenError("constraint_unsupported: this engine has no structured output");
+    if (std::find(request.stop_ids.begin(), request.stop_ids.end(), grammar->StopToken()) == request.stop_ids.end())
+      throw RecoverableOpenError("constraint_stop: a constrained request must stop on the grammar's stop token");
+    const int from = request.constraint_from < 0 ? int(request.ids.size()) : request.constraint_from;
+    if (size_t(from) > request.ids.size()) throw RecoverableOpenError("constraint_from: the output start is past the prompt");
+    for (size_t i = size_t(from); i < request.ids.size(); ++i)
+      if (!grammar->Accept(request.ids[i]))
+        throw RecoverableOpenError("constraint_replay: the output so far breaks the constraint");
+    // Review H1: an output so far that ends on the stop token leaves no legal token for the first sample.
+    if (grammar->Terminated()) throw RecoverableOpenError("constraint_replay: the output so far is complete");
+    return grammar;
   }
   std::optional<BatchDraftCounts> StepCounts(uint64_t id) const {
     if (!spec_.counts) return std::nullopt;
@@ -1946,8 +2152,11 @@ class BatchSession {
   }
   std::vector<BatchEvent> Publish(uint64_t id, int token) {
     Request& state = *active_.at(id);
+    if (state.options.grammar && state.options.grammar->DeadEnd() && token == state.options.grammar->StopToken())
+      return EndDeadEnd(id);
     state.last = token;
     ++state.count;
+    if (state.penalties.Active()) state.penalties.Add(token);
     const bool stopped = Stops(state, token);
     const BatchEvent event{id, state.generation, token, false, stopped, state.options.ids.size(), state.count,
                            state.prefill, state.decode, state.cached, cache_.bytes ? cache_.bytes() : 0,
@@ -1982,6 +2191,7 @@ class BatchSession {
       done.rope_counters = rope_counters_;
       const bool spec = state.spec;
       if (spec && spec_.stats) done.draft = spec_.stats(id);
+      if (state.options.grammar) done.constraint = state.options.grammar->counts;
       events.push_back(done);
       if (cache_.tail && state.options.cache_control != "bypass")
         tails_.push_back({id, state.slot, state.options, std::move(state.generated),
@@ -2002,10 +2212,12 @@ class BatchSession {
   BatchRopeCounters rope_counters_;
   bool poisoned_ = false;
   std::optional<size_t> prefill_cursor_;
+  size_t prefill_restored_ = 0;
   std::optional<PromptEnd> prompt_end_;
   InterleaveCheck check_;
   BatchCacheHooks cache_;
   BatchSpecHooks spec_;
+  ConstraintFactory constraint_factory_;
   std::vector<FinishedTail> tails_;
   std::vector<std::optional<Resident>> resident_;
   SlotCheckpoints checkpoints_;
@@ -2016,6 +2228,8 @@ class BatchSession {
   size_t pre_end_min_ = 0;    // SetPreEnd (0: off)
   int core_rows_ = kPrefillLaunchCoreRows;
   bool exact_resume_ = false;  // SetExactResume
+  ForkRule fork_rule_;  // SetForkRule
+  bool twin_ = false;          // SetTwin
   size_t pre_margin_ = kPreEndMargin, header_min_ = kHeaderMinRows;  // SetSavePoints
   int pass_rows_ = kMaxRows;  // SetPassRows
   int wide_from_ = 0;         // SetPassRows: decoders from which a pass uses pass_rows_ (0: always)

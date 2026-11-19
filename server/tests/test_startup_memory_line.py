@@ -2,7 +2,7 @@
 
 `memory ready` prints before batch serve allocates and warms its slots and checkpoints (about 13.8 GiB on the
 4 x 106K profile), so it overstates the headroom of the cache. The `memory serve` lines come after them, before the
-ready event. The existing lines stay as they are: tools/ple_abab.py parses `memory ready`.
+ready event. The existing lines stay as they are: other tools parse `memory ready`.
 """
 from pathlib import Path
 

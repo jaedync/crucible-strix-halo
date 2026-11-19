@@ -12,10 +12,11 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import machine
 from .doctor import GTT_PARAMS
 from .files import Sandbox
 
-REQUIRED = GTT_PARAMS.split()
+REQUIRED = GTT_PARAMS.split()   # the 128 GB class; plan() asks for the values of the machine's memory class
 _LOADER_WORDS = ("initrd=", "BOOT_IMAGE=")
 METHODS = {"grub": "GRUB", "systemd-boot": "systemd-boot", "uki": "a unified kernel image"}
 _BARE = re.compile(r"[A-Za-z0-9_.=:,/@%+-]*")
@@ -34,10 +35,10 @@ def _key(word):
     return word.split("=", 1)[0]
 
 
-def missing(cmdline):
-    """The required tokens that the command line does not hold with the right value."""
+def missing(cmdline, required=None):
+    """The required tokens (default: the 128 GB class) that the command line does not hold with the right value."""
     have = set(cmdline.split())
-    return [t for t in REQUIRED if t not in have]
+    return [t for t in (REQUIRED if required is None else required) if t not in have]
 
 
 def set_params(line, tokens):
@@ -202,7 +203,7 @@ def plan(host):
     """None when the running command line holds both parameters already. Else a Plan: can_apply only when exactly one
     boot file matched with evidence, the change is plain text, a command to make it active is known and sudo exists."""
     cmd = (_read(Path(host.proc) / "cmdline") or "").strip()
-    want = missing(cmd)
+    want = missing(cmd, machine.of_host(host).gtt_params.split())
     if not want:
         return None
     running = core(cmd.split())

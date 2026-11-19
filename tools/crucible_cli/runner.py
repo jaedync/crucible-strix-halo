@@ -112,13 +112,49 @@ class Runner:
         return b"-m" in words and b"server" in words
 
     def terminate(self, pid, wait_s=180):
+        """SIGTERM to the server PID, then wait until the server and its children (the engine) have exited (REPORT C an earlier change:
+        the engine saves its states after the server and holds its memory until it exits). False after WAIT_S."""
         if not self.alive(pid):
             return False
+        children = _children(int(pid))
         os.kill(int(pid), signal.SIGTERM)
         import time
         end = time.time() + wait_s
         while time.time() < end:
-            if not self.alive(pid):
+            if not self.alive(pid) and not any(_same_process(c) for c in children):
                 return True
-            time.sleep(1)
+            time.sleep(0.5)
         return False
+
+
+def _start_time(pid):
+    """Field 22 of /proc/PID/stat (the start time), or None for a process that has exited or is a zombie."""
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()
+    except OSError:
+        return None
+    return None if not fields or fields[0] in ("Z", "X") else fields[19]
+
+
+def _children(pid):
+    """The child processes of PID as (pid, start time): a reused PID later is not the same process."""
+    found = []
+    try:
+        tasks = list(Path(f"/proc/{pid}/task").iterdir())
+    except OSError:
+        return found
+    for task in tasks:
+        try:
+            words = (task / "children").read_text().split()
+        except OSError:
+            continue
+        for word in words:
+            start = _start_time(int(word))
+            if start is not None:
+                found.append((int(word), start))
+    return found
+
+
+def _same_process(child):
+    pid, start = child
+    return _start_time(pid) == start

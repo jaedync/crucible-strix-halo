@@ -1067,6 +1067,238 @@ void PruneBranch() {
   Equal(*ready.snapshot, *turns[0]);
 }
 
+// ---- the branch ladder ----
+
+// The ladder at 1/256 of the engine sizes: near bands of 16 rows to 128, mid bands of 64 to 512, far bands of 256.
+// A turn of 20 tokens stands for 5,000; 880 tokens for 225K; 800 for 205K.
+constexpr size_t kTurn = 20, kTip = 880;
+StateDiskOptions LadderOptions(char id, const std::string& name, bool ladder = true) {
+  auto options = Options(id, name);
+  options.ladder = ladder;
+  options.ladder_near = 128, options.ladder_near_band = 16;
+  options.ladder_mid = 512, options.ladder_mid_band = 64;
+  options.ladder_far_band = 256;
+  return options;
+}
+// One branch: a state at each turn end up to kTip, and a frontier at 870 and 875 (two states in the tip's band 0).
+std::vector<std::shared_ptr<TestSnapshot>> LadderBranch(const std::vector<int>& ids) {
+  std::vector<std::shared_ptr<TestSnapshot>> turns;
+  for (size_t n = kTurn; n < kTip; n += kTurn) turns.push_back(Make(Prefix(ids, n), 0, uint8_t(n)));
+  turns.push_back(Make(Prefix(ids, 870), 0, 1));
+  turns.push_back(Make(Prefix(ids, 875), 0, 2));
+  turns.push_back(Make(Prefix(ids, kTip), 0, 3));
+  return turns;
+}
+// The lengths of the branch's states that are on disk.
+std::vector<size_t> Kept(Disk& disk, const std::vector<std::shared_ptr<TestSnapshot>>& turns) {
+  std::vector<size_t> kept;
+  for (const auto& s : turns) if (disk.Present(s->hist, Policy(), false)) kept.push_back(s->hist.size());
+  return kept;
+}
+// A prompt that leaves the branch after `at` tokens.
+std::vector<int> Diverge(const std::vector<int>& ids, size_t at) {
+  auto key = Prefix(ids, at);
+  for (int i = 0; i < 40; ++i) key.push_back(5000 + i);
+  return key;
+}
+
+// LadderKeepsBands: below the tip, each bucket keeps its longest state, and the newest 2 older states stay. A bucket is
+// an aligned range of positions [k w, (k + 1) w); its width w comes from the state's distance below the tip (16 rows
+// nearer than 128, 64 nearer than 512, else 256). The widths nest, so the longest state of a wide bucket was the longest
+// of its narrow bucket too, and the set stays stable as the tip moves on. A prompt that leaves the branch x tokens
+// below the tip finds a state at most 2 widths below x. Trunk keeps only 2 older states: the prompt that leaves at the
+// "205K" point finds none.
+void LadderKeepsBands() {
+  const auto ids = Tokens(kTip + 40);
+  const auto turns = LadderBranch(ids);
+  Disk disk(LadderOptions('L', "ladder"));
+  for (const auto& s : turns) SpillOk(disk, s);
+  // The set after the 46 spills in order (each Prune applies the rule to the states that the earlier Prunes kept).
+  // Near: 875 (870 is in the same bucket [864, 880) but stays as one of the newest 2), 860, ..., 760. Mid buckets of
+  // 64: 740, 700, 620, 560, 500, 440, 380. Far buckets of 256: 300 ([256, 512); 380 is still mid) and 240 ([0, 256)).
+  const std::vector<size_t> want = {240, 300, 380, 440, 500, 560, 620, 700, 740, 760, 780, 800, 820, 840, 860, 870,
+                                    875, kTip};
+  assert(Kept(disk, turns) == want);
+  assert(disk.Entries() == want.size() && disk.Bytes() == DiskBytes(disk.Directory()));
+  assert(disk.Stats().pruned == turns.size() - want.size());
+  for (size_t x = 250; x < kTip; x += 5) {
+    const auto meta = disk.Best(Diverge(ids, x), Policy(), false, Any);
+    const size_t d = kTip - x, width = d < 128 ? 16 : d < 512 ? 64 : 256;
+    // A turn is 20 tokens: no state exists nearer than that below x.
+    assert(meta && meta->key.size() <= x && meta->key.size() + std::max(2 * width, kTurn) >= x);
+  }
+  Restores(disk, *turns[800 / kTurn - 1]);  // a rung restores the bytes that its spill wrote
+}
+
+// LadderOff: ladder=false keeps today's set (the tip and the newest 2 older states) and today's pruned count. The ladder
+// writes no byte more than today (Part A costs 0 new write bytes: the K2 line of the day ledger).
+void LadderOff() {
+  const auto ids = Tokens(kTip + 40);
+  const auto turns = LadderBranch(ids);
+  auto off_options = LadderOptions('M', "ladder-off", false), on_options = LadderOptions('M', "ladder-on");
+  off_options.today = on_options.today = [] { return std::string("2026-11-17"); };
+  Disk off(off_options), on(on_options);
+  for (const auto& s : turns) SpillOk(off, s), SpillOk(on, s);
+  assert((Kept(off, turns) == std::vector<size_t>{870, 875, kTip}));
+  assert(off.Stats().pruned == turns.size() - 3 && !off.Best(Diverge(ids, 805), Policy(), false, Any));
+  assert(on.DayWritten() == off.DayWritten() && on.Stats().written_bytes == off.Stats().written_bytes);
+  assert(on.Stats().blocks_written == off.Stats().blocks_written);
+}
+
+// LadderEvictOrder: under a squeeze (a restart with fewer state files allowed), the superseded state that is not a rung
+// leaves first (870), then the rungs from the least recently used (240, then 300); the tip and an unrelated live state
+// stay. The evict line says rung=0 or rung=1. After the restart (rung marks are in memory only), the start marks the
+// rungs again before it evicts.
+void LadderEvictOrder() {
+  const auto ids = Tokens(kTip + 40);
+  const auto turns = LadderBranch(ids);
+  const auto live = Make(Tokens(300, 77), 0, 9);
+  size_t entries = 0;
+  {
+    Disk disk(LadderOptions('N', "ladder-evict"));
+    SpillOk(disk, live);
+    for (const auto& s : turns) SpillOk(disk, s);
+    entries = disk.Entries();
+  }
+  {
+    std::lock_guard lock(logs.mutex);
+    logs.lines.clear();
+  }
+  auto options = LadderOptions('N', "ladder-evict");
+  options.max_states = entries - 3;
+  Disk disk(options);
+  assert(disk.Entries() == entries - 3);
+  std::vector<std::string> evicts;
+  {
+    std::lock_guard lock(logs.mutex);
+    for (const auto& line : logs.lines) if (line.starts_with("state_disk evict")) evicts.push_back(line);
+  }
+  assert(evicts.size() == 3);
+  assert(Field(evicts[0], "tokens") == 870 && Field(evicts[0], "rung") == 0 && Field(evicts[0], "superseded") == 1);
+  assert(Field(evicts[1], "tokens") == 240 && Field(evicts[1], "rung") == 1);
+  assert(Field(evicts[2], "tokens") == 300 && Field(evicts[2], "rung") == 1);
+  assert(disk.Present(live->hist, Policy(), false) && disk.Present(turns.back()->hist, Policy(), false));
+}
+
+// LadderDefaultOff: the ladder is off by default, so the default path
+// equals the earlier one: the prune rule, the evict order and the evict line (no " rung=" field).
+void LadderDefaultOff() {
+  assert(!StateDiskOptions{}.ladder);
+  const auto ids = Tokens(kTip + 40);
+  const auto turns = LadderBranch(ids);
+  const auto live = Make(Tokens(300, 77), 0, 9);
+  size_t entries = 0;
+  {
+    Disk disk(LadderOptions('Q', "ladder-default", false));
+    SpillOk(disk, live);
+    for (const auto& s : turns) SpillOk(disk, s);
+    entries = disk.Entries();
+  }
+  {
+    std::lock_guard lock(logs.mutex);
+    logs.lines.clear();
+  }
+  auto options = LadderOptions('Q', "ladder-default", false);
+  options.max_states = entries - 1;
+  Disk disk(options);
+  std::vector<std::string> evicts;
+  {
+    std::lock_guard lock(logs.mutex);
+    for (const auto& line : logs.lines) if (line.starts_with("state_disk evict")) evicts.push_back(line);
+  }
+  assert(evicts.size() == 1 && Field(evicts[0], "superseded") == 1);
+  assert(evicts[0].find(" rung=") == std::string::npos);
+}
+
+// LadderRestart: a restart and the next write of the branch keep the same set as one process that never stopped.
+void LadderRestart() {
+  const auto ids = Tokens(kTip + 40);
+  auto turns = LadderBranch(ids);
+  const auto next = Make(Prefix(ids, kTip + 20), 0, 4);
+  {
+    Disk disk(LadderOptions('O', "ladder-restart"));
+    for (const auto& s : turns) SpillOk(disk, s);
+  }
+  Disk restarted(LadderOptions('O', "ladder-restart"));
+  SpillOk(restarted, next);
+  Disk reference(LadderOptions('P', "ladder-reference"));
+  for (const auto& s : turns) SpillOk(reference, s);
+  SpillOk(reference, next);
+  turns.push_back(next);
+  assert(Kept(restarted, turns) == Kept(reference, turns));
+  assert(restarted.Entries() == reference.Entries());
+}
+
+// ---- derived spills: the fork point at release ----
+
+// A point snapshot whose trunk blocks below `blocks` hold zero bytes: the engine copies only the rest of a fork point to
+// the host, so a writer that reads those blocks gets other bytes (its digest check or the restore fails).
+std::shared_ptr<TestSnapshot> Hollow(const std::vector<int>& hist, uint8_t seed, uint64_t blocks) {
+  const uint8_t session = uint8_t(hist[0] * 7);
+  return Make(hist, 0, seed, [=](int lane, uint64_t index, uint64_t at) {
+    return lane == 0 && index < blocks ? uint8_t(0) : uint8_t(BlockByte(lane, index, at) + session);
+  });
+}
+std::string Derive(Disk& disk, const std::shared_ptr<TestSnapshot>& s, const std::vector<int>& base, uint64_t blocks) {
+  return disk.SpillDerived(s->hist, Policy(), false, false, s, *s, base, blocks);
+}
+
+// DerivedSharesBase: a fork point 3 blocks and 20 rows into a tail of 6 trunk blocks and 1 MTP block. Its derived
+// spill takes trunk blocks 0 to 2 from the tail, writes no block, and the day ledger charges its state file only. A read
+// gives the bytes of the full point snapshot. After a restart (the tail's digests come from its header), a second
+// derived spill does the same.
+void DerivedSharesBase() {
+  const auto ids = Tokens(6 * kRows + 40);
+  const auto tail = Make(ids, kRows + 3, 60);
+  const size_t p = 3 * kRows + 20, q = 4 * kRows + 8;
+  const auto point = Make(Prefix(ids, p), 0, 61), second = Make(Prefix(ids, q), 0, 62);
+  auto options = Options('D', "derived");
+  options.today = [] { return std::string("2026-11-17"); };
+  {
+    Disk disk(options);
+    SpillOk(disk, tail);
+    const uint64_t before = disk.DayWritten(), blocks = disk.Stats().blocks_written;
+    assert(Derive(disk, Hollow(point->hist, 61, 3), tail->hist, 3).empty() && disk.Drain(60));
+    const auto line = Find("result=written");
+    assert(Field(line, "tokens") == p && Field(line, "new_blocks") == 0 && Field(line, "shared") == 3);
+    assert(Field(line, "derived") == 3);
+    const auto meta = disk.Best(point->hist, Policy(), false, Any);
+    assert(meta && meta->key.size() == p && fs::file_size(disk.Directory() / meta->name) == meta->file_bytes);
+    assert(disk.DayWritten() - before == meta->file_bytes && Field(line, "written") == meta->file_bytes);
+    assert(disk.Stats().blocks_written == blocks && disk.Bytes() == DiskBytes(disk.Directory()));
+    Restores(disk, *point);
+    Restores(disk, *tail);
+  }
+  Disk disk(options);
+  Restores(disk, *point);
+  assert(Derive(disk, Hollow(second->hist, 62, 4), tail->hist, 4).empty() && disk.Drain(60));
+  assert(Field(Find("result=written"), "new_blocks") == 0);
+  Restores(disk, *second);
+}
+
+// DerivedRefusals: the base is not on disk when the writer comes (its spill was refused or evicted): reason=base, and
+// no file. A point that is not a prefix of the base, or more base blocks than the point's full blocks: policy (not
+// queued). A point with MTP rows: mtp (v1; the MTP lane is not derived).
+void DerivedRefusals() {
+  const auto ids = Tokens(6 * kRows + 40);
+  const auto tail = Make(ids, 0, 63);
+  const size_t p = 3 * kRows + 20;
+  const auto point = Hollow(Prefix(ids, p), 64, 3);
+  Disk disk(Options('E', "derived-refused"));
+  assert(Derive(disk, point, tail->hist, 3).empty() && disk.Drain(60));
+  assert(Find("state_disk spill tokens=" + std::to_string(p)).find("result=refused reason=base") != std::string::npos);
+  assert(!disk.Present(point->hist, Policy(), false) && disk.Entries() == 0 && disk.Blocks() == 0);
+  for (const auto& item : fs::directory_iterator(disk.Directory())) assert(item.path().filename() == ".lock");
+  SpillOk(disk, tail);
+  assert(Derive(disk, point, tail->hist, 4) == "policy");
+  auto other = ids;
+  other[5] = 999;
+  assert(Derive(disk, point, other, 3) == "policy");
+  assert(Derive(disk, point, Prefix(ids, p), 3) == "policy");
+  assert(Derive(disk, Make(Prefix(ids, p), kRows + 1, 65), tail->hist, 3) == "mtp");
+  assert(disk.Entries() == 1);
+}
+
 // The state file limit (max_states): the least recently used leaves.
 void StateFileLimit() {
   auto options = Options('s', "limit");
@@ -1268,6 +1500,13 @@ int main() {
   BadBlockWhileShared();
   DuplicateBlockInState();
   PruneBranch();
+  LadderKeepsBands();
+  LadderOff();
+  LadderEvictOrder();
+  LadderDefaultOff();
+  LadderRestart();
+  DerivedSharesBase();
+  DerivedRefusals();
   StateFileLimit();
   StopFinishesState();
   LedgerPerBlock();

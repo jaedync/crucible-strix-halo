@@ -100,7 +100,7 @@ nginx, `header_up Host 127.0.0.1:8790` inside `reverse_proxy` in Caddy). No name
 Run these commands on another machine:
 
 ```sh
-curl -sS https://ai.example.org/health                                   # expect: {"status": "ok"}
+curl -sS https://ai.example.org/health                                   # expect: {"status":"ok","sessions":N,"context":C}
 curl -sS https://ai.example.org/v1/models                                # expect: 401
 curl -sS https://ai.example.org/v1/models -H "Authorization: Bearer KEY" # expect: the model list
 ```

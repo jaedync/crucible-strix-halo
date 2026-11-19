@@ -327,8 +327,11 @@ def test_engine_messages_cover_the_serve_path():
     # The suffix of this text is a request key (any text), so it stays "other" and is neither known nor a prefix.
     unlogged = {"duplicate image field: "}
     assert found - KNOWN - set(PREFIXES) == unlogged
-    everything = {message for path in [*engine.rglob("*.h"), engine / "engine.hip"]
-                  for message in messages(path.read_text()) | set(returned.findall(path.read_text()))}
+    # Structured output: the grammar texts are ConstraintError throws (also in .cc files) and named constants.
+    grammar = re.compile(r'(?:ConstraintError\(|constexpr const char\* k[A-Za-z]+Message = )"([^"\\]*)"')
+    everything = {message for path in [*engine.rglob("*.h"), *engine.rglob("*.cc"), engine / "engine.hip"]
+                  for message in messages(path.read_text()) | set(returned.findall(path.read_text())) |
+                  set(grammar.findall(path.read_text()))}
     assert KNOWN - everything <= {"std::bad_alloc"}
 
 

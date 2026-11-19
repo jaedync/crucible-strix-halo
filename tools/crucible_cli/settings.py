@@ -6,15 +6,16 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import keyfile, measured, packs, rocm
+from . import keyfile, machine, measured, options, packs, rocm, state_root
 
 UNSET = object()
 # The state folder is owned by the engine, which refuses a folder that holds other files. So the proof that setup made
 # the folder (or took an empty one) is a record in the work folder, never a file inside the state folder.
 STATE_MARKER = "state-dir.json"
-STATE_IDENTITY = re.compile(r"^[0-9a-f]{16}-[0-9a-f]{16}-[0-9a-f]{16}$")
+STATE_IDENTITY = state_root.IDENTITY
 SAVED = ("pack", "models_dir", "state_dir", "port", "streams", "ctx", "state_disk_gib", "jobs", "bind", "api_key_file",
-         "allowed_hosts", "layout", "short_streams", "short_ctx")
+         "allowed_hosts", "layout", "short_streams", "short_ctx", "ngram16", "abliterated",
+         "state_write_gib_day")
 
 # One name for the Host list: a host name or an IPv4 address, or an IPv6 literal in brackets, then an optional port.
 HOST_NAME = re.compile(r"(?:[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])(?::([0-9]{1,5}))?")
@@ -41,10 +42,15 @@ class Settings:
     short_streams: int = 0
     short_ctx: int = 0
     state_disk_gib: int = 200
+    state_write_gib_day: int = 300   # the SSD wear guard of the state folder (engine/runtime/state_disk.h, default 300)
     jobs: int = 1
     allowed_hosts: tuple = ()  # more Host names for the server (a reverse proxy's name); the loopback names are always there
     own_head_dir: Path = None  # part 5: where the user's own draft head lives (outside the repo); None = off
     runtime_lib: Path = None   # the library folder of the private ROCm runtime; None when the machine has a HIP runtime of its own
+    ngram16: bool = False      # --ngram16: the 16-bit n-gram table (CRUCIBLE_PLE_BF16), built in the models folder
+    abliterated: bool = False  # --abliterated: CRUCIBLE_ABLATE with CRUCIBLE_ABLATE_MODE=request (stock stays the default)
+    ablation_dir: Path = None  # where the sidecar lives: outside the repo (tools/ablation_pack.py refuses the repo)
+    memory: object = None      # the machine.Fit of this machine (not saved); None: the measured 128 GB values
 
     def __post_init__(self):
         self.repo = Path(self.repo)
@@ -61,6 +67,20 @@ class Settings:
     @property
     def ckpt(self):
         return Path(self.models_dir) / self.spec.folder
+
+    @property
+    def ngram16_dir(self):
+        return Path(self.models_dir) / options.NGRAM16_FOLDER
+
+    @property
+    def ngram16_file(self):
+        return self.ngram16_dir / options.NGRAM16_FILE
+
+    @property
+    def ablation_file(self):
+        if self.pack == "4.05":
+            return Path(self.ablation_dir) / options.ABL_405_FOLDER / options.ABL_405_FILE
+        return Path(self.ablation_dir) / options.ABL_SOURCE_FOLDER / options.ABL_FILE
 
     @property
     def work(self):
@@ -94,6 +114,58 @@ class Settings:
         return out
 
 
+def ngram16_ready(s):
+    """True when the 16-bit table is complete: the size and the sha256 record that the build wrote (it is not read again)."""
+    f = s.ngram16_file
+    try:
+        if f.is_symlink() or f.stat().st_size != options.NGRAM16_BYTES:
+            return False
+        return Path(str(f) + ".sha256").read_text().split()[0] == options.NGRAM16_SHA256
+    except (OSError, IndexError):
+        return False
+
+
+def file_sha256(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def ablation_ready(s, path=None, pack=None):
+    """True when the sidecar of the pack (or PATH for PACK) is a plain file with the sha256 that the engine pins."""
+    path = Path(path or s.ablation_file)
+    try:
+        return not path.is_symlink() and path.is_file() and file_sha256(path) == options.ABL_SHA256[pack or s.pack]
+    except (OSError, KeyError):
+        return False
+
+
+ENGINE_WRITE_GIB_DAY = 300   # the engine's default of --state-disk-write-gib-per-day (engine/runtime/state_disk.h)
+
+
+def write_limit_line(s):
+    """One line about the SSD wear guard: the most that the state folder writes in a day and in a year."""
+    n = s.state_write_gib_day
+    if n == 0:
+        return "state writes: none (--state-write-gib-day 0: the state folder is read only)"
+    tb = n * 1024 ** 3 * 365 / 1e12
+    return (f"state writes: at most {n} GiB a day ({tb:.0f} TB a year); compare with the TBW of your SSD "
+            "(--state-write-gib-day N)")
+
+
+def ledger_today(state_dir, now):
+    """Bytes that the state folder wrote today (the engine's write-ledger: one line "YYYY-MM-DD BYTES", local day)."""
+    import time
+    try:
+        day, count = (Path(state_dir) / "write-ledger").read_text().split()[:2]
+        return int(count) if day == time.strftime("%Y-%m-%d", time.localtime(now)) else 0
+    except (OSError, ValueError):
+        return 0
+
+
 def load_saved(repo):
     try:
         return json.loads((Path(repo) / ".crucible/config.json").read_text())
@@ -104,7 +176,10 @@ def load_saved(repo):
 def build(repo, host, **kw):
     """Defaults, then the saved config, then the flags that the user gave (UNSET or None means not given)."""
     saved = load_saved(repo)
-    values = {k: saved[k] for k in SAVED if k in saved}
+    fit = machine.of_host(host)
+    # The defaults of this machine's memory class (on a 128 GB machine the measured ones, as the dataclass has them).
+    values = {"pack": fit.pack, "streams": fit.streams, "ctx": fit.ctx}
+    values.update({k: saved[k] for k in SAVED if k in saved})
     for key, value in kw.items():
         if value is not UNSET and value is not None:
             values[key] = value
@@ -116,7 +191,7 @@ def build(repo, host, **kw):
             raise ValueError(f"--layout {layout} sets the sessions and the context; do not give --streams or --ctx with it.")
         streams = kw.get("streams")
         ctx = kw.get("ctx")
-        values["streams"], values["ctx"], values["short_streams"], values["short_ctx"] = measured.LAYOUTS[layout]
+        values["streams"], values["ctx"], values["short_streams"], values["short_ctx"] = machine.layout_choice(fit, layout)
         if streams is not None:
             values["streams"] = streams
         if ctx is not None:
@@ -128,9 +203,10 @@ def build(repo, host, **kw):
     if state_dir is None and kw.get("state_dir") in (None, UNSET) and int(saved.get("ctx") or 0) > measured.PLAIN_CTX:
         state_dir = UNSET  # the saved "no folder" came from a YaRN layout: a plain layout gets the default folder back
     no_state = kw.get("no_state_dir", False)
-    s = Settings(repo=Path(repo), **{k: v for k, v in values.items() if k != "no_state_dir"})
+    s = Settings(repo=Path(repo), memory=fit, **{k: v for k, v in values.items() if k != "no_state_dir"})
     xdg = host.env.get("XDG_DATA_HOME")
     s.own_head_dir = (Path(xdg) if xdg else Path(host.home) / ".local/share") / "crucible/own-head"
+    s.ablation_dir = (Path(xdg) if xdg else Path(host.home) / ".local/share") / "crucible/ablation"
     if isinstance(s.models_dir, str):
         s.models_dir = Path(s.models_dir)
     rt = rocm.detect(host, s.work)
@@ -160,50 +236,27 @@ def stop_note(s):
     return "It saves its conversation states first; this can take a minute."
 
 
-def state_folder_problem(path, owned=False):
-    """None when PATH may be the state folder, else the sentence that says why not.
-
-    It may be new, empty, or hold only what the engine writes there (write-ledger and the identity folders: the same rule
-    that the engine applies at its start). A folder that setup made before (OWNED) is accepted as it is."""
-    path = Path(os.path.abspath(path))
-    if path.is_symlink():
-        return f"{path} is a link."
-    if not path.exists():
-        return None
-    if not path.is_dir():
-        return f"{path} is not a folder."
-    if owned:
-        return None
-    try:
-        names = os.listdir(path)
-    except OSError as exc:
-        return f"{path} cannot be read ({exc})."
-    foreign = sorted(n for n in names if n != "write-ledger" and not (STATE_IDENTITY.match(n) and (path / n).is_dir()
-                                                                       and not (path / n).is_symlink()))
-    if foreign:
-        return f"{path} holds files that Crucible did not make ({', '.join(foreign[:3])}{', ...' if len(foreign) > 3 else ''})."
-    return None
-
-
-def state_dir_inside(home, path):
-    """True when PATH is below HOME by the rule of the engine (engine/runtime/state_disk.h PrepareRoot): both paths with
-    their links resolved (weakly_canonical, here os.path.realpath), and PATH is not HOME itself. A folder under a link that
-    points out of home is outside; a folder under the real home folder is inside when HOME is a link."""
-    real_home, real_sd = Path(os.path.realpath(os.path.abspath(home))), Path(os.path.realpath(os.path.abspath(path)))
-    return real_sd != real_home and real_home in real_sd.parents
+def state_dir_verdict(home, repo, path, look_inside=False):
+    """The verdict of the engine rule on PATH as the state folder (tools/crucible_cli/state_root.py, the host copy of
+    engine/runtime/state_root.h). A folder that setup recorded as its own is accepted with what it holds, unless
+    LOOK_INSIDE (uninstall: remove only what the engine writes)."""
+    owned = False if look_inside else state_owned(repo, path)
+    return state_root.state_root_verdict(os.path.abspath(path), home=home, contents=not owned)
 
 
 def state_dir_problem(home, repo, path, look_inside=False):
     """The one check of the state folder (cache folder item 2): setup, doctor and uninstall use it. None when PATH may be the
-    state folder, else the sentence that says why not.
+    state folder, else the sentence that says why not. The folder may be anywhere that only this user (or root) can change
+    (Nov 12), but not a system folder or the home folder itself."""
+    verdict = state_dir_verdict(home, repo, path, look_inside=look_inside)
+    return None if verdict.ok else verdict.message
 
-    The folder must be inside the home folder (the rule of the v0.37 engine) and pass state_folder_problem. A folder that
-    setup recorded as its own is accepted as it is, unless LOOK_INSIDE (uninstall: remove only what the engine writes)."""
-    home, sd = Path(os.path.abspath(home)), Path(os.path.abspath(path))
-    if not state_dir_inside(home, sd):
-        return f"{sd} is not inside your home folder {home}."
-    owned = False if look_inside else state_owned(repo, sd)
-    return state_folder_problem(sd, owned=owned)
+
+def state_folder_problem(path, owned=False):
+    """The same rule without a home folder: None when PATH may be the state folder, else the sentence that says why not.
+    A folder that setup made before (OWNED) is accepted with what it holds."""
+    verdict = state_root.state_root_verdict(os.path.abspath(path), contents=not owned)
+    return None if verdict.ok else verdict.message
 
 
 def state_marker_path(repo):

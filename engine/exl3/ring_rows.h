@@ -18,8 +18,10 @@ using lin_ring::kSlots;
 using lin_ring::kSlotWords;
 constexpr int kRowWords = kChunk * 8;  // one row's activations for one chunk
 // Rows staged per slot: 8 up to R=8 (the LDS of the R <= 8 kernels stays
-// 21.5 KB), 16 for a packed pass.
-constexpr int StageRows(int R) { return R <= kMaxRows ? kMaxRows : kPackedRows; }
+// 21.5 KB), 16 for a packed pass. A wide copy span (copy-e, R 17..kRingRowsMax) stages R rounded up to 8 rows: the
+// engine does not launch it yet; bench/copy_rows.hip measures it. R <= 16 keeps its code.
+constexpr int kRingRowsMax = 32;
+constexpr int StageRows(int R) { return R <= kMaxRows ? kMaxRows : R <= kPackedRows ? kPackedRows : (R + 7) / 8 * 8; }
 constexpr int SlotWordsRows(int R) { return kSlotWords + StageRows(R) * kRowWords; }
 // Activation vectors (uint4) per loader lane: 8 per row, 64 loader lanes.
 constexpr int XVecsPerLane(int R) { return StageRows(R) * 8 / (32 * kLoaders); }
@@ -32,7 +34,7 @@ __device__ __forceinline__ void Load(const LinJob& job, const GemvItem& item, ui
   constexpr int T = 8 * K, ColVectors = kChunk * T / 4;
   constexpr int VectorsPerLane = kConsumers * ColVectors / (32 * kLoaders);
   constexpr int SW = SlotWordsRows(R), XV = XVecsPerLane(R);
-  static_assert(VectorsPerLane <= 6 && XV * 32 * kLoaders * 4 == StageRows(R) * kRowWords && XV <= 2);
+  static_assert(VectorsPerLane <= 6 && XV * 32 * kLoaders * 4 == StageRows(R) * kRowWords && XV <= 4);
   const int A = job.I / 16, span = A / job.S, a0 = item.s * span;
   const int count = span / kChunk;  // FrontFits or Group::aligned_chunk: whole chunks
   const int lane = threadIdx.x & 31, loader = threadIdx.x >> 5;
@@ -71,7 +73,9 @@ __device__ __forceinline__ void Load(const LinJob& job, const GemvItem& item, ui
   if constexpr (VectorsPerLane > 4) R_##4 = ld(S, 4); \
   if constexpr (VectorsPerLane > 5) R_##5 = ld(S, 5); \
   R_##X = ldx(S, 0); \
-  if constexpr (XV > 1) R_##Y = ldx(S, 1)
+  if constexpr (XV > 1) R_##Y = ldx(S, 1); \
+  if constexpr (XV > 2) R_##Z = ldx(S, 2); \
+  if constexpr (XV > 3) R_##W = ldx(S, 3)
 #define RR_PUT(R_, S) \
   if ((S) < count) { \
     const uint32_t global_seq = base_seq + (S); \
@@ -84,9 +88,11 @@ __device__ __forceinline__ void Load(const LinJob& job, const GemvItem& item, ui
     if constexpr (VectorsPerLane > 5) d[320] = R_##5; \
     reinterpret_cast<uint4*>(slot + kSlotWords)[xv] = R_##X; \
     if constexpr (XV > 1) reinterpret_cast<uint4*>(slot + kSlotWords)[xv + 64] = R_##Y; \
+    if constexpr (XV > 2) reinterpret_cast<uint4*>(slot + kSlotWords)[xv + 128] = R_##Z; \
+    if constexpr (XV > 3) reinterpret_cast<uint4*>(slot + kSlotWords)[xv + 192] = R_##W; \
     control.Publish(global_seq, lane); \
   }
-  uint4 A0, A1, A2, A3, A4, A5, AX, AY, B0, B1, B2, B3, B4, B5, BX, BY;
+  uint4 A0, A1, A2, A3, A4, A5, AX, AY, AZ, AW, B0, B1, B2, B3, B4, B5, BX, BY, BZ, BW;
   RR_LD(A, 0);
   int seq = 0;
   for (; seq + 2 < count; seq += 2) {
@@ -186,7 +192,7 @@ __device__ __forceinline__ void ComputeAny(int K, const LinJob& job, const GemvI
 template <int R, bool Front = true>
 __global__ void __launch_bounds__(320) LinRingRowsKernel(const LinJob* __restrict__ jobs,
                                                         const GemvItem* __restrict__ items, int n, bool out) {
-  static_assert(R >= 1 && R <= kPackedRows);
+  static_assert(R >= 1 && R <= ring_rows::kRingRowsMax);
   __shared__ lin_ring::Control control;
   __shared__ uint32_t payload[ring_rows::kSlots * ring_rows::SlotWordsRows(R)];
   __shared__ uint32_t arrived;

@@ -18,9 +18,14 @@
 # that stops half way runs nothing.
 #
 # Environment (for mirrors and tests): CRUCIBLE_TAG, CRUCIBLE_RELEASE_BASE (https:// or file://), CRUCIBLE_REPO_URL,
-# CRUCIBLE_DIR, CRUCIBLE_SUMS_SHA256, CRUCIBLE_TTY, CRUCIBLE_OS_RELEASE, ROCM_PATH.
+# CRUCIBLE_DIR, CRUCIBLE_SUMS_SHA256, CRUCIBLE_TTY, CRUCIBLE_OS_RELEASE, CRUCIBLE_PROC, CRUCIBLE_SYS, ROCM_PATH.
 
-PIN_TAG="v0.37.3"
+# PIN_SUMS_SHA256: the sha256 of SHA256SUMS of release PIN_TAG. The release step sets it in one commit on main after the
+# release (tools/release_pin.py), so a tag's own copy has it empty. Scope of the pin:
+#   it makes a replaced release file visible as a commit on main (who replaces SHA256SUMS must change this line too);
+#   it does not protect against a person who can push to main.
+# An empty pin gives a WARN line; a pin that is present and does not match stops the install (exit 4).
+PIN_TAG="v0.38.0"
 PIN_SUMS_SHA256=""
 REPO_URL_DEFAULT="https://github.com/jaedync/crucible-strix-halo.git"
 RELEASE_BASE_DEFAULT="https://github.com/jaedync/crucible-strix-halo/releases/download"
@@ -29,6 +34,50 @@ ROCM_SERIES="7.2"
 TOTAL_STEPS=7
 RAW_URL="https://raw.githubusercontent.com/jaedync/crucible-strix-halo/main/install.sh"
 PIPE_CHAR="|"
+
+# The options of ./crucible setup of release PIN_TAG and the values that each one takes. install.sh checks the options with
+# this list before any download. tests/test_install_sh.py keeps it equal to tests/data/setup_options/<PIN_TAG>.txt; the
+# release step writes both with `python3 -I tools/setup_options.py record <tag>` on the release commit.
+SETUP_OPTIONS="
+-h flag
+--help flag
+--pack choice:3.05,4.05,4.18
+--models-dir value
+--state-dir value
+--no-state-dir flag
+--state-disk-gib int
+--state-write-gib-day int:0-65536
+--no-disk-check flag
+--port int
+--bind value
+--api-key flag
+--no-api-key flag
+--allowed-host value
+--streams int:1-8
+--ctx int
+--layout choice:default,long,two-long
+--yes flag
+-y flag
+--dry-run flag
+--smoke flag
+--service choice:yes,no
+--private-runtime choice:yes,no
+--ngram16 choice:yes,no
+--abliterated choice:yes,no
+--download-anyway flag
+--jobs int
+--start-timeout int
+--allow-rocm10 flag
+"
+# The disk size of each pack in GB (tools/crucible_cli/packs.py) and the smallest memory in KiB (tools/crucible_cli/doctor.py).
+PACK_DISK_GB_405=110
+PACK_DISK_GB_305=90
+PACK_DISK_GB_418=125
+MEM_MIN_KB=125829120
+GTT_MIN_BYTES=130000000000
+# The 96 GB class (tools/crucible_cli/machine.py): from 88 GiB, the 3.05 pack with 2 sessions; the GTT limit within 3 GiB
+# of MemTotal less 1 GiB.
+MEM_MID_KB=92274688
 
 usage() {
   command_text "$(usage_text)"
@@ -50,18 +99,20 @@ Options:
   --dir DIR         install folder (default $HOME/crucible)
   --tag vX.Y.Z      install this release (alias: --version); overrides CRUCIBLE_TAG
   --source-build    do not download the engine (the manifest is still checked); ./crucible setup builds it from source (about 16 minutes with the ROCm 7.2.4 compiler)
-  --dry-run         show the plan and change nothing
+  --dry-run         show the plan and run the read-only machine checks; change nothing (exit 6: this machine cannot run Crucible)
   --yes, -y         no questions in ./crucible setup (the sudo question is never answered for you)
   --remove-models   with uninstall: also remove the model pack and the state folder
   -h, --help        show this text
-Every other option goes to ./crucible setup (for example --pack 4.05 or --state-dir DIR).
+Every other option goes to ./crucible setup (for example --pack 4.05 or --state-dir DIR). The installer checks these options
+before any download: use the full names (./crucible setup --help lists them).
 
 Steps: check the system, download SHA256SUMS and the manifest, download the engine, check every sha256, check the libraries,
 get the source at the pinned tag, put the engine in place and run setup. Nothing runs before the sha256 check passes.
 The installer asks once before it runs sudo, and shows the exact command first. It never changes the boot settings.
 The log is $XDG_STATE_HOME/crucible/install.log (default ~/.local/state/crucible/install.log).
 Exit codes: 0 done, 2 bad use or bad folder, 3 a package is needed (run the shown command, then run this again),
-4 a download or a check failed, 5 the release engine cannot run on this machine.
+4 a download or a check failed, 5 the release engine cannot run on this machine, 6 this machine cannot run Crucible
+(the dry run and step 1 check the GPU, the memory, the GPU memory limit, the HIP runtime and the disk; nothing is downloaded).
 EOF
 }
 
@@ -147,6 +198,7 @@ ask_yn() {
 
 parse_args() {
   CMD=install
+  IN_CLONE=0
   DIR_ARG=""
   TAG_ARG=""
   DRY_RUN=0
@@ -398,6 +450,236 @@ pick_python() {
   done
 }
 
+# ---- the options of ./crucible setup ------------------------------------------------------------------------------
+
+setup_opt_kind() {
+  awk -v o="$1" '$1 == o { print $2; exit }' <<<"$SETUP_OPTIONS"
+}
+
+# check_value NAME KIND VALUE: stops (exit 2) when VALUE is not a value of option NAME.
+check_value() {
+  local name=$1 kind=$2 val=$3 list lo hi
+  case "$kind" in
+    choice:*)
+      list=${kind#choice:}
+      case ",$list," in
+        *",$val,"*) return 0 ;;
+      esac
+      die 2 "$name must be one of ${list//,/, }, not '$val'. Nothing was downloaded."
+      ;;
+    int | int:*)
+      [[ $val =~ ^[0-9]+$ ]] || die 2 "$name needs a number, not '$val'. Nothing was downloaded."
+      if [ "$kind" != int ]; then
+        lo=${kind#int:}
+        hi=${lo#*-}
+        lo=${lo%-*}
+        { [ "$val" -ge "$lo" ] && [ "$val" -le "$hi" ]; } || die 2 "$name must be from $lo to $hi, not $val. Nothing was downloaded."
+      fi
+      ;;
+    value) [ -n "$val" ] || die 2 "$name needs a value. Nothing was downloaded." ;;
+  esac
+  return 0
+}
+
+# check_setup_args: every option that goes to ./crucible setup is one of its options with a good value. It runs before any
+# download, so that a bad option does not stop the install after the downloads. Use the full option names.
+check_setup_args() {
+  local i=0 n=${#PASS[@]} a name val kind has
+  while [ "$i" -lt "$n" ]; do
+    a=${PASS[$i]}
+    has=0
+    case "$a" in
+      --*=*)
+        name=${a%%=*}
+        val=${a#*=}
+        has=1
+        ;;
+      -*) name=$a ;;
+      *) die 2 "'$a' is not an option of ./crucible setup. Nothing was downloaded. See: install.sh --help" ;;
+    esac
+    kind=$(setup_opt_kind "$name")
+    [ -n "$kind" ] || die 2 "$name is not an option of ./crucible setup (use the full option name). Nothing was downloaded. See: install.sh --help"
+    if [ "$kind" = flag ]; then
+      [ "$has" = 0 ] || die 2 "$name takes no value. Nothing was downloaded."
+    else
+      if [ "$has" = 0 ]; then
+        i=$((i + 1))
+        [ "$i" -lt "$n" ] || die 2 "$name needs a value. Nothing was downloaded."
+        val=${PASS[$i]}
+        case "$val" in -*) die 2 "$name needs a value, not '$val'. Nothing was downloaded." ;; esac
+      fi
+      check_value "$name" "$kind" "$val"
+    fi
+    i=$((i + 1))
+  done
+}
+
+# setup_arg NAME: the last value of a setup option in PASS (empty when it is not given). setup_flag NAME: 0 when it is given.
+setup_arg() {
+  local i=0 n=${#PASS[@]} a out=""
+  while [ "$i" -lt "$n" ]; do
+    a=${PASS[$i]}
+    case "$a" in
+      "$1="*) out=${a#*=} ;;
+      "$1") [ $((i + 1)) -lt "$n" ] && out=${PASS[$((i + 1))]} ;;
+    esac
+    i=$((i + 1))
+  done
+  printf '%s' "$out"
+}
+
+setup_flag() {
+  local a
+  for a in "${PASS[@]}"; do [ "$a" = "$1" ] && return 0; done
+  return 1
+}
+
+# ---- the read-only machine checks ---------------------------------------------------------------------------------
+
+# free_kib PATH: free KiB on the file system of PATH (the nearest folder that exists).
+free_kib() {
+  local p=$1
+  while [ ! -e "$p" ] && [ "$p" != / ]; do p=$(dirname "$p"); done
+  df -Pk "$p" 2>/dev/null | awk 'NR == 2 { print $4 }'
+}
+
+# gpu_names: the gfx names of the GPUs that the kernel reports (kfd topology), else of rocminfo.
+gpu_names() {
+  local f v names=""
+  for f in "$SYS_DIR"/class/kfd/kfd/topology/nodes/*/properties; do
+    [ -r "$f" ] || continue
+    v=$(awk '$1 == "gfx_target_version" { print $2; exit }' "$f")
+    case "$v" in '' | 0) continue ;; esac
+    [[ $v =~ ^[0-9]+$ ]] || continue
+    names="$names gfx$((v / 10000))$(printf '%x' $(((v / 100) % 100)))$(printf '%x' $((v % 100)))"
+  done
+  if [ -z "$names" ] && [ -x "$ROCM_DIR/bin/rocminfo" ]; then
+    names=$("$ROCM_DIR/bin/rocminfo" 2>/dev/null | grep -oE '\bgfx[0-9a-f]+\b' | sort -u | tr '\n' ' ')
+  fi
+  printf '%s' "$names" | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ' | sed 's/ $//'
+}
+
+check_line() {
+  say "  $(printf '%-4s' "$1")  $2"
+}
+
+# machine_check: the read-only checks (no download, no root, no change). Sets CANNOT (the reasons that this machine cannot
+# run Crucible) and FIXES (the problems that have a fix). The kernel line, the runtime and a full disk have a fix.
+# The UMA frame buffer advice of the 96 GB memory line (machine.uma_advice in tools/crucible_cli/machine.py): only when
+# the GPU has more than 1 GiB of VRAM. A 128 GB machine with a large frame buffer has a MemTotal of the 96 GB class.
+uma_advice() {
+  local f v best=0
+  for f in "$SYS_DIR"/class/drm/card*/device/mem_info_vram_total; do
+    [ -r "$f" ] || continue
+    v=$(tr -dc '0-9' <"$f")
+    if [ -n "$v" ] && [ "$v" -gt "$best" ]; then best=$v; fi
+  done
+  [ "$best" -gt 1073741824 ] || return 0
+  printf ' The BIOS gives the GPU %s GiB of dedicated memory (UMA frame buffer). Set it to the smallest value (512 MB): the GPU uses the system memory through the GTT. On a 128 GB machine, that gives the 128 GB defaults.' "$(( (best + 536870912) / 1073741824 ))"
+}
+
+machine_check() {
+  CANNOT=()
+  FIXES=()
+  local names mem gtt f best=0 pack need models free state gib want
+  say "Machine checks (read only):"
+  names=$(gpu_names)
+  case " $names " in
+    *" $GPU_ARCH_NAME "*) check_line PASS "GPU: $GPU_ARCH_NAME (Radeon 8060S)" ;;
+    "  ")
+      check_line FAIL "GPU: no AMD GPU found. Crucible runs on $GPU_ARCH_NAME only (Ryzen AI Max+ 395, Radeon 8060S). On such a machine, check that the amdgpu driver is loaded: lsmod | grep amdgpu"
+      CANNOT+=("no $GPU_ARCH_NAME GPU")
+      ;;
+    *)
+      check_line FAIL "GPU: found $names; Crucible runs on $GPU_ARCH_NAME only (Ryzen AI Max+ 395, Radeon 8060S)"
+      CANNOT+=("the GPU is $names, not $GPU_ARCH_NAME")
+      ;;
+  esac
+  mem=$(awk '$1 == "MemTotal:" { print $2; exit }' "$PROC_DIR/meminfo" 2>/dev/null)
+  local mid=0 gtt_min=$GTT_MIN_BYTES
+  pack=$(setup_arg --pack)
+  if [ -n "$mem" ] && [ "$mem" -ge "$MEM_MIN_KB" ]; then
+    check_line PASS "memory: $((mem / 1048576)) GiB"
+  elif [ -n "$mem" ] && [ "$mem" -ge "$MEM_MID_KB" ]; then
+    mid=1
+    gtt_min=$(( (mem / 1048576 - 4) * 1073741824 ))
+    if [ "$pack" = 4.05 ] || [ "$pack" = 4.18 ]; then
+      check_line FAIL "memory: $((mem / 1048576)) GiB; the $pack pack needs a 128 GB machine. Use --pack 3.05"
+      CANNOT+=("the $pack pack does not fit $((mem / 1048576)) GiB")
+    else
+      check_line PASS "memory: $((mem / 1048576)) GiB (a 96 GB machine: the 3.05 pack with 2 sessions of 262,144 tokens; if the free memory at start is less than this class expects, the engine starts a smaller conversation cache or fewer sessions, and as the last step a shorter --ctx).$(uma_advice)"
+    fi
+  else
+    local memtext=unknown
+    [ -n "$mem" ] && memtext="$((mem / 1048576)) GiB"
+    check_line FAIL "memory: $memtext; Crucible needs a 96 GB or 128 GB machine (88 GiB or more)"
+    CANNOT+=("the memory is $memtext, not 88 GiB or more")
+  fi
+  for f in "$SYS_DIR"/class/drm/card*/device/mem_info_gtt_total; do
+    [ -r "$f" ] || continue
+    gtt=$(tr -dc '0-9' <"$f")
+    [ -n "$gtt" ] && [ "$gtt" -gt "$best" ] && best=$gtt
+  done
+  if [ "$best" -ge "$gtt_min" ]; then
+    check_line PASS "GPU memory limit: $((best / 1000000000)) GB"
+  elif [ "$best" -gt 0 ]; then
+    local gtt_need="about 133 GB"
+    [ "$mid" = 1 ] && gtt_need="$(( (mem / 1048576 - 1) * 1024 )) MiB on this 96 GB machine"
+    check_line FAIL "GPU memory limit: $((best / 1000000000)) GB; it needs $gtt_need. Fix: two kernel parameters (./crucible setup shows the exact change, and applies it only after you type yes)"
+    FIXES+=("the kernel parameters")
+  else
+    check_line WARN "GPU memory limit: not found in $SYS_DIR/class/drm (the amdgpu driver is not loaded?)"
+  fi
+  if ls "$ROCM_DIR"/lib/libamdhip64.so* >/dev/null 2>&1; then
+    check_line PASS "HIP runtime: found under $ROCM_DIR"
+  else
+    check_line FAIL "HIP runtime: none under $ROCM_DIR. Fix: install the current ROCm (10.1 tested), or let ./crucible setup download a private runtime (--private-runtime yes)"
+    FIXES+=("the HIP runtime")
+  fi
+  if [ -z "$pack" ]; then
+    pack=4.05
+    [ "$mid" = 1 ] && pack=3.05
+  fi
+  need=$PACK_DISK_GB_405
+  [ "$pack" = 3.05 ] && need=$PACK_DISK_GB_305
+  [ "$pack" = 4.18 ] && need=$PACK_DISK_GB_418
+  models=$(setup_arg --models-dir)
+  [ -n "$models" ] || models=$DIR/models
+  case "$models" in \~/*) models=$HOME/${models#\~/} ;; esac
+  free=$(free_kib "$models")
+  if [ -z "$free" ]; then
+    check_line WARN "disk for the pack: the free space of $models is not known"
+  elif [ "$((free * 1024 / 1000000000))" -ge "$need" ]; then
+    check_line PASS "disk for the pack: $((free * 1024 / 1000000000)) GB free for the $pack pack (about $need GB)"
+  else
+    check_line FAIL "disk for the pack: $((free * 1024 / 1000000000)) GB free in $models; the $pack pack needs about $need GB. Fix: free the space, or use --models-dir DIR"
+    FIXES+=("the disk space for the pack")
+  fi
+  if setup_flag --no-state-dir; then
+    check_line SKIP "disk for the conversation cache: in memory only (--no-state-dir)"
+  else
+    state=$(setup_arg --state-dir)
+    [ -n "$state" ] || state=$HOME/.cache/crucible/states
+    case "$state" in \~/*) state=$HOME/${state#\~/} ;; esac
+    gib=$(setup_arg --state-disk-gib)
+    [ -n "$gib" ] || gib=200
+    free=$(free_kib "$state")
+    want=$((gib * 1048576))
+    if [ -n "$free" ] && [ "$free" -ge "$want" ]; then
+      check_line PASS "disk for the conversation cache: $((free / 1048576)) GiB free, limit $gib GiB"
+    elif [ -n "$free" ]; then
+      check_line WARN "disk for the conversation cache: $((free / 1048576)) GiB free, limit $gib GiB. Lower the limit (--state-disk-gib N) or use --no-state-dir"
+    fi
+  fi
+  if [ ${#CANNOT[@]} -gt 0 ]; then
+    say "This machine cannot run Crucible: $(IFS=';'; printf '%s' "${CANNOT[*]}" | sed 's/;/; /g')."
+  elif [ ${#FIXES[@]} -gt 0 ]; then
+    say "This machine can run Crucible after the fixes above ($(IFS=';'; printf '%s' "${FIXES[*]}" | sed 's/;/; /g'))."
+  else
+    say "This machine can run Crucible."
+  fi
+}
+
 # ---- settings -----------------------------------------------------------------------------------------------------
 
 init_settings() {
@@ -409,11 +691,17 @@ init_settings() {
     https://* | file://*) ;;
     *) die 2 "CRUCIBLE_RELEASE_BASE must start with https:// or file://." ;;
   esac
-  SUMS_PIN=${CRUCIBLE_SUMS_SHA256:-$PIN_SUMS_SHA256}
+  # The built-in pin is for PIN_TAG only; CRUCIBLE_SUMS_SHA256 (a mirror, a test) pins any tag.
+  SUMS_PIN=${CRUCIBLE_SUMS_SHA256:-}
+  if [ -z "$SUMS_PIN" ] && [ "$TAG" = "$PIN_TAG" ]; then
+    SUMS_PIN=$PIN_SUMS_SHA256
+  fi
   STEM="crucible-engine-${TAG}-${GPU_ARCH_NAME}-rocm${ROCM_SERIES}-linux-x86_64"
   ASSET_GZ="$STEM.gz"
   ASSET_NEEDS="$STEM.needs"
   ROCM_DIR=${ROCM_PATH:-/opt/rocm}
+  PROC_DIR=${CRUCIBLE_PROC:-/proc}
+  SYS_DIR=${CRUCIBLE_SYS:-/sys}
   STATE_BASE=${XDG_STATE_HOME:-$HOME/.local/state}
   LOG_DIR="$STATE_BASE/crucible"
   LOG_PATH="$LOG_DIR/install.log"
@@ -424,10 +712,15 @@ init_settings() {
   else
     DIR=$HOME/crucible
     # status, update and uninstall from the copy of this script inside an install
-    local here=""
+    local here="" self=${BASH_SOURCE[0]:-}
     here=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd -P) || here=""
     if [ -n "$here" ] && [ -f "$here/.git/crucible-install" ] && [ "$CMD" != install ]; then
       DIR=$here
+    fi
+    # install from the install.sh of a clone (the no-pipe way): use that clone, never clone again. A pipe has no script file.
+    if [ "$CMD" = install ] && [ -n "$self" ] && [ -f "$self" ] && [ -n "$here" ] && is_clone "$here"; then
+      DIR=$here
+      IN_CLONE=1
     fi
   fi
   case "$DIR" in
@@ -440,6 +733,11 @@ init_settings() {
       die 2 "The install folder '$DIR' is a system or home folder. Use a new folder, for example --dir \$HOME/crucible."
       ;;
   esac
+}
+
+# is_clone DIR: 0 when DIR is a git checkout of Crucible that holds this script (a clone, or a worktree of one).
+is_clone() {
+  [ -e "$1/.git" ] && [ -f "$1/crucible" ] && [ -f "$1/VERSION" ] && [ -f "$1/install.sh" ]
 }
 
 start_log() {
@@ -696,7 +994,9 @@ fetch_lists() {
   step 2 "Download the release list and the manifest (release $TAG)"
   fetch SHA256SUMS
   fetch "$ASSET_NEEDS"
-  if [ -n "$SUMS_PIN" ] && [ "$(file_sha256 "$WORK/SHA256SUMS")" != "$SUMS_PIN" ]; then
+  if [ -z "$SUMS_PIN" ]; then
+    warn "WARN no pin for SHA256SUMS of $TAG: the check finds a damaged download, not a replaced release file."
+  elif [ "$(file_sha256 "$WORK/SHA256SUMS")" != "$SUMS_PIN" ]; then
     die 4 "SHA256SUMS does not match the hash that is pinned in this installer. Nothing was installed."
   fi
 }
@@ -816,26 +1116,49 @@ cmd_install() {
   check_platform
   local state
   state=$(dir_state)
+  # A clone that is not at the release tag: setup builds the engine from this source, and nothing is downloaded.
+  local own_source=0 ref=""
+  if [ "$IN_CLONE" = 1 ] && [ "$state" = other ]; then
+    own_source=1
+    ref=$(git -C "$DIR" describe --tags --always --dirty 2>/dev/null || echo unknown)
+  fi
   case "$state" in
     foreign) die 2 "$DIR exists and is not empty, and it is not a Crucible install. Choose another folder with --dir, or move it away. Nothing was changed." ;;
-    other) die 2 "$DIR is a Crucible checkout at another release than $TAG. To move it to the newest release, run: $DIR/install.sh update" ;;
+    other) [ "$own_source" = 1 ] || die 2 "$DIR is a Crucible checkout at another release than $TAG. To move it to the newest release, run: $DIR/install.sh update" ;;
   esac
+  check_setup_args
   if [ "$DRY_RUN" = 1 ]; then
     say "Plan (nothing is changed):"
     say "  release:        $TAG"
     say "  install folder: $DIR ($state)"
     say "  files:          $RELEASE_BASE/{SHA256SUMS,$ASSET_NEEDS,$ASSET_GZ}"
-    say "  source:         $REPO_URL at tag $TAG"
-    say "  engine:         $([ "$SOURCE_BUILD" = 1 ] && echo 'built from source by ./crucible setup' || echo 'release engine, checked by sha256')"
+    say "  SHA256SUMS pin: $([ -n "$SUMS_PIN" ] && echo "${SUMS_PIN:0:16}..." || echo "none (a WARN line; the check finds a damaged download only)")"
+    if [ "$IN_CLONE" = 1 ]; then
+      say "  source:         this clone ($DIR)$([ "$own_source" = 1 ] && echo " at $ref, not at $TAG")"
+    else
+      say "  source:         $REPO_URL at tag $TAG"
+    fi
+    say "  engine:         $([ "$SOURCE_BUILD" = 1 ] || [ "$own_source" = 1 ] && echo 'built from source by ./crucible setup' || echo 'release engine, checked by sha256')"
     say "  then:           ./crucible setup ${PASS[*]:-}"
+    say ""
+    machine_check
+    [ ${#CANNOT[@]} -eq 0 ] || return 6
     return 0
   fi
   start_log
   trap cleanup EXIT
   step 1 "Check this system"
+  machine_check
+  [ ${#CANNOT[@]} -eq 0 ] || die 6 "Nothing was downloaded or changed."
   check_tools venv
   python_note
   say "  Linux x86-64, install folder $DIR"
+  if [ "$own_source" = 1 ]; then
+    for n in 2 3 4 5 6; do step "$n" "Skipped: this clone is at $ref, not at release $TAG"; done
+    say "  Setup builds the engine from this source (no download of an engine). Nothing is cloned."
+    settle_packages
+    hand_over
+  fi
   if [ "$state" = same ] && [ "$SOURCE_BUILD" = 0 ] && engine_record_ok; then
     say "Crucible $TAG is already installed in $DIR (engine checked). Going on with setup."
     settle_packages
@@ -974,7 +1297,7 @@ safe_remove_target() {
 }
 
 # The pack folders that ./crucible setup makes in the models folder (a test keeps this list equal to packs.PACKS).
-PACK_FOLDERS=(Qwen3.8-Flash-Next-exl3-4.05bpw_h6_ng6 Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5)
+PACK_FOLDERS=(Qwen3.8-Flash-Next-exl3-4.05bpw_h6_ng6 Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5 Qwen3.8-Flash-Next-exl3-4.18bpw_h6_ng8)
 
 # top_name PATH REAL: the top-level name below REAL that holds PATH (both are resolved). Empty when PATH is not inside REAL.
 top_name() {

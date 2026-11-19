@@ -9,6 +9,7 @@
 #include "../runtime/ablate_request.h"
 #include "../runtime/rope_policy.h"
 #include "logprobs.h"
+#include "../runtime/constraint.h"
 #include "../model/flashnext/multimodal.h"
 #include <set>
 #include <stdexcept>
@@ -44,11 +45,40 @@ struct ServeRequest : DecodePolicy {
   // 1: an ablated request (CRUCIBLE_ABLATE_MODE=request only). Its tenant is then
   // AblatedTenant of the named one, so no state crosses the modes.
   int ablate = 0;
+  // Structured output: the grammar of the output; none for a request without one.
+  // constraint_from: where the output starts in ids (a continuation job replays ids[constraint_from:]); -1: at the end.
+  std::optional<ConstraintSpec> constraint;
+  int constraint_from = -1;
+  // Set by the batch session at open from `constraint`; shared with the speculative decoder. Never on the line.
+  std::shared_ptr<Constraint> grammar;
   // Y2: the RoPE mode that the length gate picked (RopeModeFor). A YaRN request's tenant
   // is then RopeTenant of `plain_tenant`, so no state crosses the modes; a plain request keeps its tenant.
   RopeMode rope = RopeMode::Plain;
   StateTenant plain_tenant = kLocalTenant;  // the tenant before the mode (Way A crossing count only)
 };
+// The constraint object of the request line: {"kind": ..., "spec": "<JSON text>", "reasoning": 0|1}.
+inline ConstraintSpec ParseConstraintSpec(st::Scanner& scanner) {
+  ConstraintSpec spec;
+  std::set<std::string> fields;
+  scanner.Expect('{');
+  while (!scanner.Peek('}')) {
+    const std::string key = scanner.Str();
+    if (!fields.insert(key).second) throw std::runtime_error("duplicate constraint field");
+    scanner.Expect(':');
+    if (key == "kind") spec.kind = scanner.Str();
+    else if (key == "spec") spec.spec = scanner.Str();
+    else if (key == "reasoning") {
+      const int64_t value = scanner.Int();
+      if (value != 0 && value != 1) throw std::runtime_error("constraint reasoning must be 0 or 1");
+      spec.reasoning = value == 1;
+    } else throw std::runtime_error("unknown constraint field; check the serve protocol documentation");
+    scanner.Separator('}');
+  }
+  scanner.Expect('}');
+  if (spec.kind != "json_schema" && spec.kind != "json_object" && spec.kind != "structural_tag")
+    throw std::runtime_error("constraint kind must be json_schema, json_object or structural_tag");
+  return spec;
+}
 // A tenant field that is not 64 hex characters. Only that request is refused (the batch line: a recoverable open
 // error); its message is fixed and holds no part of the value.
 struct ServeTenantError : std::runtime_error {
@@ -114,8 +144,15 @@ inline ServeRequest ParseServeRequest(const std::string& line, int ctx, const De
     else if (key == "top_p") request.sampling.top_p = scanner.Real();
     else if (key == "min_p") request.sampling.min_p = scanner.Real();
     else if (key == "seed") request.sampling.seed = scanner.Uint();
+    // Penalties (runtime/sampling_penalty.h): the server sends them only when they are not neutral.
+    else if (key == "presence_penalty") request.sampling.presence_penalty = scanner.Real();
+    else if (key == "frequency_penalty") request.sampling.frequency_penalty = scanner.Real();
+    else if (key == "repetition_penalty") request.sampling.repetition_penalty = scanner.Real();
+    else if (key == "penalty_prompt") request.sampling.penalty_prompt = RequestInt(scanner);
     else if (key == "top_logprobs") request.top_logprobs = RequestInt(scanner);
     else if (key == "images") request.images = ParseImages(scanner);
+    else if (key == "constraint") request.constraint = ParseConstraintSpec(scanner);
+    else if (key == "constraint_from") request.constraint_from = RequestInt(scanner);
     else if (key == "ablate") {
       request.ablate = RequestInt(scanner);
       if (request.ablate < 0 || request.ablate > 1) throw std::runtime_error("ablate must be 0 or 1");
@@ -134,6 +171,11 @@ inline ServeRequest ParseServeRequest(const std::string& line, int ctx, const De
   if (request.top_logprobs < 0 || request.top_logprobs > kMaxTopLogprobs ||
       (request.top_logprobs && (request.max_tokens != 1 || request.sampling.temperature != 0)))
     throw std::runtime_error("top_logprobs must be 0 to 20 and needs max_tokens 1 and temperature 0");
+  if (fields.contains("constraint_from") && (!request.constraint || request.constraint_from < 0 ||
+                                            size_t(request.constraint_from) > request.ids.size()))
+    throw std::runtime_error("constraint_from needs a constraint and must be inside the prompt");
+  if (request.constraint && request.top_logprobs)
+    throw std::runtime_error("a constrained request has no top_logprobs");
   if (request.cache_control != "auto" && request.cache_control != "bypass" && request.cache_control != "refresh")
     throw std::runtime_error("cache_control must be auto, bypass, or refresh");
   if (request.cache_tail != "auto" && request.cache_tail != "guard")
@@ -147,6 +189,8 @@ inline ServeRequest ParseServeRequest(const std::string& line, int ctx, const De
   CheckImages(request.images, request.ids);
   CheckDecodePolicy(request);
   if (const std::string error = request.sampling.Error(kVocab); !error.empty()) throw std::runtime_error(error);
+  if (request.sampling.penalty_prompt > int64_t(request.ids.size()))
+    throw std::runtime_error("penalty_prompt must be -1 or a prompt length");
   if (!RequestFitsContext(request.ids.size(), request.max_tokens, ctx))
     throw std::runtime_error("nonempty prompt and positive max_tokens must fit the configured context");
   // Last, so that a refused tenant means the rest of the request is valid.

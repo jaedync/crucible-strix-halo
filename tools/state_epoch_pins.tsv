@@ -3,3 +3,5 @@
 # state-equality gate (tools/state_equality_gate.py, the state-equality night unit) ran on both binaries
 # and showed byte-equal state files and byte-equal next tokens on both packs. Name the gate run in the third column.
 # Columns are separated by one tab. Lines that start with # are notes.
+d8ff3ea46dc55c8ba84cd4edf08a2976c2bffab439037918d306d74cea307f9e	cb5f1267a4c68f631fb85f85b19ba9c2939667b68e93106e60ef4c823bfedf45	merge-t37-sw sgt405 sgt305 PASS 2026-11-12
+0481f0bb8e434e6dee70ac89eaa7b824bf412878a827a84bc5cdfa8dbdc3f8b0	cb5f1267a4c68f631fb85f85b19ba9c2939667b68e93106e60ef4c823bfedf45	merge-t37-pm sgd405 sgd305 sg405 sg305 merge-t37-sw sgx405 sgx305 PASS 2026-11-12

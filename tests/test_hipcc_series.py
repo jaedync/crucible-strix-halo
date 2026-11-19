@@ -1,9 +1,10 @@
-"""Tests of tools/hipcc_series.py and its use in the Makefile, setup and update (v0.37.2).
+"""ROCm 10.x builds after v0.37.2: no stop, and clang 24 builds with plain hipcc (tools/hipcc_series.py).
 
-A ROCm 10.x hipcc (AMD clang 24; its `--version` says "HIP version: 7.16...", so the clang major is the only sure sign)
-builds the v0.37.0 engine with a spill in the fat gate/up prefill kernel: P1 1,091 against 1,894 tok/s (-42%, log Nov 12
-19:20). So make, setup and update warn, give the 7.2.4 advice and continue only with an explicit flag. The split build
-cannot plan the clang 24 driver, so make uses plain hipcc (SPLIT=0) for it.
+v0.37.2 stopped make, setup and update for a ROCm 10.x hipcc (AMD clang 24), because the v0.37.0 engine spilled in the fat
+gate/up prefill kernel (P1 -42%). Trunk has the source fix of that spill (cb97f418; the t38 gate measured 10.1 P1 -1.39%
+against 7.2.4), so the stop is gone, and the words of the v0.37.2 notes (`ALLOW_ROCM10=1`, `--allow-rocm10`) are accepted
+and change nothing. The gated 10.1 binary (32a92d58) is the plain hipcc build; the clang 24 split build gives other ISA in
+92 functions and has no gate. So with clang 24, make still builds plain hipcc (SPLIT=0) (coordinator, Nov 15).
 """
 import os
 import shutil
@@ -39,12 +40,6 @@ class ParseTest(unittest.TestCase):
         self.assertTrue(hs.is_rocm10(V101.replace("version 24", "version 25")))
         self.assertFalse(hs.is_rocm10("unknown"))
 
-    def test_the_warning_names_the_loss_the_advice_and_the_flag(self):
-        text = hs.warning("ALLOW_ROCM10=1")
-        for word in ("ROCm 10", "42%", "1,091", "1,894", "ROCm 7.2.4", "ALLOW_ROCM10=1"):
-            self.assertIn(word, text)
-        self.assertIn("--allow-rocm10", hs.warning("--allow-rocm10"))
-
 
 class Tree:
     """A copy of the build files with a fake hipcc, as tests/test_sec_server.py ReleaseTest makes it."""
@@ -78,6 +73,9 @@ class Tree:
                               cwd=self.tree, capture_output=True, text=True, env=env, stdin=subprocess.DEVNULL)
 
 
+DEVSPLIT_STUB = "import sys\nprint('DEVSPLIT RAN')\nsys.exit(2)\n"   # exit 2: no plan, the recipe runs plain hipcc
+
+
 class MakeTest(unittest.TestCase):
     def test_make_with_the_724_compiler_builds_and_says_nothing(self):
         tree = Tree(self)
@@ -86,30 +84,34 @@ class MakeTest(unittest.TestCase):
         self.assertNotIn("ROCm 10", r.stdout + r.stderr)
         self.assertEqual((tree.tree / "build/engine/crucible").read_bytes(), b"NEW")
 
-    def test_make_with_a_rocm10_compiler_stops_with_the_warning(self):
+    def test_make_with_a_rocm10_compiler_builds_with_no_stop(self):
         tree = Tree(self)
         r = tree.make(V101, "SPLIT=0")
-        self.assertNotEqual(r.returncode, 0)
         out = r.stdout + r.stderr
-        self.assertIn("42%", out)
-        self.assertIn("ALLOW_ROCM10=1", out)
-        self.assertFalse((tree.tree / "build/engine/crucible").exists())
+        self.assertEqual(r.returncode, 0, out)
+        self.assertNotIn("42%", out)
+        self.assertNotIn("CRUCIBLE-ROCM10-STOP", out)
+        self.assertEqual((tree.tree / "build/engine/crucible").read_bytes(), b"NEW")
 
-    def test_make_with_a_rocm10_compiler_and_the_flag_warns_and_builds(self):
+    def test_allow_rocm10_is_accepted_and_changes_nothing(self):
+        """The v0.37.2 CHANGELOG tells users to run `ALLOW_ROCM10=1 ./crucible update`: the make word and the environment
+        still build, with the same output and no warning."""
         tree = Tree(self)
         for how in (("ALLOW_ROCM10=1",), ()):
-            env = None if how else {"ALLOW_ROCM10": "1"}   # the make word and the environment (setup and update use it)
-            r = tree.make(V101, "SPLIT=0", *how, env_extra=env)
-            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-            self.assertIn("42%", r.stdout + r.stderr)
-            self.assertEqual((tree.tree / "build/engine/crucible").read_bytes(), b"NEW")
-            (tree.tree / "build/engine/crucible").unlink()
+            env = None if how else {"ALLOW_ROCM10": "1"}
+            for version in (V101, V724):
+                r = tree.make(version, "SPLIT=0", *how, env_extra=env)
+                out = r.stdout + r.stderr
+                self.assertEqual(r.returncode, 0, out)
+                self.assertNotIn("42%", out)
+                self.assertEqual((tree.tree / "build/engine/crucible").read_bytes(), b"NEW")
+                (tree.tree / "build/engine/crucible").unlink()
 
     def test_split_build_with_clang_24_uses_plain_hipcc(self):
-        """SPLIT=1 (the default) with clang 24: plain hipcc at once, devsplit is not asked (SPLIT=0 guard)."""
+        """SPLIT=1 (the default) with clang 24: plain hipcc at once, devsplit is not asked (the gated 10.1 recipe)."""
         tree = Tree(self)
-        (tree.tree / "tools/devsplit.py").write_text("import sys\nprint('DEVSPLIT RAN')\nsys.exit(1)\n")
-        r = tree.make(V101, "ALLOW_ROCM10=1")
+        (tree.tree / "tools/devsplit.py").write_text(DEVSPLIT_STUB)
+        r = tree.make(V101)
         out = r.stdout + r.stderr
         self.assertEqual(r.returncode, 0, out)
         self.assertNotIn("DEVSPLIT RAN", out)
@@ -118,30 +120,29 @@ class MakeTest(unittest.TestCase):
 
     def test_split_build_with_clang_22_still_runs_devsplit(self):
         tree = Tree(self)
-        (tree.tree / "tools/devsplit.py").write_text("import sys\nprint('DEVSPLIT RAN')\nsys.exit(1)\n")
+        (tree.tree / "tools/devsplit.py").write_text(DEVSPLIT_STUB)
         r = tree.make(V724)
-        self.assertIn("DEVSPLIT RAN", r.stdout + r.stderr)
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 0, out)
+        self.assertIn("DEVSPLIT RAN", out)
 
 
 class CliTest(unittest.TestCase):
-    """setup and update: an --allow-rocm10 flag that sets ALLOW_ROCM10=1 for make, and a clear stop without it."""
+    """setup and update accept --allow-rocm10 (the v0.37.2 flag) with no error; it changes nothing."""
 
-    def test_setup_and_update_have_the_flag(self):
+    def test_setup_and_update_accept_the_flag(self):
         from crucible_cli import cli
         p = cli.parser() if hasattr(cli, "parser") else cli.build_parser()
-        self.assertTrue(p.parse_args(["setup", "--allow-rocm10"]).allow_rocm10)
-        self.assertFalse(p.parse_args(["setup"]).allow_rocm10)
-        self.assertTrue(p.parse_args(["update", "--allow-rocm10"]).allow_rocm10)
+        for cmd in ("setup", "update"):
+            p.parse_args([cmd, "--allow-rocm10"])
+            p.parse_args([cmd])
 
-    def test_the_stop_message_leaves_the_flag_to_the_caller(self):
-        # setup and update each add their own "Run ... again with --allow-rocm10" sentence (review L2: once only).
-        from crucible_cli import steps
-        out = "make: ... " + hs.MARKER + " ..."
-        msg = steps.rocm10_stop(out)
-        self.assertNotIn("--allow-rocm10", msg)
-        self.assertIn("ROCM_PATH", msg)
-        self.assertIn("42%", msg)
-        self.assertIsNone(steps.rocm10_stop("make: other error"))
+    def test_the_flag_no_longer_reaches_make(self):
+        self.assertFalse(hasattr(hs, "MARKER"))
+        from crucible_cli import steps, update
+        self.assertFalse(hasattr(steps, "rocm10_stop"))
+        for mod in (steps, update):
+            self.assertNotIn('"ALLOW_ROCM10"', Path(mod.__file__).read_text())
 
 
 if __name__ == "__main__":

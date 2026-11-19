@@ -71,7 +71,7 @@ This source release does not include model weights or a bundled Python environme
 
 ## Model weights
 
-Both supported packs use **Qwen Community License 1.0**.
+All supported packs use **Qwen Community License 1.0**.
 The license covers model artifacts separately from Crucible's engine code.
 It is not Apache-2.0 or MIT.
 
@@ -79,13 +79,15 @@ It is not Apache-2.0 or MIT.
 |---|---|
 | `3.05bpw_h5_ng5` | `69e33439ae950f17bcbe95c98f117d80f759ab6d` |
 | `4.05bpw_h6_ng6` | `55a732e0c4c3d4614bc42b68493bb930d9b02c0a` |
+| `4.18bpw_h6_ng8` | `9796a106f998afbeb1cfd9adca0cdf057c7eae00` |
 
 Sources checked on 2026-10-03:
 
 - [3.05 pack license](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3/blob/69e33439ae950f17bcbe95c98f117d80f759ab6d/LICENSE).
 - [4.05 pack license](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3/blob/55a732e0c4c3d4614bc42b68493bb930d9b02c0a/LICENSE).
+- [4.18 pack license](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3/blob/9796a106f998afbeb1cfd9adca0cdf057c7eae00/LICENSE) (checked on 2026-11-14).
 
-Both LICENSE files have SHA-256 `a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08`.
+The three LICENSE files have SHA-256 `a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08`.
 
 The license requires preservation of its copyright and permission notice.
 Large commercial products have model-name display requirements at the stated user or revenue thresholds.

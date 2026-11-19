@@ -17,12 +17,27 @@ struct Options {
   int top_k = 0;
   double top_p = 1, min_p = 0;
   uint64_t seed = 0;
+  // Penalties (sampling_penalty.h). The neutral values (0, 0, 1) leave every path as it
+  // was: no logits copy, the device's greedy IDs.
+  double presence_penalty = 0, frequency_penalty = 0, repetition_penalty = 1;
+  // The IDs of the request before this boundary are its prompt; the IDs after it are output of an earlier job of the
+  // same request (a server continuation). -1: every ID is prompt.
+  int penalty_prompt = -1;
+
+  bool Penalized() const { return presence_penalty != 0 || frequency_penalty != 0 || repetition_penalty != 1; }
+  // The token comes from the host's copy of the logits row, not from the device's greedy ID.
+  bool HostDraw() const { return temperature > 0 || Penalized(); }
 
   std::string Error(int vocabulary) const {
     if (!std::isfinite(temperature) || temperature < 0) return "temperature must be finite and nonnegative";
     if (top_k < 0 || top_k > vocabulary) return "top_k must be in [0, vocabulary]";
     if (!std::isfinite(top_p) || top_p < 0 || top_p > 1) return "top_p must be in [0, 1]";
     if (!std::isfinite(min_p) || min_p < 0 || min_p > 1) return "min_p must be in [0, 1]";
+    if (!(presence_penalty >= -2 && presence_penalty <= 2)) return "presence_penalty must be in [-2, 2]";
+    if (!(frequency_penalty >= -2 && frequency_penalty <= 2)) return "frequency_penalty must be in [-2, 2]";
+    // The floor 0.01 (review H1): a smaller value divides a logit past the float range (1e-50 is 0 as a float).
+    if (!(repetition_penalty >= 0.01 && repetition_penalty <= 2)) return "repetition_penalty must be in [0.01, 2]";
+    if (penalty_prompt < -1) return "penalty_prompt must be -1 or a prompt length";
     return {};
   }
 };
@@ -93,6 +108,26 @@ class Distribution {
     const double floor = best_rate * kMinExponential * 0.5;
     for (size_t i = 0; i < ids_.size(); ++i) {
       if (i == top || probabilities_[i] < floor) continue;
+      const double value = rate(i);
+      if (value > best_rate || (value == best_rate && ids_[i] < best)) { best_rate = value; best = ids_[i]; }
+    }
+    return best;
+  }
+  // KeyedSample over the tokens that `legal` takes (structured output, engine/runtime/constraint.h), with the same
+  // rates and tie rule, so the result equals a full scan of the legal support: when the unrestricted winner is legal,
+  // it is this result too. -1 when no token of the support is legal. KeyedSample itself is unchanged.
+  template <class Legal>
+  int KeyedSampleWhere(uint64_t seed, uint64_t position, Legal&& legal) const {
+    const auto rate = [&](size_t i) { return probabilities_[i] / -std::log(KeyedUniform(seed, position, ids_[i])); };
+    size_t top = ids_.size();
+    for (size_t i = 0; i < ids_.size(); ++i)
+      if (legal(ids_[i]) && (top == ids_.size() || probabilities_[i] > probabilities_[top])) top = i;
+    if (top == ids_.size()) return -1;
+    double best_rate = rate(top);
+    int best = ids_[top];
+    const double floor = best_rate * kMinExponential * 0.5;
+    for (size_t i = 0; i < ids_.size(); ++i) {
+      if (i == top || probabilities_[i] < floor || !legal(ids_[i])) continue;
       const double value = rate(i);
       if (value > best_rate || (value == best_rate && ids_[i] < best)) { best_rate = value; best = ids_[i]; }
     }

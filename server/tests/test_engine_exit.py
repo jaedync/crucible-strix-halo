@@ -37,7 +37,7 @@ def test_dead_engine_exits_and_releases_port(serial, systemd, tmp_path, capsys):
                 timer.join()
         with patch.object(startup.ThreadingHTTPServer, 'serve_forever', bounded_serve):
             assert startup.main() == 3
-    assert 'The engine stopped. The server exits and frees its port.' in capsys.readouterr().err
+    assert f'The server exits with code 3 and frees port {port}.' in capsys.readouterr().err
     backend.close.assert_called_once()
     with socket.socket() as probe:
         probe.bind(('127.0.0.1', port))

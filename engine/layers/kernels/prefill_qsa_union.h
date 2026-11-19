@@ -733,7 +733,7 @@ __global__ void __launch_bounds__(256) QsaUnionStageKernel(QsaPrefill a, QsaUnio
     float v[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) v[i] = (float)gated[m][half * 128 + lane * 4 + i];
-    Wht128(v);
+    Wht128Dpp(v);  // Wht128's bits; the row test is wave-uniform, so every lane runs it
 #pragma unroll
     for (int i = 0; i < 4; ++i)
       q.xh_o[OutProjIndex(r0 + row, h * 256 + half * 128 + lane * 4 + i, q.pack_rows, q.pack_off)] =

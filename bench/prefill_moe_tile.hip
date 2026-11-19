@@ -220,6 +220,13 @@ struct Fixture {
     HIP_OK(hipMemsetAsync(fc.p + 1, 0, sizeof(int)));
     PrefillMoeTilePairKernel<6, MUT><<<512, 512>>>(a, kFxLead);
   }
+  // moe-pc: the engine's launches for a tile launch with KMAX 5 or 6 (prefill_engine.inc: the fat gate/up kernel,
+  // then the tile down kernel).
+  void PcGateUp(int lead = kTileFxLead) {
+    Plan(kTileRows);
+    LaunchPrefillMoePcEngine(set.Kmax(), a, lead);
+  }
+  void PcDown() { LaunchPrefillMoePcDownEngine(set.Kmax(), a.g_down, a.i_down, a.item_counts + 1); }
   template <int MUT = 0> void TileDown() {
     if constexpr (MUT == 0) LaunchPrefillMoeTileDown(set.Kmax(), a.g_down, a.i_down, a.item_counts + 1);
     else if (set.Kmax() == 6) PrefillMoeTileDownKernel<6, MUT><<<1024, 256>>>(a.g_down, a.i_down, a.item_counts + 1);
@@ -231,6 +238,24 @@ size_t DiffCount(const std::vector<__half>& x, const std::vector<__half>& y) {
   size_t n = 0;
   for (size_t i = 0; i < x.size(); ++i) n += std::memcmp(&x[i], &y[i], sizeof(__half)) != 0;
   return n;
+}
+// Two-compiler check: the differences that are only the sign of a zero (+0 against -0).
+size_t ZeroSignDiffCount(const std::vector<__half>& x, const std::vector<__half>& y) {
+  size_t n = 0;
+  for (size_t i = 0; i < x.size(); ++i) {
+    uint16_t p, q;
+    std::memcpy(&p, &x[i], 2);
+    std::memcpy(&q, &y[i], 2);
+    n += p != q && (p & 0x7fff) == 0 && (q & 0x7fff) == 0;
+  }
+  return n;
+}
+// Two-compiler check: FNV-1a of the bytes, so two builds (two compilers) can compare their outputs.
+unsigned long long Fnv(const std::vector<__half>& x) {
+  unsigned long long h = 1469598103934665603ull;
+  const auto* b = reinterpret_cast<const unsigned char*>(x.data());
+  for (size_t i = 0; i < x.size() * sizeof(__half); ++i) h = (h ^ b[i]) * 1099511628211ull;
+  return h;
 }
 size_t Unwritten(const std::vector<__half>& x) {
   size_t n = 0;
@@ -264,16 +289,23 @@ template <class F> double ColdTime(F run, const gm::ColdCache& cold, const std::
 // Byte checks of one fixture. Mutants run only for the 3.05 and 4.05 sets (instantiated for KMAX 5 and 6).
 bool Check(Fixture& f, const char* tag) {
   const char* name = f.set.name;
-  f.xd.Nan(); f.pd.Nan();
+  f.xd.Nan(); f.pd.Nan(); f.xg.Nan(); f.xu.Nan();
   f.TrunkGateUp(); f.TrunkDown(); CheckLaunch();
   const auto xref = f.xd.Get(), pref = f.PdWritten(f.pd.Get());
+  const auto gref = f.xg.Get(), uref = f.xu.Get();
   bool ok = Unwritten(xref) == 0 && Unwritten(pref) == 0;
-  std::printf("check set=%s R=%d routing=%s variant=trunk unwritten-xd=%zu unwritten-pd=%zu %s\n", name, f.R, tag,
-              Unwritten(xref), Unwritten(pref), ok ? "PASS" : "FAIL");
+  std::printf("check set=%s R=%d routing=%s variant=trunk unwritten-xd=%zu unwritten-pd=%zu xd-hash=%016llx "
+              "pd-hash=%016llx %s\n", name, f.R, tag, Unwritten(xref), Unwritten(pref), Fnv(xref), Fnv(pref),
+              ok ? "PASS" : "FAIL");
   auto run = [&](const char* variant, auto gateup, auto down, bool expect_equal) {
-    f.xd.Nan(); f.pd.Nan();
+    f.xd.Nan(); f.pd.Nan(); f.xg.Nan(); f.xu.Nan();
     gateup(); CheckLaunch();
     const auto xd = f.xd.Get();
+    // Info (not a pass condition): the fp16 X inputs of gate and up, and the xd bytes that differ only in a zero's sign.
+    const auto xg = f.xg.Get(), xu = f.xu.Get();
+    std::printf("info set=%s R=%d routing=%s variant=%s xg-diff=%zu xu-diff=%zu xg-zero-sign=%zu xu-zero-sign=%zu "
+                "xd-zero-sign=%zu xd-hash=%016llx\n", name, f.R, tag, variant, DiffCount(xg, gref), DiffCount(xu, uref),
+                ZeroSignDiffCount(xg, gref), ZeroSignDiffCount(xu, uref), ZeroSignDiffCount(xd, xref), Fnv(xd));
     // The down kernel reads trunk's xd, so a gate/up mutant does not hide a down difference and back.
     HIP_OK(hipMemcpy(f.xd.p, xref.data(), xref.size() * sizeof(__half), hipMemcpyHostToDevice));
     down(); CheckLaunch();
@@ -285,6 +317,8 @@ bool Check(Fixture& f, const char* tag) {
                 tag, variant, dx, xd.size(), dp, pdv.size(), expect_equal ? "equal" : "differ", pass ? "PASS" : "FAIL");
   };
   run("tile", [&] { f.TileGateUp(); }, [&] { f.TileDown(); }, true);
+  // Two-compiler check: the engine's tile launch (kPrefillMoePc) must give trunk's bytes too, with every compiler.
+  if (PrefillMoePcOn(f.set.Kmax())) run("pc", [&] { f.PcGateUp(); }, [&] { f.PcDown(); }, true);
   if (f.set.Pair()) {
     run("mut-no-suh", [&] { f.TileGateUp<1>(); }, [&] { f.TileDown(); }, false);
     run("mut-swap", [&] { f.TileGateUp<2>(); }, [&] { f.TileDown(); }, false);

@@ -190,8 +190,12 @@ DRAFT_LIST_FIELDS = (("draft_pos_proposed", DRAFT_POSITIONS), ("draft_pos_tested
                      ("draft_pos_accepted", DRAFT_POSITIONS), ("draft_len_hist", DRAFT_POSITIONS + 1))
 # Optional lists (engine/serve/draft_tally.h kDraftRunBins): an older engine does not write them.
 DRAFT_RUN_BINS = 9
+# copy-e E1: copy runs of the lookup rounds by length in tokens (bins 1-8, 9-16, 17-24, 25-31, 32-63, 64+), the count and
+# the tokens of each bin (engine/serve/draft_tally.h kCopyRunTop).
+COPY_RUN_BINS = 6
 DRAFT_WIDE_LISTS = (("draft_run_hist", DRAFT_RUN_BINS), ("draft_lookup_pos_proposed", DRAFT_POSITIONS),
-                    ("draft_lookup_pos_accepted", DRAFT_POSITIONS))
+                    ("draft_lookup_pos_accepted", DRAFT_POSITIONS), ("draft_copy_run_hist", COPY_RUN_BINS),
+                    ("draft_copy_run_tokens", COPY_RUN_BINS))
 
 
 def _count_list(value, size):
@@ -420,6 +424,7 @@ def _load_fields(turns):
     # The block length that the server gave the turn's first job (server/backend.py submit).
     shared = next((turn["shared_prefix_tokens"] for turn in turns if type(turn.get("shared_prefix_tokens")) is int), None)
     if shared is not None and shared >= 0: fields["shared_prefix_tokens"] = shared
+    fields.update(_prefix_fields(next((turn["prefix_marks"] for turn in turns if "prefix_marks" in turn), None)))
     # The prompt rows that a cancelled prefill of this turn had computed (server/batch_backend.py _cancelled).
     cancelled = [turn["cancel_prefill_tokens"] for turn in turns if type(turn.get("cancel_prefill_tokens")) is int]
     if cancelled: fields["cancel_prefill_tokens"] = sum(cancelled)
@@ -432,6 +437,26 @@ def _load_fields(turns):
     keys = ("think_tokens", "tool_tokens", "answer_tokens")
     if any(key in turn for turn in turns for key in keys):
         fields.update({key: sum(turn.get(key, 0) for turn in turns) for key in keys})
+    return fields
+
+
+PREFIX_HASH = re.compile("[0-9a-f]{10}")
+PREFIX_HASH_KEYS = ("prefix_reasoning_hash", "prefix_tools_hash")
+PREFIX_COUNT_KEYS = ("prefix_tool_count", "prefix_tools_end_tokens", "prefix_system_end_tokens")
+PREFIX_TOOL_CAP = 64  # server/prefix_marks.py TOOL_HASH_CAP
+
+
+def _prefix_fields(marks):
+    """The prefix_* fields (server/prefix_marks.py) that are keyed hashes or counts; any other value is left out."""
+    if not isinstance(marks, dict):
+        return {}
+    fields = {key: marks[key] for key in PREFIX_HASH_KEYS
+              if isinstance(marks.get(key), str) and PREFIX_HASH.fullmatch(marks[key])}
+    fields |= {key: marks[key] for key in PREFIX_COUNT_KEYS if type(marks.get(key)) is int and marks[key] >= 0}
+    hashes = marks.get("prefix_tool_hashes")
+    if isinstance(hashes, list) and len(hashes) <= PREFIX_TOOL_CAP and \
+            all(isinstance(item, str) and PREFIX_HASH.fullmatch(item) for item in hashes):
+        fields["prefix_tool_hashes"] = list(hashes)
     return fields
 
 
@@ -457,6 +482,18 @@ def _drop_unequal_classes(fields):
         for key in CLASS_KEYS: fields.pop(key, None)
 
 
+# Structured output: the done event's constraint counters, numbers only.
+STRUCT_FIELDS = ("tokens", "refusals", "cut_drafts", "fallback_us", "compile_us", "cache_hit")
+
+
+def struct_fields(event):
+    """struct_* fields of a constrained job's done event; {} for any other event. A bad value is left out."""
+    counts = event.get("constraint") if isinstance(event, dict) else None
+    if not isinstance(counts, dict):
+        return {}
+    return {"struct_" + key: counts[key] for key in STRUCT_FIELDS if type(counts.get(key)) is int and counts[key] >= 0}
+
+
 def turn_line(summary, event, draft=None, load=None):
     """One stderr line per finished turn for log collectors. Always on; never part of a response.
 
@@ -469,7 +506,7 @@ def turn_line(summary, event, draft=None, load=None):
                   completion_tokens=event.get("completion_tokens"), queue_s=summary.get("queue_s"),
                   prefill_s=summary.get("prefill_s"), decode_s=_span(done, first), ttft_s=_span(first, submit),
                   finish=event.get("finish_reason"), session_label=summary.get("session_label"),
-                  **_cache_fields(event))
+                  **_cache_fields(event), **struct_fields(event))
     if draft is not None: fields.update(draft)
     if load: fields.update(load)
     _miss_reason(fields)
@@ -534,6 +571,11 @@ def code_frames(error):
         return ""
 
 
+def engine_exit_line(code):
+    """The engine exited before a command that the server wrote reached it; close() dropped that command."""
+    return "crucible_engine_exit " + json.dumps(dict(code=code, unsent="stdin"))
+
+
 def worker_error_line(error):
     """Why a worker stopped. A server-written ProtocolError text is fixed; any other exception text could quote a
     payload value, so only its type is logged (RA-14)."""
@@ -549,11 +591,14 @@ def cancel_line(request_id, completion_tokens, streamed, client_request_id=None)
                                                  completion_tokens=completion_tokens) | _client(client_request_id))
 
 
-def fallback_line(request_id, completion_tokens, streamed, invalid=None, client_request_id=None):
-    """Output that did not parse as valid tool calls went back as content (counts and a fixed reason code only)."""
+def fallback_line(request_id, completion_tokens, streamed, invalid=None, client_request_id=None, violation=False):
+    """Output that did not parse as valid tool calls went back as content (counts and a fixed reason code only).
+    violation: the grammar enforced the calls (structured.violation), so the fallback is an engine fault."""
     return "crucible_error " + json.dumps(dict(request_id=request_id, status=200, streamed=streamed,
                                                 error="tool_call_fallback", completion_tokens=completion_tokens) |
-                                           (dict(invalid=invalid) if invalid else {}) | _client(client_request_id))
+                                           (dict(invalid=invalid) if invalid else {}) |
+                                           (dict(constraint_violation=1) if violation else {}) |
+                                           _client(client_request_id))
 
 
 def tool_pass_line(request_id, streamed, calls, reasons):
@@ -589,7 +634,8 @@ def request_line(first_turn, event, closed=None, cont_turn=None, cont_event=None
         return turn_line(summary, event, draft_fields((first_turn, event)), load_fields((first_turn,)))
     fields = dict(summary or {}, prefill_tokens=_chunk_rows(first_turn), t_done=cont_turn.get("t_done"))
     # The first job is cancelled before its done event: the cache after the turn is the continuation's report.
-    after = {key: cont_event[key] for key in CACHE_INT_FIELDS + ("cache_save_refused",) if key in (cont_event or {})}
+    kept = CACHE_INT_FIELDS + ("cache_save_refused", "constraint")
+    after = {key: cont_event[key] for key in kept if key in (cont_event or {})}
     line = turn_line(fields, dict(event, **after, cached_tokens=_opened(first_turn), cache_class_unknown=True),
                      draft_fields((first_turn, first_turn.get("draft_live")), (cont_turn, cont_event)),
                      load_fields((first_turn, cont_turn)))

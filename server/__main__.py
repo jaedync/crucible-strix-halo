@@ -9,7 +9,7 @@ from pathlib import Path
 import signal
 import sys
 import time
-from . import metrics, update_check
+from . import lenient, memory_fit, metrics, update_check
 from .engine_messages import AdmissionRefused
 from .api_key import (EXIT_BAD_KEY_FILE, KeyFileError, KeyGate, bind_error, container_open_bind, is_loopback,
                       load_digest)
@@ -23,7 +23,7 @@ from .sd_notify import Notifier, Watchdog
 from .request_id import CLIENT_REQUEST_ID_HEADER_ENV, HeaderNameError, resolve_client_request_id_header
 from .think_budget import MIN_THINKING_DEFAULT
 from .tokenization import ModelTokenizer
-from .version import server_commit, server_version
+from .version import server_label, server_version, startup_line
 
 # serve --draft-blocks: the engine's file limit (draft_policy.h kDraftBlocksFileMax).
 DRAFT_BLOCKS_FILE_MAX = 64 * 1024
@@ -127,6 +127,11 @@ def main():
     parser.add_argument("--port", type=int, default=8790, help="Port (default 8790).")
     parser.add_argument("--streams", type=int, choices=range(1, 9), default=None,
                         help="Batch slots (default 1). The batched stack serves every request, including speculation.")
+    parser.add_argument("--fit", choices=("auto", "off"), default=None,
+                        help="Memory fit at start of the batched server (default auto): when the layout does not fit the free memory, the "
+                             "engine starts with a smaller conversation cache, then fewer --streams at the same --ctx, "
+                             "then (with one slot) a lower --ctx, and prints one line that says why. Tokens do not "
+                             "change. off: a layout that does not fit stops the start (exit 4). Not with --serial.")
     parser.add_argument("--serial", action="store_true",
                         help="Serve with the serial worker: one request at a time, in a FIFO queue. It accepts draft_head "
                              "full, draft_adapt 1 and draft_q 0. Not with --streams.")
@@ -155,6 +160,10 @@ def main():
                         help="Session replay (default 1 with a conversation cache): a later turn resumes from the "
                              "previous turn's decode-time state when its prompt repeats the generated tokens. "
                              "Use 0 for the fresh-request path (exact reproduction of a request alone).")
+    parser.add_argument("--extend-tool-tails", type=int, choices=(0, 1), default=None,
+                        help="Session replay (default 1 with it): after a turn with tool calls, prefill the reply as "
+                             "the next request renders it while the client runs its tools, so that request resumes "
+                             "from the end of the reply. 0 turns it off.")
     parser.add_argument("--slot-resume", type=int, choices=(0, 1), default=None,
                         help="Batch serve with session replay (default 1): a turn that repeats the state still on "
                              "its slot resumes there with no host restore. 0 always restores from the host cache; "
@@ -172,7 +181,8 @@ def main():
                              "used for this many minutes may leave the host cache (to --state-dir when set).")
     parser.add_argument("--state-dir", type=Path, default=None, metavar="DIR",
                         help="Batch serve with session replay: write conversation states that the host cache evicts, "
-                             "and the states at a stop, to this directory inside your home directory (mode 0700), "
+                             "and the states at a stop, to this directory (mode 0700; any folder that only you can change, "
+                             "also on another disk, but not a system folder), "
                              "so a later turn or a restarted server continues without a full prefill. Off by default. "
                              "DIR must be a folder of its own: a file of anything else in it stops the engine start. "
                              "Example: ~/.cache/crucible/states")
@@ -195,6 +205,11 @@ def main():
                              f"replaces {ALLOWED_HOSTS_ENV} (same format). Default: any Host is accepted, which a "
                              "reverse proxy needs; strict mode is the defence against DNS rebinding, so use it where a "
                              "browser can reach the server, for example --allowed-host 127.0.0.1,localhost,[::1].")
+    parser.add_argument("--lenient-fields", choices=("on", "off"), default=None,
+                        help="on: ignore an allow-list of request fields that cannot change the tokens (user, metadata, "
+                             "neutral sampling values, docs/OPENAI_CLIENTS.md); every other unknown field is still "
+                             "refused. off: strict mode, every unknown field is refused. Default on, or "
+                             "CRUCIBLE_LENIENT_FIELDS (0 turns it off).")
     parser.add_argument("--clamp-max-tokens", action="store_true",
                         help="Lower max_tokens to the context room instead of rejecting the request.")
     parser.add_argument("--yarn-reply-reserve", type=int, default=None, metavar=f"1..{MAX_COUNT}",
@@ -305,6 +320,8 @@ def main():
     if args.watchdog_stall_seconds is None: args.watchdog_stall_seconds = WATCHDOG_STALL_DEFAULT
     if not 10 <= args.watchdog_stall_seconds <= 600:
         parser.error("--watchdog-stall-seconds must be in [10,600]")
+    if args.serial and args.fit is not None:
+        parser.error("--fit applies to the batched server only; remove it with --serial")
     if args.serial and args.streams is not None:
         parser.error("--serial runs one request at a time; do not use it with --streams")
     if not args.serial and args.streams is None:
@@ -377,6 +394,10 @@ def main():
     # Design decision (Oct 4): replay is the default whenever a conversation cache exists.
     if args.session_replay is None:
         args.session_replay = 1 if args.conversation_cache_mib else 0
+    if args.extend_tool_tails and not args.session_replay:
+        parser.error("--extend-tool-tails needs session replay (a conversation cache)")
+    if args.extend_tool_tails is None:
+        args.extend_tool_tails = args.session_replay
     if args.state_dir is not None:
         if args.serial or not args.session_replay:
             parser.error("--state-dir needs session replay (a conversation cache) and not --serial")
@@ -436,6 +457,10 @@ def main():
         request_id_header = resolve_client_request_id_header(args.client_request_id_header, os.environ)
     except HeaderNameError as error:
         parser.error(str(error))
+    try:
+        lenient_fields = lenient.resolve(args.lenient_fields, os.environ)
+    except ValueError as error:
+        parser.error(str(error))
     if not 1024 <= args.port <= 65535:
         parser.error("--port must be in [1024,65535]")
     if not args.model_id or len(args.model_id) > 200:
@@ -471,8 +496,12 @@ def main():
         print(f"rope: --ctx {args.ctx} starts the engine with {ROPE_ENV}={word} (plain at or below 262144 positions, "
               "YaRN above)", file=sys.stderr, flush=True)
     def stop(_signal, _frame):
+        # REPORT C an earlier change: the first SIGTERM or SIGINT starts the stop; later ones are ignored, so a second Ctrl-C or kill
+        # cannot end the server while the engine still saves its states and holds its memory.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
         raise KeyboardInterrupt
-    signal.signal(signal.SIGTERM, stop)
+    old_handlers = signal.signal(signal.SIGTERM, stop), signal.signal(signal.SIGINT, stop)
     backend = None
     server = None
     capture = None
@@ -519,7 +548,7 @@ def main():
                                            state_write_delay_ms=args.state_disk_write_delay_ms,
                                            cache_idle_minutes=args.cache_idle_minutes,
                                            engine_options=engine_options,
-                                           lookup=args.lookup, mtp_window=args.mtp_window)
+                                           lookup=args.lookup, mtp_window=args.mtp_window, fit=args.fit or "auto")
             backend.draft_detail = args.draft_stats
             # A ping must fit well inside the stall time (the default 50 s gives the design's 10 s).
             if args.systemd: backend.ping_idle_seconds = min(10.0, args.watchdog_stall_seconds / 5)
@@ -533,13 +562,21 @@ def main():
                     max_requests_per_client=args.max_requests_per_client, vision=vision,
                     default_mtp_prefix=args.mtp_window, capture=capture, allowed_hosts=allowed_hosts,
                     defaults=defaults, client_request_id_header=request_id_header, rope_reserve=rope_reserve,
-                    rope_word=rope_word, api_key=api_gate)))
+                    rope_word=rope_word, api_key=api_gate, lenient_fields=lenient_fields,
+                    extend_tool_tails=bool(args.extend_tool_tails))))
         server.daemon_threads = True
-        commit = server_commit()
-        print(f"Crucible v{server_version()}" + (f" ({commit})" if commit else ""), file=sys.stderr, flush=True)
+        print(startup_line(), file=sys.stderr, flush=True)
+        if fit := memory_fit.backend_fit(backend):
+            holders = memory_fit.memory_holders_now(exclude={os.getpid(), backend.process.pid})
+            print(memory_fit.fit_line(fit, holders), file=sys.stderr, flush=True)
+        if sessions := memory_fit.sessions_line(backend):
+            print(sessions, file=sys.stderr, flush=True)
         # The switch changes prompt IDs, so the startup line records it with the address.
         print(f"Crucible is ready at {listen_url(args.host, args.port)} (content special tokens: "
               f"{args.content_special_tokens})", file=sys.stderr, flush=True)
+        if lenient_fields:
+            print("Lenient request fields: on (an allow-list of fields is ignored; see docs/OPENAI_CLIENTS.md).",
+                  file=sys.stderr, flush=True)
         if api_gate is not None:
             print(f"API key required for every request but GET /health (key file {args.api_key_file}).",
                   file=sys.stderr, flush=True)
@@ -562,7 +599,7 @@ def main():
             print("Host check: off (any Host)", file=sys.stderr, flush=True)
         if defaults.describe():
             print("Request defaults: " + defaults.describe(), file=sys.stderr, flush=True)
-        update_check.start(server_version(), disabled=args.no_update_check)
+        update_check.start(server_version(), label=server_label(), disabled=args.no_update_check)
         watchdog = Watchdog(notifier, backend, server, stall_seconds=args.watchdog_stall_seconds)
         if args.systemd:
             notifier.send("READY=1\nSTATUS=ready")
@@ -592,6 +629,9 @@ def main():
             if backend is not None:
                 backend.close()
                 notifier.close()
+        # The engine has exited: a caller in the same process (a test) gets its own handlers back.
+        signal.signal(signal.SIGTERM, old_handlers[0])
+        signal.signal(signal.SIGINT, old_handlers[1])
     return exit_code
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@ import argparse
 import os
 from pathlib import Path
 
-from . import doctor, keyfile, measured, packs, rocm, runtime, service, settings as settings_mod, steps, update
+from . import doctor, keyfile, logcause, machine, measured, options, packs, rocm, runtime, service, settings as settings_mod, steps, update
 from .host import Host
 from .commands import output_text
 from .settings import UNSET
@@ -14,7 +14,8 @@ DESCRIPTION = """Run Crucible on a Strix Halo machine.
   ./crucible doctor   check the machine and print the fix for each problem
   ./crucible start    start the server again after a stop or a restart
   ./crucible stop     stop the server that this tool started
-  ./crucible service  install, remove or check the systemd user service (starts at boot, restarts after a fault)
+  ./crucible status   the server, the conversation cache and its SSD writes today
+  ./crucible service  install, disable, remove or check the systemd user service (starts at boot, restarts after a fault)
   ./crucible update   move to the newest release (checks every file first, goes back if the new release does not start)
   ./crucible uninstall  remove the service and the install folder (keeps the models unless you add --remove-models)
 
@@ -42,6 +43,17 @@ def _host_name(text):
     return text
 
 
+def _gib_day(text):
+    """argparse type for --state-write-gib-day: 0 to 65536, as the server takes it."""
+    try:
+        value = int(text)
+    except ValueError:
+        value = -1
+    if not 0 <= value <= 65536:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number from 0 to 65536.")
+    return value
+
+
 def _tag(text):
     """argparse type for --tag: a release name such as v1.2.3."""
     if not update.TAG_RE.fullmatch(text):
@@ -50,12 +62,18 @@ def _tag(text):
 
 
 def _common(p):
-    p.add_argument("--pack", choices=sorted(packs.PACKS), default=None, help="model pack in bits per weight (default 4.05)")
+    p.add_argument("--pack", choices=sorted(packs.PACKS), default=None, help="model pack in bits per weight (default 4.05; 3.05 on a 96 GB machine)")
     p.add_argument("--models-dir", type=Path, default=None, help="folder for the pack (default: models/ in this folder)")
     p.add_argument("--state-dir", type=Path, default=None,
-                   help="conversation cache on the disk; a new folder inside your home folder (default ~/.cache/crucible/states)")
+                   help="conversation cache on the disk; a new folder that only you can change, also on another disk "
+                        "(default ~/.cache/crucible/states)")
     p.add_argument("--no-state-dir", action="store_true", help="keep the conversation cache in memory only")
     p.add_argument("--state-disk-gib", type=int, default=None, help="largest size of the cache on the disk (default 200)")
+    p.add_argument("--state-write-gib-day", type=_gib_day, default=None, metavar="N",
+                   help="SSD wear guard: GiB that the conversation cache may write in one local day (default 300, "
+                        "118 TB a year; 0: read only). Compare it with the TBW rating of your SSD")
+    p.add_argument("--no-disk-check", action="store_true",
+                   help="do not measure the disk of the state folder (a 2 GiB direct write and read, one time)")
     p.add_argument("--port", type=int, default=None, help="server port (default 8790)")
     p.add_argument("--bind", type=_address, default=None, metavar="ADDRESS",
                    help="address to listen on (default 127.0.0.1). A private address needs no key. "
@@ -68,10 +86,12 @@ def _common(p):
     p.add_argument("--allowed-host", action="append", type=_host_name, default=None, metavar="NAME",
                    help="a Host name that the server accepts besides localhost, 127.0.0.1, [::1] and the bind address "
                         "(for a reverse proxy; repeat the flag for more). The names replace the saved list")
-    p.add_argument("--streams", type=int, choices=range(1, 9), default=None, help="sessions at the same time (default 4)")
+    p.add_argument("--streams", type=int, choices=range(1, 9), default=None, help="sessions at the same time (default 4; 2 on a 96 GB machine)")
     p.add_argument("--ctx", type=int, default=None, help="tokens per session (default 262144)")
     p.add_argument("--layout", choices=tuple(measured.LAYOUTS), default=None,
-                   help="named sessions: default (4 x 262,144), long (1 x 524,288 and 2 x 262,144), two-long (2 x 524,288). "
+                   help="named sessions. On a 128 GB machine: default (4 x 262,144), long (1 x 524,288 and 2 x 262,144), "
+                        "two-long (2 x 524,288). On a 96 GB machine: default (2 x 262,144), long (1 x 524,288); "
+                        "two-long does not fit. "
                         "Above 262,144 tokens the engine uses YaRN and the conversation cache stays in memory")
 
 
@@ -89,10 +109,20 @@ def parser(repo=None):
     st.add_argument("--private-runtime", choices=("yes", "no"), default=None,
                     help="when the machine has no HIP runtime (ROCm): download a private copy into .crucible (the question of "
                          "setup); with --yes and no --private-runtime: no download")
+    st.add_argument("--ngram16", choices=("yes", "no"), default=None,
+                    help="build the 16-bit n-gram table (104.3 GB download, 102.4 GB file; see docs/NGRAM16.md for the "
+                         "measured rows). The question of setup; with --yes and no --ngram16: the saved choice, else no")
+    st.add_argument("--abliterated", choices=("yes", "no"), default=None,
+                    help="also serve the abliterated mode (docs/ABLITERATED.md: a public sidecar, its measured costs and "
+                         "the responsibility note). The stock model stays the default of every request. The question of "
+                         "setup (Enter means no); with --yes and no --abliterated: the saved choice, else no")
+    st.add_argument("--download-anyway", action="store_true",
+                    help="download the pack also when a machine check failed (for example before the restart for the "
+                         "kernel parameters). Without it, setup stops before the download, or asks")
     st.add_argument("--jobs", type=int, default=None, help="compile jobs (default 1; more need more memory)")
     st.add_argument("--start-timeout", type=int, default=3600, help="seconds to wait for the server (default 3600)")
     st.add_argument("--allow-rocm10", action="store_true",
-                    help="build from source also with a ROCm 10 compiler (its engine is slower; use ROCm 7.2.4)")
+                    help="no effect: a ROCm 10 compiler builds with no flag now (accepted for the v0.37.2 commands)")
     dr = sub.add_parser("doctor", help="check the machine")
     _common(dr)
     dr.add_argument("--json", action="store_true", help="print the result as JSON")
@@ -106,8 +136,10 @@ def parser(repo=None):
     up.add_argument("--check", action="store_true", help="only say whether a newer release exists; change nothing")
     up.add_argument("--tag", type=_tag, default=None, metavar="vX.Y.Z", help="install this release, also when it is on hold or older")
     up.add_argument("--source-build", action="store_true", help="build the engine from source instead of the release file")
+    up.add_argument("--unattended", action="store_true",
+                    help="for the update timer: next to Kiln's unit, change nothing (only an update by hand restarts Kiln)")
     up.add_argument("--allow-rocm10", action="store_true",
-                    help="build from source also with a ROCm 10 compiler (its engine is slower; use ROCm 7.2.4)")
+                    help="no effect: a ROCm 10 compiler builds with no flag now (accepted for the v0.37.2 commands)")
     up.add_argument("--rollback", action="store_true", help="not a flag: a failed start rolls back by itself (see --tag)")
     un = sub.add_parser("uninstall", help="remove the service and the install folder")
     un.add_argument("--yes", "-y", action="store_true", help="no question (for scripts and agents)")
@@ -115,12 +147,14 @@ def parser(repo=None):
     sa = sub.add_parser("start", help="start the server")
     sa.add_argument("--start-timeout", type=int, default=3600)
     sub.add_parser("stop", help="stop the server")
+    sub.add_parser("status", help="the server, the state folder and its writes today against the daily limit")
     sv = sub.add_parser("service", help="the systemd user service")
     ssub = sv.add_subparsers(dest="service_cmd", required=True)
     si = ssub.add_parser("install", help="write the unit, enable it, start it")
     si.add_argument("--no-start", action="store_true", help="write and enable the unit, do not start it")
     si.add_argument("--start-timeout", type=int, default=None, help="seconds that systemd waits for the model load")
     ssub.add_parser("uninstall", help="stop, disable and remove the unit")
+    ssub.add_parser("disable", help="stop the service and keep it off at boot and login (the unit file stays)")
     ss = ssub.add_parser("status", help="state, restarts, health and why it is down")
     ss.add_argument("--json", action="store_true", help="print the result as JSON")
     ss.add_argument("--unit", default=service.UNIT, help=f"unit name (default {service.UNIT})")
@@ -141,15 +175,41 @@ def _settings(args, host, repo, **extra):
         raise SystemExit(2) from None
 
 
+def _yes_no(value):
+    return None if value is None else value == "yes"
+
+
 def _build_settings(args, host, repo, **extra):
     return settings_mod.build(
         repo, host, pack=getattr(args, "pack", None), models_dir=getattr(args, "models_dir", None),
         state_dir=getattr(args, "state_dir", None) or UNSET, no_state_dir=getattr(args, "no_state_dir", False),
         state_disk_gib=getattr(args, "state_disk_gib", None), port=getattr(args, "port", None),
+        state_write_gib_day=getattr(args, "state_write_gib_day", None),
         bind=getattr(args, "bind", None), api_key=getattr(args, "api_key", None),
         allowed_hosts=getattr(args, "allowed_host", None),
+        ngram16=_yes_no(getattr(args, "ngram16", None)), abliterated=_yes_no(getattr(args, "abliterated", None)),
         streams=getattr(args, "streams", None), ctx=getattr(args, "ctx", None), layout=getattr(args, "layout", None),
         jobs=getattr(args, "jobs", None), **extra)
+
+
+def _ask_pack(ask, fit):
+    """The pack question for the memory class FIT (a 96 GB machine is not offered 4.05; a smaller machine is
+    not told that 3.05 fits)."""
+    if fit is machine.FULL:
+        question = "Pack: 4.05 (best quality, 107 GB), 4.18 (the same quality, slower, 122 GB) or 3.05 (smaller, 85 GB)"
+        again = "Type 4.05, 4.18 or 3.05"
+    elif fit.supported:
+        question = f"Pack: 3.05 (85 GB; the 4.05 pack does not fit this {fit.name} machine)"
+        again = "Type 3.05 (the 4.05 pack needs a 128 GB machine)"
+    else:
+        question = ("Pack: 3.05 (85 GB). Crucible needs a 96 GB or 128 GB machine, and this machine has less: "
+                    "./crucible doctor gives the numbers")
+        again = "Type 3.05 or 4.05"
+    allowed = fit.packs or tuple(packs.PACKS)
+    pack = ask(question, fit.pack)
+    while pack not in allowed:
+        pack = ask(again, fit.pack)
+    return pack
 
 
 def _ask_settings(args, host, repo):
@@ -157,9 +217,7 @@ def _ask_settings(args, host, repo):
     ask = host.prompt
     pack = args.pack
     if pack is None:
-        pack = ask("Pack: 4.05 (best quality, 107 GB) or 3.05 (smaller, 85 GB)", packs.DEFAULT)
-        while pack not in packs.PACKS:
-            pack = ask("Type 4.05 or 3.05", packs.DEFAULT)
+        pack = _ask_pack(ask, machine.of_host(host))
         args.pack = pack
     probe = _settings(args, host, repo)
     if args.models_dir is None:
@@ -194,6 +252,12 @@ def _ask_settings(args, host, repo):
         while answer not in ("yes", "y", "no", "n"):
             answer = ask("Use an API key?", "no").strip().lower()
         args.api_key = answer in ("yes", "y")
+    if args.ngram16 is None and "ngram16" not in settings_mod.load_saved(repo):
+        host.out(options.NGRAM16_TEXT)
+        args.ngram16 = "yes" if ask(options.NGRAM16_QUESTION, "n").strip().lower() in ("y", "yes") else "no"
+    if args.abliterated is None and "abliterated" not in settings_mod.load_saved(repo):
+        host.out(options.ABL_TEXT)
+        args.abliterated = "yes" if ask(options.ABL_QUESTION, "n").strip().lower() in ("y", "yes") else "no"
 
 
 def _validate(s, host):
@@ -201,9 +265,9 @@ def _validate(s, host):
         home = Path(os.path.abspath(host.home))
         sd = Path(os.path.abspath(s.state_dir))
         problem = settings_mod.state_dir_problem(home, s.repo, sd)
-        if problem and not settings_mod.state_dir_inside(home, sd):
-            host.out(f"The state folder {sd} must be a new folder inside your home folder {home}. "
-                     "Use --state-dir ~/.cache/crucible/states or --no-state-dir.")
+        if problem and settings_mod.state_dir_verdict(home, s.repo, sd).code not in doctor.CONTENT_CODES:
+            host.out(f"The state folder is not accepted: {problem} Use a folder that only you can change, for example "
+                     "--state-dir ~/.cache/crucible/states or a folder of its own on another disk, or --no-state-dir.")
             return False
         if problem:
             host.out(f"The state folder is not accepted: {problem} Crucible removes this folder with "
@@ -226,6 +290,8 @@ def _service(args, host, repo):
         return service.install(host, s, no_start=args.no_start, start_timeout=args.start_timeout)
     if cmd == "uninstall":
         return service.uninstall(host, s)
+    if cmd == "disable":
+        return service.disable(host, s)
     if cmd == "status":
         return service.status(host, s, as_json=args.json, unit=args.unit, check_file=args.check_file)
     if cmd == "logs":
@@ -295,6 +361,31 @@ def runtime_answer(args, host, s, repo):
     return "yes"
 
 
+def status(host, repo):
+    """./crucible status: one line each for the server, the state folder and the SSD writes of today (the ledger)."""
+    if not (Path(repo) / ".crucible/config.json").exists():
+        host.out("No configuration yet. Run ./crucible setup first.")
+        return 1
+    s = settings_mod.build(repo, host)
+    code, _ = host.http.get(f"{s.base_url}/health") if host.http else (0, "")
+    host.out(f"server: {'answers' if code == 200 else 'not running'} at {s.base_url}")
+    if code != 200 and not service.installed(host):
+        causes = logcause.last_stop(s.work / "server.log")
+        if causes:
+            host.out(f"last stop of the server ({s.work / 'server.log'}):")
+            for line in causes:
+                host.out("  " + line)
+    if s.state_dir is None:
+        host.out("conversation cache: in memory only (no state folder)")
+        return 0
+    host.out(f"conversation cache: {s.state_dir} (at most {s.state_disk_gib} GiB)")
+    written = settings_mod.ledger_today(s.state_dir, host.clock())
+    limit = s.state_write_gib_day
+    host.out(f"state writes today: {written / 1e9:.1f} GB of {limit} GiB ({limit * 1024 ** 3 / 1e9:.1f} GB)")
+    host.out(settings_mod.write_limit_line(s))
+    return 0
+
+
 def main(argv=None, host=None, repo=None):
     repo = Path(repo) if repo else Path(__file__).resolve().parents[2]
     args = parser(repo).parse_args(argv)
@@ -312,7 +403,7 @@ def main(argv=None, host=None, repo=None):
         if args.for_ == "start":
             return doctor.for_start(host, _settings(args, host, repo), quiet=args.quiet, as_json=args.json,
                                     check_file=args.check_file)
-        return doctor.main(host, _settings(args, host, repo), as_json=args.json)
+        return doctor.main(host, _settings(args, host, repo), as_json=args.json, measure=not args.no_disk_check)
     if args.cmd == "service":
         return _service(args, host, repo)
     if args.cmd in ("update", "uninstall"):
@@ -321,6 +412,8 @@ def main(argv=None, host=None, repo=None):
         return run(host, repo, args, ask)
     if args.cmd == "stop":
         return steps.stop(host, settings_mod.build(repo, host))
+    if args.cmd == "status":
+        return status(host, repo)
     if args.cmd == "start":
         if not (repo / ".crucible/config.json").exists():
             host.out("No configuration yet. Run ./crucible setup first.")
@@ -371,11 +464,17 @@ def main(argv=None, host=None, repo=None):
     run = steps.Setup(host, s, smoke=args.smoke, start_timeout=args.start_timeout, service=wants,
                       hint=getattr(args, "service_hint", False) and not args.smoke, runtime=runtime_choice,
                       kernel_ask=None if (args.yes or ask_fn is None) else ask_fn,
-                      allow_rocm10=getattr(args, "allow_rocm10", False))
+                      download_anyway=args.download_anyway, measure_disk=not args.no_disk_check)
     if args.dry_run:
         run.plan()
+        if s.state_dir is not None:
+            host.out(settings_mod.write_limit_line(s))
         results = doctor.run_checks(host, s)
         host.out(doctor.format_text(results))
+        bad = steps.download_stoppers(results)
+        if bad and not args.download_anyway:
+            host.out(f"Setup stops before the download of about {s.spec.download_gb} GB, because these checks failed: "
+                     f"{', '.join(r.id for r in bad)}. Fix them first, or add --download-anyway.")
         return 0
     if not args.yes:
         answer = host.prompt(f"Download {s.spec.download_gb} GB and build now? (y/n)", "y")

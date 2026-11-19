@@ -149,20 +149,43 @@ class FakePrompt:
         return default
 
 
+class ModesNo(FakePrompt):
+    """A FakePrompt that gives the default (no) to the optional-mode questions of setup (the 16-bit n-gram table and the
+    abliterated mode). Setup asks them only while the config does not hold an answer, so a list answer would shift."""
+    MODES = ("Build the 16-bit n-gram table now?", "Turn on the abliterated mode")
+
+    def __call__(self, question, default=""):
+        if question.startswith(self.MODES):
+            self.asked.append(question)
+            return default
+        return super().__call__(question, default)
+
+
 class NoPrompt:
     def __call__(self, question, default=""):
         raise AssertionError(f"prompted with --yes: {question}")
 
 
+# /proc/self/cgroup of a command in a user shell (cgroup v2), and of the update timer's unit
+SHELL_CGROUP = "0::/user.slice/user-1000.slice/app.slice/app-term-1234.scope\n"
+TIMER_CGROUP = "0::/user.slice/user-1000.slice/app.slice/crucible-update.service\n"
+
+
 def make_machine(tmp, *, gtt=GTT_OK, gtt_used=2_000_000, vram_used=600_000_000, version="7.2.4", rocm=True,
                  hipcc=True, mem_total_kb=130_000_000, cmdline="root=/dev/nvme0n1p2 rw", py=(3, 14, 0),
                  free=2_000_000_000_000, busy_ports=(), deny=(), tools=("make", "g++", "git", "sudo"),
-                 groups=("video", "render"), platform="linux", libs=(), kfd_gfx=None, rocminfo=True, env=None):
+                 groups=("video", "render"), platform="linux", libs=(), kfd_gfx=None, rocminfo=True, env=None,
+                 cgroup=SHELL_CGROUP):
     """Build a healthy fake machine under tmp/machine. Arguments break one thing at a time.
     libs: file names to make in rocm/lib (for example "libamdhip64.so.7.16.26385"). kfd_gfx: a gfx_target_version number
-    for the kfd topology (110501 is gfx1151). rocminfo=False: no rocminfo tool. env: more environment words."""
+    for the kfd topology (110501 is gfx1151). rocminfo=False: no rocminfo tool. env: more environment words.
+    cgroup: the text of /proc/self/cgroup (default: a shell of a user session); None: the file cannot be read."""
     m = Path(tmp) / "machine"
-    (m / "proc").mkdir(parents=True, exist_ok=True)
+    (m / "proc/self").mkdir(parents=True, exist_ok=True)
+    if cgroup is None:
+        (m / "proc/self/cgroup").unlink(missing_ok=True)
+    else:
+        (m / "proc/self/cgroup").write_text(cgroup)
     (m / "proc/meminfo").write_text(f"MemTotal:       {mem_total_kb} kB\nMemAvailable:   {mem_total_kb - 5_000_000} kB\n")
     (m / "proc/cmdline").write_text(cmdline + "\n")
     dev = m / "sys/class/drm/card0/device"
@@ -201,6 +224,7 @@ def make_machine(tmp, *, gtt=GTT_OK, gtt_used=2_000_000, vram_used=600_000_000, 
         py_version=py, platform=platform, which=lambda n: bins.get(n),
         disk_free=lambda p: free, port_free=lambda h, p: p not in busy_ports, port_in_use=lambda h, p: p in busy_ports,
         groups=lambda: list(groups), can_access=lambda p, mode: str(p) not in denied,
+        disk_measure=lambda p, n: {"write_mbps": 3000, "read_mbps": 5000, "bytes": n},
         runner=None, http=None, prompt=NoPrompt(), clock=lambda: 1000.0, sleep=lambda s: None, out=lambda s: None,
         is_tty=False)
 
@@ -223,3 +247,9 @@ def make_repo(tmp):
     (repo / "requirements-cpu.txt").write_text("numpy\n")
     (repo / "VERSION").write_text("0.31.0\n")
     return repo
+
+
+def shown(text, repo, host=None):
+    """TEXT as ./crucible prints it for REPO: each ./crucible names the real launcher path (commands.output_text)."""
+    from crucible_cli.commands import output_text
+    return output_text(repo, text)

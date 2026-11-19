@@ -36,8 +36,7 @@ struct GroupShape {
 
 // Decode split of each matrix of a dense group in front order (front_order.h), or all 0 for engine
 // order: the engine's rule (decode_split.h FrontGroupSplits, which Loader::FrontSplits calls through
-// FrontLoadSplits). K7 and K8 groups stay in engine order: the ring kernels, the main front-order
-// readers of decode, hold K <= 6 only (kSupportedDecodeK).
+// FrontLoadSplits). K7 and K8 groups load in front order too (the wide ring, MaxK 8).
 inline std::vector<int> FrontSplitsFor(const std::vector<GroupShape>& group) {
   std::vector<DenseMatrix> dense;
   for (const GroupShape& g : group) dense.push_back({g.A * 16, g.B * 16, g.K});

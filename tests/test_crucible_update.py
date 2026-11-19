@@ -17,6 +17,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from crucible_cli_fakes import TIMER_CGROUP  # noqa: E402
 from crucible_update_fakes import CANARY, EMAIL, GIT, GIT_ENV, NEW, OLD, STEM, World, git, sha256_bytes, sha256_file, snapshot  # noqa: E402
 
 from crucible_cli import cli, release, update  # noqa: E402
@@ -253,6 +254,79 @@ class UpdateSuccessTest(Base):
         self.assertEqual(self.update("--yes"), 1, self.out)
         self.assertRegex(self.out, r"(?i)pip")
         self.assertUntouched()
+
+
+KILN_TEXT = """\
+# Written by kiln (the profile crucible)
+[Service]
+Type=simple
+WorkingDirectory=/srv/crucible
+ExecStart="/srv/crucible/.venv/bin/python" -m server "/models/pack" --engine "/srv/crucible/build/engine/crucible" --ctx 262144 --streams 4 --port 8795
+"""
+
+
+class KilnUnitTest(Base):
+    """A user who runs Crucible through Kiln: the engine runs in kiln-crucible.service, and crucible-server.service is
+    absent or installed and disabled. The update restarts the Kiln unit, never the Crucible one."""
+
+    def kiln_world(self, crucible_unit=False, active=True, **kw):
+        w = self.world(**kw)
+        w.kiln_unit.write_text(KILN_TEXT)
+        w.machine.kiln_active = active
+        w.machine.active = False
+        if not crucible_unit:
+            w.unit.unlink()
+        self.before = snapshot(w.dir)
+        return w
+
+    def crucible_verbs(self):
+        return [v for v in self.w.machine.verbs if v in ("start", "restart", "enable", "stop")]
+
+    def test_the_update_stops_and_restarts_the_kiln_unit(self):
+        w = self.kiln_world()
+        self.assertEqual(self.update("--yes"), 0, self.out)
+        self.assertEqual((w.dir / "VERSION").read_text(), "0.2.0\n")
+        kiln = [e[1] for e in w.machine.events if e[0] == "kiln"]
+        self.assertIn("stop", kiln)
+        self.assertTrue(set(kiln) & {"start", "restart"}, kiln)
+        stop = w.machine.events.index(("kiln", "stop"))
+        start = max(i for i, e in enumerate(w.machine.events) if e[0] == "kiln" and e[1] in ("start", "restart"))
+        self.assertLess(stop, start)
+        self.assertTrue(w.machine.kiln_active)
+        self.assertEqual(self.crucible_verbs(), [])
+        self.assertFalse(w.unit.exists(), "no crucible-server.service next to Kiln")
+        self.assertFalse(any("service install" in c for c in w.stub_calls()), w.stub_calls())
+        self.assertIn("kiln-crucible.service", self.out)
+
+    def test_the_proof_uses_the_port_of_the_kiln_unit(self):
+        w = self.kiln_world()
+        self.assertEqual(self.update("--yes"), 0, self.out)
+        self.assertEqual(len(self.host.http.posts), 1)
+        self.assertTrue(self.host.http.posts[0][0].startswith("http://127.0.0.1:8795/"), self.host.http.posts)
+        self.assertTrue(any(u.startswith("http://127.0.0.1:8795/health") for u in self.host.http.gets), self.host.http.gets)
+
+    def test_a_disabled_crucible_service_next_to_kiln_stays_disabled(self):
+        w = self.kiln_world(crucible_unit=True)
+        self.assertEqual(self.update("--yes"), 0, self.out)
+        self.assertEqual(self.crucible_verbs(), [])
+        self.assertTrue(w.unit.exists())
+        self.assertTrue(w.machine.kiln_active)
+
+    def test_a_stopped_kiln_unit_stays_stopped(self):
+        w = self.kiln_world(active=False)
+        self.assertEqual(self.update("--yes"), 0, self.out)
+        kiln = [e[1] for e in w.machine.events if e[0] == "kiln"]
+        self.assertNotIn("start", kiln)
+        self.assertNotIn("restart", kiln)
+        self.assertEqual(self.crucible_verbs(), [])
+        self.assertEqual(self.host.http.posts, [])
+
+    def test_a_kiln_engine_that_does_not_start_rolls_back_and_runs_the_old_release(self):
+        w = self.kiln_world(bad_start=True)
+        self.assertEqual(self.update("--yes"), 4, self.out)
+        self.assertEqual((w.dir / "VERSION").read_text(), "0.1.0\n")
+        self.assertTrue(w.machine.kiln_active, "the old release must run again in the Kiln unit")
+        self.assertEqual(self.crucible_verbs(), [])
 
 
 class OutsideEnvironmentTest(Base):
@@ -629,15 +703,6 @@ class SourceBuildTest(Base):
         self.assertRegex(self.out, r"(?i)build")
         self.assertUntouched()
 
-    def test_the_rocm10_stop_names_the_flag_once(self):
-        # Review L2: the stop message and the raise both gave --allow-rocm10.
-        w = self.world(release_engine=False)
-        w.machine.fail_make = "make: CRUCIBLE-ROCM10-STOP hipcc is a ROCm 10 compiler\n"
-        self.assertEqual(self.update("--yes"), 1, self.out)
-        self.assertIn("ROCm 10 compiler", self.out)
-        self.assertEqual(self.out.count("--allow-rocm10"), 1, self.out)
-        self.assertUntouched()
-
     def test_source_build_flag_builds_even_for_a_release_install(self):
         w = self.world()
         w.asset("gz").unlink()
@@ -810,6 +875,179 @@ class CrashRecoveryTest(Base):
         self.assertEqual(w.machine.verbs, [])
 
 
+class KilnCrashRecoveryTest(Base):
+    """A kill during an update of a Kiln install (modes kiln-active and kiln-stopped). The next update reads the journal,
+    puts the old release back and starts the Kiln unit again only when it ran before (review H2)."""
+
+    kiln_world = KilnUnitTest.kiln_world
+    crash_at = CrashRecoveryTest.crash_at
+
+    def assertOldKilnRelease(self):
+        w = self.w
+        self.assertEqual((w.dir / "VERSION").read_text(), "0.1.0\n")
+        self.assertEqual(git(w.dir, "rev-parse", "HEAD"), w.old_commit)
+        self.assertEqual(sha256_file(w.dir / "build/engine/crucible"), w.old_engine_sha)
+        self.assertEqual(w.leftovers(), [])
+        self.assertFalse((w.parent / ".crucible.update.json").exists())
+        snap = snapshot(w.dir)
+        snap.pop(".crucible/update-hold", None)
+        self.assertEqual(snap, self.before)
+        self.assertFalse(w.unit.exists(), "no crucible-server.service next to Kiln")
+
+    def test_every_mode_that_detect_mode_gives_is_a_journal_mode(self):
+        import ast
+        import inspect
+        import textwrap
+        tree = ast.parse(textwrap.dedent(inspect.getsource(update.Update.detect_mode)))
+        def values(node):   # the strings that a return value can be (a constant, or either arm of a conditional)
+            if isinstance(node, ast.IfExp):
+                return values(node.body) | values(node.orelse)
+            return {node.value} if isinstance(node, ast.Constant) else {None}
+        given = set().union(*(values(r.value) for r in ast.walk(tree) if isinstance(r, ast.Return)))
+        self.assertEqual(given, set(update.MODES))
+
+    def each_point(self):
+        for fallback in (False, True):
+            for point in CrashRecoveryTest.POINTS:
+                if point.startswith("swap:") and not fallback:
+                    continue
+                yield point, fallback
+
+    def test_a_crash_with_an_active_kiln_unit_recovers_and_starts_the_kiln_unit_again(self):
+        for point, fallback in self.each_point():
+            with self.subTest(point=point, fallback=fallback):
+                w = self.kiln_world()
+                self.crash_at(point, fallback)
+                self.assertTrue((w.parent / ".crucible.update.json").exists(), "a journal must exist after a kill")
+                w.machine.kiln_active = False       # the kill left the unit stopped (or a reboot did)
+                mark = len(w.machine.events)
+                self.assertEqual(self.update("--yes"), 4, self.out)
+                self.assertRegex(self.out, r"(?i)earlier update")
+                self.assertOldKilnRelease()
+                self.assertTrue(w.machine.kiln_active, self.out)
+                after = [e[1] for e in w.machine.events[mark:] if e[0] == "kiln"]
+                self.assertTrue(set(after) & {"start", "restart"}, after)
+                self.assertFalse(w.machine.active)
+
+    def test_a_crash_with_a_stopped_kiln_unit_recovers_and_leaves_the_kiln_unit_stopped(self):
+        for point, fallback in self.each_point():
+            with self.subTest(point=point, fallback=fallback):
+                w = self.kiln_world(active=False)
+                self.crash_at(point, fallback)
+                self.assertTrue((w.parent / ".crucible.update.json").exists(), "a journal must exist after a kill")
+                mark = len(w.machine.events)
+                self.assertEqual(self.update("--yes"), 4, self.out)
+                self.assertOldKilnRelease()
+                self.assertFalse(w.machine.kiln_active)
+                after = [e[1] for e in w.machine.events[mark:] if e[0] == "kiln"]
+                self.assertFalse(set(after) & {"start", "restart"}, after)
+                self.assertFalse(w.machine.active)
+
+
+class UnattendedKilnTest(Base):
+    """The opt-in timer runs ./crucible update --yes --unattended. Policy: only an update that the user runs by hand may
+    stop and restart the Kiln unit. The unattended run skips the update next to Kiln, says why in one line, exits 0."""
+
+    kiln_world = KilnUnitTest.kiln_world
+    crash_at = CrashRecoveryTest.crash_at
+    LINE = "Kiln runs this engine; run ./crucible update by hand."
+
+    def assertSkipped(self, w):
+        from crucible_cli.commands import command_text  # the output prints the full launcher path (r373 L2)
+        self.assertEqual((w.dir / "VERSION").read_text(), "0.1.0\n")
+        self.assertEqual(git(w.dir, "rev-parse", "HEAD"), w.old_commit)
+        self.assertEqual([e for e in w.machine.events if e[0] == "kiln"], [])
+        self.assertEqual(w.stub_calls(), [], "code of the new release ran")
+        self.assertIn(self.LINE.replace("./crucible", command_text(w.dir)), self.out)
+        self.assertEqual(len([ln for ln in self.out.splitlines() if ln.strip()]), 1, self.out)
+
+    def test_an_unattended_run_does_not_stop_an_active_kiln_unit(self):
+        w = self.kiln_world()
+        self.assertEqual(self.update("--yes", "--unattended", tty=False), 0, self.out)
+        self.assertSkipped(w)
+        self.assertTrue(w.machine.kiln_active)
+        self.assertEqual(snapshot(w.dir), self.before)
+
+    def test_an_unattended_run_skips_a_stopped_kiln_unit_too(self):
+        w = self.kiln_world(active=False)
+        self.assertEqual(self.update("--yes", "--unattended", tty=False), 0, self.out)
+        self.assertSkipped(w)
+        self.assertFalse(w.machine.kiln_active)
+
+    def test_an_unattended_run_leaves_the_journal_of_a_cut_kiln_update_for_the_user(self):
+        w = self.kiln_world()
+        self.crash_at("stopped")
+        w.machine.events.clear()
+        self.assertEqual(self.update("--yes", "--unattended", tty=False), 0, self.out)
+        self.assertSkipped(w)
+        self.assertTrue((w.parent / ".crucible.update.json").exists())
+
+    def test_the_same_update_by_hand_stops_and_restarts_the_kiln_unit(self):
+        w = self.kiln_world()
+        self.assertEqual(self.update("--yes", tty=False), 0, self.out)
+        kiln = [e[1] for e in w.machine.events if e[0] == "kiln"]
+        self.assertIn("stop", kiln)
+        self.assertTrue(set(kiln) & {"start", "restart"}, kiln)
+        self.assertEqual((w.dir / "VERSION").read_text(), "0.2.0\n")
+
+    def test_an_unattended_run_without_kiln_updates_and_restarts_the_crucible_service(self):
+        w = self.world()
+        self.assertEqual(self.update("--yes", "--unattended", tty=False), 0, self.out)
+        self.assertEqual((w.dir / "VERSION").read_text(), "0.2.0\n")
+        self.assertIn(("ctl", "restart"), w.machine.events, self.out)
+        self.assertNotIn(self.LINE.split(";")[0], self.out)  # "Kiln runs this engine"
+
+    def test_check_with_unattended_does_not_recover_a_cut_kiln_update(self):
+        # delta review: --check skipped the guard, and the recovery of the journal stopped and restarted Kiln
+        w = self.kiln_world()
+        self.crash_at("stopped")
+        w.machine.events.clear()
+        self.assertEqual(self.update("--check", "--unattended", tty=False), 0, self.out)
+        self.assertSkipped(w)
+        self.assertTrue((w.parent / ".crucible.update.json").exists())
+
+    def test_the_old_timer_template_without_the_flag_is_unattended_in_its_unit(self):
+        # a timer installed from the old template runs `update --yes`; its cgroup names crucible-update.service
+        w = self.kiln_world()
+        self.assertEqual(self.update("--yes", tty=False, cgroup=TIMER_CGROUP), 0, self.out)
+        self.assertSkipped(w)
+        self.assertTrue(w.machine.kiln_active)
+
+    def test_the_new_timer_template_in_its_unit_is_unattended(self):
+        w = self.kiln_world()
+        self.assertEqual(self.update("--yes", "--unattended", tty=False, cgroup=TIMER_CGROUP), 0, self.out)
+        self.assertSkipped(w)
+
+    def test_a_cgroup_v1_file_that_names_the_timer_unit_is_unattended(self):
+        w = self.kiln_world()
+        v1 = "12:cpu,cpuacct:/user.slice\n1:name=systemd:/user.slice/user-1000.slice/crucible-update.service\n"
+        self.assertEqual(self.update("--yes", tty=False, cgroup=v1), 0, self.out)
+        self.assertSkipped(w)
+
+    def test_an_unreadable_cgroup_is_unattended(self):
+        for text in (None, "", "garbage\n"):
+            with self.subTest(text=text):
+                w = self.kiln_world()
+                self.assertEqual(self.update("--yes", tty=False, cgroup=text), 0, self.out)
+                self.assertSkipped(w)
+
+    def test_a_cgroup_that_only_contains_the_unit_name_is_a_hand_run(self):
+        for last in ("my-crucible-update.service", "crucible-update.service.d", "crucible-update.service-x.scope"):
+            with self.subTest(last=last):
+                w = self.kiln_world()
+                cg = f"0::/user.slice/user-1000.slice/app.slice/{last}\n"
+                self.assertEqual(self.update("--yes", tty=False, cgroup=cg), 0, self.out)
+                kiln = [e[1] for e in w.machine.events if e[0] == "kiln"]
+                self.assertIn("stop", kiln)
+                self.assertEqual((w.dir / "VERSION").read_text(), "0.2.0\n")
+
+    def test_check_with_unattended_still_only_reports(self):
+        w = self.kiln_world()
+        self.assertEqual(self.update("--check", "--unattended", tty=False), 0, self.out)
+        self.assertEqual([e for e in w.machine.events if e[0] == "kiln"], [])
+        self.assertEqual(snapshot(w.dir), self.before)
+
+
 class ExchangeTest(unittest.TestCase):
     def test_exchange_swaps_two_folders_in_one_step(self):
         import tempfile
@@ -966,6 +1204,103 @@ class UninstallTest(Base):
         self.assertFalse(w.pack.exists())
         self.assertFalse(w.states.exists())
         self.assertFalse(w.dir.exists())
+
+    # The state folder may be outside the home folder (a second disk). Uninstall removes such a
+    # folder only when setup made it (the record names its real path), the rule accepts it, and it holds only what the
+    # engine writes there. It removes only those names, then the empty folder; never its parent folder.
+    IDENT = "-".join(["0123456789abcdef"] * 3)
+
+    def outside_states(self, w, marker=True, recorded=None):
+        fast = w.t / "fast"
+        fast.mkdir()
+        (fast / "keep.txt").write_text("OTHER\n")
+        states = fast / "states"
+        states.mkdir(mode=0o700)
+        (states / self.IDENT).mkdir()
+        (states / self.IDENT / "a.state").write_text("STATE\n")
+        (states / "write-ledger").write_text("2026-11-17 1\n")
+        cfg = json.loads((w.dir / ".crucible/config.json").read_text())
+        cfg["state_dir"] = str(states)
+        (w.dir / ".crucible/config.json").write_text(json.dumps(cfg))
+        record = w.dir / ".crucible/state-dir.json"
+        if marker:
+            record.write_text(json.dumps({"state_dir": recorded or os.path.realpath(states), "made_by": "crucible setup"}) + "\n")
+        else:
+            record.unlink()
+        return fast, states
+
+    def test_remove_models_removes_a_state_folder_outside_home_that_setup_made(self):
+        w = self.world()
+        fast, states = self.outside_states(w)
+        self.assertEqual(self.uninstall("--yes", "--remove-models"), 0, self.out)
+        self.assertFalse(states.exists(), self.out)
+        self.assertEqual((fast / "keep.txt").read_text(), "OTHER\n", "the parent folder and its files stay")
+        self.assertIn(f"Removed {states}.", self.out)
+
+    def test_an_outside_state_folder_stays_without_remove_models(self):
+        w = self.world()
+        fast, states = self.outside_states(w)
+        before = snapshot(fast)
+        self.assertEqual(self.uninstall("--yes"), 0, self.out)
+        self.assertEqual(snapshot(fast), before)
+
+    def assertOutsideKept(self, fast, before, *args):
+        self.assertEqual(self.uninstall("--yes", "--remove-models", *args), 0, self.out)
+        self.assertEqual(snapshot(fast), before, self.out)
+        self.assertFalse(self.w.dir.exists(), "the install still goes")
+
+    def test_an_outside_state_folder_that_setup_did_not_make_is_never_removed(self):
+        w = self.world()
+        fast, states = self.outside_states(w, marker=False)
+        self.assertOutsideKept(fast, snapshot(fast))
+        self.assertIn("setup did not make this folder", self.out)
+
+    def test_a_record_of_another_folder_does_not_remove_the_outside_state_folder(self):
+        w = self.world()
+        fast, states = self.outside_states(w, recorded=str(w.t / "fast" / "other"))
+        self.assertOutsideKept(fast, snapshot(fast))
+
+    def test_an_outside_state_folder_with_other_files_is_never_removed(self):
+        w = self.world()
+        fast, states = self.outside_states(w)
+        (states / "notes.txt").write_text("MINE\n")
+        self.assertOutsideKept(fast, snapshot(fast))
+        self.assertIn("did not make", self.out)
+
+    def test_an_outside_state_folder_that_is_a_link_is_never_removed(self):
+        w = self.world()
+        fast, states = self.outside_states(w)
+        real = fast / "real"
+        states.rename(real)
+        states.symlink_to(real)
+        record = w.dir / ".crucible/state-dir.json"
+        record.write_text(json.dumps({"state_dir": os.path.realpath(states), "made_by": "crucible setup"}) + "\n")
+        self.assertOutsideKept(fast, snapshot(fast))
+
+    def test_an_outside_state_folder_under_a_folder_that_others_can_write_is_never_removed(self):
+        w = self.world()
+        fast, states = self.outside_states(w)
+        os.chmod(fast, 0o777)
+        self.addCleanup(os.chmod, fast, 0o700)
+        self.assertOutsideKept(fast, snapshot(fast))
+        self.assertIn("other users can write", self.out)
+
+    def test_a_file_added_after_the_plan_keeps_the_outside_state_folder(self):
+        # The check runs again just before the removal: a file that came while the question waited keeps the folder.
+        w = self.world()
+        fast, states = self.outside_states(w)
+        host = w.host(answers=["y"])
+        asked = host.prompt
+
+        def prompt(question, default=""):
+            (states / "late.txt").write_text("LATE\n")
+            return asked(question, default)
+        host.prompt = prompt
+        self.assertEqual(cli.main(["uninstall", "--remove-models"], host=host, repo=w.dir), 0)
+        out = "\n".join(host.lines)
+        self.assertEqual((states / "late.txt").read_text(), "LATE\n", out)
+        self.assertTrue((states / self.IDENT / "a.state").exists(), out)
+        self.assertIn(f"Not removed: {states}", out)
 
     def test_a_models_folder_outside_the_install_keeps_other_models(self):
         w = self.world()

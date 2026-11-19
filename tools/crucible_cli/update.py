@@ -36,7 +36,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from . import packs, release, rocm, service, settings as settings_mod, steps
+from . import packs, release, rocm, service, settings as settings_mod, state_root, steps
 from .files import SYSTEM_PREFIXES, OutsideRoots, Sandbox
 
 ARCH = "gfx1151"
@@ -62,6 +62,10 @@ PIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9,._-]*\])?==[A-Za-
 WORK_PREFIX = ".{name}-update-"
 JOURNAL = ".{name}.update.json"
 HOLD = ".crucible/update-hold"
+# the unit of the opt-in update timer (deploy/user-systemd/crucible-update.service)
+TIMER_UNIT = "crucible-update.service"
+# every value that detect_mode() can give; the journal records one, and read_journal() accepts exactly these
+MODES = ("kiln-active", "kiln-stopped", "service-active", "service-stopped", "pidfile", "none")
 PIP_BEFORE = ".crucible/update-pip-before.txt"
 SMOKE = {"model": "crucible", "messages": [{"role": "user", "content": "Say hello."}], "max_tokens": 8, "temperature": 0,
          "stream": True}
@@ -309,6 +313,11 @@ class Update:
             os.close(lock)
 
     def _locked(self):
+        if (getattr(self.args, "unattended", False) or in_timer_unit(self.host)) and service.installed(self.host, service.KILN_UNIT):
+            # Policy: only an update that the user runs by hand stops and restarts the Kiln unit. This holds for --check
+            # too: recover() runs before the check and can stop and restart the Kiln unit.
+            self.say("Kiln runs this engine; run ./crucible update by hand. The unattended update changed nothing.")
+            return EXIT_OK
         try:
             if self.args.check:
                 # Read-only, also as root (cli.py allows it): no restore of a cut update and no cleanup here.
@@ -616,8 +625,6 @@ class Update:
         if h.which("systemd-run") and service.manager_ok(h):
             argv = ["systemd-run", "--user", "--scope", "--quiet", "-p", "MemoryMax=4G", *argv]
         env = dict(self.env)
-        if getattr(self.args, "allow_rocm10", False):
-            env["ALLOW_ROCM10"] = "1"
         say("Building the engine from source in the staging folder (about 16 minutes with the ROCm 7.2.4 compiler). "
             "The server keeps running.")
         with self.box.open_log(work / "build.log") as log:
@@ -625,9 +632,6 @@ class Update:
             if res.rc != 0 and "argument facts drift" in res.out:
                 say("The build stopped with 'argument facts drift'. Building again with SPLIT=0 (slower).")
                 res = h.runner.run(argv + ["SPLIT=0"], cwd=str(stage), env=env, log=log)
-        stop = steps.rocm10_stop(res.out) if res.rc != 0 else None
-        if stop:
-            raise CheckFailed(stop + " Run the update again with --allow-rocm10 to build with this compiler all the same.")
         if res.rc != 0 or not (stage / "build/engine/crucible").is_file():
             raise CheckFailed("The build of the new release failed. " + res.out[-300:].strip())
 
@@ -732,7 +736,7 @@ class Update:
             ok = (isinstance(data, dict) and data.get("format") == 1 and data.get("dir") == str(self.real)
                   and isinstance(data.get("work"), str) and isinstance(data.get("carry"), list)
                   and isinstance(data.get("ident"), list) and len(data["ident"]) == 2
-                  and data.get("mode") in ("service-active", "service-stopped", "pidfile", "none")
+                  and data.get("mode") in MODES
                   and all(isinstance(n, str) and n and os.sep not in n and n not in (".", "..") for n in data["carry"])
                   and isinstance(data.get("files"), dict) and isinstance(data.get("pip_freeze"), (str, type(None))))
             work = Path(data["work"]) if ok else None
@@ -815,6 +819,8 @@ class Update:
         if j["mode"].startswith("service") or service.installed(host):
             service._ctl(host, "stop", service.UNIT)
             service._ctl(host, "reset-failed", service.UNIT)
+        if j["mode"] == "kiln-active":
+            service._ctl(host, "stop", service.KILN_UNIT)
         pid = self.pid()
         if pid is not None and host.runner.alive(pid):
             host.runner.terminate(pid)
@@ -848,20 +854,26 @@ class Update:
         mode = j["mode"]
         if mode == "service-active":
             return service.start(self.host, s, restart=True) == 0
+        if mode == "kiln-active":
+            return service.start_kiln(self.host, s, restart=True) == 0
         if mode == "pidfile":
             return self.run_new("start", echo=True).rc == 0
         return True
 
     # quiesce, swap, start, commit -------------------------------------------------------------------------------
     def detect_mode(self):
+        """kiln-active: Kiln's unit runs the engine (crucible-server.service, when installed, stays as it is: disabled).
+        Then the Crucible service, then a ./crucible start server. kiln-stopped: only the Kiln unit exists."""
         host = self.host
+        if service.active(host, service.KILN_UNIT):
+            return "kiln-active"
         if service.installed(host):
             res = service._ctl(host, "is-active", service.UNIT)
             return "service-active" if res.rc == 0 and res.out.strip().splitlines()[-1:] == ["active"] else "service-stopped"
         pid = self.pid()
         if pid is not None and host.runner.alive(pid):
             return "pidfile"
-        return "none"
+        return "kiln-stopped" if service.installed(host, service.KILN_UNIT) else "none"
 
     def snapshot_files(self):
         out = {}
@@ -903,7 +915,12 @@ class Update:
                         self.box.unlink(self.journal_path, missing_ok=True)
                         raise CheckFailed("pip could not install the new requirements: " + res.out[-200:].strip()
                                           + (f" The old packages could not be put back either: {back}" if back else ""))
-                if mode in ("service-active", "pidfile"):
+                if mode == "kiln-active":
+                    say(f"Stopping {service.KILN_UNIT} (Kiln runs this engine). The update starts it again.")
+                    if service._ctl(host, "stop", service.KILN_UNIT).rc != 0:
+                        self.box.unlink(self.journal_path, missing_ok=True)
+                        raise CheckFailed(f"{service.KILN_UNIT} did not stop. Look at: systemctl --user status {service.KILN_UNIT}")
+                elif mode in ("service-active", "pidfile"):
                     code = (service.stop(host, self.s) if mode == "service-active" else steps.stop_pidfile(host, self.s))
                     if code != 0:
                         self.box.unlink(self.journal_path, missing_ok=True)
@@ -946,7 +963,11 @@ class Update:
         """Refresh the unit with the new code, start the server and prove it. Returns "" or the sentence that says what failed."""
         host = self.host
         self.s = settings_mod.build(self.real, host)
-        if mode.startswith("service"):
+        base = self.s.base_url
+        if mode.startswith("service") and service.installed(host, service.KILN_UNIT):
+            # service install refuses next to Kiln's unit; the unit file names only paths that the swap keeps.
+            self.say(f"The unit {service.UNIT} stays as it was ({service.KILN_UNIT} exists).")
+        elif mode.startswith("service"):
             res = self.run_new("service", "install", "--no-start")
             if res.rc != 0:
                 return "The new release could not write its service unit (service install failed): " + res.out[-200:].strip()
@@ -954,12 +975,16 @@ class Update:
         if mode == "service-active":
             if service.start(host, self.s, restart=True) != 0:
                 return f"The service did not start with {target}, or /health did not answer 200."
+        elif mode == "kiln-active":
+            if service.start_kiln(host, self.s, restart=True) != 0:
+                return f"{service.KILN_UNIT} did not start with {target}, or /health did not answer 200."
+            base = service.kiln_base_url(host, self.s)
         elif mode == "pidfile":
             if self.run_new("start", echo=True).rc != 0:
                 return f"The server did not start with {target}."
         else:
             return ""
-        res = host.http.chat_stream(f"{self.s.base_url}/v1/chat/completions", dict(SMOKE), key_file=self.s.api_key_file)
+        res = host.http.chat_stream(f"{base}/v1/chat/completions", dict(SMOKE), key_file=self.s.api_key_file)
         if not res.get("ok"):
             return f"The test request got no token with {target}: {res.get('error', '')}"
         return ""
@@ -971,11 +996,29 @@ class Update:
         mode = j["mode"]
         self.say(f"Updated Crucible {j['from']} to {target}.")
         self.say(f"If your shell was inside {self.real}, it still sits in the old folder. Run: cd {self.real}")
-        if mode in ("service-active", "pidfile"):
+        if mode == "kiln-active":
+            self.say(f"The engine in {service.KILN_UNIT} (Kiln) runs the new release and answered a test request.")
+        elif mode == "kiln-stopped":
+            self.say(f"{service.KILN_UNIT} (Kiln) was not running, so it was not started. Start it with: kiln switch crucible")
+        elif mode in ("service-active", "pidfile"):
             self.say("The server runs the new release and answered a test request.")
         else:
             self.say("The server was not running, so it was not started. Start it with: ./crucible start")
         return EXIT_OK
+
+
+def in_timer_unit(host):
+    """True when the update timer's unit runs this process: the last part of a cgroup path in /proc/self/cgroup is exactly
+    TIMER_UNIT. A timer from the old template runs `update --yes` with no --unattended. When the file cannot be read or
+    holds no cgroup path, the answer is True too: a skipped update costs less than a wrong restart of the Kiln unit."""
+    try:
+        text = (Path(host.proc) / "self/cgroup").read_text()
+    except (OSError, UnicodeDecodeError):
+        return True
+    paths = [line.split(":", 2)[2] for line in text.splitlines() if line.count(":") >= 2]
+    if not any(p.startswith("/") for p in paths):
+        return True
+    return any(p.split("/")[-1] == TIMER_UNIT for p in paths)
 
 
 def rel_path(root, rel):
@@ -1148,8 +1191,9 @@ def _uninstall(host, real, home, args, ask, box):
     removed_outside = []
     if remove_models:
         for p in removable:
-            if p == state and not _within(p, home):
-                say(f"Not removed: {p} is not inside your home folder. Remove it yourself if you want.")
+            if p == state:
+                if _drop_state(home, real, state, say):
+                    removed_outside.append(p)
                 continue
             _drop(box, p, say)
             removed_outside.append(p)
@@ -1173,6 +1217,27 @@ def _uninstall(host, real, home, args, ask, box):
         say(f"Removed {p}.")
     say("The systemd linger setting stays on. To turn it off: loginctl disable-linger")
     return EXIT_OK
+
+
+def _drop_state(home, repo, state, say):
+    """Remove the state folder that setup made (inside or outside the home folder): only the names that the engine writes
+    there, then the empty folder. Never its parent folder. The check runs again first, so a file that came after the plan
+    (or a link, or a parent that other users can now write) keeps the folder. True when the folder is gone."""
+    why = None if settings_mod.state_owned(repo, state) else "setup did not make this folder"
+    why = why or settings_mod.state_dir_problem(home, repo, state, look_inside=True)
+    if why:
+        say(f"Not removed: {state} ({why}). Remove it yourself if you want.")
+        return False
+    try:
+        box = Sandbox([state])
+        for name in sorted(os.listdir(state)):
+            if name == state_root.LEDGER or state_root.IDENTITY.match(name):
+                box.rmtree(Path(state) / name)
+        box.rmdir(state)
+    except (OSError, ValueError, OutsideRoots) as exc:
+        say(f"Not removed: {state} ({exc}). Remove it yourself if you want.")
+        return False
+    return True
 
 
 def _drop(box, path, say):

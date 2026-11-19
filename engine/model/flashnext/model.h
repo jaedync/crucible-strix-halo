@@ -742,10 +742,10 @@ class Loader {
     e.table = reinterpret_cast<uint16_t*>(d);
   }
 
-  // CRUCIBLE_HC_WMMA=2: int8 HC weights (hc_int8.h). Option A (CRUCIBLE_EXACT=1) keeps fp16.
+  // CRUCIBLE_HC_WMMA unset or 2: int8 HC weights (hc_int8.h); 1 and option A (CRUCIBLE_EXACT=1) keep fp16.
   static bool HcInt8() {
     try {
-      return NumericsInt("CRUCIBLE_HC_WMMA", 1, 0, 2) == 2;
+      return NumericsDefaultInt("CRUCIBLE_HC_WMMA", 2, 1, 0, 2) == 2;
     } catch (const std::invalid_argument& error) {
       Die(error.what());
     }

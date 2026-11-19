@@ -58,6 +58,22 @@ On the 4.05 pack, later turns take 1.45 to 1.56 s with replay and 2.1 to 3.9 s w
   The client sends the answer back as text, so the new prompt differs from the saved tail at that token.
   The turn then starts from the previous tail. The server log line `session_replay diverged` gives the
   position (numbers only). A turn whose think block the server closes uses the tokenizer's split for its reasoning.
+- A turn that ends with tool calls: the server prefills the reply as the next request renders it, after the response
+  and while the client runs its tools (`--extend-tool-tails`, default 1 with session replay; `cache_control` `auto`
+  only). The job generates 2 tokens, because the engine keeps no tail for a job of 1 token. When the model writes the
+  template's next-message start, the next request that sends the reply back unchanged resumes 1 row after the end
+  of the reply. Else it resumes from the job's slot point 64 rows before the reply end, or from a host point on the
+  4,096-row grid. It waits for that prefill when it is still running (at most 120 s). A stream gets no byte during
+  the wait: its headers go out when the server accepts it after the wait, so a refusal keeps its HTTP status (503,
+  400). The server sees a client that leaves during the wait. The prompt stays the template's render of the
+  request. With the switch on, integral numbers up to 2**53 in the returned tool-call arguments have no fraction
+  (`1`, not `1.0`), so a JavaScript client sends back the same values.
+- Limit of the tool-call extension: the prompt tokens do not change,
+  but the point where the next turn resumes now depends on load and timing. A full queue refuses the extension, the
+  wait can end after 120 s, and another session can take the extension's slot. A resume at a point off the core
+  grid (2,048 rows) is not always bitwise equal to a cold prefill (docs/ARCHITECTURE.md, contract A). So with
+  other sessions active, the same session history can give other tokens after a tool-call turn. Use
+  `--extend-tool-tails 0` for that reproduction.
 
 ## How to turn it off
 

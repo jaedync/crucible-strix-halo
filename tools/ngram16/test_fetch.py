@@ -350,3 +350,54 @@ def test_missing_huggingface_hub_gives_an_install_hint(monkeypatch):
     with pytest.raises(SystemExit) as e:
         fetch.hub_download("o/r", "rev", ["a"], "/nonexistent")
     assert e.value.code == 2
+
+
+# setup-extras item 1: the sha256 of each source file is checked against the pinned list before the build.
+def pins_of(repo, index):
+    return {n: hashlib.sha256((repo / n).read_bytes()).hexdigest() for n in fetch.pick_files(index)}
+
+
+def test_pinned_list_covers_the_real_files_of_the_revision():
+    pins = fetch.load_pins()
+    assert len(pins) == 33
+    assert sorted(pins) == [f"model-{i:05d}-of-00131.safetensors" for i in range(5, 38)]
+    assert all(len(h) == 64 and int(h, 16) >= 0 for h in pins.values())
+
+
+def test_source_with_a_wrong_sha256_is_removed_and_nothing_is_built(remote, tmp_path, capsys):
+    repo, _, index, tree = remote
+    fake = Fake(repo, index, tree)
+    pins = pins_of(repo, index)
+    bad = sorted(pins)[1]
+    pins[bad] = "0" * 64
+    rc, out = run(fake, tmp_path, source_sha=pins)
+    captured = capsys.readouterr()
+    assert rc == 3
+    assert bad in captured.err and "sha256" in captured.err
+    assert not (out / "src" / bad).exists()          # a run again downloads it again
+    assert not (out / fetch.OUT_NAME).exists()
+    assert not (out / (fetch.OUT_NAME + ".part")).exists()
+
+
+def test_sources_with_the_pinned_sha256_build_and_are_hashed_once(remote, tmp_path, capsys, monkeypatch):
+    repo, _, index, tree = remote
+    fake = Fake(repo, index, tree)
+    expected = learn(fake, tmp_path)
+    pins = pins_of(repo, index)
+    rc, out = run(fake, tmp_path, expected=expected, source_sha=pins)
+    assert rc == 0, capsys.readouterr().err
+    assert "sha256 ok" in capsys.readouterr().out
+    hashed = []
+    real = fetch.file_sha256
+    monkeypatch.setattr(fetch, "file_sha256", lambda p: hashed.append(p) or real(p))
+    assert fetch.check_sources(str(out / "src"), sorted(pins), pins) == []
+    assert hashed == []   # the record of the first check is used
+
+
+def test_a_planned_file_with_no_pin_is_refused(remote, tmp_path, capsys):
+    repo, _, index, tree = remote
+    pins = pins_of(repo, index)
+    pins.pop(sorted(pins)[0])
+    rc, out = run(Fake(repo, index, tree), tmp_path, source_sha=pins)
+    assert rc == 2
+    assert "pinned" in capsys.readouterr().err

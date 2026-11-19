@@ -114,6 +114,32 @@ def test_fact_stubs_of_the_split_build_are_not_functions():
     assert isa_diff.parse_disassembly(alone, STUB_SYMS) == {}
 
 
+def listing_lit(base, literal):
+    """listing() as the ROCm 10.1 llvm-objdump (clang 24) writes it: a 32-bit literal operand prints as lit(...)."""
+    hi = (literal >> 32) & 0xFFFFFFFF
+    return f"""
+{base:016x} <_ZN8crucible3FooILi4EEEvPf>:
+\ts_getpc_b64 s[2:3]                                         // {base:012X}: BE824700
+\ts_add_u32 s2, s2, {literal & 0xFFFFFFFF:#x}                // {base + 4:012X}: 8002FF02 {literal & 0xFFFFFFFF:08X}
+\ts_addc_u32 s3, s3, lit({hi:#x})                            // {base + 12:012X}: 8203FF03 {hi:08X}
+\ts_endpgm                                                   // {base + 20:012X}: BFB00000
+"""
+
+
+def test_pcrel_literal_in_the_clang24_lit_form_is_masked():
+    # a backward target: the high word is 0xffffffff, which clang 24 prints as lit(0xffffffff)
+    syms = isa_diff.symbol_table("""
+Symbol table '.symtab' contains 2 entries:
+   Num:    Value          Size Type    Bind   Vis       Ndx Name
+     0: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   UND
+     1: 0000000000000080    64 FUNC    LOCAL  DEFAULT     4 helper
+""")
+    a = isa_diff.parse_disassembly(listing_lit(0x100, (0x80 - 0x104) % 2**64), syms)
+    b = isa_diff.parse_disassembly(listing_lit(0x300, (0x80 - 0x304) % 2**64), syms)
+    assert a == b
+    assert "<pcrel hi> ; helper+0x0" in a["_ZN8crucible3FooILi4EEEvPf"]
+
+
 def _tool(folder):
     folder.mkdir(parents=True)
     (folder / "llvm-objdump").write_text("")

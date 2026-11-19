@@ -52,8 +52,24 @@ int main() {
     }
   }
 
-  // A width that the decode kernels cannot read keeps the engine order.
-  assert((FrontGroupSplits({{kIn, kKv, 7}, {kIn, kKv, 6}}) == std::vector<int>{0, 0}));
+  // K7 and K8 (the h6_ng8 packs: 4.18 dense K8) load in front order too: the wide ring
+  // (LinRingFlowKernel<Front, 8>), LinPolicyKernel<R, 8, true> and the front walk of the wide prefill GEMM
+  // read it. The split is the decode split, as for K6.
+  for (const int k : {7, 8}) {
+    const std::vector<std::vector<DenseMatrix>> wide = {
+        QsaIn(k, k), {{kWideIn, kIn, k}}, {{kIn, kGdnQkv, k}, {kIn, kGdnZ, k}}, {{kGdnZ, kIn, k}}};
+    for (const auto& group : wide) assert(FrontGroupSplits(group) == DecodeSplits(Io(group)));
+  }
+  const std::vector<DenseMatrix> mixed = {{kIn, kKv, 7}, {kIn, kKv, 6}};
+  assert(FrontGroupSplits(mixed) == DecodeSplits(Io(mixed)) && FrontGroupSplits(mixed)[0] > 0);
+  // A width that no decode kernel reads keeps the engine order.
+  assert((FrontGroupSplits({{kIn, kKv, 9}, {kIn, kKv, 6}}) == std::vector<int>{0, 0}));
+  assert((FrontGroupSplits({{kIn, kKv, 1}}) == std::vector<int>{0}));
+  // 4.18 pack headers: GDN qkv and z, the outputs, QSA input at K8 (16 K = 128) fit the front order.
+  assert(FrontLoadSplits({{160, 640, 128}, {160, 384, 128}}).bad == -1);
+  assert(FrontLoadSplits({{384, 160, 128}}).bad == -1);
+  assert((FrontLoadSplits({{160, 768, 128}, {160, 32, 128}, {160, 32, 128}, {160, 40, 128}}).splits ==
+          std::vector<int>{2, 2, 2, 2}));
 
   // Loader::FrontSplits: the trellis shapes of the pack headers (row tiles,
   // column tiles, 16 K), 4.05 and 3.05 QSA input.

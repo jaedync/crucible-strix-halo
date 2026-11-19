@@ -61,6 +61,12 @@ inline bool NumericsDefaultOn(SwitchName name) {
   return !(v && std::string(v) == "0");
 }
 
+// A landed option-B integer default: `fallback` when unset, the set value in range otherwise, and `exact` (the
+// baseline's value) in option A without a read of the switch.
+inline int NumericsDefaultInt(SwitchName name, int fallback, int exact, int low, int high) {
+  return NumericsExact() ? exact : RowPolicyInt(name, fallback, low, high);
+}
+
 inline const char* NumericsModeText() {
   return NumericsExact() ? "A (CRUCIBLE_EXACT=1: numerics switches ignored, bitwise to the baseline)"
                          : "B (numerics switches and approved non-bitwise defaults apply)";

@@ -99,7 +99,7 @@ __global__ void __launch_bounds__(256) PrefillLinInHalfJobsKernel(const LinJob* 
     float v[4];
 #pragma unroll
     for (int i=0;i<4;++i) v[i]=RoundH(s[i]*__half2float(j.suh[c+i]));
-    Wht128(v);
+    Wht128Dpp(v);  // Wht128's bits; whole waves only (the w test is per wave)
     __half* dst=j.xh+PackedIndex(r,c,j.R);
 #pragma unroll
     for (int i=0;i<4;++i) dst[i]=__float2half(v[i]*kHadNorm);
@@ -477,19 +477,24 @@ inline void LaunchPrefillGemmOut(int rm, const LinJob* lin, const Exl3GemmJob* j
   else go(std::integral_constant<int,2>{});
 }
 
-// A group of one wide width kw (7 or 8), engine tile order, RM 2, 4 or 8 (as K6).
+// A group of one wide width kw (7 or 8), engine or front tile order, RM 2, 4 or 8 (as K6).
 template <class... EPI>
-inline void LaunchPrefillGemmOutWide(int kw, int rm, const LinJob* lin, const Exl3GemmJob* jobs,
+inline void LaunchPrefillGemmOutWide(int kw, int rm, bool front, const LinJob* lin, const Exl3GemmJob* jobs,
                                      const Exl3GemmItem* items, int count, const EPI&... epi) {
-  auto go = [&](auto kc) {
+  auto go = [&](auto kc, auto fc) {
     constexpr int KW = decltype(kc)::value;
-    if (rm == 8) PrefillGemmOutWideKernel<8, 2, true, KW, false, EPI...><<<count, 32 * kFusedWaves / 2>>>(lin, jobs, items, count, epi...);
-    else if (rm == 4) PrefillGemmOutWideKernel<4, 2, true, KW, false, EPI...><<<count, 32 * kFusedWaves / 2>>>(lin, jobs, items, count, epi...);
-    else if (rm == 2) PrefillGemmOutWideKernel<2, 2, true, KW, false, EPI...><<<count, 32 * kFusedWaves / 2>>>(lin, jobs, items, count, epi...);
+    constexpr bool F = decltype(fc)::value;
+    if (rm == 8) PrefillGemmOutWideKernel<8, 2, true, KW, F, EPI...><<<count, 32 * kFusedWaves / 2>>>(lin, jobs, items, count, epi...);
+    else if (rm == 4) PrefillGemmOutWideKernel<4, 2, true, KW, F, EPI...><<<count, 32 * kFusedWaves / 2>>>(lin, jobs, items, count, epi...);
+    else if (rm == 2) PrefillGemmOutWideKernel<2, 2, true, KW, F, EPI...><<<count, 32 * kFusedWaves / 2>>>(lin, jobs, items, count, epi...);
     else { std::fprintf(stderr, "K%d fused output GEMM supports RM 2, 4 and 8\n", KW); std::abort(); }
   };
-  if (kw == 7) go(std::integral_constant<int, 7>{});
-  else if (kw == 8) go(std::integral_constant<int, 8>{});
+  auto order = [&](auto kc) {
+    if (front) go(kc, std::true_type{});
+    else go(kc, std::false_type{});
+  };
+  if (kw == 7) order(std::integral_constant<int, 7>{});
+  else if (kw == 8) order(std::integral_constant<int, 8>{});
   else { std::fprintf(stderr, "internal error: wide prefill GEMM with K%d\n", kw); std::abort(); }
 }
 
@@ -611,7 +616,7 @@ struct PrefillLinear {
         std::fprintf(stderr,"prefill linear group mixes front and engine tile orders\n"); std::exit(2);
       }
       front = fs > 0;
-      if (front && (!fused || wide || !FrontFitsShape(job.I/16,job.O/16,fs))) {
+      if (front && (!fused || !FrontFitsShape(job.I/16,job.O/16,fs))) {
         std::fprintf(stderr,"front tile order needs the fused packed prefill GEMM\n"); std::exit(2);
       }
       gj.push_back({job.tiles,repack ? repack : job.xh,job.partial,nullptr,job.I,job.O,job.R,1,job.K,job.R,fs});
@@ -703,7 +708,7 @@ struct PrefillLinear {
         }
         HalfGemmOutKernel<kHalfKC, EPI...><<<hcount, 128>>>(linear, hjobs, hitems, hcount, epi...);
       } else if (wide) {
-        LaunchPrefillGemmOutWide(wide,shape.rm,linear,gemm,items,count,epi...);
+        LaunchPrefillGemmOutWide(wide,shape.rm,front,linear,gemm,items,count,epi...);
       } else if (split) {
         LaunchPrefillGemmOut(shape.rm,linear,gemm,items,count6,true,front,epi...);
         LaunchPrefillGemmOut(shape.rm,linear,gemm,items+count6,count-count6,false,front,epi...);

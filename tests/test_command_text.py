@@ -30,3 +30,10 @@ def test_main_output_names_install_path(tmp_path):
 
 def test_help_names_install_path(tmp_path):
     assert command_text(tmp_path, 'stop') in cli.parser(repo=tmp_path).format_help()
+
+
+def test_json_output_keeps_its_layout(tmp_path):
+    # doctor --json and service status --json print indented JSON; the launcher path must not fold it into one line.
+    text = json.dumps({'checks': [{'fix': 'Run ./crucible setup'}], 'ok': False}, indent=2)
+    out = output_text(tmp_path, text)
+    assert out == text.replace('./crucible', command_text(tmp_path))

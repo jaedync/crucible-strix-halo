@@ -4,6 +4,8 @@
   release_engine.py needs   --binary ENGINE [--rocm-path DIR] [--libdir DIR]... [--allow-incomplete] [--json]
   release_engine.py release --binary ENGINE --tag vX.Y.Z --commit SHA --out NEWDIR [--rocm-path DIR] [--libdir DIR]...
   release_engine.py stamp begin|end --binary ENGINE [--repo DIR]
+  release_engine.py defaults
+  release_engine.py lib-settings --out FILE --cxx=CXX --xgr-defines=DEFINES --xgr-includes=INCLUDES
 
 `needs` walks the library list of the engine (readelf, no program is run). It prints two lists of libraries that are
 not part of ROCm and not part of the base system (libc, libm, libstdc++, libgcc_s):
@@ -21,6 +23,10 @@ It also prints the lowest glibc and libstdc++ version that the engine needs.
 `stamp` is the build-info of an engine build (the Makefile runs it before and after the compile). `begin` removes the
 old ENGINE.build-info and notes the commit and whether the tree has local changes. `end` writes ENGINE.build-info: the
 commit, dirty 0 or 1 (1 also when the commit or the tree changed during the compile), and the sha256 of ENGINE.
+`defaults` prints the default compile settings as build-info lines (`NAME VALUE`), for a tool that writes a build-info itself.
+`lib-settings` writes the settings of the static constraint library (the compiler, its path and version, XGR_DEFINES, XGR_INCLUDES)
+to FILE, and leaves FILE as it is when the text is the same. The library objects depend on FILE (Makefile CONSTRAINT_SETTINGS), so
+a build with another compiler or other settings compiles them again, and the engine build-info names the settings of its library.
 `release` refuses an engine with no build-info, with another hash, with another commit than --commit, or built from a
 dirty tree. So an old binary that a killed compiler left in place cannot be shipped.
 It refuses to run when TAG is not the version in VERSION and the PIN_TAG in install.sh, so a release cannot ship
@@ -51,17 +57,27 @@ ROCM_NAME = re.compile(r"^lib(amdhip|amd_comgr|hsa-runtime|hsakmt|hip|roc|rccl|m
 SYSTEM_DIRS = ("/usr/lib", "/usr/lib64", "/lib64", "/lib", "/usr/lib/x86_64-linux-gnu", "/lib/x86_64-linux-gnu")
 TAG_RE = re.compile(r"^v\d+\.\d+\.\d+$")
 # The compile settings of the release engine: the defaults of the Makefile. `make HIPFLAGS=... build/engine/crucible` writes
-# the settings that it used to the build-info, and `release` refuses an engine that was built with other ones.
-DEFAULT_FLAGS = {"gpu_arch": "gfx1151", "hipflags": "-O3", "cppflags": "", "ldflags": "", "ldlibs": "-pthread", "rocm_path": "/opt/rocm",
+# the settings that it used to the build-info, and `release` refuses an engine that was built with other ones. LDLIBS is the
+# value of the engine target: the Makefile adds CONSTRAINT_LDLIBS (the static structured-output library) to it.
+# tests/test_release_engine_defaults.py runs the stamp line of the real engine recipe (make -n) against these values.
+# CXX, XGR_DEFINES and XGR_INCLUDES build the static constraint library that links into the engine (Makefile XGR_DEFINES).
+ENGINE_LDLIBS = "-pthread -Wl,-Lbuild/third_party/,-lcrucible_constraint"
+XGR_DEFINES = "-DXGRAMMAR_ENABLE_CPPTRACE=0 -DXGRAMMAR_LOG_CUSTOMIZE=1"
+XGR_INCLUDES = ("-Ithird_party/xgrammar/include -isystem third_party/xgrammar/3rdparty/picojson "
+                "-isystem third_party/xgrammar/3rdparty/dlpack/include")
+DEFAULT_FLAGS = {"gpu_arch": "gfx1151", "hipflags": "-O3", "cppflags": "", "ldflags": "", "ldlibs": ENGINE_LDLIBS, "rocm_path": "/opt/rocm",
                  "hipcc_compile_flags_append": "", "hipcc_link_flags_append": "",
-                 "hip_clang_path": "", "hip_device_lib_path": ""}
+                 "hip_clang_path": "", "hip_device_lib_path": "",
+                 "cxx": "g++", "xgr_defines": XGR_DEFINES, "xgr_includes": XGR_INCLUDES}
 FLAG_NAMES = {"gpu_arch": "GPU_ARCH", "hipflags": "HIPFLAGS", "cppflags": "CPPFLAGS", "ldflags": "LDFLAGS", "ldlibs": "LDLIBS", "rocm_path": "ROCM_PATH",
               "hipcc_compile_flags_append": "HIPCC_COMPILE_FLAGS_APPEND", "hipcc_link_flags_append": "HIPCC_LINK_FLAGS_APPEND",
-              "hip_clang_path": "HIP_CLANG_PATH", "hip_device_lib_path": "HIP_DEVICE_LIB_PATH"}
+              "hip_clang_path": "HIP_CLANG_PATH", "hip_device_lib_path": "HIP_DEVICE_LIB_PATH",
+              "cxx": "CXX", "xgr_defines": "XGR_DEFINES", "xgr_includes": "XGR_INCLUDES"}
 # The settings that the Makefile passes to `stamp end`. The other ones are environment variables that hipcc reads (they change
 # the code or the compiler without a word on the make line), so `stamp end` reads them from its own environment, which is the one
 # of the compile step.
-MAKE_FLAGS = ("gpu_arch", "hipflags", "cppflags", "ldflags", "ldlibs", "rocm_path")
+MAKE_FLAGS = ("gpu_arch", "hipflags", "cppflags", "ldflags", "ldlibs", "rocm_path", "cxx", "xgr_defines", "xgr_includes")
+LIB_FLAGS = ("cxx", "xgr_defines", "xgr_includes")
 
 
 class Refusal(Exception):
@@ -215,14 +231,40 @@ def _words(text):
     return " ".join((text or "").split())
 
 
-def hipcc_version(command):
-    """The first line of `hipcc --version`, or "unknown" when it cannot run. COMMAND is the HIPCC word of the Makefile."""
+def compiler_version(command):
+    """The first line of `COMMAND --version`, or "unknown" when it cannot run. COMMAND is the HIPCC (or CXX) word of the Makefile."""
     try:
         run = subprocess.run([*shlex.split(command), "--version"], capture_output=True, text=True, timeout=60)
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return "unknown"
     lines = [line.strip() for line in (run.stdout + run.stderr).splitlines() if line.strip()]
     return _words(lines[0]) if run.returncode == 0 and lines else "unknown"
+
+
+def host_compiler(cxx):
+    """Information lines (not checked) on the host compiler of the constraint library: the file that CXX runs, and its version."""
+    try:
+        path = shutil.which(shlex.split(cxx)[0]) if cxx.strip() else None
+    except ValueError:
+        path = None
+    return {"cxx_path": path or "unknown", "cxx_version": compiler_version(cxx) if cxx.strip() else "unknown"}
+
+
+def lib_settings_text(cxx, xgr_defines, xgr_includes):
+    """The settings of the static constraint library as build-info lines (the Makefile CONSTRAINT_SETTINGS file)."""
+    values = {"cxx": cxx, "xgr_defines": xgr_defines, "xgr_includes": xgr_includes, **host_compiler(cxx)}
+    return "".join(f"{name} {_words(value)}\n" for name, value in values.items())
+
+
+def cmd_lib_settings(args):
+    text = lib_settings_text(args.cxx, args.xgr_defines, args.xgr_includes)
+    if args.out.is_file() and args.out.read_text() == text:
+        return 0  # the same settings: the old mtime stays, so make compiles nothing
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = args.out.with_name(args.out.name + ".tmp")
+    tmp.write_text(text)
+    tmp.replace(args.out)
+    return 0
 
 
 def cmd_stamp(args):
@@ -243,7 +285,8 @@ def cmd_stamp(args):
     if args.hipcc is not None:  # the Makefile passes the compile settings and the compiler
         value = lambda name: getattr(args, name) if name in MAKE_FLAGS else os.environ.get(FLAG_NAMES[name], "")  # noqa: E731
         text += "".join(f"{name} {_words(value(name))}\n" for name in DEFAULT_FLAGS)
-        text += f"hipcc_version {hipcc_version(args.hipcc)}\n"
+        text += f"hipcc_version {compiler_version(args.hipcc)}\n"
+        text += "".join(f"{name} {value}\n" for name, value in host_compiler(args.cxx).items())
     _info_path(args.binary).write_text(text)
     pending.unlink()
     return 0
@@ -359,13 +402,24 @@ def parser():
     st.add_argument("--hipcc", help="phase end: the compiler command; with it the build-info also names the settings below")
     for name in MAKE_FLAGS:
         st.add_argument("--" + name.replace("_", "-"), default="", help=f"phase end: the value of {FLAG_NAMES[name]} (write --{name.replace('_', '-')}=VALUE)")
+    sub.add_parser("defaults", help="print the default compile settings as build-info lines")
+    ls = sub.add_parser("lib-settings", help="write the settings file of the static constraint library (the Makefile calls this)")
+    ls.add_argument("--out", required=True, type=Path)
+    for name in LIB_FLAGS:
+        ls.add_argument("--" + name.replace("_", "-"), default="", help=f"the value of {FLAG_NAMES[name]} (write --{name.replace('_', '-')}=VALUE)")
     return ap
+
+
+def cmd_defaults(args):
+    sys.stdout.write("".join(f"{name} {value}\n" for name, value in DEFAULT_FLAGS.items()))
+    return 0
 
 
 def main(argv=None):
     args = parser().parse_args(argv)
     try:
-        return {"needs": cmd_needs, "release": cmd_release, "stamp": cmd_stamp}[args.cmd](args)
+        return {"needs": cmd_needs, "release": cmd_release, "stamp": cmd_stamp, "defaults": cmd_defaults,
+                "lib-settings": cmd_lib_settings}[args.cmd](args)
     except Refusal as exc:
         print(f"release_engine: {exc}", file=sys.stderr)
         return 2

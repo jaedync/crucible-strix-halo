@@ -62,7 +62,9 @@ ALLOWED = {
     'engine/engine.hip': {'scale': 6},
     # +1 wht (gdn-pipe): GdnGateRow, the gate inside the fused GDN scan, calls Wht128Dpp itself; through
     # LinInLane the fused kernel is 85 us per 2,048-row part slower.
-    'engine/layers/kernels/prefill_gdn.h': {'wht': 4, 'scale': 3},
+    # +1 wht (k101-spill 285319f1): GdnGateRow calls Wht128DppLane on clang 23 and later (ROCm 10.1: no spill) and
+    # Wht128Dpp on 7.2.4 (its instructions of before); one transform, two compiler branches.
+    'engine/layers/kernels/prefill_gdn.h': {'wht': 5, 'scale': 3},
     'engine/layers/kernels/prefill_qsa.h': {'wht': 1, 'scale': 1},
     # +1 wht, +1 scale (qsa-attn): QsaUnionStageKernel copies QsaUnionHalfQKernel's fused gate epilogue, element
     # by element, so the two kernels keep the same bits.

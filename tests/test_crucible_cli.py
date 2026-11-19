@@ -27,6 +27,10 @@ class Base(unittest.TestCase):
     def settings(self, host, **kw):
         return settings_mod.build(self.repo, host, **kw)
 
+    def fresh_repo(self, name):
+        (self.t / name).mkdir(parents=True, exist_ok=True)
+        return make_repo(self.t / name)
+
     def checks(self, **machine):
         host = wire(self.t, **machine)
         results = doctor.run_checks(host, self.settings(host))
@@ -94,13 +98,20 @@ class DoctorTest(Base):
             self.assertIn(word, r.fix)
         self.assertEqual(r.blocks, ("start",))
 
-    def test_gpu_memory_in_use_by_another_program_warns(self):
+    def test_gpu_memory_in_use_by_another_program_fails(self):
+        # Stage 1 keeps the levels (fail, blocks the start); the fix names the holders and the advice (memfit).
         r = self.checks(gtt_used=90_000_000_000)["gpu-free"]
-        self.assertEqual(r.status, "warn")
+        self.assertEqual(r.status, "fail")
+        self.assertEqual(r.blocks, ("start",))
+        self.assertIn("another program", r.fix)
         self.assertIn("Crucible does not stop other programs.", r.fix)
+        self.assertIn("Programs that hold the most memory", r.fix)
 
-    def test_low_total_memory_warns(self):
-        self.assertEqual(self.checks(mem_total_kb=32_000_000)["memory"].status, "warn")
+    def test_low_total_memory_fails(self):
+        r = self.checks(mem_total_kb=32_000_000)["memory"]
+        self.assertEqual(r.status, "fail")
+        self.assertEqual(r.blocks, ("start",))
+        self.assertIn("3.05 pack", r.fix)
 
     def test_missing_build_tools_fail_one_by_one(self):
         res = self.checks(tools=("git",))
@@ -124,17 +135,32 @@ class DoctorTest(Base):
         r305 = {x.id: x for x in doctor.run_checks(host, self.settings(host, pack="3.05"))}["disk-models"]
         self.assertEqual((r405.status, r305.status), ("fail", "pass"))
 
+    def test_4_18_needs_more_disk_than_4_05(self):
+        host = wire(self.t, free=115_000_000_000)
+        r405 = {x.id: x for x in doctor.run_checks(host, self.settings(host, pack="4.05"))}["disk-models"]
+        r418 = {x.id: x for x in doctor.run_checks(host, self.settings(host, pack="4.18"))}["disk-models"]
+        self.assertEqual((r405.status, r418.status), ("pass", "fail"))
+        self.assertIn("4.18", r418.detail)
+
     def test_busy_port_fails(self):
         r = self.checks(busy_ports=(8790,))["port"]
         self.assertEqual(r.status, "fail")
         self.assertIn("--port", r.fix)
 
-    def test_state_dir_outside_home_fails(self):
+    def test_state_dir_outside_home_passes_when_only_the_user_can_change_it(self):
+        # The state folder may be on another disk. The engine rule needs no HOME.
         host = wire(self.t)
-        s = self.settings(host, state_dir=Path("/var/tmp/crucible-states"))
+        (self.t / "fast").mkdir()
+        s = self.settings(host, state_dir=self.t / "fast" / "states")
+        r = {x.id: x for x in doctor.run_checks(host, s)}["state-dir"]
+        self.assertEqual(r.status, "pass", r.detail)
+
+    def test_state_dir_in_a_system_folder_fails(self):
+        host = wire(self.t)
+        s = self.settings(host, state_dir=Path("/usr/crucible-states"))
         r = {x.id: x for x in doctor.run_checks(host, s)}["state-dir"]
         self.assertEqual(r.status, "fail")
-        self.assertIn("home", r.detail)
+        self.assertIn("system folder", r.detail)
 
     def test_pack_not_downloaded_is_a_skip_and_incomplete_pack_is_a_failure(self):
         host = wire(self.t)
@@ -183,6 +209,18 @@ class DoctorTest(Base):
         cli.main(["doctor"], host=host, repo=self.repo)
         for argv in host.runner.calls:
             self.assertNotIn(Path(argv[0]).name, files.FORBIDDEN_COMMANDS)
+
+
+class KeyedPrompt(FakePrompt):
+    """Answers by a word of the question; every other question gets its default."""
+
+    def __init__(self, keyed):
+        super().__init__()
+        self.keyed = keyed
+
+    def __call__(self, question, default=""):
+        self.asked.append(question)
+        return next((a for k, a in self.keyed.items() if k in question), default)
 
 
 class SetupTest(Base):
@@ -245,16 +283,58 @@ class SetupTest(Base):
         self.assertEqual(hf[hf.index("--revision") + 1], "3.05bpw_h5_ng5")
         self.assertEqual(hf[2], "turboderp/Qwen3.8-Flash-Next-exl3")
 
+    def test_pack_4_18_downloads_its_own_revision_with_the_daily_launch(self):
+        # The 4.18 pack is a supported pack, with the same checks as 4.05 and 3.05.
+        code, host, out = self.setup(["--yes", "--pack", "4.18"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("about 122 GB", out)
+        hf = [c for c in host.runner.calls if Path(c[0]).name == "hf"][0]
+        self.assertEqual(hf[hf.index("--revision") + 1], "4.18bpw_h6_ng8")
+        self.assertEqual(hf[2], "turboderp/Qwen3.8-Flash-Next-exl3")
+        self.assertEqual(Path(hf[hf.index("--local-dir") + 1]).name, "Qwen3.8-Flash-Next-exl3-4.18bpw_h6_ng8")
+        spawn = host.runner.spawned[0]
+        self.assertIn("Qwen3.8-Flash-Next-exl3-4.18bpw_h6_ng8", " ".join(spawn["argv"]))
+        self.assertEqual(spawn["env"]["CRUCIBLE_PF_LAUNCH_ROWS"], "16384+128")
+        self.assertEqual(spawn["env"]["CRUCIBLE_PLE_HOST"], "1")
+        self.assertIn("--vision", spawn["argv"])   # the 4.18 pack keeps the EXL3 tower in shard 9 (q_proj.trellis), as 3.05 does
+
+    def test_interactive_answer_selects_the_4_18_pack(self):
+        host = wire(self.t, prompt=FakePrompt(["4.18"]))
+        host.is_tty = True
+        code, host, out = self.setup([], host=host)
+        self.assertEqual(code, 0, out)
+        self.assertIn("4.18bpw_h6_ng8", " ".join(host.runner.spawned[0]["argv"]))
+        self.assertTrue(any("4.18" in q and "122 GB" in q for q in host.prompt.asked), host.prompt.asked)
+
     def test_pack_option_rejects_other_values(self):
         with self.assertRaises(SystemExit) as cm:
-            cli.main(["setup", "--yes", "--pack", "4.18"], host=wire(self.t), repo=self.repo)
+            cli.main(["setup", "--yes", "--pack", "6.05"], host=wire(self.t), repo=self.repo)
         self.assertEqual(cm.exception.code, 2)
 
-    def test_state_dir_must_be_inside_the_home_folder(self):
-        code, host, out = self.setup(["--yes", "--state-dir", "/var/tmp/crucible-states"])
+    def test_state_dir_in_a_system_folder_is_refused(self):
+        code, host, out = self.setup(["--yes", "--state-dir", "/usr/crucible-states"])
         self.assertEqual(code, 2)
-        self.assertIn("home", out)
+        self.assertIn("system folder", out)
         self.assertEqual(host.runner.calls, [])
+
+    def test_state_dir_that_other_users_can_swap_is_refused(self):
+        (self.t / "shared").mkdir()
+        os.chmod(self.t / "shared", 0o777)
+        self.addCleanup(os.chmod, self.t / "shared", 0o700)
+        code, host, out = self.setup(["--yes", "--state-dir", str(self.t / "shared/states")])
+        self.assertEqual(code, 2)
+        self.assertIn("other users can write", out)
+        self.assertEqual(host.runner.calls, [])
+        self.assertFalse((self.t / "shared/states").exists())
+
+    def test_state_dir_outside_home_is_made_with_mode_0700(self):
+        # A state folder on another disk.
+        (self.t / "fast").mkdir()
+        sd = self.t / "fast/crucible-states"
+        code, host, out = self.setup(["--yes", "--state-dir", str(sd)])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sd.stat().st_mode & 0o777, 0o700)
+        self.assertIn(str(sd), host.runner.spawned[0]["argv"])
 
     def test_no_state_dir_leaves_out_the_disk_tier(self):
         code, host, out = self.setup(["--yes", "--no-state-dir"])
@@ -282,6 +362,16 @@ class SetupTest(Base):
         self.assertIn(str(self.repo / "requirements-cpu.txt"), sum(pips, []))
         self.assertIn("huggingface_hub", sum(pips, []))
 
+    def test_build_line_names_the_jobs_the_time_and_the_memory_rule(self):
+        for argv, words in (([], ("1 compile job", "about 16 minutes")), (["--jobs", "8"], ("8 compile jobs", "memory"))):
+            with self.subTest(argv=argv):
+                self.repo = self.fresh_repo(f"jobs{len(argv)}")
+                code, host, out = self.setup(["--yes", *argv])
+                self.assertEqual(code, 0, out)
+                for w in words:
+                    self.assertIn(w, out)
+                self.assertIn("Building with", out)   # a test tool finds a source build by this text
+
     def test_make_drift_error_retries_with_split_check_off(self):
         host = wire(self.t)
         host.runner.make_output = "error: argument facts drift\n"
@@ -290,15 +380,6 @@ class SetupTest(Base):
         makes = [c for c in host.runner.calls if Path(c[0]).name == "make"]
         self.assertEqual(len(makes), 2)
         self.assertIn("SPLIT=0", makes[1])
-
-    def test_the_rocm10_stop_names_the_flag_once(self):
-        # Review L2: the stop message and the raise both gave --allow-rocm10.
-        host = wire(self.t, runner=FakeRunner(fail=("make",)))
-        host.runner.make_output = "make: CRUCIBLE-ROCM10-STOP hipcc is a ROCm 10 compiler\n"
-        code, host, out = self.setup(["--yes"], host=host)
-        self.assertEqual(code, 1)
-        self.assertIn("ROCm 10 compiler", out)
-        self.assertEqual(out.count("--allow-rocm10"), 1, out)
 
     def test_other_build_error_stops_with_the_log_path(self):
         host = wire(self.t, runner=FakeRunner(fail=("make",)))
@@ -331,31 +412,100 @@ class SetupTest(Base):
         self.assertFalse([c for c in host.runner.calls if Path(c[0]).name == "hf"])
         self.assertFalse([c for c in host.runner.calls if c[1:3] == ["-m", "venv"]])
 
-    def test_small_gtt_downloads_and_builds_but_does_not_start(self):
+    def test_small_gtt_stops_before_the_download_and_still_builds(self):
+        # item 10: a machine check that the pack does not need runs BEFORE the 107 GB download, and a failure stops it
         code, host, out = self.setup(["--yes"], gtt=60_000_000_000)
         self.assertEqual(code, 1)
         self.assertIn(GTT_LINE, out)
-        self.assertTrue([c for c in host.runner.calls if Path(c[0]).name == "hf"])
+        self.assertFalse([c for c in host.runner.calls if Path(c[0]).name == "hf"], out)
         self.assertTrue([c for c in host.runner.calls if Path(c[0]).name == "make"])
         self.assertEqual(host.runner.spawned, [])
         self.assertIn("never restarts", out)
+        self.assertIn("--download-anyway", out)
 
-    def test_missing_rocm_blocks_the_build_but_not_the_download(self):
+    def test_download_anyway_downloads_on_a_machine_that_fails_a_check(self):
+        code, host, out = self.setup(["--yes", "--download-anyway"], gtt=60_000_000_000)
+        self.assertEqual(code, 1)
+        self.assertTrue([c for c in host.runner.calls if Path(c[0]).name == "hf"], out)
+        self.assertEqual(host.runner.spawned, [])
+
+    def test_missing_rocm_blocks_the_build_and_the_download(self):
         code, host, out = self.setup(["--yes"], rocm=False, hipcc=False)
         self.assertEqual(code, 1)
-        self.assertTrue([c for c in host.runner.calls if Path(c[0]).name == "hf"])
+        self.assertFalse([c for c in host.runner.calls if Path(c[0]).name == "hf"])
         self.assertFalse([c for c in host.runner.calls if Path(c[0]).name == "make"])
         self.assertIn("7.2.4", out)
+
+    def test_each_machine_check_that_cannot_wait_stops_the_download(self):
+        host = wire(self.t)
+        host.runner.gfx = "gfx1100"
+        # memory is not here: since v0.37.3 (rel-0373, "warn about memory pressure") a small memory is a warning, not a stop
+        cases = {"gpu-arch": dict(host=host),
+                 "gpu-access": dict(deny=("dev/kfd",), groups=("users",)), "python": dict(py=(3, 11, 0))}
+        for check, machine in cases.items():
+            with self.subTest(check=check):
+                repo = self.repo
+                self.repo = self.fresh_repo(check)
+                try:
+                    code, h, out = self.setup(["--yes"], **machine)
+                finally:
+                    self.repo = repo
+                self.assertEqual(code, 1, out)
+                self.assertFalse([c for c in h.runner.calls if Path(c[0]).name == "hf"], out)
+                self.assertIn(check, out)
+
+    def test_a_busy_gpu_or_port_does_not_stop_the_download(self):
+        # these pass when the other program stops: the download may go on, the start waits (stage 1 keeps the gpu-free fail)
+        for machine in (dict(gtt_used=90_000_000_000), dict(busy_ports=(8790,))):
+            with self.subTest(machine=machine):
+                repo = self.repo
+                self.repo = self.fresh_repo(next(iter(machine)))
+                try:
+                    code, h, out = self.setup(["--yes"], **machine)
+                finally:
+                    self.repo = repo
+                self.assertTrue([c for c in h.runner.calls if Path(c[0]).name == "hf"], out)
+                self.assertEqual(h.runner.spawned, [], out)
+
+    def test_interactive_run_asks_before_the_download_when_a_check_fails(self):
+        for answer, downloads in (("", False), ("n", False), ("y", True)):
+            with self.subTest(answer=answer):
+                repo = self.repo
+                self.repo = self.fresh_repo(f"ask-{answer or 'enter'}")
+                prompt = KeyedPrompt({"anyway": answer, "Apply this change": "no"})
+                host = wire(self.t, prompt=prompt, gtt=60_000_000_000)
+                host.is_tty = True
+                try:
+                    code, h, out = self.setup(["--service", "no"], host=host)
+                finally:
+                    self.repo = repo
+                self.assertTrue(any("anyway" in q for q in prompt.asked), prompt.asked)
+                self.assertEqual(bool([c for c in h.runner.calls if Path(c[0]).name == "hf"]), downloads, out)
+
+    def test_dry_run_says_that_setup_stops_before_the_download(self):
+        code, host, out = self.setup(["--yes", "--dry-run"], gtt=60_000_000_000)
+        self.assertEqual(code, 0)
+        self.assertIn("stops before the download", out)
+        code, host, out = self.setup(["--yes", "--dry-run"])
+        self.assertNotIn("stops before the download", out)
+
+    def test_no_question_and_no_stop_when_the_pack_is_on_the_disk(self):
+        code, host, out = self.setup(["--yes"])
+        self.assertEqual(code, 0, out)
+        code, host, out = self.setup(["--yes"], gtt=60_000_000_000)
+        self.assertEqual(code, 1)
+        self.assertNotIn("--download-anyway", out)
 
     def test_small_disk_blocks_the_download(self):
         code, host, out = self.setup(["--yes"], free=20_000_000_000)
         self.assertEqual(code, 1)
         self.assertFalse([c for c in host.runner.calls if Path(c[0]).name == "hf"])
 
-    def test_busy_gpu_warns_before_the_start(self):
+    def test_busy_gpu_stops_before_the_start(self):
         code, host, out = self.setup(["--yes"], gtt_used=90_000_000_000)
-        self.assertEqual(code, 0)
-        self.assertEqual(len(host.runner.spawned), 1)
+        self.assertEqual(code, 1)
+        self.assertEqual(host.runner.spawned, [])
+        self.assertIn("another program", out)
         self.assertIn("Crucible does not stop other programs.", out)
 
     def test_dry_run_prints_the_plan_and_runs_nothing(self):
@@ -468,8 +618,9 @@ class SafetyTest(Base):
                     recv = getattr(f, "value", None) if isinstance(f, ast.Attribute) else None
                     via_box = (getattr(recv, "id", "") == "box") or (getattr(recv, "attr", "") == "box")
                     # box = a files.Sandbox. keyfile.py makes the API key file with O_EXCL and O_NOFOLLOW (a Sandbox
-                    # cannot do that); steps.step_config calls box.check on the path first.
-                    if path.name not in ("files.py", "keyfile.py") and not via_box:
+                    # cannot do that); steps.step_config calls box.check on the path first. diskmeasure.py makes its one
+                    # measure file with O_EXCL next to the state folder and removes only that file.
+                    if path.name not in ("files.py", "keyfile.py", "diskmeasure.py") and not via_box:
                         self.assertNotIn(name, {"write_text", "write_bytes", "unlink", "rmtree", "rename",
                                                 "chmod", "symlink_to", "copyfile", "copy2", "move", "truncate"},
                                          f"{path.name}:{node.lineno} writes outside the sandbox helper")
@@ -501,7 +652,7 @@ class SafetyTest(Base):
             self.assertIn(word, proc.stdout)
 
     def test_launcher_doctor_runs_against_the_real_host_without_a_traceback(self):
-        proc = subprocess.run([sys.executable, str(ROOT / "crucible"), "doctor"], capture_output=True, text=True,
+        proc = subprocess.run([sys.executable, str(ROOT / "crucible"), "doctor", "--no-disk-check"], capture_output=True, text=True,
                               timeout=120, env={**os.environ, "HOME": str(self.t)})
         self.assertIn(proc.returncode, (0, 1), proc.stderr)
         self.assertNotIn("Traceback", proc.stderr)
@@ -680,6 +831,11 @@ class PackTest(unittest.TestCase):
     def test_pack_table_matches_the_public_readme(self):
         self.assertEqual(packs.PACKS["4.05"].revision, "4.05bpw_h6_ng6")
         self.assertEqual(packs.PACKS["3.05"].revision, "3.05bpw_h5_ng5")
+        self.assertEqual(packs.PACKS["4.18"].revision, "4.18bpw_h6_ng8")
+        self.assertEqual(packs.PACKS["4.18"].folder, "Qwen3.8-Flash-Next-exl3-4.18bpw_h6_ng8")
+        # HF tree of 4.18bpw_h6_ng8 at 9796a106f998afbeb1cfd9adca0cdf057c7eae00 (Nov 14, 2026): 26 files, 122.0 GB.
+        self.assertEqual(packs.PACKS["4.18"].download_gb, 122)
+        self.assertGreater(packs.PACKS["4.18"].disk_gb, packs.PACKS["4.18"].download_gb)
         self.assertEqual(packs.DEFAULT, "4.05")
         text = (ROOT / "README.md").read_text()
         for p in packs.PACKS.values():

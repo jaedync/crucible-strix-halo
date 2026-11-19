@@ -34,7 +34,7 @@ class EngineReadsTests(unittest.TestCase):
                       if re.search(READERS + r'\(\s*"' + name + '"', text)]
             self.assertEqual(direct, [], f'{name} must be read through Numerics*()')
             guarded = [path for path, text in engine_sources()
-                       if re.search(r'Numerics(?:Env|Int|On|DefaultOn)\(\s*"' + name + '"', text)]
+                       if re.search(r'Numerics(?:Env|Int|On|DefaultOn|DefaultInt)\(\s*"' + name + '"', text)]
             self.assertTrue(guarded, f'{name} has no Numerics*() read')
 
     def test_opt_in_switches_read_zero_as_off(self):
@@ -69,7 +69,7 @@ class EngineReadsTests(unittest.TestCase):
     def test_every_numerics_read_is_classified(self):
         names = set()
         for _, text in engine_sources():
-            names |= set(re.findall(r'Numerics(?:Env|Int|On|DefaultOn)\(\s*"(CRUCIBLE_[A-Z0-9_]+)"', text))
+            names |= set(re.findall(r'Numerics(?:Env|Int|On|DefaultOn|DefaultInt)\(\s*"(CRUCIBLE_[A-Z0-9_]+)"', text))
         self.assertEqual(sorted(names), sorted(g.NUMERICS_SWITCHES))
 
     def test_the_master_switch_is_not_a_numerics_switch(self):

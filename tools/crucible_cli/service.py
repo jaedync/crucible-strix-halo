@@ -12,6 +12,11 @@ from . import settings as settings_mod
 from .files import Sandbox
 
 UNIT = "crucible-server.service"
+# Kiln (github.com/jaedync/crucible-kiln) runs the engine in its own user unit. Crucible never writes or removes that file.
+KILN_UNIT = "kiln-crucible.service"
+KILN_REFUSAL = ("Kiln runs this engine in its own unit, kiln-crucible.service. A second server would need the same GPU memory, "
+                "so the Crucible service is not installed. Start the engine with: kiln switch crucible. "
+                "To use the Crucible service instead, remove the Kiln profile first (kiln uninstall), then run this command again.")
 CHECK_FILE = "last-start-check.json"
 OK_PATH = re.compile(r"^[A-Za-z0-9._/@+ -]+$")   # no %, $, quotes, backslash or newline in a unit file
 OK_BIND = re.compile(r"^[A-Za-z0-9.:@-]+$")
@@ -118,6 +123,21 @@ def installed(host, unit=UNIT):
     return unit_path(host, unit).is_file()
 
 
+def kiln_base_url(host, s):
+    """The address of the engine that kiln-crucible.service runs: the --port of its ExecStart line (Kiln v0.1.0 writes the
+    server command itself), else the port of Crucible's own settings (a Kiln unit that runs .crucible/serve.sh)."""
+    try:
+        text = unit_path(host, KILN_UNIT).read_text()
+    except OSError:
+        text = ""
+    for line in text.splitlines():
+        if line.startswith("ExecStart="):
+            m = re.search(r"(?:^|\s)--port[ =]\"?(\d{1,5})\"?(?:\s|$)", line)
+            if m and 0 < int(m.group(1)) < 65536:
+                return f"http://127.0.0.1:{int(m.group(1))}"
+    return f"http://127.0.0.1:{s.port}"
+
+
 def user_name(host):
     return host.env.get("USER") or host.env.get("LOGNAME") or Path(host.home).name
 
@@ -221,10 +241,10 @@ def _show(host, unit):
     return res, props
 
 
-def _health(host, s, tries=10):
+def _health(host, s, tries=10, base_url=None):
     code = 0
     for i in range(tries):
-        code, _ = host.http.get(f"{s.base_url}/health")
+        code, _ = host.http.get(f"{base_url or s.base_url}/health")
         if code == 200:
             return code
         if i + 1 < tries:
@@ -245,6 +265,9 @@ def install(host, s, no_start=False, start_timeout=None):
     say = host.out
     if not (s.work / "config.json").exists():
         say("No configuration yet. Run ./crucible setup first.")
+        return 2
+    if installed(host, KILN_UNIT):
+        say(KILN_REFUSAL)
         return 2
     state = {}
     try:
@@ -320,6 +343,10 @@ def uninstall(host, s):
 
 
 def start(host, s, restart=False):
+    if active(host, KILN_UNIT):
+        host.out(f"Kiln runs this engine in {KILN_UNIT}, so {UNIT} does not start (the GPU memory holds one server). "
+                 "Stop Kiln's engine first: kiln stop")
+        return 1
     _ctl(host, "reset-failed", UNIT)  # a stop after "start-limit-hit" must not block this start
     res = _ctl(host, "restart" if restart else "start", UNIT)
     if res.rc != 0:
@@ -335,6 +362,22 @@ def start(host, s, restart=False):
     return 0
 
 
+def start_kiln(host, s, restart=False):
+    """Start (or restart) Kiln's engine unit and wait for /health at its port. 0 when it answers."""
+    _ctl(host, "reset-failed", KILN_UNIT)
+    res = _ctl(host, "restart" if restart else "start", KILN_UNIT)
+    if res.rc != 0:
+        host.out(f"{KILN_UNIT} did not start.")
+        _failure_report(host, KILN_UNIT)
+        return 1
+    base = kiln_base_url(host, s)
+    if _health(host, s, base_url=base) != 200:
+        host.out(f"{KILN_UNIT} started, but {base}/health does not answer 200.")
+        _failure_report(host, KILN_UNIT)
+        return 1
+    return 0
+
+
 def stop(host, s):
     host.out("Stopping the service. " + settings_mod.stop_note(s))
     res = _ctl(host, "stop", UNIT)
@@ -347,10 +390,30 @@ def stop(host, s):
         return 1
     _, props = _show(host, UNIT)
     if props.get("UnitFileState") in ("enabled", "enabled-runtime"):
-        host.out("Stopped. The service stays enabled and can start at boot or login. "
-                 "To keep it off, run: systemctl --user disable crucible-server.service")
+        when = "at boot" if _linger(host) else "at your next login"
+        host.out(f"Stopped. The service is still enabled, so it starts again {when}. "
+                 "To keep it off, run: ./crucible service disable")
     else:
         host.out("Stopped.")
+    return 0
+
+
+def disable(host, s):
+    """Stop the service and disable it. The unit file stays, so ./crucible service install turns it on again."""
+    if not installed(host):
+        host.out("The service is not installed. Nothing to disable.")
+        return 0
+    host.out("Stopping the service. " + settings_mod.stop_note(s))
+    res = _ctl(host, "stop", UNIT)
+    if res.rc != 0:
+        host.out(f"systemctl stop failed: {res.out.strip()}")
+        return 1
+    res = _ctl(host, "disable", UNIT)
+    if res.rc != 0:
+        host.out(f"systemctl disable failed: {res.out.strip()}")
+        return 1
+    host.out("The service is stopped and disabled: it does not start at boot or at login. The unit file stays. "
+             "To turn it on again, run: ./crucible service install")
     return 0
 
 

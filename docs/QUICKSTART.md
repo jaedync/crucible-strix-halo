@@ -7,13 +7,14 @@ This guide sets up Crucible the way we run it every day:
 - the conversation cache on the SSD (`--state-dir`), so a later turn or a restarted server continues without a full prefill,
 - 4 sessions of 262,144 tokens, image input, and an OpenAI-compatible server on `127.0.0.1:8790`.
 
-The 3.05 bpw pack (faster, lower quality) and the 16-bit n-gram table are options at the end.
+The 3.05 bpw pack (faster, lower quality), the 4.18 bpw pack (the quality of 4.05, slower) and the 16-bit
+n-gram table are options at the end.
 
 | | |
 |---|---|
-| Machine | Ryzen AI Max+ 395 with Radeon 8060S (gfx1151) and 128 GB of memory. Other machines are not supported. |
-| Download | About 107 GB (the 4.05 pack). |
-| Disk | About 110 GB for the pack, plus up to 200 GiB (215 GB) for the conversation cache. Use an SSD. |
+| Machine | Ryzen AI Max+ 395 with Radeon 8060S (gfx1151) and 128 GB of memory. A 96 GB machine (88 GiB to 120 GiB) runs the 3.05 pack with 2 sessions of 262,144 tokens. Other machines are not supported. |
+| Download | About 107 GB (the 4.05 pack). The 3.05 pack is about 85 GB, the 4.18 pack about 122 GB. |
+| Disk | About 110 GB for the pack (90 GB for 3.05, 125 GB for 4.18), plus up to 200 GiB (215 GB) for the conversation cache. Use an SSD. |
 | Time | One command: the pack download, plus about 1 to 2 minutes (it downloads a 25 MB engine; it does not build). Steps 3 to 6 by hand: the download, plus a build of about 16 minutes with the ROCm 7.2.4 compiler. |
 
 ## One command
@@ -30,7 +31,7 @@ Press Enter to take a default. It downloads the model (about 107 GB) and starts 
 folder is the folder `crucible` in your home folder, and the default port is 8790.
 
 The one command does not run `make`. It downloads the release engine (about 25 MB), checks its sha256, and puts it in
-`build/engine/`. The line `[build] done: release engine v0.37.3 (verified)` means this. So the build time of step 4
+`build/engine/`. The line `[build] done: release engine v0.38.0 (verified)` means this. So the build time of step 4
 does not apply, and no compiler is needed. In our test, with the pack already on the disk, setup took 65 seconds.
 With a new pack, the download time is added, and the first model load takes a few minutes. Add `--source-build` to
 build the engine from source instead (about 16 minutes with the ROCm 7.2.4 compiler).
@@ -158,7 +159,7 @@ groups                                         # expect: render and video in the
 ## Step 2: let the GPU use the memory
 
 The GPU of Strix Halo uses the system memory. By default, Linux lets it use only part of it. The 4.05 pack with
-4 long sessions needs most of the 128 GB.
+4 long sessions needs most of the 128 GB. On a 96 GB machine, setup prints the values for its memory size.
 
 First run the check at the end of this step. If it already shows the values, skip this step.
 
@@ -223,7 +224,7 @@ and `. .venv/bin/activate` again.
 **Check:**
 
 ```sh
-python -m server --version    # expect: crucible 0.37.3 or newer
+python -m server --version    # expect: crucible 0.38.0 or newer
 hf version
 ```
 
@@ -441,6 +442,12 @@ without `--state-dir` and `--state-disk-gib`:
 
 The 3.05 pack is about 85 GB and decodes faster, at a lower quality ([Quality](QUALITY.md)). Use
 `PACK=3.05bpw_h5_ng5` in step 5 (the `du` check then shows about 80G). Step 6 is the same for this pack.
+
+## Option: the 4.18 bpw pack
+
+The 4.18 pack has the quality of the 4.05 pack and reads 14% more bytes per token, so it decodes more slowly.
+It is about 122 GB and needs a 128 GB machine and 125 GB of free disk. Use `PACK=4.18bpw_h6_ng8` in step 5
+(the `du` check then shows about 114G). Step 6 is the same for this pack.
 
 ## Option: the 16-bit n-gram table (experimental)
 

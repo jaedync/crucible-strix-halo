@@ -113,14 +113,17 @@ def latest_tag(current, *, env, now, fetch, timeout):
     return tag
 
 
-def notice_lines(current, tag):
+def notice_lines(current, tag, label=None):
+    """label names a build that is not the release v<current> (server/version.py build_label)."""
     if not is_newer(tag, current):
         return []
-    return [f"Crucible {tag} is available (you run v{current}). Update: make update. Release notes: {RELEASE_URL}{tag}",
+    return [f"Crucible {tag} is available (you run {label or 'v' + current}). Update: make update. "
+            f"Release notes: {RELEASE_URL}{tag}",
             'Automatic updates are off unless you turned on the timer. See "Updates" in the README.']
 
 
-def start(current, *, disabled=False, out=None, env=None, now=time.time, fetch=fetch_latest, timeout=TIMEOUT_SECONDS):
+def start(current, *, label=None, disabled=False, out=None, env=None, now=time.time, fetch=fetch_latest,
+          timeout=TIMEOUT_SECONDS):
     """Check in a daemon thread and print the notice if a newer release exists. Returns the thread, or None when off."""
     env = os.environ if env is None else env
     if check_disabled(env, disabled):
@@ -128,7 +131,7 @@ def start(current, *, disabled=False, out=None, env=None, now=time.time, fetch=f
 
     def work():
         try:
-            lines = notice_lines(current, latest_tag(current, env=env, now=now, fetch=fetch, timeout=timeout))
+            lines = notice_lines(current, latest_tag(current, env=env, now=now, fetch=fetch, timeout=timeout), label)
             if lines:
                 print("\n".join(lines), file=out or sys.stderr, flush=True)
         except Exception as error:

@@ -78,6 +78,21 @@ int main() {
     unsetenv(name);
   }
   unsetenv("CRUCIBLE_EXACT");
+  // A landed option-B integer default (CRUCIBLE_HC_WMMA 1 -> 2): unset gives the new default, a set value applies,
+  // and option A gives the baseline's value without a read of the switch.
+  unsetenv("CRUCIBLE_TEST_INT");
+  assert(NumericsDefaultInt(Fixture("CRUCIBLE_TEST_INT"),2,1,0,2)==2);
+  setenv("CRUCIBLE_TEST_INT","1",1);
+  assert(NumericsDefaultInt(Fixture("CRUCIBLE_TEST_INT"),2,1,0,2)==1);
+  setenv("CRUCIBLE_TEST_INT","0",1);
+  assert(NumericsDefaultInt(Fixture("CRUCIBLE_TEST_INT"),2,1,0,2)==0);
+  setenv("CRUCIBLE_TEST_INT","9",1);
+  Reject([] { NumericsDefaultInt(Fixture("CRUCIBLE_TEST_INT"),2,1,0,2); });
+  setenv("CRUCIBLE_EXACT","1",1);
+  assert(NumericsDefaultInt(Fixture("CRUCIBLE_TEST_INT"),2,1,0,2)==1);
+  unsetenv("CRUCIBLE_TEST_INT");
+  assert(NumericsDefaultInt(Fixture("CRUCIBLE_TEST_INT"),2,1,0,2)==1);
+  unsetenv("CRUCIBLE_EXACT");
   ValidateNumericsSwitches();
   return 0;
 }

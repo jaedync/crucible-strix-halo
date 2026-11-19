@@ -34,6 +34,20 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+XGrammar
+--------
+
+The structured output support of this product includes XGrammar v0.2.9
+(https://github.com/mlc-ai/xgrammar, commit 8f9a1279fdbed47739bd75b4099d1d059a1ce3e0),
+Copyright (c) 2024 by XGrammar Contributors, under the Apache License, Version 2.0. Its
+license and notice are in third_party/xgrammar/. The files there are the upstream files.
+The build modifies one of them (cpp/json_schema_converter.cc) with the patch file
+third_party/patches/xgrammar/0001-bounded-string-control-characters.patch (see
+third_party/README.md). XGrammar includes PicoJSON (Copyright 2009-2010 Cybozu Labs, Inc.,
+Copyright 2011-2014 Kazuho Oku, BSD-2-Clause, license in the header of
+third_party/xgrammar/3rdparty/picojson/picojson.h) and DLPack (Apache License, Version 2.0,
+third_party/xgrammar/3rdparty/dlpack/LICENSE).
+
 Model weights
 -------------
 

@@ -79,12 +79,19 @@ def allowed_hosts(s):
 
 def server_command(s, python):
     env = {**measured.ENV, **s.spec.extra_env, **own_head_env(s)}
+    if getattr(s, "abliterated", False):
+        env["CRUCIBLE_ABLATE"] = os.fspath(s.ablation_file)   # --abliterated: one engine serves stock and ablated requests
+        env["CRUCIBLE_ABLATE_MODE"] = "request"
+    if getattr(s, "ngram16", False):
+        env["CRUCIBLE_PLE_BF16"] = os.fspath(s.ngram16_file)   # --ngram16 (needs CRUCIBLE_PLE_HOST=1, a measured word)
     if getattr(s, "runtime_lib", None) is not None:
         env["LD_LIBRARY_PATH"] = os.fspath(s.runtime_lib)   # the private ROCm runtime (process_env puts it before the caller's path)
     flags = measured.SERVER_FLAGS
+    memory = getattr(s, "memory", None)   # machine.Fit; None or the 128 GB class: the measured cache budget
+    cache = memory.cache_mib if memory is not None else flags["--conversation-cache-mib"]
     argv = [str(python), "-m", "server", str(s.ckpt), "--engine", str(s.engine), "--host", s.bind,
             "--port", str(s.port), "--streams", str(s.streams), "--ctx", str(s.ctx), "--prefill", flags["--prefill"],
-            "--conversation-cache-mib", flags["--conversation-cache-mib"], "--host-reserve-mib", flags["--host-reserve-mib"]]
+            "--conversation-cache-mib", cache, "--host-reserve-mib", flags["--host-reserve-mib"]]
     if getattr(s, "short_streams", 0):
         argv += ["--short-streams", str(s.short_streams), "--short-ctx", str(s.short_ctx)]
     if s.api_key_file is not None:
@@ -94,6 +101,8 @@ def server_command(s, python):
         argv += ["--allowed-host", hosts]
     if s.state_dir is not None:
         argv += ["--state-dir", str(s.state_dir), "--state-disk-gib", str(s.state_disk_gib)]
+        if getattr(s, "state_write_gib_day", 300) != 300:   # 300 is the engine default: the default argv stays as it was
+            argv += ["--state-disk-write-gib-per-day", str(s.state_write_gib_day)]
     argv += ["--vision", "--clamp-max-tokens", "--default-thinking", "on", "--max-body-mib", "16"]
     return env, argv
 

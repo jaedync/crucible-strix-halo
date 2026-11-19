@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from crucible_cli_fakes import FakeHttp, FakePrompt, FakeRunner, ROOT, make_repo, wire  # noqa: E402
+from crucible_cli_fakes import FakeHttp, FakePrompt, FakeRunner, ROOT, make_repo, shown, wire  # noqa: E402
 
 from crucible_cli import cli, doctor, files, host as hostmod, launch, service  # noqa: E402
 from crucible_cli import settings as settings_mod  # noqa: E402
@@ -250,6 +250,22 @@ class InstallTest(Base):
         self.assertIn("character", "\n".join(host.lines))
         self.assertNotIn("start", host.runner.verbs())
 
+    def test_install_refuses_while_the_kiln_unit_exists(self):
+        """Kiln runs the engine in its own unit. A second server would want the same GPU and memory."""
+        self.configure()
+        kiln = self.t / "home/.config/systemd/user/kiln-crucible.service"
+        kiln.parent.mkdir(parents=True, exist_ok=True)
+        kiln.write_text("[Service]\nExecStart=/usr/bin/true\n")
+        for argv in (["service", "install"], ["service", "install", "--no-start"]):
+            code, host, out = self.run_cli(argv)
+            self.assertEqual(code, 2, out)
+            self.assertIn("kiln-crucible.service", out)
+            self.assertIn("kiln", out.replace("kiln-crucible", ""))
+            self.assertFalse(self.unit_file().exists())
+            for verb in ("enable", "start", "restart", "daemon-reload"):
+                self.assertNotIn(verb, host.runner.verbs(), argv)
+        self.assertTrue(kiln.exists(), "Crucible never removes the Kiln unit")
+
     def test_install_stops_a_pid_file_server_first_and_removes_the_record(self):
         self.configure()
         (self.repo / ".crucible/server.pid").write_text("40007 1000\n")
@@ -384,6 +400,20 @@ class RoutingTest(Base):
         self.assertEqual(code, 0, out)
         self.assertEqual(host.runner.spawned, [])
         self.assertIn("start", host.runner.verbs())
+
+    def test_no_start_of_the_crucible_service_while_kiln_runs_the_engine(self):
+        """Next to Kiln, crucible-server.service stays installed and disabled. A start of it would put a
+        second server on the GPU."""
+        self.install_unit()
+        kiln = self.t / "home/.config/systemd/user/kiln-crucible.service"
+        kiln.write_text("[Service]\nExecStart=/usr/bin/true\n")
+        for argv in (["start"], ["service", "start"], ["service", "restart"]):
+            host = self.host(runner=FakeSystemd())
+            code, host, out = self.run_cli(argv, host=host)
+            self.assertEqual(code, 1, (argv, out))
+            self.assertIn("kiln-crucible.service", out)
+            self.assertEqual([c for c in host.runner.ctl if c[0] in ("start", "restart") and UNIT in c], [], argv)
+            self.assertEqual(host.runner.spawned, [])
 
     def test_service_start_stop_restart_are_the_same_calls(self):
         self.install_unit()
@@ -613,9 +643,8 @@ class StartCheckTest(Base):
         host.sleep = sleep
         code, host, out = self.doctor(["--quiet"], host=host)
         self.assertEqual(code, 0, out)
-        self.assertEqual(clock["t"], 0)
-        self.assertIn("WARN", out)
-        self.assertIn("Crucible does not stop other programs.", out)
+        self.assertGreaterEqual(clock["t"], 60)  # the start check waits for the GPU memory (stage 1 keeps the fail)
+        self.assertLess(clock["t"], 120)
 
     def test_a1_a_port_busy_for_more_than_120_s_exits_75(self):
         self.ready_repo()
@@ -669,6 +698,27 @@ class SetupQuestionTest(Base):
         host = host or self.host(runner=FakeSystemd(), **machine)
         code = cli.main(["setup", *argv], host=host, repo=self.repo)
         return code, host, "\n".join(host.lines)
+
+    def test_setup_starts_no_second_server_while_kiln_runs_the_engine(self):
+        """kiln-crucible.service runs the engine: a setup run must not start ./crucible start's server next to it."""
+        kiln = self.t / "home/.config/systemd/user/kiln-crucible.service"
+        kiln.parent.mkdir(parents=True, exist_ok=True)
+        kiln.write_text("[Service]\nExecStart=/usr/bin/true\n")
+        code, host, out = self.setup_cli(["--yes"])
+        self.assertEqual(code, 1, out)
+        self.assertEqual(host.runner.spawned, [], "no server process next to Kiln's engine")
+        self.assertRegex(out, r"\[start\] FAILED: .*kiln-crucible\.service")
+        self.assertIn("kiln stop", out)
+
+    def test_setup_starts_its_server_when_the_kiln_unit_is_stopped(self):
+        kiln = self.t / "home/.config/systemd/user/kiln-crucible.service"
+        kiln.parent.mkdir(parents=True, exist_ok=True)
+        kiln.write_text("[Service]\nExecStart=/usr/bin/true\n")
+        runner = FakeSystemd()
+        runner.props["ActiveState"] = "inactive"
+        code, host, out = self.setup_cli(["--yes"], host=self.host(runner=runner))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(host.runner.spawned), 1)
 
     def test_yes_without_service_installs_nothing_and_prints_the_hint(self):
         code, host, out = self.setup_cli(["--yes"])
@@ -968,7 +1018,7 @@ class SetupRestartPendingTest(Base):
         # ExecStartPre runs doctor --for start while the unit is "activating"; it must still see a busy port and GPU.
         for sub in ("start-pre", "auto-restart"):
             checks = self.doctor_checks(ActiveState="activating", SubState=sub)
-            self.assertEqual(checks["gpu-free"].status, "warn", sub)
+            self.assertEqual(checks["gpu-free"].status, "fail", sub)
             self.assertEqual(checks["port"].status, "fail", sub)
 
 
@@ -1033,7 +1083,7 @@ class DoctorServiceTest(Base):
     def test_a_stopped_service_does_not(self):
         checks = self.checks(active=False)
         self.assertEqual(checks["port"].status, "fail")
-        self.assertEqual(checks["gpu-free"].status, "warn")
+        self.assertEqual(checks["gpu-free"].status, "fail")
 
 
 class StopNoteTest(Base):
@@ -1097,3 +1147,34 @@ class SourceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ServiceDisableTest(Base):
+    """REPORT C an earlier change: "Stopped." and the service came back at boot. The stop says so; service disable keeps it off."""
+
+    def test_the_stop_of_an_enabled_unit_names_the_disable_command(self):
+        self.install_unit()
+        code, host, out = self.run_cli(["stop"], host=self.host(runner=FakeSystemd(linger="yes")))
+        self.assertEqual(code, 0, out)
+        self.assertIn("starts again at boot", out)
+        self.assertIn(shown("./crucible service disable", self.repo, host), out)
+
+    def test_disable_stops_and_disables_and_keeps_the_unit_file(self):
+        self.install_unit()
+        runner = FakeSystemd()
+        code, host, out = self.run_cli(["service", "disable"], host=self.host(runner=runner))
+        self.assertEqual(code, 0, out)
+        self.assertEqual([c[0] for c in runner.ctl if c[0] in ("stop", "disable")], ["stop", "disable"])
+        self.assertTrue(self.unit_file().exists())
+        self.assertIn("does not start at boot", out)
+        self.assertIn(shown("./crucible service install", self.repo, host), out)
+
+    def test_disable_without_a_unit_says_so(self):
+        code, host, out = self.run_cli(["service", "disable"], host=self.host(runner=FakeSystemd()))
+        self.assertEqual(code, 0, out)
+        self.assertIn("not installed", out)
+
+    def test_the_help_lists_disable(self):
+        self.assertIn("disable", cli.parser().format_help())
+        sub = cli.parser()._subparsers._group_actions[0].choices["service"]
+        self.assertIn("disable", sub.format_help())

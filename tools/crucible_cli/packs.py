@@ -24,6 +24,9 @@ class Pack:
 PACKS = {
     "4.05": Pack("4.05", "4.05bpw_h6_ng6", 107, 110),
     "3.05": Pack("3.05", "3.05bpw_h5_ng5", 85, 90, {}),
+    # The HF tree of 4.18bpw_h6_ng8 at 9796a106f998afbeb1cfd9adca0cdf057c7eae00 (Nov 14, 2026): 26 files, 122.0 GB.
+    # KL from BF16 0.0239 against 0.0241 for 4.05 (Oct 23, 2026), with 14% more bytes per token.
+    "4.18": Pack("4.18", "4.18bpw_h6_ng8", 122, 125),
 }
 
 

@@ -112,12 +112,34 @@ class Request:
     # True: the request selects the ablated mode (server/ablation.py). Every engine request object of the turn then
     # carries "ablate": 1, so the engine keeps stock and ablated states apart.
     ablate: bool = False
+    # Structured output (server/structured.py): dict(kind=..., spec=JSON text) for the engine, or None (no constraint:
+    # the engine line stays byte-identical).
+    constraint: dict | None = None
+    # The tools that the template renders, when they differ from `tools`: with structured output on, `strict` is left
+    # out (an API control flag, not prompt content; the grammar enforces it). None: the template renders `tools`.
+    render_tools: tuple | None = None
     # Y2 reply reserve (server/rope.py plain_max_tokens): the max_tokens before the clamp to the plain limit, 0 when the
     # server did not clamp. The engine never sees it; the backend writes the clamp and cut lines from it.
     rope_clamped_from: int = 0
     # The RoPE mode word that the server decided for the request ("plain", "yarn2", "yarn4"; server/rope.py
     # request_mode), None on a server with no auto word. Every engine job of the request sends it.
     rope_mode: str | None = None
+    # Penalties: the engine applies them as below. The neutral values send
+    # nothing to the engine, so its job is the same as without the fields.
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
+    repetition_penalty: float = 1.0
+    # A continuation job of the server (think cap, end-of-turn guard): the client's prompt length. The engine counts
+    # the IDs after it as output. None for the first job.
+    penalty_prompt: int | None = None
+
+def rendered_tools(tools):
+    """`tools` without the `strict` key of each function, or None when no function has one."""
+    if not any("strict" in tool["function"] for tool in tools):
+        return None
+    return tuple(dict(tool, function={key: value for key, value in tool["function"].items() if key != "strict"})
+                 for tool in tools)
+
 
 def integer(value, field, low, high):
     if type(value) is not int or not low <= value <= high:
@@ -131,15 +153,19 @@ def number(value, field, low, high):
         raise ApiError(f"{field} must be a finite number in [{low},{high}].", field)
     return float(value)
 
-# Some clients (SillyTavern and other OpenAI-compatible clients) send a penalty in every request. The engine has no
-# penalty sampler, so only the neutral value is accepted: 0 for presence_penalty and frequency_penalty, 1 for
-# repetition_penalty, or null. The check keeps nothing, so the Request is the same as without the field.
-PENALTY_FIELDS = {"presence_penalty": 0, "frequency_penalty": 0, "repetition_penalty": 1}
+# Penalty field -> its neutral value. presence_penalty and frequency_penalty take OpenAI's range [-2, 2];
+# repetition_penalty (OpenAI-compatible, Hugging Face) takes [0.01, 2]: the floor keeps a logit / r inside the float range
+# (other servers take any value above 0). Null is the neutral value.
+PENALTY_FIELDS = {"presence_penalty": 0.0, "frequency_penalty": 0.0, "repetition_penalty": 1.0}
 
-def penalty_off(value, field):
-    neutral = PENALTY_FIELDS[field]
-    if value is not None and not (type(value) in (int, float) and value == neutral):  # NaN is not equal to neutral
-        raise ApiError(f"{field} must be {neutral}. Crucible has no penalty sampler.", field)
+def penalty(body, field):
+    """The field's value as a float, the neutral value for null or a missing field. -0.0 becomes 0.0."""
+    value = body.get(field)
+    if value is None:
+        return PENALTY_FIELDS[field]
+    if field == "repetition_penalty":
+        return number(value, field, 0.01, 2)
+    return number(value, field, -2, 2) + 0.0
 
 def boolean(value, field):
     if type(value) is not bool:
@@ -222,27 +248,32 @@ def scoring_count(body, kind, count, temperature, stream):
         raise ApiError("top_logprobs must be an integer in [0,20].", "top_logprobs")
     return max(integer(0 if top is None else top, "top_logprobs", 0, 20), 1)
 
+# The top-level fields of a chat or completion body. server/lenient.py reads this set too.
+REQUEST_FIELDS = frozenset({"model", "messages", "prompt", "max_tokens", "max_completion_tokens", "temperature", "n",
+                            "stream", "stream_options", "spec", "enable_thinking", "reasoning_effort",
+                            "chat_template_kwargs", *BUDGET_FIELDS, "return_token_ids", "logprobs", "top_logprobs",
+                            "top_k", "top_p", "min_p", "seed", "draft_q", "draft_head", "mtp_prefix", "draft_adapt",
+                            "cache_control", "tools", "tool_choice", "parallel_tool_calls", "stop", "crucible_metrics",
+                            "response_format", *PENALTY_FIELDS, ablation.REQUEST_FIELD})
+
 def validate_request(body, kind, model, default_thinking=False, vision=None, vocab=VOCAB,
-                     default_mtp_prefix=MTP_WINDOW, defaults=DEFAULTS, ablated_names=None, ablate_available=False):
+                     default_mtp_prefix=MTP_WINDOW, defaults=DEFAULTS, ablated_names=None, ablate_available=False,
+                     structured=True, format_field="response_format", render_strict=True):
     """vocab: the engine's vocabulary size (the backend's ModelInfo); the default suits engines before an earlier change.
     defaults: the server's values for the fields that the request leaves out (ServerDefaults).
     ablated_names: the model names that select the ablated mode (None: the served id's form).
-    ablate_available: the engine serves ablated requests on demand (its ready event, ablation.READY_FIELD)."""
+    ablate_available: the engine serves ablated requests on demand (its ready event, ablation.READY_FIELD).
+    format_field: the client's field that response_format came from (an adapter's text.format or output_config.format),
+    so an error of the answer format names it.
+    render_strict: on an engine with no structured output, the template renders a function's strict flag, as before
+    structured output (chat, Responses). False for an API whose tools never had the flag in the prompt (Anthropic)."""
     if not isinstance(body, dict):
         raise ApiError("The request must be a JSON object.")
-    allowed = {"model", "messages", "prompt", "max_tokens", "max_completion_tokens", "temperature", "n",
-               "stream", "stream_options", "spec", "enable_thinking", "reasoning_effort", "chat_template_kwargs", *BUDGET_FIELDS,
-               "return_token_ids", "logprobs", "top_logprobs",
-               "top_k", "top_p", "min_p", "seed", "draft_q", "draft_head", "mtp_prefix", "draft_adapt",
-               "cache_control", "tools", "tool_choice", "parallel_tool_calls", "stop", "crucible_metrics",
-               *PENALTY_FIELDS, ablation.REQUEST_FIELD}
-    unknown = set(body) - allowed
+    unknown = set(body) - REQUEST_FIELDS
     if unknown:
         field = sorted(unknown)[0]
         raise ApiError(f"{field} is not supported. Use temperature, top_k, top_p, min_p, and seed for sampling.", field)
-    for field in PENALTY_FIELDS:
-        if field in body:
-            penalty_off(body[field], field)
+    penalties = {field: penalty(body, field) for field in PENALTY_FIELDS}
     from .stop_sequences import validate_stop
     stop = validate_stop(body.get("stop"))
     names = ablation.ablated_names(model) if ablated_names is None else tuple(ablated_names)
@@ -315,9 +346,21 @@ def validate_request(body, kind, model, default_thinking=False, vision=None, voc
         elif not isinstance(prompt, str) or not prompt:
             raise ApiError("prompt must be nonempty text or one token-ID list. Batches are not supported.", "prompt")
     top = scoring_count(body, kind, count, temperature, stream)
+    from .structured import constraint as structured_constraint
+    constraint = structured_constraint(body, kind, tools, choice, parallel, format_field)
+    if constraint is not None and not structured:
+        # An engine without structured output (no ready field): tool requests run as before it, unconstrained;
+        # an answer format cannot be kept without the grammar.
+        if (body.get("response_format") or {}).get("type", "text") != "text":
+            raise ApiError("This engine has no structured output.", format_field, code="constraint_unsupported")
+        constraint = None
+    if constraint is not None and top:
+        raise ApiError("logprobs is not supported with structured output.", "logprobs")
     return Request(kind, requested, count, spec, stream, usage, thinking, effort, token_ids, prompt, messages,
                    temperature=temperature, top_k=top_k, top_p=top_p, min_p=min_p, seed=seed, cache_control=cache_control,
                    draft_q=draft_q, draft_head=draft_head, mtp_prefix=mtp_prefix, draft_adapt=draft_adapt,
                    tools=tools, tool_choice=choice, parallel_tool_calls=parallel, stop=stop,
                    crucible_metrics=metrics, preserve_thinking=preserve,
-                   thinking_budget=budget, images=tuple(images), top_logprobs=top, max_tokens_all=fill, ablate=ablate)
+                   thinking_budget=budget, images=tuple(images), top_logprobs=top, max_tokens_all=fill, ablate=ablate,
+                   constraint=constraint, render_tools=rendered_tools(tools) if structured or not render_strict else None,
+                   **penalties)

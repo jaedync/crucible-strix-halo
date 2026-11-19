@@ -14,6 +14,13 @@ namespace crucible {
 inline constexpr int kDraftPositions = 7;            // K: the deepest draft position (kDefaultSpecDepth)
 inline constexpr size_t kDraftDetailMax = 2048;      // entries of each per-token map of one request
 inline constexpr int kDraftRunBins = 9;              // runs of full-accept rounds of 1..8 rounds, last bin 9 or more
+// Copy runs (copy-e E1): tokens of consecutive lookup rounds, by length. Bin k holds runs of up to kCopyRunTop[k] tokens.
+inline constexpr std::array<long, 6> kCopyRunTop{8, 16, 24, 31, 63, 1L << 62};  // 1-8, 9-16, 17-24, 25-31, 32-63, 64+
+inline constexpr size_t CopyRunBin(long tokens) {
+  size_t k = 0;
+  while (k + 1 < kCopyRunTop.size() && tokens > kCopyRunTop[k]) ++k;
+  return k;
+}
 
 struct DraftTally {
   std::array<long, kDraftPositions> proposed{}, tested{}, accepted{};
@@ -21,6 +28,11 @@ struct DraftTally {
   std::array<long, kDraftPositions> lookup_proposed{}, lookup_accepted{};  // the lookup rounds alone, by position
   std::array<long, kDraftRunBins> run{};             // closed runs of full-accept rounds by length (plan wide C)
   long open_run = 0;                                 // full-accept rounds since the last miss
+  // Copy runs: a run is the tokens that consecutive lookup rounds commit from the copy (each full round: its drafts and
+  // the bonus token; the round that ends it: its accepted drafts). A partial lookup round, a head round or a round without
+  // drafts ends the run. Counts and token sums by bin (kCopyRunTop), so the share of lookup tokens in long runs is exact.
+  std::array<long, kCopyRunTop.size()> copy_runs{}, copy_tokens{};
+  long open_copy = 0;                                // tokens of the copy run that is still open
   long passes = 0, lookup_rounds = 0, detail_cut = 0;
   double head_ms = 0;
   bool detail = false;                               // per-token maps (serve --draft-stats)
@@ -42,6 +54,12 @@ struct DraftTally {
     // A round with drafts either extends the run (all accepted) or ends it. A round without drafts does neither.
     if (depth > 0 && accepted_count == depth) ++open_run;
     else if (depth > 0) CloseRun();
+    if (lookup && depth > 0) {
+      open_copy += accepted_count + (accepted_count == depth ? 1 : 0);
+      if (accepted_count < depth) CloseCopy();
+    } else {
+      CloseCopy();
+    }
     if (lookup) {
       ++lookup_rounds;
       for (int i = 0; i < std::min(depth, kDraftPositions); ++i) {
@@ -87,6 +105,11 @@ struct DraftTally {
     out += ",\"draft_lookup_rounds\":" + std::to_string(lookup_rounds);
     list("draft_lookup_pos_proposed", lookup_proposed);
     list("draft_lookup_pos_accepted", lookup_accepted);
+    auto copies = copy_runs;  // the open copy run counts here; the tally keeps it open
+    auto copied = copy_tokens;
+    if (open_copy > 0) { ++copies[CopyRunBin(open_copy)]; copied[CopyRunBin(open_copy)] += open_copy; }
+    list("draft_copy_run_hist", copies);
+    list("draft_copy_run_tokens", copied);
     if (!detail) return out;
     out += ",\"draft_tally\":[";
     bool first = true;
@@ -106,6 +129,10 @@ struct DraftTally {
   }
 
  private:
+  void CloseCopy() {
+    if (open_copy > 0) { ++copy_runs[CopyRunBin(open_copy)]; copy_tokens[CopyRunBin(open_copy)] += open_copy; }
+    open_copy = 0;
+  }
   void CloseRun() {
     if (open_run > 0) ++run[size_t(std::min<long>(open_run, kDraftRunBins) - 1)];
     open_run = 0;

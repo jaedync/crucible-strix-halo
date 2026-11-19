@@ -150,8 +150,103 @@ void JoinTests() {
   // A bad spec never reaches a launch: an engine without join rows takes none (MockEngine asserts it).
 }
 
+// Part B: the fork point. An open of another session on the slot releases the tail, then
+// writes the slot's longest general point below it to disk (fork_point), then resets the slot. No fork point on a slot
+// resume, when the disk floor is too near, or when the open resumes from a point at or above it. At most one per open.
+void ForkPointTests() {
+  MockEngine engine; engine.prefill_rows = 4;
+  crucible::BatchSession<MockEngine> session(engine, 1);
+  session.SetForkRule({8, 8, 1, 4});  // min_tokens, min_gain, tail_slack, grid: the mock's short prompts
+  std::vector<std::string> log;
+  std::vector<std::vector<int>> host;  // tails
+  size_t floor = 0;
+  bool fork_throws = false;
+  crucible::BatchCacheHooks hooks;
+  hooks.restore = [&](const crucible::ServeRequest&) -> crucible::BatchRestore { log.push_back("restore"); return 0; };
+  hooks.peek = [](const crucible::ServeRequest&) { return size_t(0); };
+  hooks.resume = [&](const crucible::ServeRequest&, crucible::BatchResident resident) -> crucible::BatchRestore {
+    log.push_back("resume");
+    return {resident.length, false, resident.replay, true, true, resident.guarded};
+  };
+  hooks.capture = [](const crucible::ServeRequest&, size_t) {};
+  hooks.tail = [&](const crucible::ServeRequest& r, std::span<const int> generated, int,
+                   crucible::BatchTailSource) -> std::optional<crucible::BatchResident> {
+    std::vector<int> hist(r.ids);
+    hist.insert(hist.end(), generated.begin(), generated.end() - 1);
+    engine.histories[engine.selected] = hist;
+    host.push_back(hist);
+    return crucible::BatchResident{hist.size(), 0, false};
+  };
+  std::map<int, std::vector<int>> buffers;
+  hooks.checkpoint_save = [&](int slot, int index) { buffers[index] = engine.histories[slot]; };
+  hooks.checkpoint_load = [&](int slot, int, const crucible::SlotCheckpoint& point) {
+    engine.histories[slot] = point.hist;
+    log.push_back("load " + std::to_string(point.hist.size()));
+  };
+  hooks.release = [&](int, bool resumed) { log.push_back("release resumed=" + std::to_string(resumed)); };
+  hooks.overwrite = [&](int) { log.push_back("overwrite"); };
+  hooks.fork_floor = [&](std::span<const int> key, const crucible::StateTenant&) { return std::min(floor, key.size()); };
+  hooks.fork_point = [&](int slot, int index, const crucible::SlotCheckpoint& point, std::span<const int> tail) {
+    // The slot still holds the tail's rows, and the point's buffer the state at the point.
+    assert(engine.histories[slot] == host.back() && std::equal(tail.begin(), tail.end(), host.back().begin()));
+    assert(buffers.at(index) == point.hist && std::equal(point.hist.begin(), point.hist.end(), tail.begin()));
+    log.push_back("fork " + std::to_string(point.hist.size()) + " tail " + std::to_string(tail.size()));
+    if (fork_throws) throw std::logic_error("fork copy");
+  };
+  session.SetCacheHooks(hooks);
+  const auto finish = [&](uint64_t id, const crucible::ServeRequest& r) {
+    log.clear();
+    auto events = session.Open(id, r);
+    for (;;) {
+      for (const auto& event : events)
+        if (event.done) return;
+      events = session.Step({id});
+    }
+  };
+  auto a = Request(1, 3);
+  a.ids.resize(40);
+  std::iota(a.ids.begin(), a.ids.end(), 1);
+  auto b = Request(500, 3);
+  b.ids.resize(24, 500);
+  finish(1, a);  // the End point at 40, the tail at 42
+  finish(2, b);  // another session takes the slot
+  assert((log == std::vector<std::string>{"release resumed=0", "fork 40 tail 42", "overwrite", "restore"}));
+  // A slot resume of b's tail keeps the slot's points: no fork point.
+  auto b2 = b;
+  b2.ids = host.back();
+  b2.ids.insert(b2.ids.end(), {7, 7, 7});
+  finish(3, b2);
+  assert((log == std::vector<std::string>{"release resumed=1", "resume"}));
+  // The disk holds a state only 4 rows below the point: it gains too little.
+  floor = 36;
+  finish(4, a);
+  assert(std::count(log.begin(), log.end(), "release resumed=0") == 1);
+  assert(std::none_of(log.begin(), log.end(), [](const std::string& line) { return line.starts_with("fork"); }));
+  floor = 0;
+  // A prompt that leaves a's tail after its prompt end resumes from the End point at 40: that point stays on the slot.
+  auto split = a;
+  split.ids = host.back();
+  split.ids[41] = 9;
+  split.ids.insert(split.ids.end(), {3, 4});
+  finish(5, split);
+  assert(std::count(log.begin(), log.end(), "load 40") == 1);
+  assert(std::none_of(log.begin(), log.end(), [](const std::string& line) { return line.starts_with("fork"); }));
+  // Another session again: one fork point, the longest (split's End point at 44 is above a's at 40).
+  finish(6, b);
+  assert(std::count_if(log.begin(), log.end(), [](const std::string& line) { return line.starts_with("fork"); }) == 1);
+  assert(log[1] == "fork 44 tail 46");
+  // Review M2: a fork point is speed only. A fault in it (SaveDerived throws logic_error) loses the point; the open goes
+  // on and the batch is not poisoned.
+  fork_throws = true;
+  finish(7, a);
+  assert(!session.Poisoned());
+  assert(std::count_if(log.begin(), log.end(), [](const std::string& line) { return line.starts_with("fork"); }) == 1);
+  assert(std::count(log.begin(), log.end(), "overwrite") == 1 && std::count(log.begin(), log.end(), "restore") == 1);
+}
+
 int main() {
   JoinTests();
+  ForkPointTests();
   // Boards 364 and 426: the done event carries the cache diagnosis and the per-tier counters as fixed words and
   // numbers only (the server copies them into its turn line).
   {

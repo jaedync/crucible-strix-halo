@@ -348,6 +348,7 @@ class RouteTableTest(unittest.TestCase):
         "/v1/chat/completions": "key", "/v1/completions": "key", "/v1/models": "key",
         "/v1/crucible/trace": "key", "/v1/crucible/version": "key", http_module.COUNT_TOKENS_PATH: "key",
         "/tokenize": "key", "/v1/tokenize": "key", "/apply-template": "key",
+        "/v1/messages": "key", "/v1/responses": "key",
         "/health": "open",
     }
 
@@ -360,6 +361,7 @@ class RouteTableTest(unittest.TestCase):
         literals = {node.value for node in ast.walk(tree)
                     if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings
                     and re.fullmatch(r"/[a-z][a-z0-9/_-]*", node.value)}
+        literals |= set(http_module.ADAPTERS)  # the routes of the other APIs (their modules hold the path literal)
         self.assertEqual(sorted(literals - set(self.TABLE)), [], "a route has no entry in RouteTableTest.TABLE")
         self.assertEqual(sorted(set(self.TABLE) - literals), [], "the table names a route that http.py lacks")
         self.assertEqual(set(http_module.LOGGED_PATHS) - set(self.TABLE), set())

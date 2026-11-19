@@ -12,9 +12,9 @@ from dataclasses import replace
 from http.server import BaseHTTPRequestHandler
 from os.path import basename
 from traceback import extract_tb
-from . import anthropic, metrics
-from . import ablation
-from .api import DEFAULTS, LEGACY_MODEL, MTP_WINDOW, STOP_IDS, ApiError, validate_request
+from . import anthropic, lenient, messages_api, metrics, responses_api
+from . import ablation, tool_tail
+from .api import DEFAULTS, LEGACY_MODEL, MTP_WINDOW, PENALTY_FIELDS, STOP_IDS, ApiError, validate_request
 from .hosts import REFUSED, host_allowed
 from .request_id import DEFAULT_CLIENT_REQUEST_ID_HEADER
 from .response import CompletionResponse
@@ -60,7 +60,17 @@ DRAIN_LIMIT_BYTES = 256 * 1024 * 1024
 LOGGED_METHODS = ("GET", "POST")
 LOGGED_VERSIONS = ("HTTP/1.0", "HTTP/1.1")
 LOGGED_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/models", "/v1/crucible/trace", "/v1/crucible/version",
-                COUNT_TOKENS_PATH, "/tokenize", "/v1/tokenize", "/apply-template", "/health")
+                COUNT_TOKENS_PATH, "/tokenize", "/v1/tokenize", "/apply-template", "/health", messages_api.PATH,
+                responses_api.PATH)
+# Other APIs on the chat path: each module maps its body to a chat body and writes the reply in its own shape.
+ADAPTERS = {messages_api.PATH: messages_api, responses_api.PATH: responses_api}
+
+
+def continuation_request(request, room, prompt_ids):
+    """The Request of a continuation job: `room` tokens. A penalized request also names the client's prompt length, so
+    the engine counts the earlier output that the job prefills again as output."""
+    penalized = any(getattr(request, name) != neutral for name, neutral in PENALTY_FIELDS.items())
+    return replace(request, max_tokens=room, **(dict(penalty_prompt=len(prompt_ids)) if penalized else {}))
 # Fixed client texts for the protocol errors that BaseHTTPRequestHandler raises before a method handler runs.
 PROTOCOL_ERRORS = {400: "The request line or headers are malformed.", 414: "The request line is too long.",
                    431: "The request headers are too large or too many.",
@@ -162,6 +172,17 @@ def close_connection(connection):
 
 
 
+def health_counts(backend):
+    """The real slot count and --ctx for GET /health, also after the start-time memory fit (server/memory_fit.py).
+    Empty for a backend that does not report them."""
+    counts = getattr(backend, "session_counts", None)
+    context = getattr(backend, "context", None)
+    if not callable(counts) or type(context) is not int:
+        return {}
+    sessions = counts()[1]
+    return dict(sessions=sessions, context=context) if type(sessions) is int else {}
+
+
 # the default request body for a context. A prompt that fills the context must reach the tokenizer: 16 bytes
 # a token holds English text (about 4), code, and \u-escaped CJK text (about 8), with room for the chat JSON.
 BODY_BYTES_PER_TOKEN = 16
@@ -177,9 +198,13 @@ class Service:
                  max_body_mib=1, thinking_answer_room=None, max_thinking_tokens=None, stream_tool_calls=True,
                  max_requests_per_client=0, vision=None, default_mtp_prefix=MTP_WINDOW, capture=None, allowed_hosts=None,
                  defaults=DEFAULTS, min_thinking_tokens=0, client_request_id_header=DEFAULT_CLIENT_REQUEST_ID_HEADER,
-                 end_of_turn_guard=True, model_name="", rope_reserve=None, rope_word=None, api_key=None):
+                 end_of_turn_guard=True, model_name="", rope_reserve=None, rope_word=None, api_key=None,
+                 lenient_fields=lenient.DEFAULT, extend_tool_tails=False):
         self.backend, self.tokenizer, self.model = backend, tokenizer, model
         self.api_key = api_key  # api_key.KeyGate or None: every route but /health needs the key when it is set
+        self.lenient_fields = lenient_fields  # serve --lenient-fields (server/lenient.py); default on
+        self.extend_tool_tails = extend_tool_tails  # serve --extend-tool-tails (server/tool_tail.py)
+        self.tail_extensions = tool_tail.Pending()  # the extension jobs that run now
         self.end_of_turn_guard = end_of_turn_guard  # serve --end-of-turn-guard (see Handler.keep_end_of_turn)
         # serve --model-name: a second public model name, whose -abliterated form also selects the ablated mode.
         self.ablated_names = ablation.ablated_names(model, model_name)
@@ -206,9 +231,24 @@ class Service:
         """True when the engine serves ablated requests on demand (its ready event, ablation.READY_FIELD)."""
         return getattr(self.backend, "ablate_request", False) is True
 
+    def structured_options(self):
+        """The validation argument of structured output: the engine's ready event named the constraint key."""
+        return dict(structured=getattr(self.backend, "constraint_ready", False) is True)
+
     def ablate_options(self):
         """The validation arguments of the ablated mode: the accepted names and the engine's capability."""
         return dict(ablated_names=self.ablated_names, ablate_available=self.ablate_available)
+
+    def request_body(self, body, client_request_id=None):
+        """A chat or completion body before validate_request: with --lenient-fields, without the fields that the
+        mode ignores (their names go to one log line). Off: the body as it is."""
+        if not self.lenient_fields:
+            return body
+        body, ignored = lenient.lenient_body(body)
+        line = lenient.log_line(ignored, client_request_id)
+        if line is not None:
+            metrics.emit(line)
+        return body
 
     def capture_turn(self, request, prompt_ids, output_ids):
         """Give a finished turn to the draft capture, if any. Only the class and the IDs leave here."""
@@ -359,7 +399,8 @@ class Service:
         except queue.Empty:
             raise ApiError("The queued request timed out. Try again later.", status=503) from None
         if event.get("event") == "error":
-            raise ApiError(event.get("error", "The engine request failed."), status=503)
+            # 400: a structured output constraint that the engine refused at open (batch_backend); else 503.
+            raise ApiError(event.get("error", "The engine request failed."), status=400 if event.get("status") == 400 else 503)
         return event
 
     @property
@@ -379,6 +420,11 @@ class Service:
                 event.get("finish_reason") not in ("stop", "length")):
             raise ApiError("The engine returned an invalid completion event.", status=500)
         return None
+
+def constraint_start(request, prompt_ids):
+    """A continuation job of a constrained request replays the output so far (ids after the client's prompt)."""
+    return dict(constraint_from=len(prompt_ids)) if getattr(request, "constraint", None) is not None else {}
+
 
 def trace_since(query):
     from urllib.parse import parse_qs
@@ -514,7 +560,7 @@ def handler_for(service):
         def handle_one_request(self):
             """Last resort: socketserver would drop the connection and print a traceback, whose text can hold content."""
             # A keep-alive connection reuses the handler: the SSE ending below must see this request's output only.
-            self.response_started, self.output = False, None
+            self.response_started, self.output, self.adapter = False, None, None
             self.headers = None  # a request line that fails to parse must not log the previous request's id
             try:
                 super().handle_one_request()
@@ -532,15 +578,14 @@ def handler_for(service):
                     request_id, message = None, f"unexpected {type(error).__name__}"
                 metrics.emit(metrics.error_line(request_id, 500, message, self.response_started,
                                                 self.client_request_id))
-                body = error_body(ApiError("The server could not process the request.", status=500))
+                failure = ApiError("The server could not process the request.", status=500)
                 output = getattr(self, "output", None)
                 try:
                     if not self.response_started:
-                        self.send_json(500, body)
+                        self.send_json(500, self.error_body(failure))
                     elif output is not None and output.headers_sent:
                         # Stream headers go out at admission, so a fault after them still ends the stream as SSE.
-                        self.sse(body)
-                        self.sse("[DONE]")
+                        self.stream_error(failure)
                 except Exception:
                     pass  # the line above records the failure; the client connection is gone or unusable
             finally:
@@ -585,14 +630,27 @@ def handler_for(service):
                 metrics.emit(metrics.error_line(request_id, error.status, error, started, self.client_request_id))
             try:
                 if started:
-                    self.sse(error_body(error))
-                    self.sse("[DONE]")
+                    self.stream_error(error)
                 else:
-                    self.send_json(error.status, error_body(error), getattr(error, "headers", None))
+                    self.send_json(error.status, self.error_body(error), getattr(error, "headers", None))
                     self.discard_body()
             except (BrokenPipeError, ConnectionResetError, TimeoutError):
                 pass  # Error output has the same disconnect semantics as successful output.
             self.close_connection = True
+
+        def error_body(self, error):
+            """The error object in the shape of the request's API (Anthropic for /v1/messages, else OpenAI)."""
+            adapter = getattr(self, "adapter", None)
+            return adapter.error_body(error) if adapter is not None else error_body(error)
+
+        def stream_error(self, error):
+            """End a started stream with an error, in the shape of the request's API."""
+            adapter = getattr(self, "adapter", None)
+            if adapter is not None:
+                adapter.stream_error(self, error)
+                return
+            self.sse(error_body(error))
+            self.sse("[DONE]")
 
         def do_GET(self):
             self.request_read()
@@ -600,7 +658,7 @@ def handler_for(service):
                 self.local_host()
                 path, _, query = self.path.partition("?")
                 if path != "/health":
-                    self.authorize()  # /health shows only ok or 503: systemd tools and proxies poll it
+                    self.authorize()  # /health shows ok (with the slot count and --ctx) or 503: systemd tools and proxies poll it
                 if path == "/v1/crucible/trace":
                     self.send_json(200, dict(object="crucible.trace", data=service.backend.trace.since(trace_since(query))))
                     return
@@ -612,7 +670,7 @@ def handler_for(service):
                     # The server binds only after the engine is ready, so an answer means ready. llama-swap polls this.
                     if getattr(service.backend, "fatal", None):
                         raise ApiError("The engine stopped.", status=503)
-                    self.send_json(200, dict(status="ok"))
+                    self.send_json(200, dict(status="ok", **health_counts(service.backend)))
                     return
                 if self.path != "/v1/models":
                     raise ApiError("This endpoint is not supported.", status=404)
@@ -700,6 +758,13 @@ def handler_for(service):
                 self.wfile.flush()
                 self.last_write = time.monotonic()
 
+        def wait_for_extension(self, prompt_ids):
+            """A prompt that extends a running tail extension waits for its end, so it resumes from there
+            (server/tool_tail.py). The wait comes before the submit, so a stream gets no headers yet: they go out
+            when the submit accepts the request, and a refusal keeps its HTTP status (server/README.md). The wait
+            lasts at most tool_tail.WAIT_SECONDS with no byte; idle() sees a client that leaves."""
+            service.tail_extensions.wait(prompt_ids, idle=self.idle)
+
         def wait_event(self, job, first=False):
             return service.next_event(job, FIRST_EVENT_SECONDS if first else NEXT_EVENT_SECONDS, self.idle)
 
@@ -765,7 +830,8 @@ def handler_for(service):
                     event.get("finish_reason") != "length"):
                 return None
             continuation = prompt_ids + output.ids
-            self.jobs.append(service.backend.submit(continuation, replace(request, max_tokens=room), **options))
+            self.jobs.append(service.backend.submit(continuation, continuation_request(request, room, prompt_ids),
+                                                    **options, **constraint_start(request, prompt_ids)))
             return continuation
 
         def end_stopped(self, cap, prompt_ids, output):
@@ -808,11 +874,12 @@ def handler_for(service):
             if output.stop_filter.stopped:
                 # A client stop string that the kept text matched ends the reply, as it does on the token path.
                 return "ended"
-            follow = replace(request, max_tokens=room)
+            follow = continuation_request(request, room, prompt_ids)
             # The cap counts the output of the whole reply; a job counts its own tokens.
             left = cap.tokens - len(output.ids) if cap and output.think.thinking else 0
             self.jobs.append(service.backend.submit(prompt_ids + output.ids, follow, **options,
-                                                    **(dict(think_cap=left) if left > 0 else {})))
+                                                    **(dict(think_cap=left) if left > 0 else {}),
+                                                    **constraint_start(request, prompt_ids)))
             return "continued"
 
         def opened_count(self, event, prompt_ids):
@@ -877,26 +944,31 @@ def handler_for(service):
                 continuation = rendered if len(rendered) <= len(continuation) else continuation
             # The continuation must resume from the first job's own end state, whatever peers do meanwhile: the batch
             # worker keeps the first job's slot for it. A backend without that rule cancels and submits.
-            follow = replace(request, max_tokens=room)
+            follow = continuation_request(request, room, prompt_ids)
             continue_job = getattr(service.backend, "continue_job", None)
+            start = constraint_start(request, prompt_ids)
             if continue_job is not None:
-                self.jobs.append(continue_job(first, continuation, follow, **options))
+                self.jobs.append(continue_job(first, continuation, follow, **options, **start))
             else:
                 first.cancelled.set()
-                self.jobs.append(service.backend.submit(continuation, follow, **options))
+                self.jobs.append(service.backend.submit(continuation, follow, **options, **start))
             return continuation
 
         def count_tokens(self):
             """Anthropic-style input token count. CPU only: no engine command, queue entry, slot or cache change."""
-            prompt_ids, _ = service.prompt_ids(self.chat_request(anthropic.chat_body(self.read_body())))
+            prompt_ids, _ = service.prompt_ids(self.chat_request(anthropic.chat_body(self.read_body()),
+                                                                 format_field=anthropic.FORMAT_FIELD,
+                                                                 render_strict=anthropic.RENDER_STRICT))
             self.send_json(200, dict(input_tokens=len(prompt_ids)))
 
-        def chat_request(self, body):
-            """A chat request from a utility body, with the chat path's validation and server flags."""
+        def chat_request(self, body, **fields):
+            """A chat request from a utility body, with the chat path's validation and server flags. fields: the
+            adapter's validate_request options (format_field, render_strict)."""
+            body = service.request_body(body, self.client_request_id)
             return validate_request(body, "chat", service.model, default_thinking=service.default_thinking,
                                     vision=service.vision, vocab=service.vocab,
                                     default_mtp_prefix=service.default_mtp_prefix, defaults=service.defaults,
-                                    **service.ablate_options())
+                                    **service.ablate_options(), **service.structured_options(), **fields)
 
         def tokenize(self):
             """OpenAI-compatible /tokenize: {"content": text or IDs} -> the completion prompt's IDs; {"messages": ...} (any
@@ -925,7 +997,8 @@ def handler_for(service):
                     raise ApiError("content must be text or a list of token IDs.", "content")
                 model = {"model": body["model"]} if "model" in body else {}
                 request = validate_request(dict(prompt=body["content"]) | model, "completion", service.model,
-                                           vocab=service.vocab, **service.ablate_options())
+                                           vocab=service.vocab, **service.ablate_options(),
+                                           **service.structured_options())
                 ids, _ = service.prompt_ids(request)
             else:
                 raise ApiError("Send content (text or token IDs) or messages.", "content")
@@ -944,6 +1017,8 @@ def handler_for(service):
             self.last_write = time.monotonic()
             started = admitted = finished = False
             address = self.client_address[0] if isinstance(getattr(self, "client_address", None), tuple) else None
+            route = self.path.partition("?")[0]
+            self.adapter = ADAPTERS.get(route)  # set first, so every error of the request has the API's shape
             try:
                 if service.api_key is not None:
                     self.local_host()  # also for an unknown path: it needs the key before it says 404
@@ -954,12 +1029,27 @@ def handler_for(service):
                     utility()
                     return
                 kinds = {"/v1/chat/completions": "chat", "/v1/completions": "completion"}
-                if self.path not in kinds:
+                fields = {}
+                if self.adapter is not None:
+                    self.api_body = self.read_body()  # the adapter's reply echoes some request fields
+                    kind, body = "chat", self.adapter.chat_body(self.api_body)
+                    default = getattr(self.adapter, "strict_default", None)
+                    if default is not None:
+                        default(body, **service.structured_options())  # the strict of a tool with none (responses_api)
+                    # The field that maps to response_format, and the prompt rule of a strict flag.
+                    fields = dict(format_field=self.adapter.FORMAT_FIELD, render_strict=self.adapter.RENDER_STRICT)
+                elif self.path in kinds:
+                    kind, body = kinds[self.path], service.request_body(self.read_body(), self.client_request_id)
+                else:
                     raise ApiError("This endpoint is not supported.", status=404)
-                request = validate_request(self.read_body(), kinds[self.path], service.model,
+                request = validate_request(body, kind, service.model,
                                            default_thinking=service.default_thinking, vision=service.vision,
                                            vocab=service.vocab, default_mtp_prefix=service.default_mtp_prefix,
-                                           defaults=service.defaults, **service.ablate_options())
+                                           defaults=service.defaults, **service.ablate_options(),
+                                           **service.structured_options(), **fields)
+                finish = getattr(self.adapter, "prompt_request", None)
+                if finish is not None:
+                    request = finish(request, self.api_body)  # the adapter's prompt rule (responses_api)
                 admitted = service.admit_client(address)
                 request, prompt_ids, offsets = service.plan(request)
                 options = {}
@@ -973,19 +1063,27 @@ def handler_for(service):
                     prefix = service.tokenizer.cache_prefix_tokens(request, prompt_ids)
                     shared = getattr(service.tokenizer, "shared_prefix_tokens", lambda request, ids: 0)(request, prompt_ids)
                     options |= dict(cache_prefix_tokens=prefix) | (dict(shared_prefix_tokens=shared) if shared else {})
+                    marks = getattr(service.tokenizer, "prefix_marks", None)
+                    marks = marks(request, prompt_ids, shared) if marks is not None else None
+                    if marks: options["prefix_marks"] = marks  # turn-line diagnostics only (metrics.load_fields)
+                if service.extend_tool_tails and service.tail_extensions.running(prompt_ids):
+                    self.wait_for_extension(prompt_ids)
                 # The batch worker holds new chunks for the continuation once the cap token is out.
                 self.jobs.append(service.backend.submit(prompt_ids, request, **options,
                                                         **(dict(think_cap=cap.tokens) if cap else {})))
-                self.output = CompletionResponse(self, service, request, prompt_ids)
+                self.output = (self.adapter.output(self, service, request, prompt_ids) if self.adapter is not None
+                               else CompletionResponse(self, service, request, prompt_ids))
                 # A stream gets its headers at admission. Keepalives then cover the queue wait and the prefill,
-                # and a later failure ends the stream with an SSE error.
-                self.output.headers()
-                started, self.last_write = request.stream, time.monotonic()
+                # and a later failure ends the stream with an SSE error. A constrained stream waits for its first
+                # event: an engine that refuses the constraint at open gives the client a 400 (struct-core K5).
+                if getattr(request, "constraint", None) is None:
+                    self.output.headers()
+                started, self.last_write = request.stream and self.output.headers_sent, time.monotonic()
                 first = self.wait_event(self.jobs[-1], first=True)
                 self.complete(request, prompt_ids, first, options, cap)
                 finished = True
             except ApiError as error:
-                self.send_api_error(error, started)
+                self.send_api_error(error, started or bool(self.output and self.output.headers_sent))
             except (BrokenPipeError, ConnectionResetError, TimeoutError):
                 self.close_connection = True
                 if self.jobs:
@@ -1003,4 +1101,7 @@ def handler_for(service):
                 if finished:
                     service.capture_turn(request, prompt_ids, self.output.ids)
                     service.capture_draft(request, [getattr(job, "turn", None) for job in self.jobs])
+                    if service.extend_tool_tails and getattr(self.output, "message", None):
+                        # After the response: the next request of an agent session resumes from the end of this reply.
+                        tool_tail.extend(service, request, prompt_ids, self.output.ids, self.output.message)
     return Handler

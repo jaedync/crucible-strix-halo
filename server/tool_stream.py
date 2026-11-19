@@ -4,12 +4,14 @@ The id and name go out when the function tag closes and the name passes the requ
 parameter streams as JSON-escaped text; any other parameter goes out when it closes and validates. The closing
 brace waits for the whole call to validate. For a valid call, the joined argument deltas are byte-equal to the
 arguments that ToolOutput.finish returns. Once this stream finds a problem it sends nothing more; ToolOutput.finish
-then decides the response from the complete text.
+then decides the response from the complete text. A value of a strict tool ends where the parser ends it
+(tool_frame.value_close): a JSON string can hold `</parameter>`, and any strict value can hold `</tool_call>`.
 """
 import json
 import uuid
 from .api import ApiError
 from .schema_limits import WorkBudget
+from .tool_frame import OPEN, raw_string, value_close
 from .tool_schema import resolve, types
 
 START, END = "<tool_call>", "</tool_call>"
@@ -36,8 +38,9 @@ class Stopped(Exception):
 
 
 class ToolCallStream:
-    def __init__(self, request, definitions):
+    def __init__(self, request, definitions, whole=False):
         self.request, self.definitions = request, definitions
+        self.whole = whole  # tool_output.whole_numbers on the values (--extend-tool-tails)
         self.calls = []  # dict(id, name, sent): sent is the argument text already sent
         self.pos = 0
         self.state = "between"
@@ -138,6 +141,10 @@ class ToolCallStream:
         self.pos += skip + close + 1
         self.value_start = self.pos
         self.value_sent = 0
+        # A strict value in the grammar's form: raw is its reader's mode; scan is where the next end tag search starts.
+        self.raw = (raw_string(self.properties[key], self.schema, self.budget)
+                    if self.strict and key in self.properties else None)
+        self.scan = 0
         self.state = "string" if self.streams_as_string(key) else "value"
         if self.state == "string":
             self.send(deltas, ("{" if len(self.keys) == 1 else ",") + dumps(key) + ':"')
@@ -150,7 +157,19 @@ class ToolCallStream:
         return types(schema, self.schema, budget=self.budget) == {"string"}
 
     def value_end(self, raw):
-        """Where the value ends, or None while open. The final parser cuts a call at its first </tool_call>."""
+        """Where the value ends, or None while open. A strict value in the grammar's form ends as the final parser
+        reads it (tool_frame.value_close). Any other value ends at its first </parameter>, and the final parser cuts
+        its call at the first </tool_call>."""
+        if self.raw is not None:
+            # The value can close only at a </parameter>: read it again only when a new one arrives, so a long value
+            # costs one read per tag, not one per piece. Off-form text found later only waits; finish decides it.
+            tag = raw.find(PARAMETER_CLOSE, self.scan)
+            if tag < 0:
+                return None
+            self.scan = tag + len(PARAMETER_CLOSE)
+            close = value_close(raw, 0, self.raw)
+            if close is not None:
+                return None if close == OPEN else close
         close, end = raw.find(PARAMETER_CLOSE), raw.find(END)
         if end >= 0 and (close < 0 or end < close):
             raise Stopped
@@ -189,7 +208,7 @@ class ToolCallStream:
             return False
         # As the final parser: a schema-only failure keeps the value (tool_output.UNCHECKED), so the stream goes on.
         parsed = argument_value(raw[:close], self.properties.get(self.key, {}), self.schema, self.budget,
-                                None if self.strict else [])
+                                None if self.strict else [], self.whole)
         self.send(deltas, ("{" if len(self.keys) == 1 else ",") + dumps(self.key) + ":" + dumps(parsed))
         self.pos = self.value_start + close + len(PARAMETER_CLOSE)
         self.state = "parameters"
@@ -205,7 +224,8 @@ class ToolCallStream:
             return False
         if rest[:end].strip():
             raise Stopped
-        call = parse_function(text[self.call_start:self.pos + end], self.definitions, self.budget, [])
+        call = parse_function(text[self.call_start:self.pos + end], self.definitions, self.budget, [],
+                              whole=self.whole)
         arguments = call["function"]["arguments"]
         sent = self.calls[-1]["sent"]
         if not arguments.startswith(sent):

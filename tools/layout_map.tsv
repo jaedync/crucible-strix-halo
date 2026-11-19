@@ -116,6 +116,7 @@ engine/runtime/layer_loop.h	engine/runtime/layer_loop.h	runtime	The one trunk la
 engine/runtime_memory_policy.h	engine/gfx1151/runtime_memory_policy.h	gfx1151	SVM migration policy.	
 engine/sampling.h	engine/runtime/sampling.h	runtime	Filtered sampling.	
 engine/sampling_generation.h	engine/runtime/sampling_generation.h	runtime	Sampled decode and rejection.	
+engine/runtime/sampling_penalty.h	engine/runtime/sampling_penalty.h	runtime	Presence, frequency and repetition penalties of a request (other engines semantics).	
 engine/sequence_state.h	engine/runtime/sequence_state.h	runtime	Mutable per-sequence state.	
 engine/serve.h	engine/serve/serve.h	serve	Serial serve loop (retires in train 19).	
 engine/serve_protocol.h	engine/serve/serve_protocol.h	serve	JSON-line request parsing.	
@@ -187,6 +188,7 @@ engine/runtime/lazy_snapshot.h	engine/runtime/lazy_snapshot.h	runtime	Lazy save 
 engine/runtime/ablate_request.h	engine/runtime/ablate_request.h	runtime	Per-request ablation: the start switch read and the ablated state tenant (CRUCIBLE_ABLATE_MODE=request).	New file; tests/ablate_request_test.cpp.
 engine/runtime/tenant.h	engine/runtime/tenant.h	runtime	Tenant key of a request and of every cached state.	New file (w1-key); tests/tenant_test.cpp.
 engine/runtime/state_format.h	engine/runtime/state_format.h	runtime	File formats of the NVMe tier: checksums, state and block headers.	New file (ssd-blocks): moved out of state_disk.h.
+engine/runtime/state_root.h	engine/runtime/state_root.h	runtime	Where the state folder can be: the rule that the host copy (tools/crucible_cli/state_root.py) shares.	New file (cache-folder, Nov 12): moved out of state_disk.h PrepareRoot.
 engine/runtime/state_epoch.h	engine/runtime/state_epoch.h	runtime	State epoch slot that tools/state_epoch.py stamps; input of the state identity.	New file (cache-epoch); tests/state_epoch_test.cpp.
 engine/runtime/state_switches.h	engine/runtime/state_switches.h	runtime	Which CRUCIBLE_* switches are part of a state identity, with a reason each.	New file (cache-epoch); tests/state_epoch_test.cpp.
 engine/exl3/kernels/lane_window.h	engine/exl3/kernels/lane_window.h	exl3/kernels	Lane geometry and trellis state extraction of DecodeLane, host-visible for tests/lane_window_test.cpp (K7, K8, K3.5).	New file (packs).
@@ -213,6 +215,14 @@ engine/runtime/draft_quant_host.h	engine/runtime/draft_quant_host.h	runtime	Host
 engine/exl3/dense_rows.h	engine/exl3/dense_rows.h	exl3	Dense fp16 rows of chosen output blocks of an EXL3 linear.	New file for runtime/draft_quant.h.
 engine/model/flashnext/draft_chain_switch.h	engine/model/flashnext/draft_chain_switch.h	model/flashnext	Resolution of CRUCIBLE_DRAFT_CHAIN (MTP-only int8 HC, lead pass, chain prior); host only.	New file; tests/draft_chain_switch_test.cpp.
 engine/model/flashnext/bf16_half.h	engine/model/flashnext/bf16_half.h	model/flashnext	BF16 to F16 conversion of vision tensors at load (host only).	New file; tests/vision_bf16_test.cpp
+engine/runtime/constraint.h	engine/runtime/constraint.h	runtime	Structured output: the grammar phases, masked targets and the draft cut.	
+engine/runtime/constraint_vocab.h	engine/runtime/constraint_vocab.h	runtime	Structured output: the vocabulary and grammar factory, the only interface to third_party/xgrammar.	
+engine/runtime/constraint_xgr.cc	engine/runtime/constraint_xgr.cc	runtime	Structured output: the xgrammar wrapper, built into build/third_party/libcrucible_constraint.a.	
+engine/runtime/constraint_helper.h	engine/runtime/constraint_helper.h	runtime	Structured output: the grammar compile helper (limits, fixed results and texts).	New file.
+engine/runtime/constraint_helper_image.S	engine/runtime/constraint_helper_image.S	runtime	Structured output: the helper program as bytes in the constraint library (.incbin).	New file.
+engine/runtime/constraint_helper_image.cc	engine/runtime/constraint_helper_image.cc	runtime	Structured output: the span of the helper image of constraint_helper_image.S.	New file.
+engine/runtime/constraint_helper_main.cc	engine/runtime/constraint_helper_main.cc	runtime	Structured output: main() of the grammar compile helper program (holds no image).	New file.
 engine/layers/rope_tables.h	engine/layers/rope_tables.h	layers	YaRN RoPE tables (factors 2 and 4), generated from the Hugging Face reference by tools/yarn/rope_header.py.	New file; tests/test_yarn_rope_header.py, tests/rope_table_test.hip.
 engine/runtime/rope_mode.h	engine/runtime/rope_mode.h	runtime	RoPE mode of a sequence (plain, YaRN factor 2 or 4), CRUCIBLE_ROPE_MODE and the context cap.	New file; tests/rope_mode_test.cpp.
 engine/runtime/rope_policy.h	engine/runtime/rope_policy.h	runtime	Y2 host policy: the RoPE length gate (RopeModeFor), the YaRN state tenant and its mark (RopeTenant, RopeTenantMode), ApplyStreamRope for serial serve.	New file; tests/rope_policy_test.cpp.
+engine/runtime/fork_point.h	engine/runtime/fork_point.h	runtime	Fork point pick at a release: the longest slot point below the tail that goes to disk.	New file; tests/fork_point_test.cpp.

@@ -101,6 +101,7 @@ class Host:
     which: Callable[[str], Any] = shutil.which
     disk_free: Callable[[Path], int] = _disk_free
     port_free: Callable[[str, int], bool] = _port_free
+    disk_measure: Callable[[Path, int], Any] = None  # diskmeasure.measure (set in real()); tests give a fake
     port_in_use: Callable[[str, int], bool] = _port_in_use
     groups: Callable[[], list] = _groups
     can_access: Callable[[Path, int], bool] = os.access
@@ -118,4 +119,6 @@ class Host:
         from .http import Http
         from .runner import Runner
         is_tty = sys.stdin.isatty() and sys.stdout.isatty()
-        return cls(runner=Runner(), http=Http(), is_tty=is_tty, tty_prompt=None if is_tty else _tty_prompt())
+        from .diskmeasure import measure
+        return cls(runner=Runner(), http=Http(), is_tty=is_tty, tty_prompt=None if is_tty else _tty_prompt(),
+                   disk_measure=measure)

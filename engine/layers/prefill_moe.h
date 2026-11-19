@@ -633,13 +633,14 @@ __global__ void __launch_bounds__(256) PrefillMoeMidKernel(PrefillMoe a) {
   for (int i=0; i<4; ++i) dst[i]=__float2half(v[i]*kHadNorm);
 }
 
-// LinOutBlock (S = 1) over an fp16 partial: 0 + p, then the same transform.
+// LinOutBlock (S = 1) over an fp16 partial: 0 + p, then the same transform. Wht128Dpp gives Wht128's bits
+// without the ds_bpermute round trips; the combine calls it with whole waves.
 __device__ __forceinline__ void LinOutBlockHalf(const LinJob& j, int r, int blk, float v[4]) {
   const int c0 = blk * 128 + (threadIdx.x & 31) * 4;
   const __half* p = reinterpret_cast<const __half*>(j.partial) + (size_t)r * j.O + c0;
 #pragma unroll
   for (int i = 0; i < 4; ++i) v[i] = 0.f + __half2float(p[i]);
-  Wht128(v);
+  Wht128Dpp(v);
 #pragma unroll
   for (int i = 0; i < 4; ++i) v[i] *= kHadNorm * __half2float(j.svh[c0 + i]);
 }

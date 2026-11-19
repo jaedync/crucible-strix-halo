@@ -9,7 +9,7 @@ with 128 GB. Its OpenAI-compatible server gives local coding agents 4 sessions o
 <picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/decode-by-context-dark.svg"><img src="docs/img/decode-by-context-light.svg" width="412" alt="Line chart: Decode by context length, in tokens per second: 4.05 bpw from 71.7 at 32K to 62.2 at 250K; 3.05 bpw from 77.0 at 32K to 69.1 at 250K. v0.33.0, Nov 3, 2026."></picture>
 </p>
 
-<sub>One request at a time, default configuration, balanced power profile, v0.33.0 (Nov 3, 2026). No new run for v0.37.3.</sub>
+<sub>One request at a time, default configuration, balanced power profile, v0.33.0 (Nov 3, 2026). No new run for v0.38.0.</sub>
 <!-- results:end charts -->
 
 ## Install
@@ -26,7 +26,7 @@ curl -fsSL https://raw.githubusercontent.com/jaedync/crucible-strix-halo/main/in
 
 <!-- results:start clone -->
 ```sh
-git clone --branch v0.37.3 https://github.com/jaedync/crucible-strix-halo.git
+git clone --branch v0.38.0 https://github.com/jaedync/crucible-strix-halo.git
 cd crucible-strix-halo
 ./crucible setup
 ```
@@ -45,27 +45,30 @@ Read more: [setup guide](docs/QUICKSTART.md) · [service](docs/QUICKSTART.md#run
 
 ## What you need
 
-- **Machine:** Ryzen AI Max+ 395 with Radeon 8060S (gfx1151) and 128 GB of memory. Other machines are not supported.
-- **System:** Linux with Python 3.12 or newer. The tested system is Arch Linux.
+- **Machine:** Ryzen AI Max+ 395 with Radeon 8060S (gfx1151) and 128 GB of memory, or 96 GB
+  (3.05 pack only). Other machines are not supported.
+- **System:** Linux with Python 3.12 or newer, tested on Arch Linux.
 - **ROCm:** the release engine is built with ROCm 7.2.4. It runs on ROCm 10.1 (recommended) and on 7.2.4.
-- **GPU memory:** two kernel parameters let the GPU use the system memory. Setup prints the change and applies it
-  only after you type `yes`.
-- **Disk:** an SSD with about 110 GB for the model, and up to 200 GiB for the conversation cache.
+- **GPU memory:** two kernel parameters let the GPU use system memory. Setup applies them after you type
+  `yes`.
+- **Disk:** an SSD, about 110 GB for the model (125 GB for 4.18), and up to 200 GiB for the conversation cache.
 
 Read more: [step 1 and step 2 of the setup guide](docs/QUICKSTART.md#step-1-rocm-the-hip-compiler-and-gpu-access)
 
 ## Configurations
 
 Setup installs the pack [`4.05bpw_h6_ng6`](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3/tree/4.05bpw_h6_ng6).
-With `--pack 3.05` it installs [`3.05bpw_h5_ng5`](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3/tree/3.05bpw_h5_ng5),
-the faster pack with the lower [quality](docs/QUALITY.md). `./crucible setup --layout NAME` sets the sessions:
+`--pack 3.05` installs [`3.05bpw_h5_ng5`](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3/tree/3.05bpw_h5_ng5),
+faster, lower [quality](docs/QUALITY.md). `--pack 4.18` installs
+[`4.18bpw_h6_ng8`](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3/tree/4.18bpw_h6_ng8), 4.05 quality, slower, 128 GB only.
+`./crucible setup --layout NAME` sets the sessions:
 
 - `default`: 4 sessions of 262,144 tokens.
 - `long`: 1 session of 524,288 tokens and 2 of 262,144.
 - `two-long`: 2 sessions of 524,288 tokens.
 
-Each one needs about 28 GB of GPU memory for the sessions. A request that fits in 262,144 tokens gets the same tokens in
-all three. A longer request uses YaRN. Measured in `long`:
+Each needs about 28 GB of GPU memory for the sessions. Up to 262,144 tokens, all three give the same
+tokens. A longer request uses YaRN. Measured in `long`:
 
 <!-- results:start long -->
 | `long`, 4.05 pack | 250,000 tokens | 490,000 tokens (YaRN) |
@@ -74,7 +77,7 @@ all three. A longer request uses YaRN. Measured in `long`:
 | Cold prompt: prefill | 1,677.6 tok/s | 1,436.2 tok/s |
 | Decode, code | 67.7 tok/s | 59.8 tok/s |
 
-<sub>v0.37.0, measured Nov 11, 2026: 1 run, balanced power profile. No new run for v0.37.3.</sub>
+<sub>v0.37.0, measured Nov 11, 2026: 1 run, balanced power profile. No new run for v0.38.0.</sub>
 <!-- results:end long -->
 
 Read more: [long context](docs/LONG_CONTEXT.md)
@@ -86,20 +89,20 @@ Read more: [long context](docs/LONG_CONTEXT.md)
 <picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/prefill-by-release-dark.svg"><img src="docs/img/prefill-by-release-light.svg" width="412" alt="Line chart: Cold prefill of a 32K prompt, by release, in tokens per second: 4.05 bpw from 1,585 at v0.22.0 to 1,831 at v0.34.0; 3.05 bpw from 1,656 at v0.22.0 to 1,877 at v0.34.0. Oct 27 to Nov 7, 2026."></picture>
 </p>
 
-<sub>Each release ran with the settings of its own time, balanced power profile. No new run for v0.37.3.</sub>
+<sub>Each release ran with the settings of its own time, balanced power profile. No new run for v0.38.0.</sub>
 <!-- results:end releases -->
 
 <!-- results:start table -->
-| v0.37.3 | 4.05 pack | 3.05 pack |
+| v0.38.0 | 4.05 pack | 3.05 pack |
 |---|---:|---:|
-| Cold 32K prompt: first token | 16.3 s | 16.1 s |
-| Cold 130K prompt: first token | 69.7 s | 68.7 s |
-| Same 32K prompt again: first token | 0.018 s | 0.018 s |
-| Decode at 32K, 1 session, code | 72.1 tok/s | 77.0 tok/s |
-| Decode at 32K, 1 session, prose | 54.8 tok/s | 61.2 tok/s |
-| Decode, 4 sessions, total | 115.0 tok/s | 129.3 tok/s |
+| Cold 32K prompt: first token | 16.2 s | 16.2 s |
+| Cold 130K prompt: first token | 69.3 s | 69.3 s |
+| Same 32K prompt again: first token | 0.017 s | 0.017 s |
+| Decode at 32K, 1 session, code | 72.9 tok/s | 79.1 tok/s |
+| Decode at 32K, 1 session, prose | 58.3 tok/s | 63.4 tok/s |
+| Decode, 4 sessions, total | 112.8 tok/s | 127.9 tok/s |
 
-<sub>v0.37.3, measured Nov 17, 2026: median of 6 texts (decode: mean, 3 runs a text), balanced power profile, default configuration.</sub>
+<sub>v0.38.0, measured Nov 19, 2026: median of 6 texts (decode: mean, 3 runs a text), balanced power profile, default configuration.</sub>
 <!-- results:end table -->
 
 The 4-session row uses warm prompts and the all-4 window.

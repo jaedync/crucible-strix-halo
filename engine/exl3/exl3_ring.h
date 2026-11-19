@@ -9,7 +9,10 @@ namespace crucible {
 namespace lin_ring {
 constexpr int kSlots = 3, kLoaders = 2, kConsumers = 8, kChunk = 4;
 constexpr int kMaxK = 6;
-constexpr int kSlotWords = kConsumers * kChunk * 8 * kMaxK;
+// MaxK 8 (the h6_ng8 packs): a wider slot in separate instantiations, so the K <= 6 kernels keep their code.
+template <int MaxK>
+constexpr int SlotWords = kConsumers * kChunk * 8 * MaxK;
+constexpr int kSlotWords = SlotWords<kMaxK>;
 using Control = LdsStreamRing<kSlots, kLoaders, kConsumers>;
 
 // Front order (front_order.h) stores chunk q of every item of a job side
@@ -20,12 +23,12 @@ constexpr int ChunkBytes(int K) { return kConsumers * kChunk * 8 * K * 4; }
 // A named register pair keeps next-chunk VMEM live while this chunk reaches LDS.
 // Front-order items must stay inside one eight-column group. A narrower item
 // reads the contiguous part of each chunk that holds its columns.
-template <int K, bool Front = false>
+template <int K, bool Front = false, int MaxK = kMaxK>
 __device__ __forceinline__ void Load(const LinJob& job, const GemvItem& item,
                                     uint32_t* payload, Control& control, uint32_t base_seq = 0) {
   constexpr int T = 8 * K, ColVectors = kChunk * T / 4;
   constexpr int VectorsPerLane = kConsumers * ColVectors / (32 * kLoaders);
-  static_assert(VectorsPerLane <= 6);
+  static_assert(K <= MaxK && VectorsPerLane <= 8);
   const int A = job.I / 16, span = A / job.S, a0 = item.s * span;
   const int count = (span + kChunk - 1) / kChunk;
   const int lane = threadIdx.x & 31, loader = threadIdx.x >> 5;
@@ -51,19 +54,24 @@ __device__ __forceinline__ void Load(const LinJob& job, const GemvItem& item,
   R##0 = ld(S, 0); R##1 = ld(S, 1); R##2 = ld(S, 2); \
   if constexpr (VectorsPerLane > 3) R##3 = ld(S, 3); \
   if constexpr (VectorsPerLane > 4) R##4 = ld(S, 4); \
-  if constexpr (VectorsPerLane > 5) R##5 = ld(S, 5)
+  if constexpr (VectorsPerLane > 5) R##5 = ld(S, 5); \
+  if constexpr (VectorsPerLane > 6) R##6 = ld(S, 6); \
+  if constexpr (VectorsPerLane > 7) R##7 = ld(S, 7)
 #define LR_PUT(R, S) \
   if ((S) < count) { \
     const uint32_t global_seq = base_seq + (S); \
     control.WaitWritable(global_seq); \
-    uint4* d = reinterpret_cast<uint4*>(payload + (global_seq % kSlots) * kSlotWords) + loader * 32 + lane; \
+    uint4* d = reinterpret_cast<uint4*>(payload + (global_seq % kSlots) * SlotWords<MaxK>) + loader * 32 + lane; \
     d[0] = R##0; d[64] = R##1; d[128] = R##2; \
     if constexpr (VectorsPerLane > 3) d[192] = R##3; \
     if constexpr (VectorsPerLane > 4) d[256] = R##4; \
     if constexpr (VectorsPerLane > 5) d[320] = R##5; \
+    if constexpr (VectorsPerLane > 6) d[384] = R##6; \
+    if constexpr (VectorsPerLane > 7) d[448] = R##7; \
     control.Publish(global_seq, lane); \
   }
   uint4 A0, A1, A2, A3, A4, A5, B0, B1, B2, B3, B4, B5;
+  [[maybe_unused]] uint4 A6, A7, B6, B7;
   // Chunks past the item end would cost DRAM reads that nobody consumes.
   LR_LD(A, 0);
   // Full pairs with unconditional loads let each store wait only for its own
@@ -83,7 +91,7 @@ __device__ __forceinline__ void Load(const LinJob& job, const GemvItem& item,
 #undef LR_PUT
 }
 
-template <int K>
+template <int K, int MaxK = kMaxK>
 __device__ __forceinline__ void Compute(const LinJob& job, const GemvItem& item,
                                        const uint32_t* payload, Control& control,
                                        const uint32_t* xs, uint32_t base_seq = 0) {
@@ -96,7 +104,7 @@ __device__ __forceinline__ void Compute(const LinJob& job, const GemvItem& item,
     const uint32_t global_seq = base_seq + seq;
     control.WaitReady(global_seq);
     if (cw < item.nb) {
-      const uint32_t* column = payload + (global_seq % kSlots) * kSlotWords + cw * kChunk * T;
+      const uint32_t* column = payload + (global_seq % kSlots) * SlotWords<MaxK> + cw * kChunk * T;
 #pragma unroll
       for (int f = 0; f < kChunk; ++f) {
         if (a + f >= span) break;
@@ -158,19 +166,31 @@ __device__ __forceinline__ void ConsumerBarrier(uint32_t* arrived, uint32_t roun
   asm volatile("" ::: "memory");
 }
 
-template <bool Front, size_t N = 0>
+// MaxK 8 walks K7 and K8 first, then the narrow list (as DispatchLinGemv).
+template <bool Front, size_t N = 0, int MaxK = kMaxK>
 __device__ __forceinline__ void LoadAny(int K, const LinJob& job, const GemvItem& item, uint32_t* payload,
                                        Control& control, uint32_t seq) {
-  if (K == kSupportedDecodeK[N]) Load<kSupportedDecodeK[N], Front>(job, item, payload, control, seq);
-  else if constexpr (N + 1 < kSupportedDecodeK.size()) LoadAny<Front, N + 1>(K, job, item, payload, control, seq);
+  if constexpr (MaxK > kMaxNarrowDecodeK && N == 0) {
+    static_assert(MaxK == kMaxWideDecodeK);
+    if (K == 7) { Load<7, Front, MaxK>(job, item, payload, control, seq); return; }
+    if (K == 8) { Load<8, Front, MaxK>(job, item, payload, control, seq); return; }
+  }
+  if (K == kSupportedDecodeK[N]) Load<kSupportedDecodeK[N], Front, MaxK>(job, item, payload, control, seq);
+  else if constexpr (N + 1 < kSupportedDecodeK.size())
+    LoadAny<Front, N + 1, MaxK>(K, job, item, payload, control, seq);
 }
 
-template <size_t N = 0>
+template <size_t N = 0, int MaxK = kMaxK>
 __device__ __forceinline__ void ComputeAny(int K, const LinJob& job, const GemvItem& item,
                                           const uint32_t* payload, Control& control, const uint32_t* xs,
                                           uint32_t seq) {
-  if (K == kSupportedDecodeK[N]) Compute<kSupportedDecodeK[N]>(job, item, payload, control, xs, seq);
-  else if constexpr (N + 1 < kSupportedDecodeK.size()) ComputeAny<N + 1>(K, job, item, payload, control, xs, seq);
+  if constexpr (MaxK > kMaxNarrowDecodeK && N == 0) {
+    if (K == 7) { Compute<7, MaxK>(job, item, payload, control, xs, seq); return; }
+    if (K == 8) { Compute<8, MaxK>(job, item, payload, control, xs, seq); return; }
+  }
+  if (K == kSupportedDecodeK[N]) Compute<kSupportedDecodeK[N], MaxK>(job, item, payload, control, xs, seq);
+  else if constexpr (N + 1 < kSupportedDecodeK.size())
+    ComputeAny<N + 1, MaxK>(K, job, item, payload, control, xs, seq);
 }
 
 __device__ __forceinline__ uint32_t Chunks(const LinJob& job) {
@@ -185,12 +205,13 @@ __device__ __forceinline__ uint32_t Chunks(const LinJob& job) {
 // flight). in: the input transform runs in the item fill (no LinInKernel).
 // out: the last split of each column group writes the output transform, as
 // in LinPolicyKernel (no LinOutKernel). Dynamic LDS: two activation buffers.
-template <bool Front = false>
+// MaxK 8: the wide groups of the h6_ng8 packs (K7, K8, and any narrower job of the group) in 8 KB slots.
+template <bool Front = false, int MaxK = lin_ring::kMaxK>
 __global__ void __launch_bounds__(320) LinRingFlowKernel(const LinJob* __restrict__ jobs,
                                                         const GemvItem* __restrict__ items, int n,
                                                         int xs_words, bool in, bool out) {
   __shared__ lin_ring::Control control;
-  __shared__ uint32_t payload[lin_ring::kSlots * lin_ring::kSlotWords];
+  __shared__ uint32_t payload[lin_ring::kSlots * lin_ring::SlotWords<MaxK>];
   __shared__ uint32_t arrived;
   extern __shared__ uint32_t xs[];
   if (blockIdx.x == 0 && threadIdx.x == 0) PublishWeights(jobs[items[0].job].tiles);
@@ -204,7 +225,7 @@ __global__ void __launch_bounds__(320) LinRingFlowKernel(const LinJob* __restric
       const GemvItem item = items[it];
       const LinJob& job = jobs[item.job];
       const int K = __builtin_amdgcn_readfirstlane(job.K);
-      lin_ring::LoadAny<Front>(K, job, item, payload, control, seq);
+      lin_ring::LoadAny<Front, 0, MaxK>(K, job, item, payload, control, seq);
       seq += lin_ring::Chunks(job);
     }
     return;
@@ -220,7 +241,7 @@ __global__ void __launch_bounds__(320) LinRingFlowKernel(const LinJob* __restric
     uint32_t* x = xs + (k & 1) * xs_words;
     lin_ring::FillActivations(job, item, in, x);
     lin_ring::ConsumerBarrier(&arrived, ++round, lane);
-    lin_ring::ComputeAny(K, job, item, payload, control, x, seq);
+    lin_ring::ComputeAny<0, MaxK>(K, job, item, payload, control, x, seq);
     seq += lin_ring::Chunks(job);
     if (out) {
       // Arrival order selects the writer, never the reduction order.

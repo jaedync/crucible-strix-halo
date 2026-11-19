@@ -8,7 +8,7 @@ import queue
 import threading
 import time
 from .api import MAX_MTP_WINDOW, MTP_WINDOW, ApiError
-from . import metrics
+from . import memory_fit, metrics, structured
 from .engine_messages import ENGINE_REJECTED, IMAGE_FAILED, ProtocolError
 from .backend import EngineBackend, LOOKUP_DEPTH, MAX_CONVERSATION_CACHE_MIB, QUEUED_SECONDS
 from .batch_scheduler import (ENCODER_SLICE_BAND, ENCODER_SLICE_SECONDS, INTERLEAVE_MIN_ROWS, PACK_ENTER, PASS_EVENTS, MODEL_LAYERS,
@@ -51,6 +51,12 @@ WAITING_LIMIT = 64
 STAGE_MIN_TOKENS = 16384
 STAGE_POLL_SECONDS = 0.05
 STAGE_WAIT_SECONDS = 30.0
+# Start plan B3 (order L15): a turn that holds a free slot waits for its read in progress as long as a cold prefill of
+# the read's tokens would take at this rate (below the measured 1,526 to 1,879 tok/s, so the wait is on the long side),
+# at least 2 * STAGE_WAIT_SECONDS and at most STAGE_WAIT_CAP_SECONDS. A longer wait can never beat the prefill; a
+# shorter one threw away reads of 95% to 99% of the prompt on Nov 2 (waits of 41 to 114 s, then 76 to 91 s cold).
+STAGE_COLD_TOKENS_PER_S = 1500.0
+STAGE_WAIT_CAP_SECONDS = 180.0
 STAGE_AHEAD = 4
 # A reading turn that has no slot yet is polled less often: each poll costs the engine command thread about 8 ms
 # (JSON out and in) while other sessions decode.
@@ -99,6 +105,7 @@ class LiveRequest:
 
 
 class BatchedEngineBackend(EngineBackend):
+    compile_waits = None  # set in __init__; None in tests that build the object without it
     counts_stall = True
     bounds_think_cap = False  # the worker stops stepping a job at its think cap and keeps the slot for the continuation
     packed_rows = ""  # CRUCIBLE_PACKED_ROWS as the engine reads it; set in __init__
@@ -117,7 +124,7 @@ class BatchedEngineBackend(EngineBackend):
                  interleave_min_rows=INTERLEAVE_MIN_ROWS, state_dir=None, state_disk_gib=None, cache_probation=None,
                  state_write_gib_per_day=None, cache_idle_minutes=None, engine_options=(), lookup=LOOKUP_DEPTH,
                  state_write_delay_ms=None,
-                 mtp_window=MTP_WINDOW):
+                 mtp_window=MTP_WINDOW, fit="auto"):
         if (type(streams) is not int or not 1 <= streams <= 8 or
                 type(output_timeout) not in (int, float) or not 0 < output_timeout <= 300):
             raise ValueError("Use one to eight batch streams and an output timeout within 300 seconds.")
@@ -155,8 +162,15 @@ class BatchedEngineBackend(EngineBackend):
         if prefill_interleave:
             # Every pass of one command may publish for a decoder before its client reads.
             self.event_capacity = 32 + PASS_EVENTS * interleave_passes(prefill_interleave)
+        if fit not in ("auto", "off"):
+            raise ValueError('Use the memory fit auto or off.')
         # Slot classes (G4). The engine reports them at ready; this worker mirrors its slot choice.
         self.expected_contexts = [context] * (streams - short_streams) + [short_ctx] * short_streams
+        # Memory stage 2: the engine's start-time fit may start fewer slots, a smaller cache or a lower --ctx
+        # (server/memory_fit.py). None when the requested layout fits.
+        self.short_streams, self.short_ctx = short_streams, short_ctx
+        self.requested_layout = (streams, context, conversation_cache_mib)
+        self.memory_fit = None
         self.free_contexts = []
         # Slots kept for think-cap continuations: id(first job) -> (first job, slot class, time). While one is kept, no other job
         # opens, so the continuation takes that engine slot (its checkpoint affinity) and resumes from the first job's
@@ -166,6 +180,8 @@ class BatchedEngineBackend(EngineBackend):
         self.state_disk = False
         self.requested_state_dir = state_dir
         self.staging = {}
+        # id(job) -> (first refusal, next open): turns whose grammar the engine still compiles (structured.pending).
+        self.compile_waits = {}
         self.queued_polls = {}  # id(job) -> the last read=0 stage of a turn behind the first (_stage_ahead)
         self.waiting = deque()
         self.requested_prefill = prefill
@@ -185,6 +201,8 @@ class BatchedEngineBackend(EngineBackend):
         self.prefill_rate = 1000.0
         # The engine's prompt cursor after the last prefill command, when its batch_end names one.
         self.prefill_cursor = None
+        # The rows that the last prefill command copied from another slot (twin or header copy), or 0.
+        self.prefill_copied = 0
         self.last_step = float("-inf")
         # Above the slot count, packing never starts: every speculative decoder keeps solo steps.
         self.pack_enter = PACK_ENTER if packed_op == "verify_step" else 3
@@ -229,10 +247,14 @@ class BatchedEngineBackend(EngineBackend):
             options += ('--state-disk-write-gib-per-day', str(state_write_gib_per_day))
         # The same-second proof only; 0 (the engine default) never goes out, so older engines see the same options.
         if state_write_delay_ms: options += ('--state-disk-write-delay-ms', str(state_write_delay_ms))
+        # The fit is the engine default; only "off" goes out, so the default command line does not change.
+        if fit == "off": options += ('--fit', 'off')
         super().__init__(executable, checkpoint, context, engine_options=options + tuple(engine_options),
                          lookup=lookup)
 
     def _validate_ready(self, ready):
+        if isinstance(ready, dict) and ready.get("event") == "ready" and "fit" in ready:
+            self._take_fit(ready)
         super()._validate_ready(ready)
         if (ready.get("protocol") != "batch-v1" or type(ready.get("context")) is not int or
                 type(ready.get("streams")) is not int or ready["streams"] != self.streams):
@@ -252,6 +274,16 @@ class BatchedEngineBackend(EngineBackend):
         # An engine before the ping op does not name it, so it never gets the command (the pattern of stage_job).
         self.ping_op = ready.get("ping") is True
 
+    def _take_fit(self, ready):
+        """The engine's memory fit: take its slot count and --ctx, after the fit object matches the request."""
+        fit = memory_fit.parse_fit(ready["fit"], ready.get("streams"), ready.get("context"), self.requested_layout,
+                                   self.short_streams)
+        if fit is None:
+            raise ProtocolError("The engine returned an invalid memory fit.")
+        self.memory_fit = fit
+        self.streams, self.context = fit.streams, fit.context
+        self.expected_contexts = [fit.context] * (fit.streams - self.short_streams) + [self.short_ctx] * self.short_streams
+
     def session_counts(self):
         return len(self.active), self.streams
 
@@ -264,7 +296,7 @@ class BatchedEngineBackend(EngineBackend):
             raise ProtocolError("The engine returned an unexpected ping reply.")
 
     def submit(self, ids, request, cache_prefix_tokens=0, shared_prefix_tokens=0, log_turn=True, image_offsets=(),
-               after=None, think_cap=None, client_request_id=None):
+               after=None, think_cap=None, client_request_id=None, constraint_from=None, prefix_marks=None):
         if request.spec and request.max_tokens > 1:
             # G6a: solo speculative steps (greedy and sampled) with one fixed head.
             # Serial serve with the same policy and seed is the reference.
@@ -283,7 +315,7 @@ class BatchedEngineBackend(EngineBackend):
             if self.jobs.full() or len(ids) > self.pending_token_limit - self.pending_tokens:
                 raise ApiError("The batch request queue is full. Try again later.", status=503)
             job = super().submit(ids, request, cache_prefix_tokens, shared_prefix_tokens, log_turn, image_offsets, after,
-                                 think_cap, client_request_id)
+                                 think_cap, client_request_id, constraint_from, prefix_marks)
             self.pending_tokens += len(ids)
             return job
 
@@ -341,8 +373,8 @@ class BatchedEngineBackend(EngineBackend):
         start = metrics.now()
         self.process.stdin.write(json.dumps(payload, separators=(",", ":"), allow_nan=False) + "\n")
         self.process.stdin.flush()
-        events, tokens, finished = [], {}, set()
-        part, part_tokens, part_finished, part_start = [], {}, set(), start
+        events, tokens, finished, dead = [], {}, set(), set()
+        part, part_tokens, part_finished, part_dead, part_start = [], {}, set(), set(), start
         engine_s = None
         opened, rejection, passes = False, None, 0
         while True:
@@ -359,23 +391,37 @@ class BatchedEngineBackend(EngineBackend):
                 if not decoders or events or event.get("op") != "verify_step":
                     raise ProtocolError("The engine returned an unexpected decode pass boundary.")
                 live = set(decoders)
-                self._check_complete("verify_step", live, part_tokens, part_finished)
+                self._check_complete("verify_step", live, part_tokens, part_finished, part_dead)
                 stepped = self._count_rounds(part_tokens, "verify_step")
-                self._publish(part, part_finished)
-                self._decode_lines(stepped, part_finished)
+                self._publish(part, part_finished, part_dead)
+                self._decode_lines(stepped, part_finished | part_dead)
                 end = metrics.now()
                 self.trace.add(part_start, end, "verify_step", sorted(live), None, None)
                 self.last_step = time.monotonic()
                 for id in part_tokens:
                     if id in self.active: self.active[id].last_step = self.last_step
-                decoders = [id for id in decoders if id not in part_finished]
-                part, part_tokens, part_finished, part_start = [], {}, set(), end
+                decoders = [id for id in decoders if id not in part_finished and id not in part_dead]
+                part, part_tokens, part_finished, part_dead, part_start = [], {}, set(), set(), end
                 passes += 1
                 continue
             if rejection is not None: raise ProtocolError("The engine returned output after a rejected open.")
+            id = event.get("request_id")
+            if type(id) is int and (id in dead or id in part_dead):
+                raise ProtocolError("The engine returned output after a dead end.")
+            if kind == "error" and self._dead_end(event, op):
+                # A grammar with no legal token ends only its own request: its tokens before the
+                # error are published, the peers of the command go on.
+                in_part = id in decoders and not events
+                self._check_dead(event, part_finished if in_part else finished, set(decoders) if in_part else selected)
+                metrics.emit(metrics.engine_error_line(id, op, event["error"], True))
+                (part_dead if in_part else dead).add(id)
+                (part if in_part else events).append(event)
+                continue
             if kind == "error":
-                metrics.emit(metrics.engine_error_line(payload.get("request_id", payload.get("request_ids")), op,
-                                                       event.get("error"), event.get("recoverable") is True))
+                # A pending compile is no engine error (it is the normal path of a new grammar): no log line.
+                if not (op == "open" and structured.pending(event.get("error"))):
+                    metrics.emit(metrics.engine_error_line(payload.get("request_id", payload.get("request_ids")), op,
+                                                           event.get("error"), event.get("recoverable") is True))
                 # An open may be refused before it leases a slot. A prefill may end its own request when an image
                 # file fails its check after the open (the engine closed the request before any device work, so
                 # before any decode pass of the command; review F1).
@@ -409,15 +455,29 @@ class BatchedEngineBackend(EngineBackend):
             if self.fatal: raise ProtocolError(self.fatal)
             self.trace.add(start, end, op, sorted(selected), rows, engine_s)
             id = payload["request_id"]
-            self._deliver(self.active[id].job, dict(event="error", error=IMAGE_FAILED if op == "prefill" else ENGINE_REJECTED))
+            if op == "open" and structured.pending(rejection.get("error")):
+                self._compile_pending(self.active.pop(id))
+                return start, end
+            refused = structured.engine_refusal(rejection.get("error")) if op == "open" else None
+            # A constraint the engine refused at open is the client's error (400, a fixed message; a full compile
+            # queue is 503), sent before any response header (the server holds a constrained stream's headers until
+            # the first event).
+            status = structured.refusal_status(rejection.get("error"))
+            self._deliver(self.active[id].job, dict(event="error", error=refused, status=status) if refused else
+                          dict(event="error", error=IMAGE_FAILED if op == "prefill" else ENGINE_REJECTED))
             self._release(id)
             return start, end
         if op == "open" and not opened: raise ProtocolError("The engine omitted a sequence lease.")
-        self._check_complete(op, selected, tokens, finished)
+        self._check_complete(op, selected, tokens, finished, dead)
         stepped = self._count_rounds(tokens, op) if op in ("step", "spec_step", "verify_step") else {}
         if op == "close" and events: raise ProtocolError("The engine returned output after cancellation.")
+        if op == "prefill":
+            self.prefill_copied = (self._copied_rows(self.active[payload["request_id"]], boundary["restored"],
+                                                     "cursor" in boundary) if "restored" in boundary else 0)
         if op == "prefill" and "cursor" in boundary:
             rows = self._reported_rows(self.active[payload["request_id"]], boundary["cursor"])
+        elif op == "prefill" and self.prefill_copied:
+            rows = 0  # a copy of the whole prompt (an End point): the command ran no prompt row
         elif op == "prefill" and self.active[payload["request_id"]].vision_slices:
             rows = 0  # an encoder slice
         self.trace.add(start, end, op, sorted(selected), rows, engine_s)
@@ -425,9 +485,22 @@ class BatchedEngineBackend(EngineBackend):
             turn = self.active[payload["request_id"]].job.turn
             metrics.add_chunk(turn, start, end, rows)
             if tokens: turn["t_prefill_end"] = end
-        self._publish(events, finished)
-        self._decode_lines(stepped, finished)
+        self._publish(events, finished, dead)
+        self._decode_lines(stepped, finished | dead)
         return start, end
+
+    @staticmethod
+    def _dead_end(event, op):
+        """A grammar dead end (engine/serve/batch_session.h EndDeadEnd) in a command that publishes tokens."""
+        return (op in ("step", "spec_step", "verify_step", "prefill") and event.get("recoverable") is True and
+                event.get("error") == structured.DEAD_END_TEXT)
+
+    def _check_dead(self, event, finished, selected):
+        """The dead end names a live request of the command, at its generation, that has not finished."""
+        id = event.get("request_id")
+        if (type(id) is not int or id not in selected or id not in self.active or id in finished or
+                event.get("slot_generation") != self.active[id].generation):
+            raise ProtocolError("The engine returned an invalid dead end.")
 
     def _count_rounds(self, tokens, op):
         """One decode round per request that a step or pass served, and the tokens it published (metrics.rounds).
@@ -464,16 +537,18 @@ class BatchedEngineBackend(EngineBackend):
             line = metrics.decode_line(job, t)
             if line is not None: metrics.emit(line)
 
-    def _check_complete(self, op, selected, tokens, finished):
-        """Every selected decoder published, and exactly the turns that reached a stop or their limit finished."""
-        if op in ("step", "spec_step", "verify_step") and set(tokens) != selected:
+    def _check_complete(self, op, selected, tokens, finished, dead=frozenset()):
+        """Every selected decoder published or reached a dead end, and exactly the turns that reached a stop or their
+        limit finished. A dead request may publish tokens before its error, and it has no done event."""
+        if op in ("step", "spec_step", "verify_step") and set(tokens) | dead != selected:
             raise ProtocolError("The engine omitted a batch token.")
-        terminal = {id for id, seen in tokens.items() if seen[-1] in self.active[id].job.payload["stop_ids"] or
-                    self.active[id].count + len(seen) == self.active[id].job.payload["max_tokens"]}
+        terminal = {id for id, seen in tokens.items() if id not in dead and (
+                    seen[-1] in self.active[id].job.payload["stop_ids"] or
+                    self.active[id].count + len(seen) == self.active[id].job.payload["max_tokens"])}
         if finished != terminal: raise ProtocolError("The engine omitted a required completion event.")
 
-    def _publish(self, events, finished):
-        """Deliver one command's (or one decode pass's) events and release its finished turns."""
+    def _publish(self, events, finished, dead=frozenset()):
+        """Deliver one command's (or one decode pass's) events and release its finished and dead turns."""
         for event in events:
             entry = self.active[event["request_id"]]
             if event["event"] == "opened":
@@ -493,8 +568,19 @@ class BatchedEngineBackend(EngineBackend):
                 if entry.last_step is None: entry.last_step = time.monotonic()
                 if entry.count == entry.job.think_cap: entry.capped_at = time.monotonic()
                 self._deliver(entry.job, self._stamp(entry.job, event))
+            elif event["event"] == "error":  # a dead end (_dead_end): the client's 503 after the tokens before it
+                self._deliver(entry.job, dict(event="error", error=structured.DEAD_END, status=503))
             else: self._deliver(entry.job, self._stamp(entry.job, dict(event, slot_context=entry.slot_context)))
-        for id in finished: self._release(id)
+        for id in finished | dead: self._release(id)
+
+    def _copied_rows(self, entry, restored, cursor):
+        """Progress without prefill time: the open reported none of these rows, so SRPT and the rate must not see a
+        32K-row chunk in a few ms. Without a cursor the command ran no row, so the copy must end the prompt."""
+        rest = len(entry.job.payload["ids"]) - entry.prefilled
+        if type(restored) is not int or not 0 < restored <= rest or (not cursor and restored != rest):
+            raise ProtocolError("The engine returned invalid restored rows.")
+        entry.prefilled += restored
+        return restored
 
     def _reported_rows(self, entry, cursor):
         if type(cursor) is not int or not entry.prefilled < cursor <= len(entry.job.payload["ids"]):
@@ -526,6 +612,9 @@ class BatchedEngineBackend(EngineBackend):
             # continuation takes the first job's slot and not another free one.
             if job.after is not None and not job.cancelled.is_set() and self._running(job.after): return False
             if job.cancelled.is_set(): slot_context = None
+            # A turn whose grammar compiles opens again at its time; until then a later turn may take a free slot.
+            elif self.compile_waits and (job_wait := self.compile_waits.get(id(job))):
+                if time.monotonic() < job_wait[1] or (slot_context := self._slot_for(job.payload)) is None: continue
             elif (slot_context := self._slot_for(job.payload)) is None: continue
             # The disk read runs before the open, so the open restores from memory (FIFO: later turns wait too).
             elif self.state_disk and not self._staged(job, opening=True, position=self._position(job)): return False
@@ -540,7 +629,26 @@ class BatchedEngineBackend(EngineBackend):
             return self._open(job, slot_context)
         return False
 
+    def _compile_pending(self, entry):
+        """The engine refused the open because the request's grammar still compiles (engine/runtime/constraint_vocab.h
+        ServeConstraintFactory; the compile never runs on the engine's serve loop). The turn holds no slot meanwhile:
+        it goes back to the head of the line and opens again after COMPILE_POLL_SECONDS. Other turns may take the
+        free slot. After COMPILE_WAIT_SECONDS the turn ends with COMPILE_TIMEOUT (503)."""
+        job = entry.job
+        self.free_contexts.append(entry.slot_context)
+        now = time.monotonic()
+        if self.compile_waits is None: self.compile_waits = {}
+        first = self.compile_waits.get(id(job), (now, now))[0]
+        if now - first > structured.COMPILE_WAIT_SECONDS:
+            self._deliver(job, dict(event="error", error=structured.COMPILE_TIMEOUT))
+            self._forget_job(job)
+            return
+        self.compile_waits[id(job)] = (first, now + structured.COMPILE_POLL_SECONDS)
+        self.waiting.appendleft(job)
+        with self.admission_lock: self.pending_tokens += len(job.payload["ids"])
+
     def _forget_job(self, job):
+        if self.compile_waits: self.compile_waits.pop(id(job), None)
         if self.state_disk:
             self.staging.pop(id(job), None)
             self.queued_polls.pop(id(job), None)
@@ -620,8 +728,16 @@ class BatchedEngineBackend(EngineBackend):
             if tag: job.turn["state_disk_tag"] = tag
         if opening and record["slot_from"] is None and record["state"] == "reading":
             record["slot_from"], record["wait_from"] = now, now
-        return record["state"] != "reading" or (now - record["wait_from"] > STAGE_WAIT_SECONDS or
-                                                (record["slot_from"] is not None and now - record["slot_from"] > 2 * STAGE_WAIT_SECONDS))
+        if record["state"] != "reading": return True
+        if record["slot_from"] is not None: return now - record["slot_from"] > self._read_bound(job)
+        return now - record["wait_from"] > STAGE_WAIT_SECONDS
+
+    @staticmethod
+    def _read_bound(job):
+        """Start plan B3 (L15): how long a turn with a free slot waits for its read: the cold prefill time of the
+        read's tokens (state_disk_tokens of its last reply), within [2 * STAGE_WAIT_SECONDS, STAGE_WAIT_CAP_SECONDS]."""
+        tokens = job.turn.get("state_disk_tokens") or 0
+        return min(STAGE_WAIT_CAP_SECONDS, max(2 * STAGE_WAIT_SECONDS, tokens / STAGE_COLD_TOKENS_PER_S))
 
     def _job_tag(self, job):
         """Fix 2 (cause.md item 10): the turn's tag on the engine's stage and host_evict lines and on its turn line
@@ -768,6 +884,7 @@ class BatchedEngineBackend(EngineBackend):
         if decoders:
             payload |= dict(request_ids=decoders, every=self.prefill_interleave)
         self.prefill_cursor = None
+        self.prefill_copied = 0
         # Decoders that this chunk holds back (not the ones that decode inside it): they wait for the whole chunk.
         waiting = [other.job.turn for other_id, other in self.active.items()
                    if other_id != id and other.ready and other_id not in decoders and not other.job.cancelled.is_set()]
@@ -776,6 +893,7 @@ class BatchedEngineBackend(EngineBackend):
         for turn in waiting: turn["stall_s"] = turn.get("stall_s", 0.0) + elapsed
         measured = self.prefill_cursor is not None
         if measured: rows = self.prefill_cursor - entry.prefilled
+        elif self.prefill_copied: rows = 0  # the copy already moved the progress (_copied_rows)
         elif entry.vision_slices:
             # No cursor from an engine that reports slices: the command ran one encoder slice and no prompt row.
             entry.vision_slices -= 1

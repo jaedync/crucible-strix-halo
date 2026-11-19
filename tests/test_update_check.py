@@ -329,3 +329,11 @@ def test_engine_environment_drops_the_server_only_variable_without_a_note():
     environment, removed = engine_environment({"CRUCIBLE_NO_UPDATE_CHECK": "1", "PATH": "/bin"})
     assert environment == {"PATH": "/bin"}
     assert removed == []
+
+
+def test_a_development_build_names_its_commit_and_its_base_release(tmp_path, releases):
+    # A build that is not a release tag must not say "you run v<VERSION>": the owner read "you run v0.33.1" on trunk.
+    label = "development build 1a2b3c4d5, based on v0.22.2"
+    printed, _ = run(tmp_path, releases(release()).url, label=label)
+    assert printed.splitlines()[0] == (f"Crucible {NEWER} is available (you run {label}). Update: make update. "
+                                       f"Release notes: https://github.com/jaedync/crucible-strix-halo/releases/tag/{NEWER}")

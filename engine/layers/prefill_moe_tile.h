@@ -58,33 +58,27 @@ template <int K, int N, int S, int D, bool F = false>
 __device__ __forceinline__ void TileBodyPipe(const Exl3GemmJob& j, int m0, int b0, uint32_t* lds,
                                              GemmF8 (&acc)[3][4]);
 
-// DecodeLane<K, kMulTrue16> with fewer VALU ops and the same bits: state 0 is a0 >> 16 (end 16 for every K), so
-// its two multiplies read a0's high half by op_sel instead of a shift; and v_sad_hi_u8 adds the second byte sum
-// into the high half (each sum is at most 1020, so 0x6400 + sum never carries), which is the permute's packing.
-template <int K>
-__device__ __forceinline__ void TileDecodeFast(uint32_t w0, uint32_t w1, uint32_t w2, int shift, __half2 P[4]) {
-  uint32_t st[8];
-  if constexpr (7 * K + 16 <= 64) {
-    const uint32_t a0 = __builtin_amdgcn_alignbit(w0, w1, 32 - shift);
-    const uint32_t a1 = __builtin_amdgcn_alignbit(w1, w2, 32 - shift);
-    st[0] = a0;  // the high half is the state; read by op_sel below
-#pragma unroll
-    for (int j = 1; j < 8; ++j) {
-      const int end = j * K + 16;
-      st[j] = end <= 32 ? a0 >> (32 - end) : __builtin_amdgcn_alignbit(a0, a1, 64 - end);
-    }
-  } else {
-    LaneStates<K>(w0, w1, w2, shift, st);
-    st[0] = __builtin_amdgcn_alignbit(w0, w1, 32 - shift);
+// K4: the first state bit of LaneWindow<4> lane t is s = 32 t - 12, so every lane has shift 20 and its
+// 7 K + 16 = 44 state bits are bits 20 .. 63 of w0:w1 (w2 is not read).
+constexpr int kTileK4Shift = 20;
+constexpr bool TileK4ShiftHolds() {
+  for (int t = 0; t < 32; ++t) {
+    const int s = (8 * t + 1) * 4 - 16, dw = (s - 1 >= 0) ? (s - 1) / 32 : -((32 - s) / 32);  // LaneWindow<4>
+    if (s - dw * 32 != kTileK4Shift) return false;
   }
-  uint32_t p[8];
-  {
-    uint32_t hi;
-    asm("v_pk_mul_lo_u16 %0, %1, %2 op_sel_hi:[1,1]" : "=v"(hi) : "v"(st[0]), "s"(0x83DC0000u));
-    asm("v_mad_u32_u16 %0, %1.h, 0xd12d, %2" : "=v"(p[0]) : "v"(st[0]), "v"(hi));
-  }
-#pragma unroll
-  for (int j = 1; j < 8; ++j) p[j] = Mul1Product<kMulTrue16>(st[j]);
+  return kTileK4Shift + 7 * 4 + 16 == 64;
+}
+static_assert(TileK4ShiftHolds());
+// Mul1Product<kMulTrue16> of the state in the high half of x (op_sel).
+__device__ __forceinline__ uint32_t TileMul1High(uint32_t x) {
+  uint32_t hi, p;
+  asm("v_pk_mul_lo_u16 %0, %1, %2 op_sel_hi:[1,1]" : "=v"(hi) : "v"(x), "s"(0x83DC0000u));
+  asm("v_mad_u32_u16 %0, %1.h, 0xd12d, %2" : "=v"(p) : "v"(x), "v"(hi));
+  return p;
+}
+// Mul1Pair of the products p[2 i] and p[2 i + 1]: v_sad_hi_u8 adds the second byte sum into the high half (each
+// sum is at most 1020, so 0x6400 + sum never carries), which is the permute's packing.
+__device__ __forceinline__ void TileMul1Pairs(const uint32_t p[8], __half2 P[4]) {
   const __half2 inv = __halves2half2(__ushort_as_half(0x1eee), __ushort_as_half(0x1eee));
   const __half2 bias = __halves2half2(__ushort_as_half(0xc931), __ushort_as_half(0xc931));
 #pragma unroll
@@ -93,6 +87,49 @@ __device__ __forceinline__ void TileDecodeFast(uint32_t w0, uint32_t w1, uint32_
     const uint32_t packed = __builtin_amdgcn_sad_hi_u8(p[2 * i + 1], 0u, s0);
     P[i] = __hfma2(*reinterpret_cast<const __half2*>(&packed), inv, bias);
   }
+}
+
+// DecodeLane<K, kMulTrue16> with fewer VALU ops and the same bits: state 0 is a0 >> 16 (end 16 for every K), so
+// its two multiplies read a0's high half by op_sel instead of a shift, and the pairs pack by v_sad_hi_u8
+// (TileMul1Pairs).
+// K4 (the routed experts of the 4.05 pack): state i + 4 starts 16 bits after state i, so the 32-bit window at
+// lane bit 4 i (i = 0 .. 3) holds state i in its high half and state i + 4 in its low half, and the op_sel
+// multiplies read both halves: 3 alignbits (the last window is w1) for the 8 states, where the general form
+// needs 2 alignbits, a shift for a1, 3 shifts and 3 alignbits. The same states, so the same bits.
+template <int K>
+__device__ __forceinline__ void TileDecodeFast(uint32_t w0, uint32_t w1, uint32_t w2, int shift, __half2 P[4]) {
+  uint32_t p[8];
+  if constexpr (K == 4) {
+    (void)w2;
+    (void)shift;
+    // Window i = bits 20 + 4 i .. 51 + 4 i of w0:w1 (alignbit by 12 - 4 i; window 3 is w1).
+    const uint32_t q[4] = {__builtin_amdgcn_alignbit(w0, w1, 12), __builtin_amdgcn_alignbit(w0, w1, 8),
+                           __builtin_amdgcn_alignbit(w0, w1, 4), w1};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      p[i] = TileMul1High(q[i]);
+      p[i + 4] = Mul1Product<kMulTrue16>(q[i]);
+    }
+  } else {
+    uint32_t st[8];
+    if constexpr (7 * K + 16 <= 64) {
+      const uint32_t a0 = __builtin_amdgcn_alignbit(w0, w1, 32 - shift);
+      const uint32_t a1 = __builtin_amdgcn_alignbit(w1, w2, 32 - shift);
+      st[0] = a0;  // the high half is the state; read by op_sel below
+#pragma unroll
+      for (int j = 1; j < 8; ++j) {
+        const int end = j * K + 16;
+        st[j] = end <= 32 ? a0 >> (32 - end) : __builtin_amdgcn_alignbit(a0, a1, 64 - end);
+      }
+    } else {
+      LaneStates<K>(w0, w1, w2, shift, st);
+      st[0] = __builtin_amdgcn_alignbit(w0, w1, 32 - shift);
+    }
+    p[0] = TileMul1High(st[0]);
+#pragma unroll
+    for (int j = 1; j < 8; ++j) p[j] = Mul1Product<kMulTrue16>(st[j]);
+  }
+  TileMul1Pairs(p, P);
 }
 
 template <int I, int N, class F> __device__ __forceinline__ void TileFor(F&& f) {
@@ -134,6 +171,9 @@ template <int KMAX, class F> __device__ __forceinline__ void TileDispatchK(int K
 // each) into registers in step a and into the free A buffer in step a + 1, so each global A load has two k steps
 // to land and is read once per block (the two column groups of a side read the same A). The fragments that the
 // WMMAs read are the bytes of GemmAFragment (row r of the packed [I/16][M][16] layout; 0 past M).
+// The decode is TileDecodeFast (DecodeLane's bits). Most stall cycles of the down kernel are VALU instructions
+// that wait behind WMMAs (prefill-moe.md section 10), and the decode is most of its VALU: per K4 step 31 VALU
+// ops instead of DecodeLane's 41.
 template <int K, int N, int S, int MUT = 0>
 __device__ __forceinline__ void TileBody(const Exl3GemmJob& j, int m0, int b0, uint32_t* lds,
                                          GemmF8 (&acc)[kTileSlots][kTileCols]) {
@@ -202,7 +242,7 @@ __device__ __forceinline__ void TileBody(const Exl3GemmJob& j, int m0, int b0, u
   aload(0, sts[0]);
   {
     __half2 p[4];
-    DecodeLane<K, kMulTrue16>(raws[0][0], raws[0][1], raws[0][2], win.shift, p);
+    TileDecodeFast<K>(raws[0][0], raws[0][1], raws[0][2], win.shift, p);
     GemmNativeStore(p, mine, lane);
   }
   load(1, raws[0]);  // past the stream (A = 1) the loads return 0 and the decode is not used
@@ -234,7 +274,7 @@ __device__ __forceinline__ void TileBody(const Exl3GemmJob& j, int m0, int b0, u
         const uint32_t v[4] = {raw[0], raw[1], raw[2], raw[0] ^ raw[1]};
         for (int z = 0; z < 4; ++z) p[z] = *reinterpret_cast<const __half2*>(&v[z]);
       } else {
-        DecodeLane<K, kMulTrue16>(raw[0], raw[1], raw[2], win.shift, p);
+        TileDecodeFast<K>(raw[0], raw[1], raw[2], win.shift, p);
       }
       GemmNativeStore(p, mine + (1 - P) * kBuf, lane);
     }
@@ -507,6 +547,7 @@ __device__ __forceinline__ void TilePairEpilogue(const PrefillMoe& a, int e, int
       const float* gp = stage + lr * kPairPad + (MUT == 2 ? 128 : 0) + lane * 4;
       const float* up = stage + lr * kPairPad + (MUT == 2 ? 0 : 128) + lane * 4;
       float gv[4], uv[4];
+      // Wht128, not the DPP form: on ROCm 10.1 the DPP form raises the scratch of this kernel (KMAX 5: 68 -> 228 B).
       LinOutLane(gp, gs, gv);
       LinOutLane(up, us, uv);
       // PrefillMoeMidKernel's expression: RoundH(RoundH(Silu(g) * u) * suh).
@@ -698,9 +739,6 @@ __device__ __forceinline__ int PcTid() {
 // block. The same values at the same addresses as two PrefillFxTransform items, and the same fx_ready count (2).
 // No branch per row (as PcXProd): a row past M loads from an empty buffer (0) and stores past the output range
 // (dropped), so the waits count only the loads of the column block that the arithmetic reads.
-// FOLD (the fat kernel): both sides in one LinInHalfPairLane (Wht128Fold2), the same bytes. The thin kernel keeps the
-// two LinInHalfLane calls: with the fold its X loop spilled (420 bytes of scratch per lane at 144 VGPRs).
-template <bool FOLD>
 __device__ __forceinline__ void PcFxPairTransform(const PrefillMoe& a, int x, int t) {
   using U2 = uint32_t __attribute__((ext_vector_type(2)));
   const int code = PrefillUniform(a.fx_items[x]), e = code >> 16, rg = (code >> 1) & 0x7fff;
@@ -730,6 +768,12 @@ __device__ __forceinline__ void PcFxPairTransform(const PrefillMoe& a, int x, in
   }
   // PackedIndex(l, cb * 128 + lane * 4, M) * 2 = ro + cb * M * 256 + dlane (bytes).
   const uint32_t dlane = (uint32_t)(((lane >> 2) * M * 16 + (lane & 3) * 4) * 2), xlane = lane * 8;
+  // kHadNorm here is a VGPR that an asm writes in each call, with the same bits as crucible::kHadNorm (the name hides
+  // it for the transform calls below). With the constant, the compiler made the norm (and -kHadNorm of a sign fold)
+  // once at the kernel entry and kept it in a VGPR through the fat consumer's k loop: one VGPR more next to the 232
+  // of the accumulators and fragments, and ROCm 10.1 then spilled the k loop (k101-spill).
+  float kHadNorm;
+  asm volatile("v_mov_b32 %0, %1" : "=v"(kHadNorm) : "i"(__builtin_bit_cast(int, ::crucible::kHadNorm)));
   U2 xv[kFxDepth][4], gv[kFxDepth], uv[kFxDepth];
   auto load = [&](int slot, int cb) {
     gv[slot] = __builtin_amdgcn_raw_buffer_load_b64(rsg, cb * 256 + xlane, 0, 0);
@@ -748,13 +792,7 @@ __device__ __forceinline__ void PcFxPairTransform(const PrefillMoe& a, int x, in
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
         const uint2 x2 = make_uint2(xv[k][i].x, xv[k][i].y);
-        uint2 hg, hu;
-        if constexpr (FOLD) {
-          LinInHalfPairLane(x2, g2, u2, kHadNorm, lane, hg, hu);
-        } else {
-          hg = LinInHalfLane(x2, g2, kHadNorm, lane);
-          hu = LinInHalfLane(x2, u2, kHadNorm, lane);
-        }
+        const uint2 hg = LinInHalfLane(x2, g2, kHadNorm, lane), hu = LinInHalfLane(x2, u2, kHadNorm, lane);
         __builtin_amdgcn_raw_buffer_store_b64(U2{hg.x, hg.y}, rdg, ro[i] + cbo, 0, 0);
         __builtin_amdgcn_raw_buffer_store_b64(U2{hu.x, hu.y}, rdu, ro[i] + cbo, 0, 0);
       }
@@ -1064,12 +1102,24 @@ __device__ __forceinline__ void PcFatConsume(int A, const uint32_t* lds, GemmF8 
   };
   using P0 = std::integral_constant<int, 0>;
   using P1 = std::integral_constant<int, 1>;
-  int a = 0;
-  for (; a + 1 < A; a += 2) {
-    step(P0{});
-    step(P1{});
+  if constexpr (S == 2) {
+    // Gate/up: A = kHidden / 16 is even, so the loop has no odd last step after it. That step kept lane & 15 (its
+    // addresses) in a VGPR through the loop, and ROCm 10.1 then spilled the 192 accumulators in the loop (772 bytes
+    // per lane, k101-spill). An odd A traps.
+    static_assert(kHidden / 16 % 2 == 0);
+    if (A & 1) __builtin_trap();
+    for (int a = 0; a < A; a += 2) {
+      step(P0{});
+      step(P1{});
+    }
+  } else {
+    int a = 0;
+    for (; a + 1 < A; a += 2) {
+      step(P0{});
+      step(P1{});
+    }
+    if (a < A) step(P0{});
   }
-  if (a < A) step(P0{});
 }
 
 // TilePairEpilogue with the lane values from t (PcTid), LinOutLaneAt and LinInLaneAt (exl3.h), and the 2 rows of a wave one
@@ -1177,7 +1227,8 @@ __device__ __forceinline__ void PcFatPairEpilogue(const PrefillMoe& a, int e, in
       const float* gp = stage + lr * kPairPad + (MUT == 2 ? 128 : 0) + lane * 4;
       const float* up = stage + lr * kPairPad + (MUT == 2 ? 0 : 128) + lane * 4;
       float gv[4], uv[4];
-      LinOutPairLaneAt(gp, up, gs, us, gv, uv, lane);
+      LinOutLaneAt(gp, gs, gv, lane);
+      LinOutLaneAt(up, us, uv, lane);
       float s[4], v[4];
 #pragma unroll
       for (int i = 0; i < 4; ++i) s[i] = Silu(gv[i]) * uv[i];
@@ -1192,7 +1243,16 @@ __device__ __forceinline__ void PcFatPairEpilogue(const PrefillMoe& a, int e, in
 template <int N, int MUT>
 __device__ __forceinline__ void PcFatPairItem(const PrefillMoe& a, const Exl3GemmJob& j, const Exl3GemmItem& it,
                                               uint32_t* lds) {
-  GemmF8 acc[kFatSlots][kTileCols] = {};
+  // A fresh zero per item: ROCm 10.x's register allocator keeps a hoisted all-zero 8-VGPR tuple live across the
+  // K loop instead of rematerializing it here, which pushes this kernel past its 240-VGPR budget (772 B/lane spill).
+  float z0;
+  asm volatile("v_mov_b32 %0, 0" : "=v"(z0));
+  const GemmF8 zv = {z0, z0, z0, z0, z0, z0, z0, z0};
+  GemmF8 acc[kFatSlots][kTileCols];
+#pragma unroll
+  for (int i = 0; i < kFatSlots; ++i)
+#pragma unroll
+    for (int c = 0; c < kTileCols; ++c) acc[i][c] = zv;
   PcFatConsume<N, 2, MUT>(j.I / 16, lds, acc);
   PcFatPairEpilogue<N, MUT == 1 || MUT == 2 ? MUT : 0>(a, it.job >> 1, j.M, it.m0, it.b0, acc,
                                                        reinterpret_cast<float*>(lds), PcTid());
@@ -1244,7 +1304,7 @@ __device__ __forceinline__ void PcPairLoop(const PrefillMoe& a, int lead, uint32
       const int x = PrefillUniform(claim);
       __syncthreads();
       if (x >= nx) break;
-      if (x + 2 * grp < nx) PcFxPairTransform<FAT>(a, x + 2 * grp, t & 127);
+      if (x + 2 * grp < nx) PcFxPairTransform(a, x + 2 * grp, t & 127);
       else PcFxPairIdle();
     }
     if (g >= ng) return;

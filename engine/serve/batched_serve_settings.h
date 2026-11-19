@@ -31,12 +31,24 @@ struct BatchedServeSettings {
   bool state_write_set=false;
   int state_write_delay_ms=0;  // the same-second GPU test only (an earlier change): each state write waits this long
   bool state_write_delay_set=false;
+  // The branch ladder (state_disk.h): a new state keeps the longest older state of each
+  // ladder bucket of its branch, so a backtrack finds a near state. 0 (the default): the earlier
+  // prune rule (the 2 newest older states).
+  bool state_disk_ladder=false;
+  bool state_disk_ladder_set=false;
+  // The fork point: at a release, the longest slot point below the tail goes to disk
+  // too, as a derived state (one state file). Off by default until its load test passes.
+  bool state_disk_fork=false;
+  bool state_disk_fork_set=false;
   // The server's default MTP window (serve --mtp-window). It sizes each slot's MTP cache (draft_warmup.h MtpSlotRows,
   // an earlier change); 0 (the whole prompt) keeps the context. Requests still choose their own window.
   int mtp_window=kDefaultMtpPrefix;
   // serve --draft-blocks FILE: the block IDs of the served draft head; empty keeps the embedded 64K head.
   // The head changes only drafts, never an output.
   std::string draft_blocks;
+  // Memory stage 2 (batch_admission.h FitServeLayout): a layout that does not fit the free memory at start becomes the
+  // largest one that does. "--fit off" keeps the requested layout, which the start then refuses.
+  bool fit=true;
 };
 inline BatchedServeSettings ParseBatchedServeSettings(std::span<const std::string_view> args) {
   if (args.size()%2) throw std::invalid_argument("batch options need a value after each switch");
@@ -100,6 +112,18 @@ inline BatchedServeSettings ParseBatchedServeSettings(std::span<const std::strin
       if (result.state_write_delay_ms<0 || result.state_write_delay_ms>60000)
         throw std::invalid_argument("state-disk-write-delay-ms must be in [0,60000]");
     }
+    else if (key=="--state-disk-ladder") {
+      const int parsed=ServeNumber<int>(value);
+      if (parsed<0 || parsed>1) throw std::invalid_argument("state-disk-ladder must be 0 or 1");
+      result.state_disk_ladder=parsed!=0;
+      result.state_disk_ladder_set=true;
+    }
+    else if (key=="--state-disk-fork") {
+      const int parsed=ServeNumber<int>(value);
+      if (parsed<0 || parsed>1) throw std::invalid_argument("state-disk-fork must be 0 or 1");
+      result.state_disk_fork=parsed!=0;
+      result.state_disk_fork_set=true;
+    }
     else if (key=="--mtp-window") {
       result.mtp_window=ServeNumber<int>(value);
       if (result.mtp_window<0 || result.mtp_window>262144) throw std::invalid_argument("mtp-window must be in [0,262144]");
@@ -109,6 +133,10 @@ inline BatchedServeSettings ParseBatchedServeSettings(std::span<const std::strin
           std::any_of(value.begin(),value.end(),[](char c){return static_cast<unsigned char>(c)<0x20 || c==0x7f;}))
         throw std::invalid_argument("draft-blocks must be an absolute file path");
       result.draft_blocks=std::string(value);
+    }
+    else if (key=="--fit") {
+      if (value!="auto" && value!="off") throw std::invalid_argument("fit must be auto or off");
+      result.fit=value=="auto";
     }
     else if (key=="--vision") {
       const int parsed=ServeNumber<int>(value);
@@ -138,6 +166,10 @@ inline BatchedServeSettings ParseBatchedServeSettings(std::span<const std::strin
     throw std::invalid_argument("state-dir needs --session-replay 1 and a conversation cache");
   if ((result.state_disk_gib_set || result.state_write_set || result.state_write_delay_set) && result.state_dir.empty())
     throw std::invalid_argument("state-disk-gib, state-disk-write-gib-per-day and state-disk-write-delay-ms need --state-dir");
+  if (result.state_disk_ladder_set && result.state_dir.empty())
+    throw std::invalid_argument("state-disk-ladder needs --state-dir");
+  if (result.state_disk_fork_set && result.state_dir.empty())
+    throw std::invalid_argument("state-disk-fork needs --state-dir");
   // Slot 0 keeps the full context, so every request that fits --ctx has a slot.
   if (result.short_streams<0 || result.short_streams>=result.streams ||
       (result.short_streams ? result.short_ctx<1 || result.short_ctx>=result.ctx : result.short_ctx!=0))

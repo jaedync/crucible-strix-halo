@@ -61,7 +61,8 @@ int main() {
                          "\"draft_pos_accepted\":[1,0,0,0,0,0,0],\"draft_len_hist\":[0,0,1,0,0,0,0,0],"
                          "\"draft_passes\":2,\"draft_ms\":1.750,\"draft_run_hist\":[0,0,0,0,0,0,0,0,0],"
                          "\"draft_lookup_rounds\":0,\"draft_lookup_pos_proposed\":[0,0,0,0,0,0,0],"
-                         "\"draft_lookup_pos_accepted\":[0,0,0,0,0,0,0]");
+                         "\"draft_lookup_pos_accepted\":[0,0,0,0,0,0,0],"
+                         "\"draft_copy_run_hist\":[0,0,0,0,0,0],\"draft_copy_run_tokens\":[0,0,0,0,0,0]");
   }
   {  // runs of full-accept rounds (plan wide C): 3 full, 1 miss, 2 full; the open run counts in Fields
     DraftTally t;
@@ -104,6 +105,40 @@ int main() {
     const std::string f = t.Fields();
     const auto at = f.find("\"draft_lookup_rounds\"");
     assert(at != std::string::npos && f.find("\"draft_lookup_rounds\"", at + 1) == std::string::npos);
+  }
+  {  // copy runs (copy-e E1): a copy of 40 tokens over 3 lookup rounds counts one run in bin 32-63
+    DraftTally t;
+    Run(t, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, 12, -1, true);   // full: 12 drafts + the bonus token = 13
+    Run(t, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, 12, -1, true);   // 26
+    Run(t, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, 12, -1, true);   // 39
+    Run(t, {1, 2, 3, 4, 5}, 1, 9, true);                            // 40, then a reject closes the run
+    assert((t.copy_runs == std::array<long, 6>{0, 0, 0, 0, 1, 0}));
+    assert((t.copy_tokens == std::array<long, 6>{0, 0, 0, 0, 40, 0}) && t.open_copy == 0);
+    Run(t, {1, 2, 3}, 0, 9, true);                                  // a lookup round that copies nothing: no run
+    assert((t.copy_runs == std::array<long, 6>{0, 0, 0, 0, 1, 0}));
+  }
+  {  // a head round ends a copy run; bins 1-8, 9-16, 17-24, 25-31, 32-63, 64+ by tokens; the open run counts in Fields
+    DraftTally t;
+    Run(t, {1, 2, 3, 4, 5, 6, 7}, 7, -1, true);                     // 8 tokens, open
+    Run(t, {1, 2}, 2);                                              // an MTP round: closes the run in bin 1-8
+    assert((t.copy_runs == std::array<long, 6>{1, 0, 0, 0, 0, 0}) && (t.copy_tokens[0] == 8));
+    Run(t, {1, 2, 3, 4, 5, 6, 7, 8}, 8, -1, true);                  // 9
+    Run(t, {1, 2, 3, 4, 5, 6, 7}, 3, 4, true);                      // 12, closed in bin 9-16
+    for (int i = 0; i < 4; ++i) Run(t, {1, 2, 3, 4, 5, 6, 7}, 7, -1, true);  // 32, open
+    Run(t, {}, 0);                                                  // a round without drafts also ends it: bin 32-63
+    for (int i = 0; i < 5; ++i) Run(t, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, 12, -1, true);  // 65, open
+    assert((t.copy_runs == std::array<long, 6>{1, 1, 0, 0, 1, 0}) && t.open_copy == 65);
+    const std::string f = t.Fields();
+    assert(f.find("\"draft_copy_run_hist\":[1,1,0,0,1,1],\"draft_copy_run_tokens\":[8,12,0,0,32,65]") != std::string::npos);
+    assert(t.open_copy == 65);                                      // Fields does not close the run
+    DraftTally u;
+    Run(u, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, 12, -1, true);  // 13
+    Run(u, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, 10, -1, true);          // 24: bin 17-24
+    Run(u, {1}, 0, 3, true);
+    Run(u, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, 12, -1, true);  // 13
+    Run(u, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, 12, -1, true);  // 26
+    Run(u, {1, 2, 3, 4, 5, 6, 7}, 5, 3, true);                      // 31: bin 25-31
+    assert((u.copy_runs == std::array<long, 6>{0, 0, 1, 1, 0, 0}) && (u.copy_tokens == std::array<long, 6>{0, 0, 24, 31, 0, 0}));
   }
   {  // a bad call is ignored, never thrown
     DraftTally t;

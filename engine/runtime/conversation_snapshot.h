@@ -261,6 +261,64 @@ struct ConversationStateIO {
     CopySnapshotRanges(copies, snapshot->bytes, true);
     return snapshot;
   }
+  // Part B: the trunk blocks [0, blocks) of a save of `length` rows, as snapshot ranges (the
+  // ranges that StateDisk::SpillDerived takes from the base state). Empty when the geometry gives no full block.
+  static std::vector<StreamRange> DerivedIntervals(const SequenceState& state, const ConversationResume& r, size_t block_rows,
+                                                   uint64_t head, uint64_t tail, size_t blocks) {
+    SnapshotGeometry geometry;
+    const auto layout = Layout(state);  // the geometry holds a view of it
+    geometry.layout = layout;
+    geometry.rows = r.length;
+    geometry.mpos = size_t(std::max(r.mpos, 0));
+    geometry.head = head;
+    geometry.tail = tail;
+    for (const auto& span : Spans(state, r.length, r.mpos, nullptr, nullptr)) geometry.total += span.bytes;
+    return LazyIntervals(geometry, block_rows, blocks * block_rows);
+  }
+  // SaveAt's spans with `sources`, where a source may also lie inside a span (the open pool block of a point off the
+  // 128-row grid, slot_checkpoint_io.h): the span splits there, and the source gives the bytes that the span holds of it.
+  static std::vector<DeviceSpan> SplitAtSources(const std::vector<DeviceSpan>& spans, std::span<const SpanSource> sources) {
+    std::vector<DeviceSpan> out;
+    for (const auto& span : spans) {
+      const auto* base = static_cast<const uint8_t*>(span.pointer);
+      std::vector<const SpanSource*> inside;
+      for (const auto& source : sources) {
+        const auto* live = static_cast<const uint8_t*>(source.live);
+        if (live >= base && live < base + span.bytes) inside.push_back(&source);
+      }
+      std::sort(inside.begin(), inside.end(), [](const SpanSource* a, const SpanSource* b) { return a->live < b->live; });
+      size_t done = 0;
+      for (const SpanSource* source : inside) {
+        const size_t at = size_t(static_cast<const uint8_t*>(source->live) - base);
+        if (at < done) throw std::logic_error("snapshot span sources overlap");
+        if (at > done) out.push_back({base + done, at - done});
+        const size_t bytes = std::min(source->bytes, span.bytes - at);
+        out.push_back({source->source, bytes});
+        done = at + bytes;
+      }
+      if (done < span.bytes) out.push_back({base + done, span.bytes - done});
+    }
+    return out;
+  }
+  // Part B: a save of the first `hist.size()` rows for a derived disk state. The `derived` ranges stay on the device
+  // behind `source` (the disk writer takes those blocks from the base state and never reads them); `sources` give the
+  // bytes at the point (SlotCheckpointIO::SaveDerived). The rest is copied now.
+  static std::shared_ptr<const ConversationSnapshot> SaveDerivedAt(Engine& e, const SequenceState& state,
+      const ConversationResume& r, float* stk, float* carry, std::span<const int> hist, const RetainedPrefix& retained,
+      std::span<const SpanSource> sources, std::span<const StreamRange> derived, const std::shared_ptr<LazySource>& source) {
+    Validate(e, state, r, hist.size(), stk, carry);
+    auto snapshot = std::make_shared<ConversationSnapshot>();
+    snapshot->hist.assign(hist.begin(), hist.end());
+    snapshot->retained = retained;
+    snapshot->resume = r;
+    snapshot->qsa_layout = Layout(state);
+    const auto spans = SplitAtSources(Spans(state, r.length, r.mpos, stk, carry), sources);
+    const auto parts = SplitLazyParts(spans, derived, source);
+    std::vector<SnapshotRange> copies;
+    snapshot->bytes = SnapshotBytes::Compose(parts, copies);
+    CopySnapshotRanges(copies, snapshot->bytes, true);
+    return snapshot;
+  }
   static ConversationResume Restore(Engine& e, SequenceState& state, const ConversationSnapshot& snapshot,
                                     float* stk, float* carry) {
     Validate(e, state, snapshot.resume, snapshot.hist.size(), stk, carry, false);

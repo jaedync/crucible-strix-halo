@@ -33,6 +33,35 @@ def git_commit(root=ROOT):
     return commit if re.fullmatch(r"[0-9a-f]{7,40}", commit) else None
 
 
+def at_release_tag(root, version):
+    """True when HEAD is the commit of the tag v<version> (plain or annotated)."""
+    try:
+        done = subprocess.run(["git", "-C", str(root), "tag", "--points-at", "HEAD", "--list", f"v{version}"],
+                              capture_output=True, text=True, timeout=GIT_TIMEOUT_SECONDS, check=True)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.stdout.split() == [f"v{version}"]
+
+
+def build_label(root=ROOT):
+    """What this build is, for the owner: "v0.37.0" for a release (a tree without git, or a checkout of the tag
+    v<VERSION>), else "development build <commit>, based on v0.37.0". VERSION names the last release it is based on."""
+    version, commit = read_version(root), git_commit(root)
+    if commit is None or (version != UNKNOWN and at_release_tag(root, version)):
+        return f"v{version}"
+    return f"development build {commit}, based on v{version}"
+
+
+def startup_line(root=ROOT):
+    label, commit = build_label(root), git_commit(root)
+    return f"Crucible {label}" + (f" ({commit})" if commit and label.startswith("v") else "")
+
+
+@lru_cache(maxsize=1)
+def server_label():
+    return build_label()
+
+
 @lru_cache(maxsize=1)
 def server_version():
     return read_version()

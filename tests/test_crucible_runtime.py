@@ -10,7 +10,7 @@ import unittest
 import zipfile
 from pathlib import Path
 
-from crucible_cli_fakes import FakeHttp, FakePrompt, FakeRunner, make_repo, wire
+from crucible_cli_fakes import FakeHttp, FakePrompt, FakeRunner, ModesNo, make_repo, wire
 
 import make_runtime_pin  # noqa: E402  (tools/ is on the path through crucible_cli_fakes)
 from crucible_cli import cli, doctor, launch, rocm, runtime  # noqa: E402
@@ -381,7 +381,7 @@ class SetupBase(Base):
         machine.setdefault("hipcc", False)
         machine.setdefault("rocminfo", False)
         machine.setdefault("kfd_gfx", 110501)
-        host = wire(self.t, http=FakeDownload(), prompt=FakePrompt(answers) if interactive else None, **machine)
+        host = wire(self.t, http=FakeDownload(), prompt=ModesNo(answers) if interactive else None, **machine)
         host.is_tty = interactive
         base = ["--state-dir", str(self.t / "home/states"), "--bind", "127.0.0.1"]
         if interactive:

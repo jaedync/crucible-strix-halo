@@ -7,6 +7,7 @@
 #include <optional>
 #include <mutex>
 #include <regex>
+#include <set>
 #include <vector>
 
 std::mutex pinned_mutex;
@@ -284,12 +285,85 @@ void IdentitiesAndLocks() {
   assert(next.Enabled() && next.Entries() == 0);
   assert(fs::exists(old_dir));  // another identity's directory stays at start (a rollback finds its states there)
   assert(!fs::exists(own / "abc.state.tmp.1"));
-  // A state root outside the home directory is refused.
-  auto outside = Options("f", logs);
-  outside.root = "/var/tmp/crucible-states-test";
+  // A state root in a system folder is refused, and nothing is made there.
+  auto system = Options("f", logs);
+  system.root = "/usr/crucible-states-test";
   bool threw = false;
-  try { Disk bad(outside); } catch (const std::invalid_argument&) { threw = true; }
-  assert(threw);
+  try { Disk bad(system); } catch (const std::invalid_argument&) { threw = true; }
+  assert(threw && !fs::exists(system.root));
+}
+
+// The message of a refused root (the host copy, tools/crucible_cli/state_root.py, has the same sentences).
+std::string Refusal(StateDiskOptions options) {
+  try { Disk disk(std::move(options)); } catch (const std::invalid_argument& error) { return error.what(); }
+  return "";
+}
+
+// Nov 12: a state root outside the home folder, for example a second SSD. The rule needs no HOME: a
+// folder that only this user (or root) can change is accepted; a place where another user could move or replace the
+// folder is refused with a clear message. tests/state_root_test.cpp holds the full table.
+void RootOutsideHome() {
+  Logs logs;
+  const fs::path outside = Root().parent_path() / "fast";  // a sibling of the test HOME
+  auto fresh = Options("g", logs);
+  fresh.root = outside / "crucible" / "states";
+  {
+    Disk disk(fresh);
+    assert(disk.Enabled() && Mode(fresh.root) == 0700 && Mode(fresh.root.parent_path()) == 0700);
+    Spill(disk, Make(Tokens(10), 3000, 3));
+    assert(disk.Drain(30) && disk.Entries() == 1);
+  }
+  // Without HOME, the same root still opens and finds its state.
+  const std::string home = std::getenv("HOME");
+  ::unsetenv("HOME");
+  {
+    Disk again(fresh);
+    assert(again.Enabled() && again.Entries() == 1);
+  }
+  ::setenv("HOME", home.c_str(), 1);
+  // A parent folder that every user can write (no sticky bit): another user could swap the folder. Refused, and no
+  // folder is made in it.
+  fs::create_directories(outside / "open");
+  fs::permissions(outside / "open", fs::perms::all);
+  auto open = Options("g", logs);
+  open.root = outside / "open" / "states";
+  const std::string why = Refusal(open);
+  assert(why == "the state directory is not accepted: other users can write " + (outside / "open").string() +
+                " (mode 0777, no sticky bit), so they could move or replace " + open.root.string() + ".");
+  assert(!fs::exists(open.root));
+  // The same parent with the sticky bit (as /tmp): accepted.
+  fs::permissions(outside / "open", fs::perms::all | fs::perms::sticky_bit);
+  { Disk sticky(open); assert(sticky.Enabled() && Mode(open.root) == 0700); }
+  fs::permissions(outside / "open", fs::perms::owner_all);
+  // The root as a link: refused, and the target stays as it was.
+  fs::create_directories(outside / "target");
+  fs::permissions(outside / "target", fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec);
+  fs::create_symlink(outside / "target", outside / "link");
+  auto link = Options("g", logs);
+  link.root = outside / "link";
+  assert(Refusal(link) == "the state directory is not accepted: " + link.root.string() + " is a link.");
+  assert(Mode(outside / "target") == 0750 && fs::is_empty(outside / "target"));
+  // A link in a parent folder is resolved: the engine uses the real path.
+  auto through = Options("g", logs);
+  through.root = outside / "link" / "states";
+  { Disk disk(through); assert(disk.Enabled() && disk.Directory().parent_path() == outside / "target" / "states"); }
+  // Review M1: a missing parent that another user makes between the two checks (here a link to another folder). The
+  // second check resolves the link; the engine must not keep the path of the first check, so the start stops.
+  fs::create_directories(outside / "elsewhere");
+  fs::permissions(outside / "elsewhere", fs::perms::owner_all);
+  auto race = Options("g", logs);
+  race.root = outside / "race" / "states";
+  race.after_root_check = [&] { fs::create_symlink(outside / "elsewhere", outside / "race"); };
+  const std::string raced = Refusal(race);
+  assert(raced == "the state directory is not accepted: " + race.root.string() + " changed while the engine made it (now " +
+                      (outside / "elsewhere" / "states").string() + ").");
+  // The home folder itself and a relative path stay refused.
+  auto at_home = Options("g", logs);
+  at_home.root = Root();
+  assert(Refusal(at_home).find("is your home folder") != std::string::npos);
+  auto relative = Options("g", logs);
+  relative.root = "states";
+  assert(Refusal(relative) == "the state directory is not accepted: states is not an absolute path.");
 }
 
 // A rollback from the block storage format: this binary removes the newer
@@ -509,6 +583,17 @@ void IdentityText() {
            StateDiskIdentityFor(b1, c1, settings_of({"CRUCIBLE_PLE_HOST=1", "CRUCIBLE_PLE_FETCH=1"})).directory);
     assert(StateDiskIdentityFor(b1, c1, base).directory !=
            StateDiskIdentityFor(b1, c1, settings_of({"CRUCIBLE_PLE_HOST=1", "CRUCIBLE_EXACT=1"})).directory);
+    // The HC width (hc-rows step 0): a state saved with int8 HC weights never restores under the fp16 HC read, or back.
+    // Unset, 0, 1 and 2 are four folders; the MTP-only width (DRAFT_CHAIN hc8) is a folder of its own too.
+    {
+      const auto dir = [&](std::vector<const char*> words) { return StateDiskIdentityFor(b1, c1, settings_of(words)).directory; };
+      const std::set<std::string> dirs = {dir({"CRUCIBLE_PLE_HOST=1"}), dir({"CRUCIBLE_PLE_HOST=1", "CRUCIBLE_HC_WMMA=0"}),
+                                          dir({"CRUCIBLE_PLE_HOST=1", "CRUCIBLE_HC_WMMA=1"}),
+                                          dir({"CRUCIBLE_PLE_HOST=1", "CRUCIBLE_HC_WMMA=2"}),
+                                          dir({"CRUCIBLE_PLE_HOST=1", "CRUCIBLE_HC_WMMA=2", "CRUCIBLE_DRAFT_CHAIN=hc8,lead"}),
+                                          dir({"CRUCIBLE_PLE_HOST=1", "CRUCIBLE_DRAFT_CHAIN=hc8,lead"})};
+      assert(dirs.size() == 6);
+    }
   }
   // The MTP sidecar enters the identity by file content, as the ablation file does: another file at the same path
   // must miss (a stale sidecar would restore wrong MTP rows).
@@ -1218,6 +1303,7 @@ int main() {
   ReadStaysWhilePolled();
   EvictionScales();
   DirectoryModes();
+  RootOutsideHome();
   FlushIgnoresQueueLimit();
   SizeAndHeaderChecks();
   SharedLedger();

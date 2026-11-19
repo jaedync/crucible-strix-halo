@@ -84,6 +84,30 @@ struct SlotCheckpointIO {
     const auto sources = Sources(state, buffer, point, r);
     return ConversationStateIO::SaveAt(e, state, r, stk, carry, base, point.hist, buffer.retained, sources);
   }
+  // Part B: the host snapshot of a general point (End, Pre or Grid, target state, no pending
+  // rows) for a derived disk state. The fixed state, the raw rings and the open pool block come from the buffer (any
+  // position: the pool block of the point splits its span); the rows below the point are the stream's own. The trunk
+  // blocks in `derived` stay on the device behind a source that never reads (StateDisk::SpillDerived takes them from the
+  // released tail), so only the rest is copied.
+  template <class E>
+  static std::shared_ptr<const ConversationSnapshot> SaveDerived(E& e, const SequenceState& state, const Buffer& buffer,
+      const crucible::SlotCheckpoint& point, const ConversationResume& r, float* stk, float* carry,
+      std::span<const crucible::StreamRange> derived) {
+    const size_t length = point.hist.size();
+    if (buffer.position != length || r.length != length || r.mpos != 0 || r.have_carry || point.replay != 0 ||
+        state.hist.size() < length || !std::equal(point.hist.begin(), point.hist.end(), state.hist.begin()))
+      throw std::logic_error("slot fork point needs a point whose rows are still on the slot");
+    std::vector<ConversationStateIO::SpanSource> sources;
+    size_t offset = 0;
+    for (const auto& span : Spans(state, length)) {
+      sources.push_back({span.pointer, buffer.device + offset, span.bytes});
+      offset += span.bytes;
+    }
+    // A source that throws: a read of a derived range would be a fault of the writer (the write is refused as lost).
+    auto never = std::make_shared<crucible::LazySource>([](const void*, void*, size_t) { throw crucible::SnapshotLost(); }, 0);
+    never->Invalidate();
+    return ConversationStateIO::SaveDerivedAt(e, state, r, stk, carry, point.hist, buffer.retained, sources, derived, never);
+  }
   // fc-d2d: the frontier copy without a host stage. A host snapshot
   // needs cache room, and with host-only session tails in the budget there was none (refused, a full prefill). This
   // writes the device bytes that SaveFrom and then ConversationStateIO::Restore write to `target`, in the same order:

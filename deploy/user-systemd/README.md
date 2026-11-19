@@ -14,8 +14,11 @@ the command fills in the paths of your clone. A test keeps the two texts equal.
 
 ## Opt-in automatic updates
 
-Templates for a systemd user timer that runs `./crucible update --yes` every day. They are off by default. No script and no
+Templates for a systemd user timer that runs `./crucible update --yes --unattended` every day. They are off by default. No script and no
 make target installs or enables them. "Updates" in the main README shows the commands.
 
-- `crucible-update.service`: runs `./crucible update --yes` in your clone. The command restarts `crucible-server.service` if it runs, and it rolls back by itself if a step fails.
+- `crucible-update.service`: runs `./crucible update --yes --unattended` in your clone. The command restarts `crucible-server.service` if it runs, and it rolls back by itself if a step fails. When Kiln's unit `kiln-crucible.service` exists, the timer changes nothing and logs one line: run `./crucible update` by hand. Only an update by hand stops and restarts the Kiln unit.
+  A timer from an older template runs `./crucible update --yes` with no `--unattended`. The update sees that it runs in
+  `crucible-update.service` (or cannot read `/proc/self/cgroup`) and acts as with `--unattended`. Install the new template
+  again to get the flag in the unit.
 - `crucible-update.timer`: runs the service daily at 04:00.

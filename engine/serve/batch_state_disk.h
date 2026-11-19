@@ -146,6 +146,24 @@ class BatchReadQueue {
              Prefix(point, w.key);
     });
   }
+  // Start plan B3 (L4): may the read of the next turn (`position` 0) take the host point `point` of a session that is
+  // not in a slot? Yes, unless it is a prefix of the reader's own prompt: the point goes to the disk (the spill hook) or
+  // is there already, and its own turn reads it back. A point whose spill the disk refuses stays (MakeRoom "spill").
+  // The rule of Behind (only a session that waits behind the reader) refused the reads of 6 sessions on 4 slots
+  // (a load test: 31 `reason=protected` stage lines, then cold prefills of 124K tokens).
+  bool MayTake(std::span<const int> point, std::span<const int> reader, size_t position) const {
+    return position == 0 && !Prefix(point, reader);
+  }
+  // b3-fix (soak spb3d-n6b, Nov 10: 5 lost turns): MayTake for a point that may be in a slot (`in_slot`: a prefix of a
+  // state that a slot holds or runs, the restore source of a running turn or a point below an idle tail). The slot
+  // holds the newer state, so the host point is only a fallback, and it may leave for the read too: MakeRoom's `taken`
+  // keeps it unless the disk holds it or the spill queued it, so it leaves through the disk only. A point below the
+  // disk's `min_tokens` can never reach the disk, so it stays. The B3 rule kept every in-slot point: two restore
+  // sources (about 8.1 GB of the 8.33 GB entry budget) refused 6 reads as `protected`.
+  bool MayTakeFor(std::span<const int> point, std::span<const int> reader, size_t position, bool in_slot,
+                  size_t min_tokens) const {
+    return MayTake(point, reader, position) && (!in_slot || point.size() >= min_tokens);
+  }
   // A read took `point`: its tag (1, 2, ...).
   uint64_t Took(std::span<const int> point) {
     if (taken_.size() >= kMaxTaken) taken_.erase(taken_.begin());
@@ -429,6 +447,45 @@ class BatchDiskTier {
     // The room check above used `need`, not the whole snapshot: its shared chunks are in host memory already.
     const auto result = disk_.Spill(key, policy, compact_, false, guarded, snapshot, *snapshot, false);
     return result.empty() ? "queued" : result == "queued" ? "waiting" : result;
+  }
+  // Part B: a fork point of `key` beside the tail `tail` that a release just queued or wrote.
+  // Its first `blocks` trunk blocks are the tail's blocks (StateDisk::SpillDerived), so `save` copies only the rest
+  // (`need` host bytes). `base_now`: this release queued the tail now. A tail that was on disk before may hold the bytes
+  // of another computation of the same tokens (a retry after another restore point): no fork point derives from it.
+  // "queued", or why not: off, rope, short, present, waiting, base (the release did not queue the tail now, or it is
+  // neither on disk nor queued), memory, busy, fault (the copy threw), and the refusals of SpillDerived and Spill
+  // (policy, mtp, daily).
+  template<class Save>
+  std::string SpillFork(std::span<const int> key, const ConversationPolicy& policy, bool guarded, std::span<const int> tail,
+                        bool base_now, uint64_t blocks, size_t need, uint64_t room, Save save) {
+    if (!Enabled()) return "off";
+    if (!DiskKeepsRope(policy)) return "rope";
+    if (key.size() < disk_.MinTokens()) return "short";
+    if (disk_.Present(key, policy, compact_)) return "present";
+    if (disk_.Waiting(key, policy, compact_)) return "waiting";
+    if (!base_now || (!disk_.Present(tail, policy, compact_) && !disk_.Waiting(tail, policy, compact_))) return "base";
+    const uint64_t reading = disk_.UnallocatedReadBytes();
+    if (need > (room > reading ? room - reading : 0)) return "memory";
+    if (disk_.QueueFull(need, key, policy, compact_)) return "busy";
+    std::shared_ptr<const Snapshot> snapshot;
+    try {
+      snapshot = save();
+    } catch (const std::bad_alloc&) {
+      return "memory";
+    } catch (const std::exception&) {
+      return "fault";  // review M2: a fork point is speed only; a copy fault must not poison the batch
+    }
+    if (!snapshot) return "memory";
+    const auto result = disk_.SpillDerived(key, policy, compact_, guarded, snapshot, *snapshot, tail, blocks);
+    return result.empty() ? "queued" : result;
+  }
+  // The fork floor: the length of the longest state on disk or in the writer queue whose key `key` starts (0: none).
+  size_t ForkFloor(std::span<const int> key, const ConversationPolicy& policy) const {
+    const auto any = [](const StateMeta&) { return true; };
+    size_t floor = 0;
+    if (const auto best = disk_.Best(key, policy, compact_, any)) floor = best->key.size();
+    if (const auto pending = disk_.Pending(key, policy, compact_, any, 1e18)) floor = std::max(floor, pending->key.size());
+    return floor;
   }
   static bool DirectRefusal(std::string_view refused) {
     return refused == "protected" || refused == "host" || refused == "memory" || refused == "budget";

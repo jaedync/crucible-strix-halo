@@ -7,13 +7,23 @@ import subprocess
 import sys
 import threading
 import time
-from . import ablation, metrics, rope
+from . import ablation, metrics, rope, structured
 from .engine_messages import ENGINE_REJECTED, ProtocolError, AdmissionRefused
-from .api import LEGACY_MODEL, ApiError, ModelInfo, STOP_IDS
+from .api import LEGACY_MODEL, PENALTY_FIELDS, ApiError, ModelInfo, STOP_IDS
 from .hosts import ALLOWED_HOSTS_ENV
 from .request_id import CLIENT_REQUEST_ID_HEADER_ENV
 from .sd_notify import ENV_NAMES as SERVICE_ENV_NAMES
 from .pixel_files import PixelStore
+
+
+def engine_penalties(request):
+    """The penalty fields of an engine job: only the values that are not neutral, so the
+    payload of a neutral request keeps its old bytes. A continuation job adds the client's prompt length."""
+    fields = {name: getattr(request, name, neutral) for name, neutral in PENALTY_FIELDS.items()}
+    fields = {name: value for name, value in fields.items() if value != PENALTY_FIELDS[name]}
+    if fields and getattr(request, "penalty_prompt", None) is not None:
+        fields["penalty_prompt"] = request.penalty_prompt
+    return fields
 
 @dataclass
 class Job:
@@ -59,7 +69,7 @@ LOOKUP_DEPTH, LOOKUP_MIN = 7, 8
 # (tests/test_switch_lists.py checks this set).
 ENGINE_KEEP_SWITCHES = frozenset({
     "CRUCIBLE_ABLATE", "CRUCIBLE_ABLATE_MODE", "CRUCIBLE_COMPACT_STATE",
-    "CRUCIBLE_DECODE_RING", "CRUCIBLE_DRAFT_CHAIN", "CRUCIBLE_DRAFT_HEAD", "CRUCIBLE_EXACT", "CRUCIBLE_EXACT_RESUME",
+    "CRUCIBLE_DECODE_RING", "CRUCIBLE_DRAFT_CHAIN", "CRUCIBLE_DRAFT_HEAD", "CRUCIBLE_EXACT", "CRUCIBLE_EXACT_RESUME", "CRUCIBLE_TWIN",
     "CRUCIBLE_FUSE", "CRUCIBLE_GDN_VERIFY", "CRUCIBLE_HC_WMMA",
     "CRUCIBLE_LAZY_SHADOW", "CRUCIBLE_LOOKAHEAD", "CRUCIBLE_LOOKAHEAD_MIB",
     "CRUCIBLE_MOE_B128", "CRUCIBLE_MTP_SIDECAR", "CRUCIBLE_PACKED_ROWS",
@@ -206,6 +216,8 @@ class EngineBackend:
         # Per-request ablation: an engine without the request mode refuses "ablate", so the server never sends it there
         # (validate_request refuses an ablated request first).
         self.ablate_request = ready.get(ablation.READY_FIELD) == 1
+        # Structured output: only an engine that names the field takes the constraint keys.
+        self.constraint_ready = ready.get("constraint") == 1
         if "model" in ready:
             self.model = self._ready_model(ready["model"])
 
@@ -266,8 +278,10 @@ class EngineBackend:
         return follow
 
     def submit(self, ids, request, cache_prefix_tokens=0, shared_prefix_tokens=0, log_turn=True, image_offsets=(),
-               after=None, think_cap=None, client_request_id=None):
-        """log_turn=False leaves the crucible_turn line to the caller (one line for a request that uses two jobs).
+               after=None, think_cap=None, client_request_id=None, constraint_from=None, prefix_marks=None):
+        """prefix_marks: the prefix_* fields of the turn line (server/prefix_marks.py); never sent to the engine.
+        log_turn=False leaves the crucible_turn line to the caller (one line for a request that uses two jobs).
+        constraint_from: where the output starts in ids, for a continuation of a constrained request.
         client_request_id: the gateway's id for the request (metrics.client_request_id), for the job's log lines."""
         counts = dict(prompt_tokens=len(ids), max_tokens=request.max_tokens, context=self.context)
         if not ids:
@@ -307,13 +321,22 @@ class EngineBackend:
             pixels = self.pixels.write(request.images)
             policy = policy | dict(images=engine_images(request.images, image_offsets, pixels.paths))
         scoring = dict(top_logprobs=request.top_logprobs) if getattr(request, "top_logprobs", 0) else {}
+        penalties = engine_penalties(request)
+        constraint = structured.engine_constraint(request) if getattr(request, "constraint", None) else None
+        if constraint is not None:
+            # Sent only with a constraint, so the payload of every other request stays byte-identical.
+            if not getattr(self, "constraint_ready", False):
+                raise ApiError("This engine has no structured output.", "response_format", code="constraint_unsupported")
+            scoring = scoring | dict(constraint=constraint)
+            if constraint_from is not None:
+                scoring = scoring | dict(constraint_from=constraint_from)
         bounded = self.bounds_think_cap and think_cap is not None and 0 < think_cap < request.max_tokens
         try:
             job = Job(dict(ids=list(ids), max_tokens=think_cap if bounded else request.max_tokens, spec=request.spec,
                            stop_ids=list(STOP_IDS),
                            temperature=request.temperature, top_k=request.top_k, top_p=request.top_p,
                            min_p=request.min_p, seed=request.seed, cache_control=request.cache_control,
-                           cache_prefix_tokens=cache_prefix_tokens) | policy | scoring,
+                           cache_prefix_tokens=cache_prefix_tokens) | policy | scoring | penalties,
                       events=queue.Queue(maxsize=self.event_capacity), pixels=pixels)
             if len(json.dumps(job.payload, separators=(",", ":"))) + LINE_WRAPPER_BYTES > (self.engine_line_bytes or ENGINE_LINE_BYTES):
                 raise ApiError("The request is too large for the engine. Send a shorter prompt.", status=413,
@@ -330,6 +353,7 @@ class EngineBackend:
             if self.counts_stall: job.turn["stall_s"] = 0.0
             # Start plan B1a: the block length that the server gave (the turn line's shared_prefix_tokens).
             job.turn["shared_prefix_tokens"] = int(shared_prefix_tokens or 0)
+            if prefix_marks: job.turn["prefix_marks"] = dict(prefix_marks)
             # Token classes (crucible_turn): a continuation resumes after the closed think block.
             job.turn["think_open"] = after is None and getattr(request, "kind", None) == "chat" and \
                 getattr(request, "enable_thinking", False) is True
@@ -491,7 +515,7 @@ class EngineBackend:
                     self.process.kill()
                     self.process.wait(timeout=10)
             if self.process.stdin:
-                self.process.stdin.close()
+                self._close_stdin()
             if self.process.stdout:
                 self.process.stdout.close()
             # The engine has exited, so no request reads a pixel file any more.
@@ -500,3 +524,14 @@ class EngineBackend:
         for thread in (getattr(self, "worker", None), getattr(self, "reader", None)):
             if thread is not None and thread is not threading.current_thread():
                 thread.join(timeout=10)
+
+    def _close_stdin(self):
+        """Close stdin after the engine exited. A command written after the exit met the closed pipe and stays in
+        the buffer; the close flushes it again. That BrokenPipeError is logged once with the exit code (a closed
+        file closes again without a flush). Any other error, or a pipe error from a live engine, still raises."""
+        try:
+            self.process.stdin.close()
+        except BrokenPipeError:
+            code = self.process.poll()
+            if code is None: raise
+            metrics.emit(metrics.engine_exit_line(code))

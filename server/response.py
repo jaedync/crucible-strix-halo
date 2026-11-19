@@ -5,6 +5,7 @@ import time
 import uuid
 from . import metrics
 from .api import ApiError
+from .timings import timings
 from .tool_output import ToolOutput
 from .stop_sequences import StopSequences
 from .thinking import ThinkSplitter
@@ -29,9 +30,11 @@ class CompletionResponse:
         self.stream = service.tokenizer.stream()
         self.ids, self.text, self.raw_text, self.displayed = [], "", "", 0
         self.scores = None  # the engine's [[id, logprob], ...] for a scoring request
-        self.stop_filter = StopSequences(request.stop)
+        # Client stop strings do not cut a constrained answer: it would no longer parse.
+        self.stop_filter = StopSequences(() if getattr(request, "constraint", None) is not None else request.stop)
         stream_calls = request.stream and getattr(service, "stream_tool_calls", True)
-        self.tools = ToolOutput(request, stream_calls) if request.kind == "chat" and request.tools else None
+        self.tools = (ToolOutput(request, stream_calls, getattr(service, "extend_tool_tails", False))
+                      if request.kind == "chat" and request.tools else None)
         self.think = ThinkSplitter(request.kind == "chat" and request.enable_thinking)
         self.reasoning_tokens = 0
         self.closed = None  # the ThinkCap when the server closed the think block
@@ -58,14 +61,14 @@ class CompletionResponse:
         if self.request.kind == "chat":
             self.chunk(dict(role="assistant", content=""))
 
-    def chunk(self, delta, reason=None, token=None):
+    def chunk(self, delta, reason=None, token=None, extra=None):
         choice = dict(index=0, finish_reason=reason)
         choice["delta" if self.request.kind == "chat" else "text"] = delta
         if token is not None and self.request.return_token_ids:
             choice["token_id"] = token
         usage = dict(usage=None) if self.request.include_usage else {}
         stamp = dict(crucible_t=self.token_time) if self.request.crucible_metrics and token is not None else {}
-        self.handler.sse(self.base | dict(choices=[choice]) | usage | stamp)
+        self.handler.sse(self.base | dict(choices=[choice]) | usage | stamp | (extra or {}))
 
     def content(self, text, token=None):
         if self.request.stream and (text or (token is not None and self.request.return_token_ids)):
@@ -113,6 +116,7 @@ class CompletionResponse:
             message = dict(role="assistant", content=full_text)
         if self.think.enabled:
             message["reasoning_content"] = self.think.reasoning.strip()
+        self.message = message  # the returned reply (tool_tail.extend renders it as the next request does)
         remember = getattr(self.service.tokenizer, "remember_output", None)
         if remember is not None and self.request.kind == "chat":
             remember(self.ids, message)  # replay: the next turn keeps the added tokens that the model wrote here
@@ -142,14 +146,20 @@ class CompletionResponse:
         if self.tools and self.tools.fallback:
             usage["tool_call_fallback"] = True
             usage["tool_call_invalid"] = self.tools.invalid
+            from .structured import violation
             metrics.emit(metrics.fallback_line(request_id, len(self.ids), self.request.stream, self.tools.invalid,
-                                                getattr(self.handler, "client_request_id", None)))
+                                                getattr(self.handler, "client_request_id", None),
+                                                # A fault in the grammar's free text is not an engine fault.
+                                                violation=violation(self.request) and not self.tools.free_text))
         elif self.tools and self.tools.unchecked and message.get("tool_calls"):
             metrics.emit(metrics.tool_pass_line(request_id, self.request.stream, len(message["tool_calls"]),
                                                 self.tools.unchecked))
+        # OpenAI-compatible `timings` (server/timings.py): on the response, or on the last chunk of a stream.
+        timing = timings(jobs if jobs != [None] else [], self.prompt_count, len(self.ids), event.get("cached_tokens"))
+        timing = dict(timings=timing) if timing else {}
         if self.request.stream:
             self.reasoning(reasoning_tail)
-            self.finish_stream(message, deltas, reason, usage)
+            self.finish_stream(message, deltas, reason, usage, timing)
         else:
             choice = dict(index=0, finish_reason=reason)
             choice["message" if self.request.kind == "chat" else "text"] = message if self.request.kind == "chat" else full_text
@@ -158,14 +168,16 @@ class CompletionResponse:
             if getattr(self.request, "top_logprobs", 0):
                 choice["logprobs"] = scoring_field(self.request, self.ids[0], self.scores)
             self.handler.send_json(200, self.base | dict(
-                object="chat.completion" if self.request.kind == "chat" else "text_completion", choices=[choice], usage=usage))
+                object="chat.completion" if self.request.kind == "chat" else "text_completion", choices=[choice], usage=usage) |
+                timing)
 
-    def finish_stream(self, message, deltas, reason, usage):
+    def finish_stream(self, message, deltas, reason, usage, timing=None):
         self.content((message["content"] or "")[self.displayed:])
         for delta in deltas:
             self.chunk(delta)
-        self.chunk({} if self.request.kind == "chat" else "", reason)
+        last = timing if not self.request.include_usage else None
+        self.chunk({} if self.request.kind == "chat" else "", reason, extra=last)
         if self.request.include_usage:
-            self.handler.sse(self.base | dict(choices=[], usage=usage))
+            self.handler.sse(self.base | dict(choices=[], usage=usage) | (timing or {}))
         self.handler.sse("[DONE]")
         self.handler.close_connection = True

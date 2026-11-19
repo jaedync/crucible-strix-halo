@@ -1,0 +1,65 @@
+# The state folder rule (docs/CONVERSATION_CACHE.md "Where the state folder can be"): one table, two implementations.
+# tests/state_root_test.cpp runs it against engine/runtime/state_root.h, tests/test_state_root_rule.py against
+# tools/crucible_cli/state_root.py state_root_verdict. Both must give the code in the last column.
+#
+# Columns (tab separated): name, setup, path, uid, gid, code.
+# setup: steps joined by ';' (or '-' for none): `dir P MODE` makes a folder and sets its octal mode, `file P` makes a file,
+#   `link P TARGET` makes a symbolic link. In setup and path, T is a fresh folder of this case (mode 0700) and H is the
+#   home folder T/home (mode 0700). S is a fresh folder directly inside /tmp (a root folder with the sticky bit); a row
+#   that names S is skipped when /tmp is not such a folder. ID is an identity folder name (3 groups of 16 hex digits).
+# uid: self (this user) or other (a user that owns nothing here). gid: self (the group of T) or other.
+# code: ok, or the refusal: relative, system, home, link, not-dir, parent-owner, parent-open, owner, shared, foreign,
+#   unreadable (the path cannot be read: a path fault), contents-unreadable (the list of the folder cannot be read).
+home-new	-	H/.cache/crucible/states	self	self	ok
+home-existing	dir H/s 0700;dir H/s/ID 0700;file H/s/write-ledger	H/s	self	self	ok
+home-ledger-folder	dir H/s 0700;dir H/s/write-ledger 0700	H/s	self	self	ok
+home-open-own-folder	dir H/s 0777	H/s	self	self	ok
+home-itself	-	H	self	self	home
+home-other-files	dir H/s 0700;file H/s/notes.txt	H/s	self	self	foreign
+home-final-link	dir H/real 0700;link H/s H/real	H/s	self	self	link
+home-identity-link	dir T/real 0700;dir H/s 0700;link H/s/ID T/real	H/s	self	self	foreign
+home-identity-file	dir H/s 0700;file H/s/ID	H/s	self	self	foreign
+home-not-folder	file H/s	H/s	self	self	not-dir
+home-parent-file	file H/f	H/f/states	self	self	not-dir
+home-dotdot	dir H/a 0700	H/a/../s	self	self	ok
+home-trailing-slash	-	H/s/	self	self	ok
+parent-link-out	dir T/fast 0700;link H/fast T/fast	H/fast/states	self	self	ok
+parent-link-missing	link H/fast T/gone/fast	H/fast/states	self	self	link
+parent-link-missing-deep	link H/fast T/gone	H/fast/a/states	self	self	link
+parent-link-unreadable	dir T/locked 0000;link H/fast T/locked/x	H/fast/states	self	self	link
+cache-link-out	dir T/elsewhere 0755;link H/.cache T/elsewhere	H/.cache/crucible/states	self	self	ok
+outside-new	-	T/fast/crucible/states	self	self	ok
+outside-existing	dir T/fast 0755;dir T/fast/states 0700	T/fast/states	self	self	ok
+outside-open-parent	dir T/shared 0777	T/shared/states	self	self	parent-open
+outside-open-parent-existing	dir T/shared 0777;dir T/shared/states 0700	T/shared/states	self	self	parent-open
+outside-open-grandparent	dir T/shared 0777;dir T/shared/a 0700	T/shared/a/states	self	self	parent-open
+outside-sticky-parent	dir T/sticky 1777	T/sticky/states	self	self	ok
+outside-group-parent-own	dir T/g 0770	T/g/states	self	self	ok
+outside-group-parent-other	dir T/g 0770	T/g/states	self	other	parent-open
+outside-group-final-other	dir T/g 0770	T/g	self	other	ok
+outside-sticky-final	dir T/s 1777	T/s	self	self	shared
+outside-other-files	dir T/s 0700;file T/s/data.bin	T/s	self	self	foreign
+outside-final-link	dir T/real 0700;link T/s T/real	T/s	self	self	link
+parent-unreadable	dir T/locked 0000	T/locked/a/states	self	self	unreadable
+final-unreadable	dir T/locked 0000	T/locked/states	self	self	unreadable
+parent-link-then-unreadable	dir T/fast 0700;dir T/fast/locked 0000;link H/fast T/fast	H/fast/locked/a/states	self	self	unreadable
+contents-unreadable	dir T/s 0300	T/s	self	self	contents-unreadable
+parent-other-user	dir T/x 0755	T/x/states	other	self	parent-owner
+final-other-user	-	S	other	self	owner
+final-other-user-child	-	S/states	other	self	parent-owner
+tmp-new	-	S/states	self	self	ok
+root	-	/	self	self	system
+etc	-	/etc	self	self	system
+etc-child	-	/etc/crucible	self	self	system
+usr-child	-	/usr/lib/crucible/states	self	self	system
+proc-child	-	/proc/crucible	self	self	system
+sys-child	-	/sys/crucible	self	self	system
+dev-child	-	/dev/shm/crucible	self	self	system
+boot	-	/boot	self	self	system
+run	-	/run	self	self	system
+tmp	-	/tmp	self	self	system
+var	-	/var	self	self	system
+var-tmp	-	/var/tmp	self	self	system
+home-root	-	/home	self	self	system
+mnt	-	/mnt	self	self	system
+relative	-	states	self	self	relative

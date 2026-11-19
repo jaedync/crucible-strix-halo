@@ -34,7 +34,7 @@ BASELINE = frozenset({
 
 # Top-level directories with a charter. kernels/ leaves with the layout move.
 TOP_LEVEL = {'bench', 'deploy', 'docs', 'engine', 'ref', 'server',
-             'tests', 'tools', 'training'} | ({'kernels'} if (layout.ROOT / 'kernels').is_dir() else set())
+             'tests', 'third_party', 'tools', 'training'} | ({'kernels'} if (layout.ROOT / 'kernels').is_dir() else set())
 
 HOW_TO_FIX = (
     'Include only your own module or a lower one (see tools/layout.py RANKS and '

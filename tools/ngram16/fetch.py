@@ -9,8 +9,9 @@ Steps:
      pick only the files that hold *.ngram_embedding.shard_*.weight tensors.
   2. Print the files and the download size. Stop if the disk has too little free space
      (downloads that are still missing + the output file). --dry-run stops here.
-  3. Download the files into DIR/src (a stopped download resumes), run convert.py, and check
-     the size and the sha256 of DIR/ngram_embedding_bf16.safetensors.
+  3. Download the files into DIR/src (a stopped download resumes), check the sha256 of each one against
+     the pinned list sources.sha256 (a bad file is removed: run again to fetch it again), run convert.py,
+     and check the size and the sha256 of DIR/ngram_embedding_bf16.safetensors.
   4. Print the two environment lines for the engine. --delete-source also removes the
      downloaded files in DIR/src, but only after the checks pass. After a normal run, run the
      command again with --delete-source: it checks the finished file again and then deletes.
@@ -22,6 +23,7 @@ Exit codes: 0 ok, 2 refused before the work (disk, memory, existing output, bad 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -40,6 +42,8 @@ OUT_SHA256 = "71205584be130551594a3e1f43949f47c576a3cc65486f1e51f4e7ba45fa42be"
 OUT_NAME = "ngram_embedding_bf16.safetensors"
 NGRAM_MARK = ".ngram_embedding.shard_"
 HF = "https://huggingface.co"
+PINS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sources.sha256")
+VERIFIED = ".verified.json"   # in DIR/src: name -> [size, mtime_ns, sha256] of each file that passed its check
 TIMEOUT_S = 60
 GB = 1e9
 
@@ -60,6 +64,52 @@ def pick_files(index: dict) -> list[str]:
         if os.path.isabs(name) or "/" in name or "\\" in name or ".." in name:
             raise ValueError(f"unsafe file name in the index: {name!r}")
     return sorted(files)
+
+
+def load_pins(path: str = PINS) -> dict[str, str]:
+    """The sha256 of each source file of REVISION (from the Hugging Face file list of that revision, kept in the repo)."""
+    pins = {}
+    with open(path) as f:
+        for line in f:
+            if line.strip():
+                digest, name = line.split()
+                pins[name] = digest
+    return pins
+
+
+def file_sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 24), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def check_sources(src: str, files: list[str], pins: dict[str, str]) -> list[str]:
+    """Check the sha256 of each downloaded file. A file that fails is removed. Returns the names that failed.
+    A file that passed before (same size and time in the record) is not read again."""
+    record_path = os.path.join(src, VERIFIED)
+    try:
+        with open(record_path) as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        record = {}
+    bad = []
+    for name in files:
+        path = os.path.join(src, name)
+        st = os.stat(path)
+        if record.get(name) == [st.st_size, st.st_mtime_ns, pins[name]]:
+            continue
+        if file_sha256(path) != pins[name]:
+            bad.append(name)
+            record.pop(name, None)
+            os.unlink(path)
+            continue
+        record[name] = [st.st_size, st.st_mtime_ns, pins[name]]
+    with open(record_path + ".tmp", "w") as f:
+        json.dump(record, f)
+    os.replace(record_path + ".tmp", record_path)
+    return bad
 
 
 def plan_sizes(files: list[str], tree: list[dict]) -> list[tuple[str, int]]:
@@ -130,6 +180,10 @@ def delete_source(src: str, files: list[str]) -> int:
             os.unlink(path)
     shutil.rmtree(os.path.join(src, ".cache"), ignore_errors=True)
     try:
+        os.unlink(os.path.join(src, VERIFIED))
+    except OSError:
+        pass
+    try:
         os.rmdir(src)  # only an empty folder: never remove files that are not ours
     except OSError:
         pass
@@ -138,7 +192,7 @@ def delete_source(src: str, files: list[str]) -> int:
 
 def main(argv=None, *, repo_id=REPO, revision=REVISION, expected_bytes=OUT_BYTES,
          expected_sha=OUT_SHA256, get_json=http_get_json, download=hub_download,
-         free_bytes=free_bytes) -> int:
+         free_bytes=free_bytes, source_sha=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--out", default="ngram16", help="work folder (default ./ngram16)")
     ap.add_argument("--dry-run", action="store_true", help="list the files and the sizes, then stop")
@@ -159,6 +213,12 @@ def main(argv=None, *, repo_id=REPO, revision=REVISION, expected_bytes=OUT_BYTES
     except (ValueError, KeyError, OSError) as e:
         return fail(f"cannot read the file list of {repo_id}: {e}")
 
+    if source_sha is None:
+        source_sha = load_pins() if revision == REVISION else {}
+    if source_sha:
+        unpinned = [n for n, _ in plan if n not in source_sha]
+        if unpinned:
+            return fail(f"no pinned sha256 for {', '.join(unpinned[:3])} (sources.sha256). Nothing was downloaded.")
     total = sum(s for _, s in plan)
     sidecar, part = final + ".sha256", final + ".part"
     have_final, have_sidecar = os.path.exists(final), os.path.exists(sidecar)
@@ -204,6 +264,12 @@ def main(argv=None, *, repo_id=REPO, revision=REVISION, expected_bytes=OUT_BYTES
     short = [n for n, s in plan if not os.path.isfile(os.path.join(src, n)) or os.path.getsize(os.path.join(src, n)) != s]
     if short:
         return fail(f"download incomplete: {', '.join(short[:3])}. Run the command again to resume.", 3)
+    if source_sha:
+        bad = check_sources(src, files_done, source_sha)
+        if bad:
+            return fail(f"the sha256 of {', '.join(bad[:3])} does not match the pinned list (sources.sha256). "
+                        "The file was removed. Run the command again to download it again.", 3)
+        print(f"sha256 ok: {len(files_done)} source files match the pinned list", flush=True)
 
     args = [src, final, "--revision", revision, "--rate-mb", str(a.rate_mb), "--chunk-mb", str(a.chunk_mb)]
     if a.stop_at:

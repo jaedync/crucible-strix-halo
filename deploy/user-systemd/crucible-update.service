@@ -1,13 +1,15 @@
 # Template. Off until you install it (see "Updates" in the README). Nothing in the repository installs or enables it.
 # Replace @CHECKOUT@ with the folder of your clone; the install command in the README does it with sed.
 [Unit]
-Description=Update Crucible to the newest release (./crucible update --yes)
+Description=Update Crucible to the newest release (./crucible update --yes --unattended)
 
 [Service]
 Type=oneshot
 WorkingDirectory=@CHECKOUT@
 # ./crucible update restarts crucible-server.service by itself when it runs, and rolls back by itself when a step fails.
-ExecStart=@CHECKOUT@/crucible update --yes
+# --unattended: when Kiln's unit (kiln-crucible.service) exists, the update changes nothing and says so in one line. Only an
+# update that you run by hand stops and restarts the Kiln unit. The update also acts so when its cgroup is this unit.
+ExecStart=@CHECKOUT@/crucible update --yes --unattended
 # The update can build the engine, and that takes a long time. Give the rest of the system the first turn.
 Nice=19
 # The server and its model share this memory. A build (make, one job) peaked at 1.4 GB in a test, so the cap is about

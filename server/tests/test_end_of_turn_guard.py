@@ -210,6 +210,28 @@ class ToolCallTest(unittest.TestCase):
         self.assertEqual(body["usage"]["completion_tokens_details"]["end_of_turn_kept"], 1)
 
 
+class InvokeTokenizer(GuardTokenizer):
+    """Prose that names the Anthropic call tag, and the start of a real call in that form (tool_invoke.py)."""
+    pieces = GuardTokenizer.pieces | {CALL: 'See <invoke name="read"> blocks.', VALUE: '<invoke name="read">\n<par'}
+
+
+class InvokeTest(unittest.TestCase):
+    def body(self):
+        return dict(model="crucible", messages=[dict(role="user", content="Read")], tools=TOOLS,
+                    enable_thinking=False, max_tokens=256)
+
+    def test_end_of_turn_after_prose_that_names_the_tag_ends_the_reply(self):
+        backend = SequenceBackend(([CALL, IM_END], "stop"))
+        _, body = run(backend, self.body(), tokenizer=InvokeTokenizer())
+        self.assertEqual(len(backend.submissions), 1)
+        self.assertEqual(body["choices"][0]["message"]["content"], 'See <invoke name="read"> blocks.')
+        self.assertNotIn("end_of_turn_kept", body["usage"].get("completion_tokens_details", {}))
+
+    def test_end_of_turn_inside_an_open_invoke_block_is_kept(self):
+        backend = SequenceBackend(([VALUE, IM_END], "stop"), ([IM_END], "stop"))
+        _, body = run(backend, self.body(), tokenizer=InvokeTokenizer())
+        self.assertEqual(backend.submissions[1][0], PROMPT + [VALUE] + list(TEXT))
+
 
 if __name__ == "__main__":
     unittest.main()

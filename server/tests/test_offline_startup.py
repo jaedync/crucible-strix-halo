@@ -131,8 +131,16 @@ def test_serial_startup_options_and_interrupt_cleanup():
     assert server.call_args.args[0] == ("127.0.0.1", 8790)
     listener.server_close.assert_called_once()
     backend.return_value.close.assert_called_once()
-    with pytest.raises(KeyboardInterrupt):
-        register.call_args.args[1](None, None)
+    # The stop handler is the first registration (SIGTERM, then SIGINT); the last two restore the caller's handlers.
+    first, second = register.call_args_list[:2]
+    assert first.args[0] == startup.signal.SIGTERM and second.args[0] == startup.signal.SIGINT
+    assert first.args[1] is second.args[1]
+    # REPORT C an earlier change: after the first stop signal, the server ignores further SIGTERM and SIGINT during the save.
+    # (signal.signal stays patched here: the real handlers of this test process must not change.)
+    with patch.object(startup.signal, "signal") as again, pytest.raises(KeyboardInterrupt):
+        first.args[1](None, None)
+    assert {c.args for c in again.call_args_list} == {(startup.signal.SIGTERM, startup.signal.SIG_IGN),
+                                                     (startup.signal.SIGINT, startup.signal.SIG_IGN)}
 
 
 @pytest.mark.parametrize("options, mode", [([], "text"), (["--content-special-tokens", "parse"], "parse")])

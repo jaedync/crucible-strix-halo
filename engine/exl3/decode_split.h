@@ -53,6 +53,9 @@ struct DenseMatrix {
 };
 
 // Front-order splits for one dense decode group, or all 0 (engine order).
+// K7 and K8 (the h6_ng8 packs) load in front order too: the wide ring (LinRingFlowKernel<Front, 8>),
+// LinPolicyKernel<R, 8, true> and the front walk of the wide prefill GEMM read it (p418-kernel: the
+// 4.18 dense K8 decode in engine order ran at 149 GB/s cold, front order at 218 GB/s).
 // A group that mixes K6 with K3..5 (4.05 QSA input: q, k, v K6, indexer K4)
 // also loads in front order: the ring decoders take K per job, and the
 // prefill GEMM runs such a group as one fused launch per width class, each
@@ -61,7 +64,7 @@ struct DenseMatrix {
 inline std::vector<int> FrontGroupSplits(const std::vector<DenseMatrix>& group) {
   std::vector<std::pair<int, int>> io;
   for (const DenseMatrix& m : group) {
-    if (!SupportedDecodeK(m.K)) return std::vector<int>(group.size(), 0);
+    if (!LoadableDecodeK(m.K)) return std::vector<int>(group.size(), 0);
     io.push_back({m.I, m.O});
   }
   return DecodeSplits(io);

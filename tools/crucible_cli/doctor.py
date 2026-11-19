@@ -9,19 +9,23 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import keyfile, packs, rocm, service, settings as settings_mod
+from . import keyfile, machine, options, packs, rocm, service, settings as settings_mod
 from .files import Sandbox
 from .memfit import memory_advice
 from .measured import SERVER_FLAGS
 
-GTT_PARAMS = "amdgpu.gttsize=126976 ttm.pages_limit=32505856"
-GTT_MIN_BYTES = 130_000_000_000      # the tested machine shows about 133 GB
+GTT_PARAMS = machine.FULL.gtt_params          # the 128 GB class: "amdgpu.gttsize=126976 ttm.pages_limit=32505856"
+GTT_MIN_BYTES = machine.FULL.gtt_min_bytes    # 130 GB: the tested machine shows about 133 GB
 GPU_BUSY_BYTES = 8 * 1024 ** 3        # more than this in use: another program holds the GPU memory
-MEM_MIN_KB = 120 * 1024 * 1024        # 120 GiB: the guide expects "total 120 or more" in free -g
+MEM_MIN_KB = machine.FULL_MIN_KB      # 120 GiB: the guide expects "total 120 or more" in free -g
 ROCM_VERSION = "7.2.4"   # the older tested version; rocm.RECOMMENDED is the one to install
 PY_MIN = (3, 12)
 STEPS_ALL = ("venv", "download", "build", "start")
 GB = 1_000_000_000
+
+# Verdicts about what the state folder holds: a warning (the engine stops at start). Every other refusal fails the check,
+# also "unreadable" (a parent folder or the path cannot be read: a path fault, review L4).
+CONTENT_CODES = ("foreign", "contents-unreadable")
 
 
 
@@ -46,18 +50,24 @@ ROCM_FIX = (
     "This tool does not install system packages. You run these lines yourself."
 )
 
-KERNEL_FIX = (
-    f"Add these two parameters to the kernel command line, then restart: {GTT_PARAMS}\n"
-    "Keep every parameter that is already there (see: cat /proc/cmdline) and do not add one twice. "
-    "Where the line is depends on how your system starts:\n"
-    "  - systemd-boot with entry files: the options line of your entry in /boot/loader/entries/\n"
-    "  - GRUB: GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub, then: sudo grub-mkconfig -o /boot/grub/grub.cfg\n"
-    "  - a unified kernel image: usually /etc/kernel/cmdline, then build the image again (for example: sudo mkinitcpio -P)\n"
-    "  - another boot loader: see its documentation\n"
-    "Keep a working boot entry until the new one starts. A wrong command line can stop the machine from starting.\n"
-    "./crucible setup shows the exact change for this machine. It applies the change with sudo only after you type yes, "
-    "makes a backup first, and never restarts the machine."
-)
+
+def kernel_fix(params):
+    """The fix text of the GTT check for the two kernel parameters PARAMS of this machine."""
+    return (
+        f"Add these two parameters to the kernel command line, then restart: {params}\n"
+        "Keep every parameter that is already there (see: cat /proc/cmdline) and do not add one twice. "
+        "Where the line is depends on how your system starts:\n"
+        "  - systemd-boot with entry files: the options line of your entry in /boot/loader/entries/\n"
+        "  - GRUB: GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub, then: sudo grub-mkconfig -o /boot/grub/grub.cfg\n"
+        "  - a unified kernel image: usually /etc/kernel/cmdline, then build the image again (for example: sudo mkinitcpio -P)\n"
+        "  - another boot loader: see its documentation\n"
+        "Keep a working boot entry until the new one starts. A wrong command line can stop the machine from starting.\n"
+        "./crucible setup shows the exact change for this machine. It applies the change with sudo only after you type yes, "
+        "makes a backup first, and never restarts the machine."
+    )
+
+
+KERNEL_FIX = kernel_fix(GTT_PARAMS)
 
 
 @dataclass
@@ -96,16 +106,77 @@ def _meminfo(host, key):
     return None
 
 
+def _layout_text(s):
+    """"2 sessions of 262,144 tokens" (and the short sessions of a layout)."""
+    long_count = s.streams - getattr(s, "short_streams", 0)
+    text = f"{long_count} session{'s' if long_count != 1 else ''} of {s.ctx:,} tokens"
+    if getattr(s, "short_streams", 0):
+        text += f" and {s.short_streams} of {s.short_ctx:,}"
+    return text
+
+
 def _cards(host):
     base = Path(host.sysfs) / "class/drm"
     return sorted(base.glob("card*/device")) if base.is_dir() else []
+
+
+def _vram_total(host):
+    """The largest mem_info_vram_total of the amdgpu cards (the UMA frame buffer on Strix Halo), or None."""
+    values = [v for v in (_int(c / "mem_info_vram_total") for c in _cards(host)) if v is not None]
+    return max(values) if values else None
 
 
 def _gb(n):
     return f"{n / GB:.1f} GB"
 
 
-def run_checks(host, s):
+MEASURE_FILE = "disk-measure.json"
+SLOW_WRITE_MBPS = 500
+SLOW_READ_MBPS = 1000
+STATE_100K_GB = 2.8   # a state of 100K tokens (docs/CONVERSATION_CACHE.md: about 26.5 KB a token and 150 MB a state)
+
+
+def _disk_speed(host, s, add, measure):
+    """Item 8: the state folder's disk, measured one time (the result is saved in .crucible/disk-measure.json)."""
+    title = "Disk speed of the state folder"
+    record = s.work / MEASURE_FILE
+    key = os.path.realpath(s.state_dir)
+    saved = None
+    try:
+        data = json.loads(record.read_text())
+        saved = data if data.get("state_dir") == key else None
+    except (OSError, ValueError, AttributeError):
+        pass
+    if saved is None:
+        from .diskmeasure import SIZE
+        why = ("not asked in this run (--no-disk-check, or doctor --for start)" if not measure else "the server runs" if _server_alive(host, s)
+               else "less than 4 GB free" if host.disk_free(s.state_dir) < 2 * SIZE
+               else "no measure tool" if host.disk_measure is None else "")
+        if why:
+            add("disk-speed", title, "skip", f"not measured ({why})")
+            return
+        res = host.disk_measure(Path(s.state_dir), SIZE)
+        if not res:
+            add("disk-speed", title, "skip", "not measured: the file system does not take direct I/O")
+            return
+        saved = {"state_dir": key, "write_mbps": res["write_mbps"], "read_mbps": res["read_mbps"],
+                 "at": time.strftime("%Y-%m-%d", time.localtime(host.clock()))}
+        try:
+            Sandbox([s.work]).write_json(record, saved)
+        except (OSError, ValueError):
+            pass
+    w, r = saved["write_mbps"], saved["read_mbps"]
+    detail = (f"write {w} MB/s, read {r} MB/s (measured {saved.get('at', '')}); at this read rate a 100K-token state "
+              f"({STATE_100K_GB} GB) in about {STATE_100K_GB * 1000 / max(r, 1):.1f} s")
+    if w < SLOW_WRITE_MBPS or r < SLOW_READ_MBPS:
+        add("disk-speed", title, "warn", detail + f"; slower than {SLOW_WRITE_MBPS} MB/s write or {SLOW_READ_MBPS} MB/s "
+            "read: turns that come back start slowly, and full write queues refuse states",
+            "Use a folder on a faster SSD (--state-dir DIR) or keep the cache in memory (--no-state-dir).")
+    else:
+        add("disk-speed", title, "pass", detail)
+
+
+def run_checks(host, s, measure=False):
     out = []
     rel = release_engine(s.repo)  # a verified release engine needs no compiler and no make
 
@@ -202,14 +273,32 @@ def run_checks(host, s):
 
     # Memory
     total = _meminfo(host, "MemTotal")
-    if total is not None and total >= MEM_MIN_KB:
+    fit = machine.fit(total)
+    if total is None:
+        # machine.fit(None) is the 128 GB class, so this test comes first (review M1). Stage 1 keeps the fail level
+        # (stage 2, the start-time fit, decides it later); the fix adds the advice of memfit.
+        add("memory", "System memory 120 GiB or more", "fail", "this machine has unknown",
+            "The 4.05 pack with 4 long sessions needs a 128 GB machine. " + memory_advice(host), ("start",))
+    elif total >= MEM_MIN_KB:
         add("memory", "System memory 120 GiB or more", "pass", f"{total / 1024 / 1024:.0f} GiB")
+    elif fit.supported and s.pack in fit.packs:
+        add("memory", "System memory 88 GiB or more", "pass",
+            f"{total / 1024 / 1024:.0f} GiB, a {fit.name} machine: the {s.pack} pack with {_layout_text(s)}. "
+            + machine.START_FIT_NOTE + machine.uma_advice(_vram_total(host)))
+    elif fit.supported:
+        add("memory", "System memory 88 GiB or more", "fail", f"this machine has {total / 1024 / 1024:.0f} GiB",
+            f"The {s.pack} pack needs a 128 GB machine. On a {fit.name} machine, use the 3.05 pack: "
+            "./crucible setup --pack 3.05", ("start",))
     else:
-        got = "unknown" if total is None else f"{total / 1024 / 1024:.0f} GiB"
-        add("memory", "System memory 120 GiB or more", "warn", f"this machine has {got}", memory_advice(host))
+        add("memory", "System memory 88 GiB or more", "fail", f"this machine has {total / 1024 / 1024:.0f} GiB",
+            machine.refusal(total), ("start",))
     available = _meminfo(host, "MemAvailable")
     reserve_kb = int(SERVER_FLAGS["--host-reserve-mib"]) * 1024
-    if available is None or available < reserve_kb:
+    if available is not None and available < reserve_kb and _server_alive(host, s):
+        # The Crucible server itself holds that memory: no warning about it.
+        add("memory-available", "Available host memory", "pass",
+            f"{available / 1024 / 1024:.1f} GiB; most of the rest is in use by the Crucible server")
+    elif available is None or available < reserve_kb:
         got = "unknown" if available is None else f"{available / 1024 / 1024:.1f} GiB"
         add("memory-available", "Available host memory", "warn", f"{got}; the host reserve is {reserve_kb / 1024 / 1024:.0f} GiB",
             memory_advice(host))
@@ -224,13 +313,15 @@ def run_checks(host, s):
         add("gtt", "GPU memory limit (GTT)", "fail", "no amdgpu memory value found in /sys/class/drm",
             "Check that the amdgpu driver is loaded (lsmod | grep amdgpu) and that this is a Strix Halo machine.\n"
             + KERNEL_FIX, ("start",))
-    elif max(totals) >= GTT_MIN_BYTES:
+    elif max(totals) >= fit.gtt_min_bytes:
         add("gtt", "GPU memory limit (GTT)", "pass", _gb(max(totals)))
     else:
-        why = ("The GPU of Strix Halo uses the system memory, and Linux lets it use only part of it by default. "
-               "The 4.05 pack with 4 long sessions needs about 133 GB.")
+        need = ("The 4.05 pack with 4 long sessions needs about 133 GB." if fit is machine.FULL else
+                f"On a {fit.name} machine, set the limit to {fit.gtt_params.split()[0].split('=')[1]} MiB.")
+        why = ("The GPU of Strix Halo uses the system memory, and Linux lets it use only part of it by default. " + need)
         note = " The two parameters are on the command line already: restart if you changed them just now." if has_params else ""
-        add("gtt", "GPU memory limit (GTT)", "fail", f"the limit is {_gb(max(totals))}. {why}{note}", KERNEL_FIX, ("start",))
+        add("gtt", "GPU memory limit (GTT)", "fail", f"the limit is {_gb(max(totals))}. {why}{note}",
+            kernel_fix(fit.gtt_params), ("start",))
 
     # GPU memory in use
     live = _server_alive(host, s)
@@ -238,7 +329,9 @@ def run_checks(host, s):
     if live:
         add("gpu-free", "GPU memory is free", "pass", "in use by the Crucible server (started by this tool, or the service)")
     elif used and max(used) > GPU_BUSY_BYTES:
-        add("gpu-free", "GPU memory is free", "warn", f"{_gb(max(used))} of GPU memory is in use", memory_advice(host))
+        add("gpu-free", "GPU memory is free", "fail", f"{_gb(max(used))} of GPU memory is in use",
+            "The GPU memory is held by another program (for example another inference server). Stop it first. "
+            "Crucible does not start while it runs. " + memory_advice(host), ("start",))
     else:
         add("gpu-free", "GPU memory is free", "pass", f"{_gb(max(used or [0]))} in use")
 
@@ -253,6 +346,19 @@ def run_checks(host, s):
     else:
         add("disk-models", "Disk space for the pack", "fail", f"{_gb(free)} free; the {s.pack} pack needs about {s.spec.disk_gb} GB",
             f"Free about {s.spec.disk_gb} GB, or choose another folder: ./crucible setup --models-dir DIR", ("download",))
+    if getattr(s, "ngram16", False) and not settings_mod.ngram16_ready(s):
+        need_ng = options.NGRAM16_PEAK_GB * GB
+        same = Path(os.path.abspath(s.models_dir)) in Path(os.path.abspath(s.ngram16_dir)).parents
+        if same and state != "ok":
+            need_ng += need   # the pack is not on the disk yet and goes to the same folder
+        free_ng = host.disk_free(s.ngram16_dir)
+        what = f"the 16-bit n-gram table needs about {options.NGRAM16_PEAK_GB} GB at the peak" + \
+            (f", and the pack {s.spec.disk_gb} GB" if same and state != "ok" else "")
+        if free_ng >= need_ng:
+            add("disk-ngram16", "Disk space for the 16-bit n-gram table", "pass", f"{_gb(free_ng)} free; {what}")
+        else:
+            add("disk-ngram16", "Disk space for the 16-bit n-gram table", "fail", f"{_gb(free_ng)} free; {what}",
+                f"Free {_gb(need_ng - free_ng)}, choose another folder (--models-dir DIR), or use --ngram16 no.", ("ngram16",))
     if s.state_dir is not None:
         free_state = host.disk_free(s.state_dir)
         want = s.state_disk_gib * 1024 ** 3
@@ -265,14 +371,17 @@ def run_checks(host, s):
         home = Path(os.path.abspath(host.home))
         sd = Path(os.path.abspath(s.state_dir))
         problem = settings_mod.state_dir_problem(home, s.repo, sd)
-        if not settings_mod.state_dir_inside(home, sd):
-            add("state-dir", "State folder is inside your home folder", "fail", f"{sd} is not inside your home folder {home}",
-                "Use a new folder inside your home folder: ./crucible setup --state-dir ~/.cache/crucible/states", ("start",))
+        verdict = settings_mod.state_dir_verdict(home, s.repo, sd)
+        if problem and verdict.code not in CONTENT_CODES:
+            add("state-dir", "State folder", "fail", problem,
+                "Use a folder that only you can change, for example ./crucible setup --state-dir ~/.cache/crucible/states "
+                "or a folder of its own on another disk", ("start",))
         elif problem and not (s.work / "server.pid").exists():
-            add("state-dir", "State folder is inside your home folder", "warn", f"{problem} The server stops at start if "
+            add("state-dir", "State folder", "warn", f"{problem} The server stops at start if "
                 "the folder holds a file that is not a Crucible state file", "Use a new, empty folder: ./crucible setup --state-dir DIR")
         else:
-            add("state-dir", "State folder is inside your home folder", "pass", str(sd))
+            add("state-dir", "State folder", "pass", str(sd))
+        _disk_speed(host, s, add, measure)
     else:
         add("state-dir", "State folder", "skip", "the conversation cache stays in memory (--no-state-dir)")
 
@@ -301,7 +410,37 @@ def run_checks(host, s):
     else:
         add("pack", f"Pack {s.pack} is complete", "fail", detail, "Run ./crucible setup again: a stopped download continues.")
     _key_file_check(s, add)
+    out.extend(ngram16_results(s))
+    out.extend(ablation_results(s))
     return out
+
+
+def ablation_results(s):
+    """The check of the sidecar of the abliterated mode (--abliterated). Missing after setup: the start fails."""
+    if not getattr(s, "abliterated", False):
+        return []
+    title = "Sidecar of the abliterated mode"
+    if settings_mod.ablation_ready(s):
+        return [CheckResult("abliterated", title, "pass", str(s.ablation_file))]
+    if not (s.work / "config.json").exists():
+        return [CheckResult("abliterated", title, "skip", "not downloaded yet: ./crucible setup downloads it")]
+    return [CheckResult("abliterated", title, "fail", f"{s.ablation_file} is missing or has another sha256",
+                        "Run ./crucible setup again: it downloads the sidecar again. Or turn it off: "
+                        "./crucible setup --abliterated no", ("start",))]
+
+
+def ngram16_results(s):
+    """The check of the 16-bit table (--ngram16). Missing after setup: the start fails (the engine needs the file)."""
+    if not getattr(s, "ngram16", False):
+        return []
+    title = "16-bit n-gram table"
+    if settings_mod.ngram16_ready(s):
+        return [CheckResult("ngram16", title, "pass", str(s.ngram16_file))]
+    if not (s.work / "config.json").exists():
+        return [CheckResult("ngram16", title, "skip", "not built yet: ./crucible setup builds it")]
+    return [CheckResult("ngram16", title, "fail", f"{s.ngram16_file} is missing or incomplete",
+                        "Run ./crucible setup again: it continues the build. Or turn it off: ./crucible setup --ngram16 no",
+                        ("start",))]
 
 
 def key_file_results(s):
@@ -361,8 +500,8 @@ def format_text(results):
     return "\n".join(lines)
 
 
-def main(host, s, as_json=False):
-    results = run_checks(host, s)
+def main(host, s, as_json=False, measure=True):
+    results = run_checks(host, s, measure=measure)
     if as_json:
         host.out(json.dumps({"checks": [r.as_dict() for r in results],
                              "ok": not any(r.status == "fail" for r in results)}, indent=2))

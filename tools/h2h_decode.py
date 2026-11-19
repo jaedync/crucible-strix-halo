@@ -177,16 +177,22 @@ def valid_json(text):
         return False
 
 
+def strict(tools):
+    """The same tools with `strict: true` (structured output enforces each call; --strict-tools)."""
+    return [dict(t, function=dict(t["function"], strict=True)) for t in tools]
+
+
 class Session:
     """One append-only agent conversation."""
 
-    def __init__(self, base, target, model, extra):
+    def __init__(self, base, target, model, extra, strict_tools=False):
         self.messages, self.target, self.model, self.extra = list(base["messages"]), target, model, extra
+        self.tools = strict(TOOLS) if strict_tools else TOOLS
 
     def body(self, workload, max_tokens=0):
         thinking, sampling, default_max = ALL_WORKLOADS[workload]
         msgs = self.messages + [{"role": "user", "content": user_request(workload, self.target)}]
-        body = {"model": self.model, "messages": msgs, "tools": TOOLS, "stream": True,
+        body = {"model": self.model, "messages": msgs, "tools": self.tools, "stream": True,
                 "stream_options": {"include_usage": True}, "max_tokens": max_tokens or default_max,
                 "enable_thinking": thinking}
         if thinking:
@@ -400,14 +406,15 @@ def run(args):
     workloads = workload_list(getattr(args, "workloads", None))
     turns = len(workloads) if getattr(args, "turns", None) is None else args.turns
     stagger = float(getattr(args, "stagger", 0.0) or 0.0)
+    strict_tools = bool(getattr(args, "strict_tools", False))  # callers that build args by hand may omit it
     salt0 = args.prefix_salt or str(time.time_ns())
     rows = [(c, int(n), e) for c in args.contexts.split(",") for n in args.sessions.split(",") for e in extras]
     for row_no, (ctx, n, extra) in enumerate(rows):
         base = prompts[ctx]
         first = 0 if n == 1 else 1  # session 0 runs alone; sessions 1..n run together
         bases = session_bases(base, n, args.prefix, f"{salt0}-{row_no}")  # a new salt per row: no row reuses another's cache
-        sessions = [Session(bases[k], base["targets"][(first + k) % len(base["targets"])], args.model, extra)
-                    for k in range(n)]
+        sessions = [Session(bases[k], base["targets"][(first + k) % len(base["targets"])], args.model, extra,
+                            strict_tools=strict_tools) for k in range(n)]
         for k, x in enumerate(sessions):
             t = time.time()
             r = stream(url, x.body(workloads[0], 1))
@@ -439,6 +446,7 @@ def run(args):
             rates = [per_request(r) for r in results]
             total, win = window_total(results) if n > 1 else (rates[0], 0.0)
             row = {"engine": args.engine, "ctx": int(ctx), "workload": workload, "sessions": n, "extra": extra,
+                   "strict_tools": strict_tools,
                    "prefix": args.prefix if n > 1 else "none", "rates": rates, "total": total, "window_s": win, "e2e": [e2e(r) for r in results],
                    "max_gap_s": [max_gap(r) for r in results], **clocks.summary(),
                    "trace": None, "arrival": arrival_row if arrival is not None else None,
@@ -484,7 +492,7 @@ def table(args):
         print(f"| {k[0]} | {k[1]} | {k[2]} | " + " | ".join(cells) + " |")
 
 
-def main():
+def parser():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     b = sub.add_parser("build")
@@ -516,9 +524,14 @@ def main():
     r.add_argument("--turns", type=int, default=None, help="run only the first N turns of each session (default all)")
     r.add_argument("--extra", default="{}", help="JSON merged into every measured request, or a list of them "
                    "(each runs its own sessions, in order)")
+    r.add_argument("--strict-tools", action="store_true", help="send every tool with strict: true (structured output)")
     t = sub.add_parser("table")
     t.add_argument("files", nargs="+")
-    a = ap.parse_args()
+    return ap
+
+
+def main():
+    a = parser().parse_args()
     {"build": build, "run": run, "table": table}[a.cmd](a)
 
 

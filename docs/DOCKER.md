@@ -19,7 +19,7 @@ Other kernels and ROCm versions are not tested.
 ## Build
 
 ```sh
-docker build -t crucible:v0.37.3 .
+docker build -t crucible:v0.38.0 .
 ```
 
 The build needs no GPU. It clones the tag in `CRUCIBLE_VERSION` and runs `make engine` for gfx1151.
@@ -27,11 +27,11 @@ These build arguments change the defaults:
 
 | Argument | Default | Content |
 |---|---|---|
-| `CRUCIBLE_VERSION` | `v0.37.3` | The release tag to build |
+| `CRUCIBLE_VERSION` | `v0.38.0` | The release tag to build |
 | `BUILD_JOBS` | `1` | Parallel HIP compiles. Each compile needs some GB of RAM. |
 | `ROCM_IMAGE` | `docker.io/rocm/dev-ubuntu-24.04:7.2.4` | The base image of the build and the run |
 
-Example: `docker build --build-arg BUILD_JOBS=2 -t crucible:v0.37.3 .`
+Example: `docker build --build-arg BUILD_JOBS=2 -t crucible:v0.38.0 .`
 
 ## Model
 
@@ -43,7 +43,7 @@ This run line gives the configuration of the speed table in the [main README](..
 that `./crucible start` sets on a host (the table is `tools/crucible_cli/measured.py`; a test checks this page against it).
 
 ```sh
-docker run --rm \
+docker run --rm --name crucible \
   --device /dev/kfd --device /dev/dri \
   --group-add "$(getent group video | cut -d: -f3)" \
   --group-add "$(getent group render | cut -d: -f3)" \
@@ -52,7 +52,7 @@ docker run --rm \
   -e CRUCIBLE_DRAFT_HEAD=q2 -e CRUCIBLE_DRAFT_CHAIN=hc8,lead -e CRUCIBLE_PF_LAUNCH_ROWS=16384+128 \
   -v "$CKPT":/models/pack:ro \
   -p 127.0.0.1:8790:8790 \
-  crucible:v0.37.3 \
+  crucible:v0.38.0 \
   /models/pack --host 0.0.0.0 --port 8790 --streams 4 --ctx 262144 --prefill 4096 \
   --conversation-cache-mib 9700 --host-reserve-mib 11264 --vision
 ```
@@ -69,6 +69,7 @@ docker run --rm \
 - The arguments after the image name go to `python -m server`. The first argument is the pack directory in the container.
 - `--host 0.0.0.0` is necessary in the container, because Docker forwards the port to the container address.
 - `-p 127.0.0.1:8790:8790` publishes the port to your own machine only. Keep this form.
+- `--name crucible` gives the container a name for the stop command (see [Stop](#stop)).
 
 Without Docker, run the server from the install folder with `.venv/bin/python -m server`.
 Pass the model folder, `--engine build/engine/crucible`, and the server options to that command, not to the engine.
@@ -121,7 +122,7 @@ docker run --rm \
   -v ~/.config/crucible/api-key:/run/crucible-api-key:ro \
   --user "$(id -u):$(id -g)" \
   -p 8790:8790 \
-  crucible:v0.37.3 \
+  crucible:v0.38.0 \
   /models/pack --host 0.0.0.0 --port 8790 --ctx 32768 --api-key-file /run/crucible-api-key
 ```
 
@@ -138,6 +139,15 @@ Test a request:
 curl -sS http://127.0.0.1:8790/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model":"crucible","messages":[{"role":"user","content":"Say hello."}],"temperature":0,"max_tokens":32}'
 ```
+
+## Stop
+
+- Stop the container with `docker stop -t 130 crucible`. The server saves its conversation states first, so a stop
+  can take up to two minutes. The Docker default (10 s) kills the engine during the save, and the states are lost.
+- A run without `-d` stays in the foreground: Ctrl-C in that terminal stops it the same way. When the terminal or the
+  SSH link closes, the container can keep running. Find it with `docker ps`.
+- Without `--name crucible`, take the container ID from `docker ps`: `docker stop -t 130 CONTAINER`.
+- Do not stop the engine process inside the container. Stop the container.
 
 ## Updates
 

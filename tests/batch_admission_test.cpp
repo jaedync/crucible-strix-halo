@@ -10,6 +10,7 @@
 #include <functional>
 #include <limits>
 #include <string>
+#include <tuple>
 
 using namespace crucible;
 
@@ -162,6 +163,239 @@ void CheckFormat() {
   assert(kAdmissionOsReserve == 8 * GiB && kAdmissionPlanReserve == 512 * MiB && kAdmissionHostReserve == 512 * MiB);
 }
 
+// Memory stage 2, the start-time fit (FitServeLayout). Each fitted layout must pass the check that the engine runs next,
+// and one step more in the dimension that the fit changed must fail. The order is fixed: the conversation cache budget,
+// then the slot count at the same --ctx, then --ctx at the smallest slot count. --ctx moves only when no slot count fits.
+FitLayout Fit(const Pack& pack, uint64_t available, uint64_t cache, int streams, int context, FitLimits limits = {}) {
+  if (pack.shorts) limits.min_streams = pack.shorts + 1;
+  return FitServeLayout(Memory(pack, available, cache, streams, context), Trial(pack), limits);
+}
+// The fitted layout passes the engine's check with kFitMargin to spare (H1: the check measures again after the fit).
+// The check runs at the requested --ctx on slot 0 that exists now.
+bool FitPasses(const Pack& pack, uint64_t available, const FitLayout& layout, int context) {
+  return Passes(pack, available - kFitMargin, layout.cache_budget, layout.streams, layout.context, pack.FirstSlot(context));
+}
+constexpr uint64_t kM = kFitMargin;
+
+void CheckFitRequested() {
+  // A setting that fits keeps every value, exactly (the default stays bit-identical).
+  for (const auto& [pack, available, cache, streams, context] :
+       {std::tuple{Pack{}, 64 * GiB, 9700 * MiB, 4, 262144}, std::tuple{Pack{}, 64 * GiB, uint64_t(0), 8, 32768}}) {
+    const FitLayout layout = Fit(pack, available, cache, streams, context);
+    assert(layout.step == FitStep::kRequested);
+    assert(layout.streams == streams && layout.context == context && layout.cache_budget == cache);
+    assert(layout.reason.empty());
+  }
+  // The exact boundary: the requested setting at the last byte still fits.
+  const Pack full;
+  const AdmissionCharge charge = full.Charge(4, 262144);
+  const uint64_t exact = kAdmissionReserve + charge.new_states_bytes + 9700 * MiB;
+  assert(Fit(full, exact, 9700 * MiB, 4, 262144).step == FitStep::kRequested);
+  assert(Fit(full, exact - 1, 9700 * MiB, 4, 262144).step == FitStep::kCache);
+}
+
+void CheckFitCache() {
+  // Step 1: the state fits, the cache budget does not. Only the budget moves, to the largest whole MiB that fits.
+  const Pack full;
+  const uint64_t cache = 9700 * MiB;
+  const AdmissionCharge charge = full.Charge(4, 262144);
+  const uint64_t available = kAdmissionReserve + charge.new_states_bytes + 5000 * MiB + 123;
+  const FitLayout layout = Fit(full, available, cache, 4, 262144);
+  assert(layout.step == FitStep::kCache);
+  assert(layout.streams == 4 && layout.context == 262144);
+  assert(layout.cache_budget == 5000 * MiB - kM);  // the fit keeps the margin free
+  assert(FitPasses(full, available, layout, 262144));
+  assert(!AdmissionFits(available - kM, charge.new_states_bytes, layout.cache_budget + MiB));
+  // The measured numbers for the start line: the free memory and what the request needs.
+  assert(layout.free_bytes == available);
+  assert(layout.need_bytes == kAdmissionReserve + charge.new_states_bytes + cache);
+  // The floor (2,048 MiB) still fits: the cache step, not the slot step.
+  const uint64_t at_floor = kAdmissionReserve + charge.new_states_bytes + kFitCacheFloor + kM;
+  const FitLayout floor = Fit(full, at_floor, cache, 4, 262144);
+  assert(floor.step == FitStep::kCache && floor.cache_budget == kFitCacheFloor && floor.streams == 4);
+  // A budget below the floor is the slot step: the cache never goes below min(budget, floor).
+  const FitLayout below = Fit(full, at_floor - 1, cache, 4, 262144);
+  assert(below.step == FitStep::kStreams && below.streams == 3);
+  assert(below.cache_budget >= kFitCacheFloor && below.cache_budget <= cache);
+}
+
+void CheckFitStreams() {
+  // Step 2: no budget at or above the floor fits 4 slots; 3 slots at the same --ctx do. The budget then takes the
+  // largest value that fits 3 slots, up to the request.
+  const Pack full;
+  const uint64_t cache = 9700 * MiB;
+  const uint64_t slot = full.Serve(262144);
+  for (const uint64_t spare : {uint64_t(0), 3000 * MiB, slot - MiB}) {
+    const AdmissionCharge three = full.Charge(3, 262144);
+    const uint64_t available = kAdmissionReserve + three.new_states_bytes + kFitCacheFloor + spare + kM;
+    const FitLayout layout = Fit(full, available, cache, 4, 262144);
+    assert(layout.step == FitStep::kStreams);
+    assert(layout.streams == 3 && layout.context == 262144);
+    assert(layout.cache_budget == std::min(cache, (kFitCacheFloor + spare) / MiB * MiB));
+    assert(FitPasses(full, available, layout, 262144));
+    // One slot more fails even at the floor budget, so the slot step was needed.
+    assert(!AdmissionFits(available - kM, full.Charge(4, 262144).new_states_bytes, kFitCacheFloor));
+  }
+  // No cache requested: the slot step comes first, and the budget stays 0.
+  {
+    const uint64_t available = kAdmissionReserve + full.Charge(2, 262144).new_states_bytes + kM;
+    const FitLayout layout = Fit(full, available, 0, 4, 262144);
+    assert(layout.step == FitStep::kStreams && layout.streams == 2 && layout.cache_budget == 0);
+  }
+  // A budget below the floor is kept as requested in the slot step (min(budget, floor)).
+  {
+    const uint64_t available = kAdmissionReserve + full.Charge(2, 262144).new_states_bytes + 1000 * MiB + kM;
+    const FitLayout layout = Fit(full, available, 1000 * MiB, 4, 262144);
+    assert(layout.step == FitStep::kStreams && layout.streams == 2 && layout.cache_budget == 1000 * MiB);
+  }
+  // --short-streams 2 of 4: the fit keeps the short slots, so 3 slots is the smallest count (2 short + 1 full).
+  {
+    Pack shorted;
+    shorted.shorts = 2;
+    shorted.short_ctx = 4096;
+    const uint64_t available = kAdmissionReserve + shorted.Charge(3, 262144).new_states_bytes + kM;
+    const FitLayout layout = Fit(shorted, available, 0, 4, 262144);
+    assert(layout.step == FitStep::kStreams && layout.streams == 3);
+    assert(FitPasses(shorted, available, layout, 262144));
+  }
+}
+
+void CheckFitContext() {
+  // Step 3: not even one slot fits at --ctx, so --ctx moves down in steps of 128 at one slot.
+  const Pack full;
+  const uint64_t cache = 9700 * MiB;
+  // The last value: the reserve fits, but one slot plus the floor budget does not.
+  for (const uint64_t available : {uint64_t(8'544'751'616ull), kAdmissionReserve + 1, kAdmissionReserve + kFitCacheFloor - 1}) {
+    const FitLayout layout = Fit(full, available, cache, 4, 262144);
+    assert(layout.step == FitStep::kContext);
+    assert(layout.streams == 1 && layout.context % kAdmissionContextGrain == 0 && layout.context < 262144);
+    assert(layout.cache_budget >= std::min(cache, kFitCacheFloor) && layout.cache_budget <= cache);
+    assert(FitPasses(full, available, layout, 262144));
+    // The next step up fails at the floor budget.
+    FitLayout up = layout;
+    up.context += kAdmissionContextGrain;
+    up.cache_budget = kFitCacheFloor;
+    assert(!FitPasses(full, available, up, 262144));
+    // And it equals the refusal text's largest --ctx at one stream with the floor budget.
+    AdmissionMemory memory = Memory(full, available - kM, kFitCacheFloor, 1, 262144);
+    assert(LargestAdmissionContext(memory, Trial(full)) == layout.context);
+  }
+  // A YaRN layout (--ctx above 262,144) keeps --ctx above 262,144: a lower --ctx that still holds YaRN is used.
+  {
+    const uint64_t available = kAdmissionReserve + full.Serve(400000) - full.FirstSlot(524288) + kFitCacheFloor + kM;
+    const FitLayout layout = Fit(full, available, cache, 2, 524288, FitLimits{1, kFitPlainContext});
+    assert(layout.step == FitStep::kContext && layout.streams == 1);
+    assert(layout.context > kFitPlainContext && layout.context < 524288);
+    assert(FitPasses(full, available, layout, 524288));
+  }
+}
+
+void CheckFitRefused() {
+  const Pack full;
+  // A YaRN layout whose only fit is at or below 262,144: the fit refuses and says why, and changes nothing.
+  {
+    // At the check, a lower --ctx frees the difference of slot 0: only a --ctx at or below 262,144 frees enough.
+    const uint64_t available = kAdmissionReserve + 1 - (full.FirstSlot(524288) - full.FirstSlot(262144)) + kM;
+    const FitLayout layout = Fit(full, available, 0, 2, 524288, FitLimits{1, kFitPlainContext});
+    assert(layout.step == FitStep::kRefused);
+    assert(layout.streams == 2 && layout.context == 524288 && layout.cache_budget == 0);
+    assert(Has(layout.reason, "YaRN"));
+    assert(Has(layout.reason, "262,144"));
+    // Without the YaRN limit the same memory fits --ctx 262,144.
+    const FitLayout plain = Fit(full, available, 0, 2, 524288);
+    assert(plain.step == FitStep::kContext && plain.context == kFitPlainContext);
+  }
+  // Nothing fits at all: refused, with the reason.
+  {
+    const FitLayout layout = Fit(full, GiB, 9700 * MiB, 4, 262144);
+    assert(layout.step == FitStep::kRefused);
+    assert(layout.streams == 4 && layout.context == 262144 && layout.cache_budget == 9700 * MiB);
+    assert(Has(layout.reason, "no smaller layout fits"));
+  }
+  assert(std::string(FitStepName(FitStep::kRequested)) == "requested");
+  assert(std::string(FitStepName(FitStep::kCache)) == "cache");
+  assert(std::string(FitStepName(FitStep::kStreams)) == "streams");
+  assert(std::string(FitStepName(FitStep::kContext)) == "context");
+  assert(std::string(FitStepName(FitStep::kRefused)) == "refused");
+}
+
+// H1: the margin. A fitted layout keeps kFitMargin free beyond the check, so a small drop of the free memory between the
+// fit and the second check does not refuse it. The requested layout never pays the margin (exact default).
+void CheckFitMargin() {
+  assert(kFitMargin == 256 * MiB);
+  const Pack full;
+  const AdmissionCharge four = full.Charge(4, 262144);
+  // The request fits with no byte to spare: no margin, no change.
+  assert(Fit(full, kAdmissionReserve + four.new_states_bytes + 9700 * MiB, 9700 * MiB, 4, 262144).step ==
+         FitStep::kRequested);
+  // The sweep: every fitted layout still passes after the free memory falls by the margin less one byte.
+  for (uint64_t available = 48 * GiB; available > 6 * GiB; available -= 37 * MiB) {
+    const FitLayout layout = Fit(full, available, 9700 * MiB, 4, 262144);
+    if (layout.step == FitStep::kRequested || layout.step == FitStep::kRefused) continue;
+    assert(Passes(full, available - kFitMargin, layout.cache_budget, layout.streams, layout.context,
+                  full.FirstSlot(262144)));
+  }
+  // After FitContext the engine measures again (FitCacheAgain): the budget follows the measured memory, up to the
+  // request, with the margin; a measure that cannot hold the floor gives nullopt (the engine keeps the fitted budget
+  // and the check then decides; the refusal note names the measure, not a drop of free memory).
+  const uint64_t one = full.Charge(1, 131072).new_states_bytes;
+  const uint64_t measured = kAdmissionReserve + one + 3000 * MiB + kM;
+  assert(FitCacheAgain(measured, one, 9700 * MiB) == 3000 * MiB);
+  assert(FitCacheAgain(measured + 20 * GiB, one, 9700 * MiB) == 9700 * MiB);
+  assert(!FitCacheAgain(kAdmissionReserve + one + 1000 * MiB + kM, one, 9700 * MiB));
+  assert(!FitCacheAgain(kAdmissionReserve, one, 9700 * MiB));
+  assert(FitCacheAgain(measured, one, 1000 * MiB) == 1000 * MiB);  // a request below the floor
+}
+
+// H1: a refusal at the second check after a fit names the fit and the requested layout.
+void CheckFitRefusalNote() {
+  FitLayout layout;
+  layout.step = FitStep::kStreams;
+  layout.streams = 3;
+  layout.context = 262144;
+  layout.cache_budget = 2048 * MiB;
+  const std::string note = FitRefusalNote(layout, 4, 262144, 9700 * MiB);
+  assert(Has(note, "The memory fit ran (step streams): the request was 4 streams at 262,144 context with a "
+                   "9,700 MiB conversation cache, and the fit chose 3 streams at 262,144 context with a 2,048 MiB "
+                   "conversation cache."));
+  assert(Has(note, "The free memory fell before the slots were allocated."));
+  assert(note.back() == '\n');
+  layout.step = FitStep::kContext;
+  layout.streams = 1;
+  layout.context = 131072;
+  layout.cache_budget = 0;
+  const std::string plain = FitRefusalNote(layout, 1, 262144, 0);
+  assert(Has(plain, "the request was 1 stream at 262,144 context, and the fit chose 1 stream at 131,072 context."));
+  // After FitContext the new measure did not fit the layout: the note says so, not that the free memory fell.
+  const std::string short_measure = FitRefusalNote(layout, 1, 262144, 0, true);
+  assert(Has(short_measure, "The measure after the fit did not fit that layout."));
+  assert(HasNot(short_measure, "fell"));
+}
+
+// The fit's order on a sweep of free memory: the steps never go back (a smaller free memory never gives a later
+// step a larger layout), and each result passes the check.
+void CheckFitOrder() {
+  const Pack full;
+  const uint64_t cache = 9700 * MiB;
+  FitStep last = FitStep::kRequested;
+  int last_streams = 4, last_context = 262144;
+  for (uint64_t available = 64 * GiB; available > 4 * GiB; available -= 64 * MiB) {
+    const FitLayout layout = Fit(full, available, cache, 4, 262144);
+    assert(uint8_t(layout.step) >= uint8_t(last));
+    if (layout.step == FitStep::kRefused) break;
+    assert(layout.streams <= last_streams && layout.context <= last_context);
+    if (layout.step <= FitStep::kStreams) assert(layout.context == 262144);
+    if (layout.step == FitStep::kCache) assert(layout.streams == 4);
+    // The request pays no margin; a fitted layout keeps kFitMargin free.
+    if (layout.step == FitStep::kRequested) assert(Passes(full, available, cache, 4, 262144, full.FirstSlot(262144)));
+    else assert(FitPasses(full, available, layout, 262144));
+    last = layout.step;
+    last_streams = layout.streams;
+    last_context = layout.context;
+  }
+  assert(last == FitStep::kContext || last == FitStep::kRefused);
+}
+
 // The accept or refuse decision is the trunk one, so a change here is a change of behaviour.
 void CheckPredicate() {
   const uint64_t huge = std::numeric_limits<uint64_t>::max();
@@ -186,6 +420,14 @@ int main() {
   }
   CheckFormat();
   CheckPredicate();
+  CheckFitRequested();
+  CheckFitCache();
+  CheckFitStreams();
+  CheckFitContext();
+  CheckFitRefused();
+  CheckFitOrder();
+  CheckFitMargin();
+  CheckFitRefusalNote();
   const Pack full;
   Pack compact_pack; compact_pack.compact = true;
   Pack vision_pack; vision_pack.vision = true;
