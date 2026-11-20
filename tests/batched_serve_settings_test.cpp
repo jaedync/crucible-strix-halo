@@ -16,6 +16,16 @@ int main() {
     }
     assert(rejected);
   }
+  // --admission-reserve-mib: unset keeps the default, in range is taken, out of range is refused.
+  assert(parse({"--streams","2"}).admission_reserve_mib==0);
+  assert(parse({"--streams","2","--admission-reserve-mib","4096"}).admission_reserve_mib==4096);
+  assert(parse({"--streams","2","--admission-reserve-mib","1024"}).admission_reserve_mib==1024);
+  for (const char* bad : {"0", "1023", "1048577"}) {
+    bool rejected=false;
+    try { parse({"--streams","2","--admission-reserve-mib", bad}); }
+    catch (const std::invalid_argument& error) { rejected=std::string(error.what())=="admission-reserve-mib must be an integer in [1024,1048576]"; }
+    assert(rejected);
+  }
   assert(parse({"--streams","2"}).prefill_rows==kServePrefillAuto);
   assert(parse({"--streams","8","--prefill","4096"}).prefill_rows==4096);
   assert(parse({"--streams","1","--prefill","1024"}).prefill_rows==1024);

@@ -16,6 +16,8 @@ PREFIXES = ("duplicate request field: ", "MTP cache allocation failed: ", "MTP c
 _SUFFIX = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,39}")  # a name, never a number such as a token ID
 
 KNOWN = frozenset((
+    # Memory stage 2 (--admission-reserve-mib, engine/serve/batched_serve_settings.h).
+    'admission-reserve-mib must be an integer in [1024,1048576]',
     # Structured output (engine/serve/serve_protocol.h, engine/serve/batch_session.h, engine/runtime/constraint.h).
     # The compile errors reach the server through RecoverableOpenError(error.what()): the helper's fixed texts are
     # listed below.
