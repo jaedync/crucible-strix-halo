@@ -237,8 +237,8 @@ make
 The build uses one compile job and takes about 16 minutes with the ROCm 7.2.4 compiler. More jobs (`make -j2`) need more
 memory; see [BUILD](BUILD.md).
 
-With a ROCm 10 compiler, `make` stops, because that engine is slower (a 32K prefill: 42% less). Use the ROCm 7.2.4
-compiler. To build with ROCm 10 all the same, run `make ALLOW_ROCM10=1`; it then builds with plain `hipcc`.
+With a ROCm 10 compiler, `make` builds with plain `hipcc`. With ROCm 10.1 that engine is about 1.5% slower at a 32K
+prefill than a build with the ROCm 7.2.4 compiler. `ALLOW_ROCM10=1` is still accepted and has no effect.
 
 Fallback: if `make` stops with `argument facts drift` (another ROCm build), run `make SPLIT=0`. It builds with plain
 `hipcc`, which takes longer. Please report the drift as an issue.
