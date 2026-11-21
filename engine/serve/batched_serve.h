@@ -110,6 +110,16 @@ class BatchPrefixCache {
     crucible::SnapshotChunkPool::Instance().SetPinnedLimit(cache_.Budget());
     std::fprintf(stderr, "conversation cache: %zu bytes budget, host reserve %llu MiB\n", budget,
                  static_cast<unsigned long long>(host_reserve >> 20));
+    // Print how much is in reserve when the engine starts.
+    {
+      const uint64_t reserve = AdmissionReserveBytes();
+      const uint64_t fixed = kAdmissionPlanReserve + kAdmissionHostReserve;
+      std::fprintf(stderr, "admission reserve: %llu MiB (system %llu, plans %llu, host part %llu)\n",
+                   static_cast<unsigned long long>(reserve >> 20),
+                   static_cast<unsigned long long>((reserve > fixed ? reserve - fixed : 0) >> 20),
+                   static_cast<unsigned long long>(kAdmissionPlanReserve >> 20),
+                   static_cast<unsigned long long>(kAdmissionHostReserve >> 20));
+    }
     if (disk && session_replay_) OpenDisk(std::move(*disk), host_reserve);
     // x4-tail: one cut buffer for the server (a joined launch uses it, and the worker saves it before the next one).
     if (cut_bytes_) {
@@ -2230,6 +2240,9 @@ inline std::optional<int> TryBatchedServeCommand(int argc, char** argv) {
     std::vector<int> draft_blocks;
     if (!settings.draft_blocks.empty())
       draft_blocks=crucible::ReadServeDraftBlocks(settings.draft_blocks,crucible::kVocab/128);
+    // --admission-reserve-mib, before the admission check runs.
+    if (settings.admission_reserve_mib > 0)
+      SetAdmissionReserveBytes(AdmissionReserveFromMib(uint64_t(settings.admission_reserve_mib)));
     return BatchedServe(argv[2],settings.ctx,settings.streams,settings.prefill_rows,settings.cache_mib,
                         settings.short_streams,settings.short_ctx,settings.session_replay,settings.slot_resume,
                         settings.slot_checkpoints,settings.vision,settings.host_reserve_mib,settings.state_dir,
@@ -2243,7 +2256,7 @@ inline std::optional<int> TryBatchedServeCommand(int argc, char** argv) {
     return 4;
   } catch (const std::exception& error) {
     // A memory refusal is a block of lines (engine/runtime/batch_admission.h): keep the options on their own line.
-    std::fprintf(stderr, "batched serve error: %s\n  options: serve CKPT --streams 1..8 [--ctx 1..262144] [--prefill 0..4096] [--conversation-cache-mib 0..131072] [--host-reserve-mib 1024..131072] [--short-streams N --short-ctx T] [--cache-probation 0|1] [--cache-idle-minutes 1..10080] [--mtp-window 0..262144] [--draft-blocks FILE] [--state-dir DIR [--state-disk-gib 1..65536] [--state-disk-write-gib-per-day 0..65536] [--state-disk-write-delay-ms 0..60000] [--state-disk-ladder 0|1] [--state-disk-fork 0|1]]\n", error.what());
+    std::fprintf(stderr, "batched serve error: %s\n  options: serve CKPT --streams 1..8 [--ctx 1..262144] [--prefill 0..4096] [--conversation-cache-mib 0..131072] [--host-reserve-mib 1024..131072] [--admission-reserve-mib 1024..1048576] [--short-streams N --short-ctx T] [--cache-probation 0|1] [--cache-idle-minutes 1..10080] [--mtp-window 0..262144] [--draft-blocks FILE] [--state-dir DIR [--state-disk-gib 1..65536] [--state-disk-write-gib-per-day 0..65536] [--state-disk-write-delay-ms 0..60000] [--state-disk-ladder 0|1] [--state-disk-fork 0|1]]\n", error.what());
     return 2;
   }
 }

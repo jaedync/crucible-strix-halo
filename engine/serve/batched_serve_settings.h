@@ -8,6 +8,7 @@ inline constexpr int kServeBatchSlots = 8;
 struct BatchedServeSettings {
   int ctx=32768, streams=0, prefill_rows=kServePrefillAuto, cache_mib=0;
   int host_reserve_mib=kServeHostReserveMib;  // MemAvailable that each cache save keeps free
+  int admission_reserve_mib=0;  // --admission-reserve-mib; 0 keeps kAdmissionReserve (9216 MiB)
   // Slot classes (G4): the last short_streams slots hold short_ctx tokens.
   int short_streams=0, short_ctx=0;
   bool session_replay=false;  // G15 opt-in A/B; needs the conversation cache
@@ -62,6 +63,11 @@ inline BatchedServeSettings ParseBatchedServeSettings(std::span<const std::strin
     else if (key=="--prefill") result.prefill_rows=ServeNumber<int>(value);
     else if (key=="--conversation-cache-mib") result.cache_mib=ServeNumber<int>(value);
     else if (key=="--host-reserve-mib") result.host_reserve_mib=ServeNumber<int>(value);
+    else if (key=="--admission-reserve-mib") {
+      const int parsed=ServeNumber<int>(value);
+      if (parsed<1024 || parsed>1048576) throw std::invalid_argument("admission-reserve-mib must be an integer in [1024,1048576]");
+      result.admission_reserve_mib=parsed;
+    }
     else if (key=="--short-streams") result.short_streams=ServeNumber<int>(value);
     else if (key=="--short-ctx") result.short_ctx=ServeNumber<int>(value);
     else if (key=="--session-replay") {

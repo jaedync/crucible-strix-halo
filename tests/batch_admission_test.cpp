@@ -161,6 +161,17 @@ void CheckFormat() {
   assert(BytesText(std::numeric_limits<uint64_t>::max()).find("17179869184.0 GiB") == 0);
   assert(kAdmissionReserve == 9 * GiB);
   assert(kAdmissionOsReserve == 8 * GiB && kAdmissionPlanReserve == 512 * MiB && kAdmissionHostReserve == 512 * MiB);
+  // --admission-reserve-mib: the default until set, then the value, never below the plans and host part.
+  assert(AdmissionReserveBytes() == kAdmissionReserve);
+  assert(AdmissionReserveFromMib(4096) == 4 * GiB);
+  assert(AdmissionReserveFromMib(9216) == kAdmissionReserve);
+  assert(AdmissionReserveFromMib(1024) == 1 * GiB);
+  assert(AdmissionReserveFromMib(1023) == 1 * GiB);
+  assert(AdmissionReserveFromMib(1) == 1 * GiB);
+  SetAdmissionReserveBytes(AdmissionReserveFromMib(4096));
+  assert(AdmissionReserveBytes() == 4 * GiB);
+  SetAdmissionReserveBytes(kAdmissionReserve);
+  assert(AdmissionReserveBytes() == kAdmissionReserve);
 }
 
 // Memory stage 2, the start-time fit (FitServeLayout). Each fitted layout must pass the check that the engine runs next,
@@ -176,6 +187,33 @@ bool FitPasses(const Pack& pack, uint64_t available, const FitLayout& layout, in
   return Passes(pack, available - kFitMargin, layout.cache_budget, layout.streams, layout.context, pack.FirstSlot(context));
 }
 constexpr uint64_t kM = kFitMargin;
+
+// --admission-reserve-mib changes what the check accepts: a layout that the default reserve refuses fits with a lower
+// one. This is the behaviour, not just the stored value.
+void CheckReserveChangesTheCheck() {
+  const uint64_t available = 6 * GiB;
+  const uint64_t states = 2 * GiB;
+  const uint64_t cache = 1 * GiB;
+  SetAdmissionReserveBytes(kAdmissionReserve);
+  assert(!AdmissionFits(available, states, cache));
+  SetAdmissionReserveBytes(AdmissionReserveFromMib(1024));
+  assert(AdmissionReserveBytes() == 1 * GiB);
+  assert(AdmissionFits(available, states, cache));
+  // The refusal text names the parts of the reserve in force. At 1024 MiB the plans and the host part fill it, so the
+  // system part is 0, not the whole reserve.
+  AdmissionMemory memory;
+  memory.host_free = 3 * GiB;
+  memory.device_free = 3 * GiB;
+  memory.states_bytes = 4 * GiB;
+  memory.new_states_bytes = 4 * GiB;
+  memory.streams = 1;
+  memory.context = 262144;
+  const Pack pack;
+  const std::string text = BatchAdmissionError(memory, Trial(pack));
+  assert(Has(text, "start-time reserve: 1.0 GiB (1,073,741,824 bytes): system 0.0 GiB, plans 512.0 MiB, host 512.0 MiB"));
+  SetAdmissionReserveBytes(kAdmissionReserve);
+  assert(AdmissionReserveBytes() == kAdmissionReserve);
+}
 
 void CheckFitRequested() {
   // A setting that fits keeps every value, exactly (the default stays bit-identical).
@@ -420,6 +458,7 @@ int main() {
   }
   CheckFormat();
   CheckPredicate();
+  CheckReserveChangesTheCheck();
   CheckFitRequested();
   CheckFitCache();
   CheckFitStreams();
