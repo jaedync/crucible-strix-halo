@@ -1,6 +1,8 @@
 #include "../engine/runtime/slot_checkpoints.h"
 #include <cassert>
+#include <cstdio>
 #include <numeric>
+#include <random>
 #include <span>
 using namespace crucible;
 
@@ -147,7 +149,156 @@ static void EndOutputs() {
   }
 }
 
+// cache-thinkcap: the event order of a think-capped chat turn on one slot. The first
+// job keeps its Pre point (2,432) and End point (2,499); the continuation resumes at the Pre point (Keep drops the End
+// point) and saves its own Pre (2,524) and End (2,588) points, past the client's boundary (2,494). With the boundary the
+// End save leaves the continuation's Pre point, so the client's next prompt resumes at 2,432; without it (the old rule,
+// boundary 0) the shortest point leaves and the next prompt finds no point.
+static void BoundaryKeepsTheClientsPoint() {
+  auto continuation = Tokens(2588);
+  const std::vector<int> prompt(continuation.begin(), continuation.begin() + 2499);
+  for (const size_t boundary : {size_t(0), size_t(2494)}) {
+    SlotCheckpoints c(1);
+    c.Store(0, *c.Victim(0, Below(prompt, 2432), CheckpointKind::Pre, 1, kLocalTenant), Point(prompt, 2432, CheckpointKind::Pre, 1));
+    c.Store(0, *c.Victim(0, Below(prompt, 2499), CheckpointKind::End, 1, kLocalTenant), Point(prompt, 2499, CheckpointKind::End, 1));
+    c.Keep(0, 2432);
+    const auto pre = c.Victim(0, Below(continuation, 2524), CheckpointKind::Pre, 2, kLocalTenant, boundary);
+    assert(pre == 1);  // an empty buffer first
+    c.Store(0, *pre, Point(continuation, 2524, CheckpointKind::Pre, 2));
+    const auto end = c.Victim(0, Below(continuation, 2588), CheckpointKind::End, 2, kLocalTenant, boundary);
+    assert(end == (boundary ? 1 : 0));
+    c.Store(0, *end, Point(continuation, 2588, CheckpointKind::End, 2));
+    const auto best = c.Best(0, prompt, kLocalTenant);
+    assert(boundary ? best && c.At(0, *best).hist.size() == 2432 : !best);
+    assert(c.At(0, *c.Best(0, Tokens(2700), kLocalTenant)).hist.size() == 2588);  // the tool loop resumes at the End point
+  }
+  // The kept point is the newest at or below the boundary, of the request's tenant; a later grid point of the same
+  // request does not replace it; with one general point in all (the other buffer empty) the empty one goes first.
+  SlotCheckpoints c(1);
+  const auto ids = Tokens(300);
+  c.Store(0, 0, Point(ids, 100, CheckpointKind::Grid, 6));
+  c.Store(0, 1, Point(ids, 120, CheckpointKind::Grid, 7));
+  assert(c.KeptPoint(0, 110, kLocalTenant) == 0 && c.KeptPoint(0, 120, kLocalTenant) == 1 && !c.KeptPoint(0, 99, kLocalTenant));
+  assert(!c.KeptPoint(0, 0, kLocalTenant));
+  StateTenant other{};
+  other[0] = 9;
+  assert(!c.KeptPoint(0, 200, other));
+  assert(c.Victim(0, Below(ids, 140), CheckpointKind::Grid, 7, kLocalTenant) == 1);       // the old rule: its grid point
+  assert(c.Victim(0, Below(ids, 140), CheckpointKind::Grid, 7, kLocalTenant, 110) == 1);  // 100 stays: the same
+  assert(c.Victim(0, Below(ids, 140), CheckpointKind::Grid, 7, kLocalTenant, 130) == 0);  // 120 stays, 100 goes
+  assert(c.Victim(0, Below(ids, 140), CheckpointKind::End, 8, kLocalTenant) == 0);        // the old rule: the shortest
+  assert(c.Victim(0, Below(ids, 140), CheckpointKind::End, 8, kLocalTenant, 110) == 1);   // 100 stays, 120 goes
+  c.Keep(0, 110);
+  assert(c.Victim(0, Below(ids, 140), CheckpointKind::End, 8, kLocalTenant, 110) == 1);   // an empty buffer first
+}
+
+// The old victim rule (boundary 0), as it was before cache-thinkcap: the reference of the property test below.
+static std::optional<int> OldVictim(const std::array<std::optional<SlotCheckpoint>, kSlotCheckpoints>& held,
+                                    std::span<const int> key, CheckpointKind kind, uint64_t owner) {
+  for (int i = 0; i < kSlotCheckpoints; ++i)
+    if (held[i] && held[i]->key.size() == key.size()) {
+      if (std::equal(key.begin(), key.end(), held[i]->key.begin())) return std::nullopt;
+      if (i < kGeneralCheckpoints) return i;
+    }
+  if (kind == CheckpointKind::Grid)
+    for (int i = 0; i < kGeneralCheckpoints; ++i)
+      if (held[i] && held[i]->owner == owner && held[i]->kind == CheckpointKind::Grid) return i;
+  int victim = 0;
+  for (int i = 0; i < kGeneralCheckpoints; ++i) {
+    if (!held[i]) return i;
+    if (held[i]->hist.size() < held[victim]->hist.size()) victim = i;
+  }
+  return victim;
+}
+
+// Property (cache-thinkcap): random event orders on one slot, as the session calls the store. Requests restore at a
+// held point (Keep), reset or restore from the host (Keep 0), run rows past the cursor and save Start, Grid, Pre, End and
+// Frontier points; a save names the request's boundary (0 for a client prompt, KeepBoundary for a continuation).
+// After every save:
+//   - the new point is held, every held point is a prefix of the slot's rows;
+//   - boundary 0: the victim is the old rule's (normal requests keep the old behavior);
+//   - boundary B: the newest point at or below B before the save, or a newer one at or below B, is still held (the
+//     store has room: two general buffers, one for that point and one for the new point).
+static void BoundaryProperty() {
+  std::mt19937_64 random(20261118);
+  int saves = 0, kept_checks = 0;
+  for (int run = 0; run < 400; ++run) {
+    SlotCheckpoints c(1);
+    std::vector<int> rows;  // the slot's rows
+    std::array<std::optional<SlotCheckpoint>, kSlotCheckpoints> mirror{};  // what the store holds, by index
+    uint64_t owner = 0;
+    size_t boundary = 0;
+    const auto held_points = [&] {
+      std::vector<std::pair<int, size_t>> found;
+      c.ForEach(0, [&](int index, const SlotCheckpoint& point) { found.emplace_back(index, point.hist.size()); });
+      return found;
+    };
+    for (int event = 0; event < 60; ++event) {
+      const int what = int(random() % 10);
+      if (what == 0) {  // reset, or a host restore
+        c.Keep(0, 0);
+        rows.clear();
+        mirror = {};
+      } else if (what <= 2) {  // a new request: it restores at a held point (or keeps the rows), with a boundary
+        const auto points = held_points();
+        size_t keep = rows.size();
+        if (!points.empty() && random() % 3) keep = points[random() % points.size()].second;
+        c.Keep(0, keep);
+        rows.resize(keep);
+        for (auto& item : mirror) if (item && item->hist.size() > keep) item.reset();
+        ++owner;
+        // A client prompt (boundary 0 for KeepBoundary), or a continuation whose client boundary lies near the restore.
+        boundary = random() % 2 ? 0 : keep + random() % 9 - std::min<size_t>(keep, 4);
+        if (boundary > 0 && boundary < keep / 2) boundary = keep;
+      } else {  // the request runs rows and saves a point at the cursor
+        const size_t more = 1 + random() % 40;
+        for (size_t i = 0; i < more; ++i) rows.push_back(int(random() % 4));
+        const std::span<const int> key(rows.data(), rows.size());
+        if (what == 9) {  // a Frontier point
+          const auto pick = c.FrontierVictim(0, key, owner, kLocalTenant);
+          if (!pick.held && pick.index) {
+            auto point = Frontier(rows, rows.size(), owner);
+            c.Store(0, *pick.index, point);
+            mirror[size_t(*pick.index)] = point;
+          }
+          continue;
+        }
+        const CheckpointKind kinds[] = {CheckpointKind::Start, CheckpointKind::Grid, CheckpointKind::Pre,
+                                        CheckpointKind::End};
+        const CheckpointKind kind = kinds[random() % 4];
+        std::optional<size_t> before;  // the newest point at or below the boundary
+        for (int i = 0; i < kGeneralCheckpoints; ++i)
+          if (boundary && mirror[i] && mirror[i]->hist.size() <= boundary)
+            before = std::max(before.value_or(0), mirror[i]->hist.size());
+        const auto victim = c.Victim(0, key, kind, owner, kLocalTenant, boundary);
+        if (!boundary) assert(victim == OldVictim(mirror, key, kind, owner));
+        if (!victim) continue;
+        ++saves;
+        auto point = Point(rows, rows.size(), kind, owner);
+        c.Store(0, *victim, point);
+        mirror[size_t(*victim)] = point;
+        assert(c.At(0, *victim).hist == rows);
+        if (before) {
+          ++kept_checks;
+          bool kept = false;
+          for (int i = 0; i < kGeneralCheckpoints; ++i)
+            kept |= mirror[i] && mirror[i]->hist.size() >= *before && mirror[i]->hist.size() <= boundary;
+          assert(kept);
+        }
+      }
+      c.ForEach(0, [&](int index, const SlotCheckpoint& point) {
+        assert(mirror[size_t(index)] && mirror[size_t(index)]->hist == point.hist);
+        assert(point.hist.size() <= rows.size() && std::equal(point.hist.begin(), point.hist.end(), rows.begin()));
+      });
+    }
+  }
+  assert(saves > 5000 && kept_checks > 1000);
+  std::printf("BoundaryProperty: %d saves, %d with a kept point\n", saves, kept_checks);
+}
+
 int main() {
+  BoundaryKeepsTheClientsPoint();
+  BoundaryProperty();
   TenantPoints();
   static_assert(kGeneralCheckpoints == 2 && kSlotCheckpoints == 3, "a development branch T4 and one Frontier buffer");
   // An earlier change: fix A's logits rows per stream: one per general buffer (End points) and the in-flight row of

@@ -10,6 +10,7 @@
 #include "sha256.h"
 #include "snapshot_bytes.h"
 #include "state_epoch.h"
+#include "state_private_dir.h"
 #include "state_format.h"
 #include "state_root.h"
 #include "state_switches.h"
@@ -180,6 +181,7 @@ struct StateDiskStats {
   uint64_t written_bytes = 0, read_bytes = 0, present = 0, refused_daily = 0;
   uint64_t lazy_written = 0, lazy_read = 0;  // files written from device rows, and reads of such files
   uint64_t blocks_written = 0, blocks_shared = 0, pruned = 0;
+  uint64_t branch_checks = 0;  // branch (prefix) checks under the lock: the eviction work that tests count
 };
 // The local calendar day, as YYYY-MM-DD.
 inline std::string StateToday() {
@@ -300,8 +302,8 @@ class StateDisk {
       throw std::invalid_argument("state disk ladder widths must nest");
     PrepareRoot();
     dir_ = options_.root / options_.directory;
-    MakePrivateDirectory(dir_);
-    lock_ = ::open((dir_ / ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    const auto folder = MakePrivateDirectory(dir_);
+    lock_ = ::openat(folder.Get(), ".lock", O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (lock_ < 0 || ::flock(lock_, LOCK_EX | LOCK_NB) != 0) {
       Log("state_disk off reason=locked");
       return;
@@ -595,7 +597,12 @@ class StateDisk {
   size_t Blocks() const { std::lock_guard lock(mutex_); return blocks_.size(); }
   // Bytes on disk: every state file and every block file once.
   uint64_t Bytes() const { std::lock_guard lock(mutex_); return bytes_; }
-  StateDiskStats Stats() const { std::lock_guard lock(mutex_); return stats_; }
+  StateDiskStats Stats() const {
+    std::lock_guard lock(mutex_);
+    StateDiskStats stats = stats_;
+    stats.branch_checks = branch_checks_;
+    return stats;
+  }
   // Bytes that the tier wrote today (all engines that share the state root), as the ledger last showed them.
   uint64_t DayWritten() {
     std::lock_guard lock(mutex_);
@@ -825,12 +832,11 @@ class StateDisk {
     if (!verdict.Accepted()) throw std::invalid_argument("the state directory is not accepted: " + verdict.message);
     const auto& root = verdict.path;
     if (options_.after_root_check) options_.after_root_check();
-    if (!verdict.exists) MakeParents(root);
-    MakePrivateDirectory(root);
+    MakePrivateDirectory(root);  // makes the missing parents too, one name at a time (state_private_dir.h)
     // Again after the mode change: a file that came before it (from another user, when the folder was open) stops the
     // start, as it does at the next start.
-    // The root is the path of this second check: a missing parent that came between the checks (a link that another user
-    // made) resolves to another path here, and that stops the start (review M1).
+    // The root is the path of this second check (review M1). The walk above already refuses a link that another user made
+    // after the first check (L-A), so a changed path here is a second guard only.
     const auto again = CheckStateRoot(root, home, ::geteuid(), ::getegid());
     if (!again.Accepted()) throw std::invalid_argument("the state directory is not accepted: " + again.message);
     if (again.path != root)
@@ -838,27 +844,12 @@ class StateDisk {
                                   " changed while the engine made it (now " + again.path.string() + ").");
     options_.root = again.path;
   }
-  // The missing folders above the root, each mode 0700. The rule has checked every folder that is there.
-  static void MakeParents(const std::filesystem::path& root) {
-    std::filesystem::path path;
-    for (const auto& part : root.parent_path()) {
-      path /= part;
-      if (::mkdir(path.c_str(), 0700) != 0 && errno != EEXIST)
-        throw std::runtime_error("cannot create the state directory " + path.string() + ": " + std::strerror(errno));
-    }
-  }
-  // The folder with no link in its last name (O_NOFOLLOW): this user's own, mode 0700.
-  static void MakePrivateDirectory(const std::filesystem::path& path) {
-    if (::mkdir(path.c_str(), 0700) != 0 && errno != EEXIST)
-      throw std::runtime_error("cannot create the state directory " + path.string() + ": " + std::strerror(errno));
-    const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    if (fd < 0) throw std::runtime_error("the state directory is not a private directory of this user");
-    struct Close { int fd; ~Close() { ::close(fd); } } closer{fd};
-    struct stat info{};
-    if (::fstat(fd, &info) != 0 || !S_ISDIR(info.st_mode) || info.st_uid != ::geteuid())
-      throw std::runtime_error("the state directory is not a private directory of this user");
-    if ((info.st_mode & 07777) != 0700 && ::fchmod(fd, 0700) != 0)
-      throw std::runtime_error("cannot set the state directory mode");
+  // The folder, made one name at a time from "/" with no link at any depth (state_private_dir.h, review cache-folder-r4
+  // L-A): each missing name gets mode 0700, and only this user's own folder gets the mode change. Returns its fd.
+  static StateFd MakePrivateDirectory(const std::filesystem::path& path) {
+    auto result = OpenPrivateDirectory(path, PrivateDirRule::Process(), true);
+    if (!result.Ok()) throw std::invalid_argument("the state directory is not accepted: " + result.message);
+    return std::move(result.fd);
   }
   // Every name that this tier writes. Train 22 matches the same names, so a rollback to it
   // removes this directory in full.
@@ -1063,7 +1054,9 @@ class StateDisk {
     if (::statvfs(dir_.c_str(), &info) != 0) return 0;
     return uint64_t(info.f_bavail) * info.f_frsize;
   }
-  static bool Extends(const StateMeta& longer, const StateMeta& meta) {
+  // Holds mutex_ (it counts the check).
+  bool Extends(const StateMeta& longer, const StateMeta& meta) const {
+    ++branch_checks_;
     return longer.key.size() > meta.key.size() && longer.policy == meta.policy &&
            longer.compact == meta.compact && std::equal(meta.key.rbegin(), meta.key.rend(),
                                                         longer.key.rbegin() + (longer.key.size() - meta.key.size()));
@@ -1768,6 +1761,7 @@ class StateDisk {
   std::deque<std::string> reads_;
   uint64_t staged_bytes_ = 0;
   StateDiskStats stats_;
+  mutable uint64_t branch_checks_ = 0;  // Extends calls (const readers make them too); guarded by mutex_
   std::thread writer_, reader_;
 };
 }  // namespace crucible

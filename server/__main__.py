@@ -143,6 +143,11 @@ def main():
     parser.add_argument("--host-reserve-mib", type=int, default=None, metavar="1024..131072",
                         help="Free host memory (MemAvailable) that each conversation cache save keeps (default 8192, "
                              "the engine's). On a unified-memory host the GPU uses the same memory.")
+    parser.add_argument("--admission-reserve-mib", type=int, default=None, metavar="1024..1048576",
+                        help="Free memory (the smaller of host MemAvailable and device free) kept at each start "
+                             "(default 9216 MiB: 8 GiB OS, 512 MiB plans, 512 MiB host part). Batched server only. "
+                             "A low value leaves less memory for the OS; on a unified-memory host the GPU uses the "
+                             "same memory. Cache saves keep --host-reserve-mib separately.")
     parser.add_argument("--short-streams", type=int, default=0, help="Batch slots that hold only --short-ctx tokens.")
     parser.add_argument("--short-ctx", type=int, default=0)
     parser.add_argument("--packed-op", choices=("verify_step", "step"), default=None,
@@ -330,7 +335,8 @@ def main():
     batch_only = {"--slot-resume": args.slot_resume, "--slot-checkpoints": args.slot_checkpoints,
                   "--packed-op": args.packed_op, "--prefill-interleave": args.prefill_interleave,
                   "--interleave-min-rows": args.interleave_min_rows,
-                  "--draft-capture": args.draft_capture, "--draft-blocks": args.draft_blocks}
+                  "--draft-capture": args.draft_capture, "--draft-blocks": args.draft_blocks,
+                  "--admission-reserve-mib": args.admission_reserve_mib}
     for flag, value in batch_only.items():
         if args.serial and value is not None:
             parser.error(f"{flag} needs the batched stack; do not use it with --serial")
@@ -389,6 +395,8 @@ def main():
     if args.host_reserve_mib is not None and (not args.conversation_cache_mib or
                                               not 1024 <= args.host_reserve_mib <= MAX_CONVERSATION_CACHE_MIB):
         parser.error(f"--host-reserve-mib needs --conversation-cache-mib and a value in [1024,{MAX_CONVERSATION_CACHE_MIB}]")
+    if args.admission_reserve_mib is not None and not 1024 <= args.admission_reserve_mib <= 1048576:
+        parser.error("--admission-reserve-mib must be in [1024,1048576] MiB")
     if args.session_replay and not args.conversation_cache_mib:
         parser.error("--session-replay needs --conversation-cache-mib")
     # Design decision (Oct 4): replay is the default whenever a conversation cache exists.
@@ -426,12 +434,14 @@ def main():
     vision = None
     if args.vision:
         from . import vision as vision_module
-        from .vision import MAX_PIXELS, MAX_IMAGES, MAX_IMAGE_BYTES, tower_fault
+        from .hy4_format import is_hy4
+        from .vision import HY4_VISION, QWEN_VISION, MAX_IMAGES, MAX_IMAGE_BYTES, tower_fault
         if fault := tower_fault(args.checkpoint):
             parser.error("--vision: " + fault)
+        family = HY4_VISION if is_hy4(args.checkpoint) else QWEN_VISION
         # The image tokens of one request must fit the context (review F2: no aggregate pixel cap otherwise).
         vision = vision_module.VisionSettings(
-            max_image_tokens=args.ctx, max_pixels=args.vision_max_pixels or MAX_PIXELS,
+            max_image_tokens=args.ctx, max_pixels=args.vision_max_pixels or family.max_pixels, family=family,
             max_images=args.vision_max_images or MAX_IMAGES,
             max_image_bytes=args.vision_max_image_mib << 20 if args.vision_max_image_mib else MAX_IMAGE_BYTES)
     from .vision import VISION_BODY_MIB, VISION_BODY_MIB_MAX
@@ -447,6 +457,8 @@ def main():
     # Sent only when set, so the default engine command stays as before; the engine prints its reserve at startup.
     if args.host_reserve_mib is not None:
         engine_options += ("--host-reserve-mib", str(args.host_reserve_mib))
+    if args.admission_reserve_mib is not None:
+        engine_options += ("--admission-reserve-mib", str(args.admission_reserve_mib))
     if args.draft_blocks is not None:
         engine_options += ("--draft-blocks", str(args.draft_blocks))
     try:

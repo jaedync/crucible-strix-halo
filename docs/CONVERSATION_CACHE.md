@@ -72,6 +72,11 @@ The engine, setup, doctor and uninstall use the same rule:
 6. The state folder belongs to you, is not shared (no sticky bit), and holds only the `write-ledger` file and
    state identity folders. The engine sets its mode to 0700 and makes missing parent folders with mode 0700.
    Then it checks the path again. When the real path changed between the two checks, the server does not start.
+7. The engine and setup make and open the folder one name at a time from `/`. They do not follow a link at any
+   depth, and they check each parent folder again with rule 5. Thus a link that another user puts in a shared folder
+   (for example `/tmp`) after the check stops the start, and the error names the link. A folder of another user
+   never gets a mode change. A parent folder needs only the search permission (`x`), as before. Thus a parent such
+   as `/home` with mode 0711 is accepted.
 
 Why: the folder holds the state of your conversations. Another user must not be able to read it, or move or
 replace it while the server runs. The rule keeps that promise without a fixed place in the home folder.

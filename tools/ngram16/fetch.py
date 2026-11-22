@@ -66,14 +66,19 @@ def pick_files(index: dict) -> list[str]:
     return sorted(files)
 
 
-def load_pins(path: str = PINS) -> dict[str, str]:
-    """The sha256 of each source file of REVISION (from the Hugging Face file list of that revision, kept in the repo)."""
+def load_pins(path: str | None = None) -> dict[str, str]:
+    """The sha256 of each source file of REVISION (from the Hugging Face file list of that revision, kept in the repo).
+    Raises OSError when the file cannot be read and ValueError for a line that is not `<sha256> <name>`."""
+    path = PINS if path is None else path
     pins = {}
     with open(path) as f:
-        for line in f:
-            if line.strip():
-                digest, name = line.split()
-                pins[name] = digest
+        for number, line in enumerate(f, 1):
+            if not line.strip():
+                continue
+            parts = line.split()
+            if len(parts) != 2 or len(parts[0]) != 64 or any(c not in "0123456789abcdef" for c in parts[0]):
+                raise ValueError(f"line {number} is not '<sha256> <file name>'")
+            pins[parts[1]] = parts[0]
     return pins
 
 
@@ -214,7 +219,11 @@ def main(argv=None, *, repo_id=REPO, revision=REVISION, expected_bytes=OUT_BYTES
         return fail(f"cannot read the file list of {repo_id}: {e}")
 
     if source_sha is None:
-        source_sha = load_pins() if revision == REVISION else {}
+        try:
+            source_sha = load_pins() if revision == REVISION else {}
+        except (OSError, ValueError) as e:
+            return fail(f"cannot read the pinned sha256 list {PINS}: {e}. The file belongs to this tree; get it "
+                        f"again with git (git checkout -- tools/ngram16/sources.sha256). Nothing was downloaded.")
     if source_sha:
         unpinned = [n for n, _ in plan if n not in source_sha]
         if unpinned:

@@ -322,7 +322,7 @@ __global__ void __launch_bounds__((kHcWsCompute*RTB/4+LW)*32) HcDotsNextKernel(c
 #pragma unroll
       for (int z=0;z<8;++z) {
         const int r=r0+(rg*RT+i)*16+prefill::FragmentRow(z);
-        if (r<R) dots[((size_t)r*M+n)*4+s]=hi[i][j][z];
+        if (r<R) dots[HcDotsAt(s,r,n,R,M)]=hi[i][j][z];  // the engine order (hc_dots_index.h)
       }
   }
 }

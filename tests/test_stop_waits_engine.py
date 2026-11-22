@@ -56,6 +56,20 @@ class StopWaitsForTheEngineTest(unittest.TestCase):
             if reaper is not None:
                 reaper.join(timeout=30)
 
+    def test_the_stop_wait_covers_the_server_stop(self):
+        """./crucible stop waits longer than the server's whole stop (its wait for the engine's flush after stdin
+        close, then 10 s for the kill), and so does the service unit (TimeoutStopSec). Else the command reports "did not
+        stop yet", or systemd kills the server, while the engine still saves its states."""
+        import inspect
+        import re
+        sys.path.insert(0, str(ROOT))
+        from server.batch_backend import STATE_FLUSH_SECONDS
+        wait = inspect.signature(runner.Runner.terminate).parameters["wait_s"].default
+        unit = (ROOT / "deploy/user-systemd/crucible-server.service").read_text()
+        stop_unit = float(re.search(r"^TimeoutStopSec=(\d+)s?$", unit, re.M)[1])
+        self.assertGreaterEqual(wait, STATE_FLUSH_SECONDS + 10 + 15)
+        self.assertGreaterEqual(stop_unit, STATE_FLUSH_SECONDS + 10 + 15)
+
 
 if __name__ == "__main__":
     unittest.main()

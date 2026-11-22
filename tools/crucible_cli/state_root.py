@@ -121,14 +121,24 @@ def _parent_problem(real, uid, gid, owners):
             return "unreadable", f"{current} cannot be read ({exc.strerror})."
         if stat.S_ISLNK(st.st_mode):
             return _link_problem(current)
-        if not stat.S_ISDIR(st.st_mode):
-            return "not-dir", f"{current} is not a folder."
-        if st.st_uid not in owners:
-            return "parent-owner", f"{current} belongs to another user, who could move or replace {real}."
-        open_bits = st.st_mode & (0o002 | (0o020 if st.st_gid != gid else 0))
-        if open_bits and not st.st_mode & stat.S_ISVTX:
-            mode = f"{stat.S_IMODE(st.st_mode):04o}"
-            return "parent-open", f"other users can write {current} (mode {mode}, no sticky bit), so they could move or replace {real}."
+        problem = parent_folder_problem(current, real, st, owners, gid)
+        if problem:
+            return problem
+    return None
+
+
+def parent_folder_problem(current, real, st, owners, gid):
+    """The verdict on one parent folder CURRENT of REAL (its lstat or fstat in ST, not a link), as (code, message), or
+    None: a folder that only a trusted owner can change, or one with the sticky bit. private_dir.py checks each opened
+    parent with it too (engine copy: state_root.h StateRootParentFolder)."""
+    if not stat.S_ISDIR(st.st_mode):
+        return "not-dir", f"{current} is not a folder."
+    if st.st_uid not in owners:
+        return "parent-owner", f"{current} belongs to another user, who could move or replace {real}."
+    open_bits = st.st_mode & (0o002 | (0o020 if st.st_gid != gid else 0))
+    if open_bits and not st.st_mode & stat.S_ISVTX:
+        mode = f"{stat.S_IMODE(st.st_mode):04o}"
+        return "parent-open", f"other users can write {current} (mode {mode}, no sticky bit), so they could move or replace {real}."
     return None
 
 

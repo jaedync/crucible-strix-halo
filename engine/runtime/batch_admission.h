@@ -45,6 +45,60 @@ inline constexpr uint64_t kAdmissionHostReserve = 512ull << 20;
 inline constexpr uint64_t kAdmissionReserve =
     kAdmissionOsReserve + kAdmissionPlanReserve + kAdmissionHostReserve;
 
+// The reserve the admission check uses: kAdmissionReserve (9216 MiB), or the value of --admission-reserve-mib.
+inline uint64_t& AdmissionReserveSlot() {
+  static uint64_t bytes = kAdmissionReserve;
+  return bytes;
+}
+
+inline void SetAdmissionReserveBytes(uint64_t bytes) { AdmissionReserveSlot() = bytes; }
+
+inline uint64_t AdmissionReserveBytes() { return AdmissionReserveSlot(); }
+
+// A MiB value as bytes, never below the plans and host part.
+inline uint64_t AdmissionReserveFromMib(uint64_t mib) {
+  const uint64_t floor = kAdmissionPlanReserve + kAdmissionHostReserve;
+  const uint64_t wanted = mib << 20;
+  return wanted < floor ? floor : wanted;
+}
+
+// The device memory that EnsureMtpCache keeps free when it allocates an MTP cache (engine.hip). With compact state the
+// batched start allocates the MTP caches after the check, which charged them, so this step keeps the same reserve:
+// 9 GiB by default (the value before --admission-reserve-mib), or that value. Only a batched serve sets it.
+inline uint64_t MtpCacheReserveBytes() { return AdmissionReserveBytes(); }
+
+// The caller of an MTP cache allocation (EnsureMtpCache in engine.hip), for its refusal text. Each text names only the
+// options that its own command takes.
+enum class MtpCacheCaller { kGen, kSerialServe, kBatchedServe };
+
+inline const char* MtpCacheRefusal(MtpCacheCaller caller) {
+  switch (caller) {
+    case MtpCacheCaller::kBatchedServe:
+      return "not enough device memory for the MTP cache at start; reduce --streams or --ctx, or stop other programs that use memory";
+    // The server refuses --streams and --admission-reserve-mib with --serial, so this text names neither.
+    case MtpCacheCaller::kSerialServe:
+      return "not enough device memory for the MTP cache at start; reduce --ctx, or stop other programs that use memory";
+    case MtpCacheCaller::kGen:
+      break;
+  }
+  return "not enough device memory for the MTP cache; reduce the context, or use --spec 0 in gen";
+}
+
+// The system part of a reserve: the reserve less the plans and host parts, so 0 at the lowest value (1024 MiB).
+inline uint64_t AdmissionSystemReserve(uint64_t reserve) {
+  const uint64_t fixed = kAdmissionPlanReserve + kAdmissionHostReserve;
+  return reserve > fixed ? reserve - fixed : 0;
+}
+
+// The start line of a batched serve: the reserve that the check uses, and its parts, in MiB. The refusal text gives the
+// same parts (BatchAdmissionError).
+inline std::string AdmissionReserveLine() {
+  const uint64_t reserve = AdmissionReserveBytes();
+  return "admission reserve: " + std::to_string(reserve >> 20) + " MiB (system " +
+         std::to_string(AdmissionSystemReserve(reserve) >> 20) + ", plans " +
+         std::to_string(kAdmissionPlanReserve >> 20) + ", host part " + std::to_string(kAdmissionHostReserve >> 20) + ")";
+}
+
 // A --ctx that the refusal suggests moves in 128 positions: QsaCacheBytes pools 128 positions at a time and the slot
 // checkpoints copy pool blocks of 4096 floats (slot_checkpoint_io.h kPoolBlockFloats).
 inline constexpr int kAdmissionContextGrain = 128;
@@ -103,8 +157,8 @@ struct AdmissionMemory {
 // The start-time predicate, unchanged from trunk: free memory above the reserve, and the new state plus the cache
 // budget inside it. A setting that fits returns no text.
 inline bool AdmissionFits(uint64_t available, uint64_t new_states, uint64_t cache_budget) {
-  if (available <= kAdmissionReserve) return false;
-  const uint64_t room = available - kAdmissionReserve;
+  if (available <= AdmissionReserveBytes()) return false;
+  const uint64_t room = available - AdmissionReserveBytes();
   if (new_states > room) return false;
   return cache_budget <= room - new_states;
 }
@@ -194,8 +248,8 @@ struct FitLayout {
 // The largest cache budget, at most `requested`, that the check accepts beside `new_states`; whole MiB when it is
 // below the request. nullopt when the state alone does not fit.
 inline std::optional<uint64_t> LargestAdmissionCache(uint64_t available, uint64_t new_states, uint64_t requested) {
-  if (available <= kAdmissionReserve) return std::nullopt;
-  const uint64_t room = available - kAdmissionReserve;
+  if (available <= AdmissionReserveBytes()) return std::nullopt;
+  const uint64_t room = available - AdmissionReserveBytes();
   if (new_states > room) return std::nullopt;
   const uint64_t free = room - new_states;
   return requested <= free ? requested : free / (1ull << 20) * (1ull << 20);
@@ -259,7 +313,7 @@ inline FitLayout FitServeLayout(const AdmissionMemory& memory, const AdmissionTr
   layout.cache_budget = memory.cache_budget;
   const uint64_t available = std::min(memory.host_free, memory.device_free);
   layout.free_bytes = available;
-  layout.need_bytes = SaturatedSum(SaturatedSum(kAdmissionReserve, memory.new_states_bytes), memory.cache_budget);
+  layout.need_bytes = SaturatedSum(SaturatedSum(AdmissionReserveBytes(), memory.new_states_bytes), memory.cache_budget);
   if (AdmissionFits(available, memory.new_states_bytes, memory.cache_budget)) return layout;
   return FitWithMargin(memory, try_setting, limits, layout);
 }
@@ -325,14 +379,17 @@ inline std::string BatchAdmissionError(const AdmissionMemory& memory, const Admi
           : BytesText(memory.allocated_bytes) + " of it is already allocated.";
   text += "\n  free host memory: " + BytesText(memory.host_free);
   text += "\n  free device memory: " + BytesText(memory.device_free);
-  text += "\n  start-time reserve: " + BytesText(kAdmissionReserve) + ": system " + GibText(kAdmissionOsReserve) +
+  const uint64_t reserve = AdmissionReserveBytes();
+  const uint64_t fixed_part = kAdmissionPlanReserve + kAdmissionHostReserve;
+  const uint64_t system_part = reserve > fixed_part ? reserve - fixed_part : 0;
+  text += "\n  start-time reserve: " + BytesText(reserve) + ": system " + GibText(system_part) +
           ", plans " + MibText(kAdmissionPlanReserve) + ", host " + MibText(kAdmissionHostReserve);
   text += "\n  conversation cache budget: " + BytesText(memory.cache_budget) + "\n";
 
-  if (available <= kAdmissionReserve) {
+  if (available <= AdmissionReserveBytes()) {
     // The check needs free memory above the reserve, so no stream count fits. A lower --ctx does fit when its slot 0
     // frees enough. The check cannot tell which program holds the memory: the engine's own first slot is one of them.
-    const uint64_t needed = SaturatedSum(SaturatedSum(kAdmissionReserve, memory.new_states_bytes), memory.cache_budget);
+    const uint64_t needed = SaturatedSum(SaturatedSum(AdmissionReserveBytes(), memory.new_states_bytes), memory.cache_budget);
     const bool exclusive = memory.new_states_bytes == 0 && memory.cache_budget == 0;
     const int context = LargestAdmissionContext(memory, try_setting);
     text += "Free memory is at or below the reserve before any new state, so no stream count fits.\n";
@@ -346,7 +403,7 @@ inline std::string BatchAdmissionError(const AdmissionMemory& memory, const Admi
     text += "These numbers are text only: Crucible did not change your settings.";
     return text;
   }
-  const uint64_t room = available - kAdmissionReserve;
+  const uint64_t room = available - AdmissionReserveBytes();
   const uint64_t states_room = memory.cache_budget < room ? room - memory.cache_budget : 0;
   if (memory.new_states_bytes > room) {
     // The reserve fits but the state alone does not. Name the settings that the check accepts, tried one by one.

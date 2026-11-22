@@ -3,7 +3,7 @@ import json
 import time
 from pathlib import Path
 
-from . import doctor, kernelparams, keyfile, launch, logcause, options, packs, rocm, runtime as runtime_mod, service, settings as settings_mod
+from . import doctor, kernelparams, keyfile, launch, logcause, options, packs, private_dir, rocm, runtime as runtime_mod, service, settings as settings_mod
 from .files import Sandbox
 from .launch import process_env
 
@@ -408,7 +408,11 @@ class Setup:
             if problem:
                 raise StepFailed(f"the state folder is not accepted: {problem} Use a new or empty folder (--state-dir) "
                                  "or --no-state-dir.")
-            self.box.mkdir(s.state_dir, mode=0o700)
+            try:
+                self.box.mkdir_private(s.state_dir)
+            except private_dir.Refused as exc:
+                raise StepFailed(f"the state folder is not accepted: {exc} Use a new or empty folder (--state-dir) "
+                                 "or --no-state-dir.") from None
         self.box.mkdir(s.work)
         if s.state_dir is not None:
             self.box.write_text(settings_mod.state_marker_path(s.repo), settings_mod.state_marker_text(s.state_dir))

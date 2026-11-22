@@ -777,6 +777,11 @@ std::shared_ptr<ConstraintVocab> Build(const std::vector<std::string>& tokens, i
 }  // namespace
 
 std::shared_ptr<ConstraintVocab> LoadConstraintVocab(const std::string& path, int rows, int stop) {
+  return LoadConstraintVocab(path, ConstraintFamily{rows, stop, kConstraintThinkEnd, {kCallOpen, kCallClose}});
+}
+
+std::shared_ptr<ConstraintVocab> LoadConstraintVocab(const std::string& path, const ConstraintFamily& family) {
+  const int rows = family.rows, stop = family.stop;
   const std::string text = ReadFile(path);
   picojson::value root;
   const std::string error = picojson::parse(root, text);
@@ -792,7 +797,8 @@ std::shared_ptr<ConstraintVocab> LoadConstraintVocab(const std::string& path, in
     if (!id.is<int64_t>() || id.get<int64_t>() < 0 || id.get<int64_t>() >= rows) throw ConstraintError("constraint_vocab: a token ID is out of range");
     tokens[size_t(id.get<int64_t>())] = token;
   }
-  // Added tokens: only the call tags are text; the stop token keeps its content (the library marks it a stop).
+  // Added tokens: only the family's text tokens (the call tags) are text; the stop token keeps its content (the
+  // library marks it a stop).
   if (const auto added = object.find("added_tokens"); added != object.end() && added->second.is<picojson::array>())
     for (const auto& entry : added->second.get<picojson::array>()) {
       if (!entry.is<picojson::object>()) continue;
@@ -801,7 +807,9 @@ std::shared_ptr<ConstraintVocab> LoadConstraintVocab(const std::string& path, in
       if (id == fields.end() || content == fields.end() || !id->second.is<int64_t>() || !content->second.is<std::string>()) continue;
       const int64_t value = id->second.get<int64_t>();
       if (value < 0 || value >= rows) throw ConstraintError("constraint_vocab: an added token ID is out of range");
-      tokens[size_t(value)] = value == kCallOpen || value == kCallClose || value == stop ? content->second.get<std::string>() : "";
+      const bool text_token = std::find(family.text_tokens.begin(), family.text_tokens.end(), value) !=
+                              family.text_tokens.end();
+      tokens[size_t(value)] = text_token || value == stop ? content->second.get<std::string>() : "";
     }
   return Build(tokens, rows, stop, true);
 }

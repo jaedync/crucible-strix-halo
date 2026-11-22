@@ -24,7 +24,11 @@ README_ENV = {
     "CRUCIBLE_DRAFT_HEAD": "q2",
     "CRUCIBLE_DRAFT_CHAIN": "hc8,lead",
     "CRUCIBLE_PF_LAUNCH_ROWS": "16384+128",
+    "CRUCIBLE_EXACT_RESUME": "1",
+    "CRUCIBLE_TWIN": "1",
 }
+# 4 sessions send one new prompt (the README row): the twin rule (CRUCIBLE_TWIN) needs exact resume.
+ROW7_ENV = {"CRUCIBLE_EXACT_RESUME": "1", "CRUCIBLE_TWIN": "1"}
 README_FLAGS = {"--streams": "4", "--ctx": "262144", "--prefill": "4096", "--conversation-cache-mib": "9700",
                 "--host-reserve-mib": "11264"}
 
@@ -107,6 +111,49 @@ class ConversationCacheNoticeTest(unittest.TestCase):
         from server.__main__ import conversation_cache_notice
         self.assertIsNone(conversation_cache_notice(9700))
 
+
+
+class Row7ReleaseStartTest(unittest.TestCase):
+    """A release start (./crucible start, the service, the Docker run line) prefills one new prompt of 4 sessions once.
+
+    Twin prompts act only with exact resume (engine/serve/batch_session.h TwinDonor), so both words are in the table. The
+    engine defaults stay 0 (engine/switches.h): a direct engine run and the gates that leave the words unset keep their path."""
+
+    def test_the_service_of_each_pack_sets_twin_and_exact_resume(self):
+        for pack in packs.PACKS:
+            env, _ = service_command(pack)
+            for key, value in ROW7_ENV.items():
+                self.assertEqual(env.get(key), value, f"{pack} {key}")
+
+    def test_serve_sh_sets_them_when_unset(self):
+        got = UserEnvWinsTest().run_script({})
+        for key, value in ROW7_ENV.items():
+            self.assertEqual(got.get(key), value, key)
+
+    def test_the_docker_run_line_sets_them(self):
+        env, _ = docker_run_words()
+        for key, value in ROW7_ENV.items():
+            self.assertEqual(env.get(key), value, key)
+
+    def test_the_server_passes_them_to_the_engine(self):
+        from server.backend import engine_environment
+        env, _ = service_command("4.05")
+        kept, removed = engine_environment(launch.process_env({"PATH": "/bin"}, env))
+        for key, value in ROW7_ENV.items():
+            self.assertEqual(kept.get(key), value, key)
+            self.assertNotIn(key, removed)
+
+    def test_the_engine_defaults_stay_off(self):
+        text = (ROOT / "engine/switches.h").read_text()
+        for key in ROW7_ENV:
+            row = re.search(r'\{"' + key + r'", K::\w+, "([^"]*)"', text)
+            self.assertIsNotNone(row, key)
+            self.assertEqual(row.group(1), "0", key)
+
+    def test_a_user_word_turns_them_off(self):
+        env, _ = service_command("4.05")
+        merged = launch.process_env({"CRUCIBLE_TWIN": "0", "CRUCIBLE_EXACT_RESUME": "0"}, env)
+        self.assertEqual((merged["CRUCIBLE_TWIN"], merged["CRUCIBLE_EXACT_RESUME"]), ("0", "0"))
 
 
 class UserEnvWinsTest(unittest.TestCase):

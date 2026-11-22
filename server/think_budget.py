@@ -59,10 +59,11 @@ def skips_thinking(max_tokens, budget=None, room_setting=None, minimum=0):
     return room > 0 and max_tokens - room < minimum
 
 
-def close_ids(tokenizer):
-    """Token IDs of the forced close. The end tag is its own token, as the template writes it."""
-    end = tokenizer.token_to_id(THINK_END)
+def close_ids(tokenizer, end_tag=THINK_END, before="\n", after="\n\n"):
+    """Token IDs of the forced close. The end tag is its own token, as the template writes it. The Hy4-flash template
+    writes the answer directly after its end tag, so it uses before="" and after="" (hy4_format.THINK_END)."""
+    end = tokenizer.token_to_id(end_tag)
     if end is None:
-        raise ValueError("The tokenizer has no </think> token.")
-    encode = lambda text: tokenizer.encode(text, add_special_tokens=False).ids
-    return tuple(encode("\n\n" + QWEN_BUDGET_SENTENCE + "\n")) + (end,) + tuple(encode("\n\n"))
+        raise ValueError("The tokenizer has no " + end_tag + " token.")
+    encode = lambda text: tokenizer.encode(text, add_special_tokens=False).ids if text else []
+    return tuple(encode("\n\n" + QWEN_BUDGET_SENTENCE + before)) + (end,) + tuple(encode(after))

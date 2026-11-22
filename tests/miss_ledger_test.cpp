@@ -33,14 +33,34 @@ constexpr int hipMemcpyDeviceToHost = 0, hipMemcpyHostToDevice = 1;
 int hipMemcpy(void* out, const void* in, size_t n, int) { std::memcpy(out, in, n); return 0; }
 int hipStreamSynchronize(int) { return 0; }
 #define HIP_OK(expr) assert((expr) == 0)
+// The ledger file reaches the disk before its rename. This program's fsync counts the calls on the ledger's
+// temporary file and on its folder, then does the real call (the executable's symbol comes before libc's).
+#include <atomic>
+#include <string>
+#include <string_view>
+#include <sys/syscall.h>
+#include <unistd.h>
+std::atomic<int> ledger_file_syncs{0}, ledger_dir_syncs{0};
+std::string ledger_dir;   // the folder of the ledger under test (set before the save)
+extern "C" int fsync(int fd) {
+  char link[4096];
+  const ssize_t n = readlink(("/proc/self/fd/" + std::to_string(fd)).c_str(), link, sizeof link - 1);
+  const std::string_view path(link, n > 0 ? size_t(n) : 0);
+  if (path.ends_with("/lost.ledger.tmp")) ++ledger_file_syncs;
+  if (!ledger_dir.empty() && path == ledger_dir) ++ledger_dir_syncs;
+  return int(syscall(SYS_fsync, fd));
+}
 #include "../engine/serve/batch_state_disk.h"
 #include "../engine/serve/miss_ledger.h"
 #include "support/disk_test_dir.h"
 #include <chrono>
 #include <fstream>
 #include <future>
+#include <iterator>
 #include <string>
 #include <thread>
+#include <fcntl.h>
+#include <unistd.h>
 
 using namespace crucible;
 namespace fs = std::filesystem;
@@ -237,12 +257,73 @@ void Stop() {
     Wire(cache, tier);
     assert(Save(cache, Conversation(1)));
     tier.NoteStop(cache);
+    const int files = ledger_file_syncs, dirs = ledger_dir_syncs;
+    const auto folder = fs::weakly_canonical(options.root).string() + ".ledger";
+    ledger_dir = folder + "/" + options.directory;
     assert(tier.SaveLedger(cache));
+    // The fsync of the file before the rename, and of its folder after it (a power loss keeps the old or the new
+    // list, never a short one).
+    if (ledger_file_syncs == files) std::fprintf(stderr, "miss_ledger_test: SaveLedger renamed an unsynced file\n");
+    assert(ledger_file_syncs > files && ledger_dir_syncs > dirs);
+    assert(fs::exists(ledger_dir + "/lost.ledger") && !fs::exists(ledger_dir + "/lost.ledger.tmp"));
+    ledger_dir.clear();
   }
   Tier tier(options, false);
   Cache cache(kTwo, {}, 1, 1000, false);
   Wire(cache, tier);
   Expect("stop", "stop", Open(cache, Next(1), &tier), "lost", kState);
+}
+// The text that `body` writes to stderr (the tier logs there).
+template<class Body>
+std::string Stderr(Body body) {
+  const fs::path file = Home() / "stderr.txt";
+  std::fflush(stderr);
+  const int saved = ::dup(2);
+  const int out = ::open(file.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  assert(saved >= 0 && out >= 0 && ::dup2(out, 2) == 2);
+  ::close(out);
+  body();
+  std::fflush(stderr);
+  assert(::dup2(saved, 2) == 2);
+  ::close(saved);
+  std::ifstream in(file);
+  std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  fs::remove(file);
+  std::fputs(text.c_str(), stderr);
+  return text;
+}
+// Review cache-folder-r4 L-A for the side folder: the engine does not follow a `<root>.ledger` link (another user can
+// make one beside a root in a shared sticky folder). The start reads no list through it, and a stop writes none.
+void LedgerLink() {
+  const auto source = Options("states-ledger-a");
+  {
+    Tier tier(source, false);
+    Cache cache(kTwo, {}, 1, 1000, false);
+    Wire(cache, tier);
+    assert(Save(cache, Conversation(1)));
+    tier.NoteStop(cache);
+    assert(tier.SaveLedger(cache));
+  }
+  const fs::path planted = Home() / "states-ledger-a.ledger";
+  const fs::path file = planted / source.directory / "lost.ledger";
+  const auto size = fs::file_size(file);
+  const auto time = fs::last_write_time(file);
+  const fs::path link = Home() / "states-ledger-b.ledger";
+  fs::create_symlink(planted, link);
+  // Review state-dir-race L2: each refusal log names the reason (here the link).
+  const std::string reason = "reason=folder error=" + link.string() + " is a link, and the engine does not follow a link";
+  Tier tier(Options("states-ledger-b"), false);
+  Cache cache(kTwo, {}, 1, 1000, false);
+  const auto load = Stderr([&] { Wire(cache, tier); });
+  assert(load.find("state_disk ledger_load result=refused " + reason) != std::string::npos);
+  assert(tier.Enabled() && cache.LostRecords() == 0);
+  assert(Save(cache, Conversation(2)));
+  tier.NoteStop(cache);
+  bool saved = true;
+  const auto save = Stderr([&] { saved = tier.SaveLedger(cache); });
+  assert(save.find("state_disk ledger_save result=refused " + reason) != std::string::npos);
+  assert(cache.LostRecords() > 0 && !saved);
+  assert(fs::file_size(file) == size && fs::last_write_time(file) == time);
 }
 // The stop flush wrote the state; the next start has another state epoch, so the state is not readable: `switch`.
 // With the same epoch the state is on disk (best tier disk, no loss).
@@ -357,6 +438,7 @@ int main() {
   Handover();
   Stop();
   Switch();
+  LedgerLink();
   Lineage();
   Bounds();
   Stage();

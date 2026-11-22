@@ -13,6 +13,8 @@ CALL_STARTS = (START, INVOKE_START)
 CHECKPOINT = Form(FUNCTION, PARAMETER, "</function>")
 # Prose that starts with `<invoke` is checked again while it is at most this long, then each time it doubles.
 RECHECK = 256
+FUNCTION_OPEN = "<function="
+SPACE = re.compile(r"\s*")
 
 
 def first_start(text, start=0):
@@ -203,18 +205,38 @@ class ToolOutput:
         if self.stream is not None and not self.calls_text.startswith(INVOKE_START):
             self.deltas += self.stream.advance(self.calls_text)
 
+    def prose_start(self, text):
+        """True when text starts with a `<tool_call>` that cannot open a call: the next text that is not white space
+        cannot start `<function=`. Only with no grammar armed: the call grammar writes the function
+        tag after the start tag. A start tag that the output ends on, or cuts in the function tag, is not prose. The
+        JSON form (`{` next) is a malformed call: it keeps the content fallback and its reason code."""
+        if getattr(self.request, "constraint", None) is not None or not text.startswith(START):
+            return False
+        pos = SPACE.match(text, len(START)).end()
+        if pos == len(text) or text.startswith(("{", FUNCTION_OPEN), pos):
+            return False
+        return not (len(text) - pos < len(FUNCTION_OPEN) and FUNCTION_OPEN.startswith(text[pos:]))
+
     def release(self, final=False):
-        """Content: prose at the start of calls_text that names `<invoke` but is not a block (tool_invoke.block_end).
-        The search for the first call goes on after it. A check reads the whole text, so a long open block is checked
-        again only when its length doubles. final: the output has ended (check now)."""
+        """Content: prose at the start of calls_text that names `<invoke` but is not a block (tool_invoke.block_end),
+        or that names `<tool_call>` but opens no call (prose_start). The search for the first call goes on after it.
+        A check of `<invoke` prose reads the whole text, so a long open block is checked again only when its length
+        doubles. final: the output has ended (check now)."""
         released = ""
-        while self.calls_text is not None and self.calls_text.startswith(INVOKE_START):
+        while self.calls_text is not None:
             text = self.calls_text
-            if not final and RECHECK < len(text) < 2 * self.checked:
+            if self.prose_start(text):
+                if self.stream is not None:
+                    # The stream read only the start tag and white space (feed releases before advance): no delta.
+                    self.stream = ToolCallStream(self.request, self.definitions, self.whole)
+            elif not text.startswith(INVOKE_START):
                 break
-            self.checked = len(text)
-            if block_end(text, 0, self.definitions, WorkBudget(), final) is not None:
-                break
+            else:
+                if not final and RECHECK < len(text) < 2 * self.checked:
+                    break
+                self.checked = len(text)
+                if block_end(text, 0, self.definitions, WorkBudget(), final) is not None:
+                    break
             marker = first_start(text, 1)
             if marker < 0:
                 keep = held(text)

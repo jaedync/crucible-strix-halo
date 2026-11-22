@@ -177,7 +177,9 @@ __global__ void __launch_bounds__(256) LinOutKernel(const LinJob* __restrict__ j
 
 // Front: tiles in the front order of exl3_ring.h (chunks of 8 columns x 4 tiles).
 // Sched: MoeGemvCols' loop (moe_rows.h); the caller guarantees span % kPrefetch == 0.
-template <int K, int R, int CACHE = 0, bool Front = false, bool Sched = false>
+// CB: the codebook tag (codebook.h). mul24 lanes own one column and 8 rows of a tile (TilePos), so their dots
+// read 4 dwords of x and their sum adds lanes L and L + 16; kCbMul24Int8 scales the sum by kMul24Step.
+template <int K, int R, int CACHE = 0, bool Front = false, bool Sched = false, int CB = kCbMul1>
 __device__ __forceinline__ void LinGemvBody(const LinJob& job, const GemvItem& item,
                                             uint32_t* xs, bool in = false) {
   const int lane = threadIdx.x & 31;
@@ -233,6 +235,20 @@ __device__ __forceinline__ void LinGemvBody(const LinJob& job, const GemvItem& i
 #pragma unroll
     for (int r = 0; r < R; ++r) acc[r][0] = acc[r][1] = 0.f;
     auto dots = [&](int a, const __half2 (&P)[4]) {
+      if constexpr (IsMul24(CB)) {
+        // Rows 8 h .. 8 h + 7 of column lane % 16 (h = lane / 16): x halves 8 h + 2 i, + 1 are dword 4 h + i.
+        const int h4 = 4 * (lane >> 4);
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+          const uint32_t* xr = xs + (r * span + a) * 8 + h4;
+#pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            uint32_t xi = xr[i];
+            acc[r][0] = Dot2(P[i], *reinterpret_cast<__half2*>(&xi), acc[r][0]);
+          }
+        }
+        return;
+      }
 #pragma unroll
       for (int r = 0; r < R; ++r) {
         const uint32_t* xr = xs + (r * span + a) * 8;
@@ -258,7 +274,7 @@ __device__ __forceinline__ void LinGemvBody(const LinJob& job, const GemvItem& i
 #pragma unroll
         for (int f = 0; f < PF; ++f) {
           __half2 P[4];
-          DecodeLane<K, kMulMode>(ring[f][0], ring[f][1], ring[f][2], win.shift, P);
+          DecodeLane<K, kMulMode, CB>(ring[f][0], ring[f][1], ring[f][2], win.shift, P);
           load_tile(a + f + PF, ring[f]);
           __builtin_amdgcn_sched_barrier(0);
           dots(a + f, P);
@@ -272,28 +288,39 @@ __device__ __forceinline__ void LinGemvBody(const LinJob& job, const GemvItem& i
           const uint32_t w0 = ring[f][0], w1 = ring[f][1], w2 = ring[f][2];
           load_tile(a + f + PF, ring[f]);
           __half2 P[4];
-          DecodeLane<K, kMulMode>(w0, w1, w2, win.shift, P);
+          DecodeLane<K, kMulMode, CB>(w0, w1, w2, win.shift, P);
           dots(a + f, P);
         }
       }
     }
-#pragma unroll
-    for (int r = 0; r < R; ++r) {
-#pragma unroll
-      for (int c = 0; c < 2; ++c) {
-        float v = acc[r][c];
-        v = v + __shfl_xor(v, 1);
-        v = v + __shfl_xor(v, 2);
-        acc[r][c] = v;
-      }
-    }
-    if (q == 0) {
-      const int col = 16 * b + lane / 4;
-      float* out = job.partial + (size_t)item.s * R * job.O;
+    if constexpr (IsMul24(CB)) {
+      // Column c = lane % 16: lane c's rows 0 .. 7 plus lane c + 16's rows 8 .. 15, the same order on both lanes.
+      float* out = job.partial + (size_t)item.s * R * job.O + 16 * b + lane;
 #pragma unroll
       for (int r = 0; r < R; ++r) {
-        out[r * job.O + col] = acc[r][0];
-        out[r * job.O + col + 8] = acc[r][1];
+        float v = acc[r][0] + __shfl_xor(acc[r][0], 16);
+        if constexpr (CB == kCbMul24Int8) v *= kMul24Step;
+        if (lane < 16) out[r * job.O] = v;
+      }
+    } else {
+#pragma unroll
+      for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int c = 0; c < 2; ++c) {
+          float v = acc[r][c];
+          v = v + __shfl_xor(v, 1);
+          v = v + __shfl_xor(v, 2);
+          acc[r][c] = v;
+        }
+      }
+      if (q == 0) {
+        const int col = 16 * b + lane / 4;
+        float* out = job.partial + (size_t)item.s * R * job.O;
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+          out[r * job.O + col] = acc[r][0];
+          out[r * job.O + col + 8] = acc[r][1];
+        }
       }
     }
   }
@@ -361,18 +388,18 @@ __global__ void __launch_bounds__(256) LinPolicyKernel(const LinJob* __restrict_
 }
 
 // The disabled policy retains a separate kernel to avoid fusion register overhead.
-template <int R, size_t N = 0, int MaxK = 6, bool Front = false>
+template <int R, size_t N = 0, int MaxK = 6, bool Front = false, int CB = kCbMul1>
 __device__ __forceinline__ void DispatchLinBaseline(int K, const LinJob& job,
                                                    const GemvItem& item, uint32_t* xs) {
   if constexpr (MaxK > kMaxNarrowDecodeK) {
     static_assert(N == 0 && MaxK == kMaxWideDecodeK);
-    if (K == 7) LinGemvBody<7, R, 0, Front>(job, item, xs);
-    else if (K == 8) LinGemvBody<8, R, 0, Front>(job, item, xs);
-    else DispatchLinBaseline<R, 0, kMaxNarrowDecodeK, Front>(K, job, item, xs);
-  } else if (K == kSupportedDecodeK[N]) LinGemvBody<kSupportedDecodeK[N], R, 0, Front>(job, item, xs);
+    if (K == 7) LinGemvBody<7, R, 0, Front, false, CB>(job, item, xs);
+    else if (K == 8) LinGemvBody<8, R, 0, Front, false, CB>(job, item, xs);
+    else DispatchLinBaseline<R, 0, kMaxNarrowDecodeK, Front, CB>(K, job, item, xs);
+  } else if (K == kSupportedDecodeK[N]) LinGemvBody<kSupportedDecodeK[N], R, 0, Front, false, CB>(job, item, xs);
   else if constexpr (N + 1 < kSupportedDecodeK.size()) {
     if constexpr (kSupportedDecodeK[N + 1] <= MaxK)
-      DispatchLinBaseline<R, N + 1, MaxK, Front>(K, job, item, xs);
+      DispatchLinBaseline<R, N + 1, MaxK, Front, CB>(K, job, item, xs);
   }
 }
 template <int R, int MaxK = 6, bool Front = false>

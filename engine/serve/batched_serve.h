@@ -10,6 +10,7 @@
 #include "slot_base.h"
 #include "draft_tally.h"
 #include "handover_spill.h"
+#include "state_stop.h"
 #include <atomic>
 #include <csignal>
 #include "../runtime/draft_accept.h"
@@ -1959,25 +1960,7 @@ class BatchSpecDecoder : public BatchMtpSlots {
   std::vector<uint64_t> settle_;
 };
 
-// The disk tier's stop rule: a stopping engine flushes its states for this long at most. SIGTERM (a service stop
-// that signals the whole group) does not end the engine; the server then closes stdin, the engine flushes and exits.
-// Without a server, the engine exits kStateTermGrace seconds after SIGTERM. Both fit inside a systemd
-// TimeoutStopSec=120 with a margin (server/batch_backend.py STATE_FLUSH_SECONDS waits 85 s, then kills).
-inline constexpr double kStateFlushSeconds = 75, kStateTermGrace = 90;
-inline volatile std::sig_atomic_t g_state_term = 0;
-inline void KeepRunningOnTerm() {
-  struct sigaction action{};
-  action.sa_handler = [](int) { g_state_term = 1; };
-  sigemptyset(&action.sa_mask);
-  action.sa_flags = SA_RESTART;
-  sigaction(SIGTERM, &action, nullptr);
-  std::thread([] {
-    while (!g_state_term) std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    std::this_thread::sleep_for(std::chrono::duration<double>(kStateTermGrace));
-    std::fprintf(stderr, "state_disk stop: no end of input %.0f s after SIGTERM\n", kStateTermGrace);
-    std::_Exit(143);
-  }).detach();
-}
+// The disk tier's stop rule (kStateFlushSeconds, KeepRunningOnTerm): engine/serve/state_stop.h.
 // The disk tier's options: the directory names the state epoch, the checkpoint and every state-changing setting.
 inline crucible::StateDiskOptions BatchStateDiskOptions(const std::string& checkpoint, const std::string& dir, int gib,
                                                         int prefill_rows, bool vision, int write_gib_per_day,
@@ -2033,6 +2016,8 @@ inline int BatchedServe(const std::string& checkpoint, int context, int streams,
   Engine engine(checkpoint, context, prefill_rows, mtp_rows);
   if (vision) engine.EnableVision(checkpoint);
   size_t cache_budget = size_t(cache_mib) << 20;
+  // The reserve that the memory fit and the admission check use (--admission-reserve-mib), also without a cache.
+  std::fprintf(stderr, "%s\n", crucible::AdmissionReserveLine().c_str());
   // Memory stage 2: the layout that fits now. A layout that fits stays as requested, and the ready event is the same.
   std::string fit_json;
   if (fit) {
@@ -2055,7 +2040,7 @@ inline int BatchedServe(const std::string& checkpoint, int context, int streams,
     }
   }
   crucible::BatchSession<Engine> session(engine, streams, cache_budget, short_streams, short_ctx);
-  engine.EnsureServeMtpCaches();
+  engine.EnsureServeMtpCaches(crucible::MtpCacheCaller::kBatchedServe);
   std::unique_ptr<BatchPrefixCache> cache;
   if (cache_budget) {
     std::optional<crucible::StateDiskOptions> disk;
@@ -2230,6 +2215,9 @@ inline std::optional<int> TryBatchedServeCommand(int argc, char** argv) {
     std::vector<int> draft_blocks;
     if (!settings.draft_blocks.empty())
       draft_blocks=crucible::ReadServeDraftBlocks(settings.draft_blocks,crucible::kVocab/128);
+    // --admission-reserve-mib, before the admission check runs.
+    if (settings.admission_reserve_mib > 0)
+      SetAdmissionReserveBytes(AdmissionReserveFromMib(uint64_t(settings.admission_reserve_mib)));
     return BatchedServe(argv[2],settings.ctx,settings.streams,settings.prefill_rows,settings.cache_mib,
                         settings.short_streams,settings.short_ctx,settings.session_replay,settings.slot_resume,
                         settings.slot_checkpoints,settings.vision,settings.host_reserve_mib,settings.state_dir,
@@ -2243,7 +2231,7 @@ inline std::optional<int> TryBatchedServeCommand(int argc, char** argv) {
     return 4;
   } catch (const std::exception& error) {
     // A memory refusal is a block of lines (engine/runtime/batch_admission.h): keep the options on their own line.
-    std::fprintf(stderr, "batched serve error: %s\n  options: serve CKPT --streams 1..8 [--ctx 1..262144] [--prefill 0..4096] [--conversation-cache-mib 0..131072] [--host-reserve-mib 1024..131072] [--short-streams N --short-ctx T] [--cache-probation 0|1] [--cache-idle-minutes 1..10080] [--mtp-window 0..262144] [--draft-blocks FILE] [--state-dir DIR [--state-disk-gib 1..65536] [--state-disk-write-gib-per-day 0..65536] [--state-disk-write-delay-ms 0..60000] [--state-disk-ladder 0|1] [--state-disk-fork 0|1]]\n", error.what());
+    std::fprintf(stderr, "batched serve error: %s\n  options: serve CKPT --streams 1..8 [--ctx 1..262144] [--prefill 0..4096] [--conversation-cache-mib 0..131072] [--host-reserve-mib 1024..131072] [--admission-reserve-mib 1024..1048576] [--short-streams N --short-ctx T] [--cache-probation 0|1] [--cache-idle-minutes 1..10080] [--mtp-window 0..262144] [--draft-blocks FILE] [--state-dir DIR [--state-disk-gib 1..65536] [--state-disk-write-gib-per-day 0..65536] [--state-disk-write-delay-ms 0..60000] [--state-disk-ladder 0|1] [--state-disk-fork 0|1]]\n", error.what());
     return 2;
   }
 }

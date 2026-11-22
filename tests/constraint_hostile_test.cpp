@@ -6,8 +6,10 @@
 // and a 45-byte bounded repeat takes about 13 s.
 #include "../engine/runtime/constraint_vocab.h"
 #include <csignal>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <sys/resource.h>
 #include <sys/wait.h>
@@ -20,6 +22,30 @@ namespace {
 // The helper's compile deadline (constraint_helper.h) and 2 s for the helper start and this child's own work.
 constexpr unsigned kDeadlineSeconds = unsigned(kHelperDeadlineMs / 1000) + 2;
 constexpr rlim_t kMemoryBytes = rlim_t(2) << 30;
+
+#if defined(__SANITIZE_ADDRESS__)
+constexpr bool kAsan = true;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+constexpr bool kAsan = true;
+#else
+constexpr bool kAsan = false;
+#endif
+#else
+constexpr bool kAsan = false;
+#endif
+
+rlim_t AddressSpaceBytes() {
+  std::ifstream statm("/proc/self/statm");
+  uint64_t pages = 0;
+  statm >> pages;
+  return rlim_t(pages * uint64_t(sysconf(_SC_PAGESIZE)));
+}
+
+// The address-space cap of a case child. A normal build caps the child at kMemoryBytes in total. ASAN reserves terabytes
+// of shadow and allocator space at start, so a total cap of 2 GiB makes each of its mmap calls fail. Under ASAN the child
+// may add kMemoryBytes to what it has, the same rule as the runtime helper (constraint_xgr.cc, CompileChild).
+rlim_t ChildMemoryCap() { return kAsan ? AddressSpaceBytes() + kMemoryBytes : kMemoryBytes; }
 
 std::vector<std::string> CharTokens() {
   std::vector<std::string> tokens;
@@ -51,7 +77,8 @@ bool Survives(const Case& c, std::string& how) {
     return false;
   }
   if (pid == 0) {
-    rlimit memory{kMemoryBytes, kMemoryBytes};
+    const rlim_t cap = ChildMemoryCap();
+    rlimit memory{cap, cap};
     setrlimit(RLIMIT_AS, &memory);
     alarm(kDeadlineSeconds);
     try {
@@ -73,6 +100,7 @@ bool Survives(const Case& c, std::string& how) {
 }  // namespace
 
 int main() {
+  if (kAsan) std::puts("NOTE: ASAN build: each case child may add 2 GiB of address space to its start size (not 2 GiB in total)");
   const std::string nest = Repeat("(", 40000) + "a" + Repeat(")", 40000);
   const std::string star = Repeat("(", 20000) + "a" + Repeat(")*", 20000);
   const std::vector<Case> cases = {

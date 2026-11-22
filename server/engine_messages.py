@@ -16,6 +16,8 @@ PREFIXES = ("duplicate request field: ", "MTP cache allocation failed: ", "MTP c
 _SUFFIX = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,39}")  # a name, never a number such as a token ID
 
 KNOWN = frozenset((
+    # Memory stage 2 (--admission-reserve-mib, engine/serve/batched_serve_settings.h).
+    'admission-reserve-mib must be an integer in [1024,1048576]',
     # Structured output (engine/serve/serve_protocol.h, engine/serve/batch_session.h, engine/runtime/constraint.h).
     # The compile errors reach the server through RecoverableOpenError(error.what()): the helper's fixed texts are
     # listed below.
@@ -209,6 +211,8 @@ KNOWN = frozenset((
     'no free sequence slot holds this request; retry after a close',
     'nonempty prompt and positive max_tokens must fit the configured context',
     'nonfinite model logits',
+    'not enough device memory for the MTP cache at start; reduce --streams or --ctx, or stop other programs that use memory',
+    'not enough device memory for the MTP cache at start; reduce --ctx, or stop other programs that use memory',
     'not enough device memory for the MTP cache; reduce the context, or use --spec 0 in gen',
     'open requires a positive request ID and an explicit spec request',
     'prefill cut buffer is too small',

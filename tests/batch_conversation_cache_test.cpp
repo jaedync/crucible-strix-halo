@@ -3,7 +3,10 @@
 #include "../engine/runtime/spec_span.h"
 #include <cstdio>
 #include <cassert>
+#include <cstring>
+#include <map>
 #include <numeric>
+#include <random>
 using namespace crucible;
 struct Snapshot { std::vector<int> hist; ConversationResume resume; std::vector<unsigned char> bytes; };
 struct Ledger : SnapshotMemoryLedger {
@@ -1135,6 +1138,235 @@ static void NewestBound() {
   assert(c.Hit(x) == 0 && c.Hit(y) == 16 && c.Hit(z) == 16 && c.Hit(w) == 16);
 }
 
+// load-miss (v0.38.1 stand load, short-1 turn 2): the Shared prefix that other states extend
+// is the floor of each session whose own state left. In the load, the session's own speculative tail save evicted the
+// 12,288-token system prefix (kExtra) before two waiting resume points (kWaiting); a trusted save of another session
+// then evicted the tail (kNewest), and the next turn found nothing (13,932 of 13,932 tokens prefilled). Both states are
+// under the disk minimum of 16,384 tokens, so neither had a disk copy. The waiting resume points had one.
+static void SharedPrefixFloor() {
+  const auto base = Tokens(1, 8);
+  const auto session = [&](int first) {
+    auto ids = Tokens(first, 40);
+    std::copy(base.begin(), base.end(), ids.begin());
+    return ids;
+  };
+  const auto a = session(100), b = session(200), d = session(300), e = session(400), f = session(500);
+  Cache c(1, 3, true);  // one live session (protect 1), three entries, probation on (as the server)
+  assert(c.Capture(f, 8, CacheRetention::Shared));  // the system prefix
+  assert(c.Tail(b, 21, true) && c.Tail(d, 21, true));  // two resume points that extend it: d is kept, b waits
+  assert(c.Hit(a) == 8);  // a's first turn restores the prefix
+  // a's speculative tail: the cache is full. A speculative save takes no waiting resume point (b) and not the prefix,
+  // so it is refused (trunk: the prefix left for it).
+  assert(!c.Tail(a, 21) && c.cache.LastRefusal() == std::string("protected"));
+  assert(c.Tail(e, 21, true));  // another session's trusted tail: the waiting b leaves (to disk in the server)
+  // The prefix stays, so a's next turn re-prefills only its own turn past the prefix.
+  assert(c.Hit(a) == 8 && c.HitTail(d) == 21 && c.HitTail(e) == 21 && !c.HitTail(b));
+  // The bound: one prefix only, the one that the most branches extend (P8: x, y and w; Q16: x and y; Q16 itself is
+  // not a branch, x extends it). Q16 leaves in plain LRU, before the waiting resume points x and y. A Shared entry
+  // that fewer than two branches extend keeps plain LRU too (SupersededFirst: x's 16 and the fork are one branch).
+  const auto x = Tokens(1000, 40), z = Tokens(5000, 40);
+  auto y = Tokens(2000, 40), w = Tokens(3000, 40);
+  std::copy(x.begin(), x.begin() + 16, y.begin());
+  std::copy(x.begin(), x.begin() + 8, w.begin());
+  Cache g(1, 5, true);
+  assert(g.Capture(x, 8, CacheRetention::Shared) && g.Capture(x, 16, CacheRetention::Shared));
+  assert(g.Hit(Fork(x, 12, 800)) == 8 && g.Hit(Fork(x, 18, 800)) == 16);  // both prefixes leave probation
+  assert(g.Tail(x, 21, true) && g.Tail(y, 21, true) && g.Tail(w, 21, true));  // w is kept, x and y wait
+  assert(g.Tail(z, 21, true));  // full: one entry leaves
+  assert(g.Hit(Fork(x, 20, 700)) == 8 && g.HitTail(x) == 21 && g.HitTail(y) == 21 && g.HitTail(w) == 21 &&
+         g.HitTail(z) == 21);
+}
+
+// load-miss review M1 (scenario W): the floor outlasts a waiting resume point only when that point extends the floor
+// (it then falls back to the floor) or the disk keeps it. A waiting point of a session without the floor prefix and
+// without a disk copy (under the disk minimum) has no fallback: the floor leaves before it, as on trunk.
+static void SharedFloorSparesForeignPoint() {
+  const auto base = Tokens(1, 8);
+  const auto with = [&](int first) {
+    auto ids = Tokens(first, 40);
+    std::copy(base.begin(), base.end(), ids.begin());
+    return ids;
+  };
+  const auto b1 = with(100), b2 = with(200), r = with(400), f = with(500);
+  const auto q = Tokens(7000, 40);  // a session without the system prefix
+  Cache c(1, 4, true);
+  assert(c.Capture(f, 8, CacheRetention::Shared));
+  assert(c.Hit(b1) == 8);  // the prefix leaves probation
+  assert(c.Tail(q, 21, true));
+  assert(c.Tail(b2, 21, true) && c.Tail(b1, 21, true));  // b1 is kept (live 1); q and b2 wait
+  // The floor P has two branches (b1, b2). A trusted save of a new session r needs one entry. q has no fallback, so it
+  // stays; b2 extends P, so it leaves and its next turn restores P (an earlier rule made q leave: a full miss of its session).
+  assert(c.Tail(r, 21, true));
+  assert(c.HitTail(q) == 21 && c.Hit(with(900)) == 8 && c.HitTail(b1) == 21 && c.HitTail(r) == 21 && !c.HitTail(b2));
+  // A speculative save still keeps the floor and every waiting point: it is refused.
+  assert(!c.Tail(Tokens(8000, 40), 21) && c.cache.LastRefusal() == std::string("protected"));
+  assert(c.HitTail(q) == 21 && c.Hit(with(901)) == 8);
+  // The same series when the disk keeps q (a disk copy, or 16,384 tokens or more): q waits as b2 does and leaves first
+  // (the least recently used waiting point), to the disk. The floor stays.
+  Cache d(1, 4, true);
+  size_t asked = 0;
+  d.cache.SetDiskKeeps([&](std::span<const int> key, const ConversationPolicy&) {
+    ++asked;
+    return std::ranges::equal(key, std::span<const int>(q.data(), 21));
+  });
+  assert(d.Capture(f, 8, CacheRetention::Shared));
+  assert(d.Hit(b1) == 8);
+  assert(d.Tail(q, 21, true));
+  assert(d.Tail(b2, 21, true) && d.Tail(b1, 21, true));
+  assert(d.Tail(r, 21, true));
+  assert(!d.HitTail(q) && d.Hit(with(900)) == 8 && d.HitTail(b1) == 21 && d.HitTail(r) == 21 && d.HitTail(b2) == 21);
+  assert(asked > 0);  // only for a waiting point that does not extend the floor
+}
+
+// Review L3 (the short form of the review's property probe): seeded series of session turns that share one or two
+// Shared system prefixes (nested in some seeds), with sessions without a prefix, one-time requests, reasoning turns
+// whose next prompt drops part of the reply, and restarts. A lookup is FindTail, then Find (batched_serve.h); frontiers
+// are saved only past the restored length; tails are trusted or speculative. Each hit must restore a prefix of the
+// query with the bytes of the last save of its key, and the cache bytes stay inside the budget.
+static void SharedPrefixProperty() {
+  using Hit = std::shared_ptr<const BatchConversationCache<Snapshot>::Entry>;
+  for (uint64_t seed = 0; seed < 240; ++seed) {
+    std::mt19937_64 rng(seed * 7919 + 13);
+    const auto r = [&](uint64_t n) { return n ? rng() % n : 0; };
+    const bool nested = seed % 3 == 2, two = seed % 3 == 1;
+    const size_t sessions = 2 + r(7), live = 1 + r(4), per_token = 1 + r(4);
+    const size_t p1 = 8 * (2 + r(12)), p2 = nested ? p1 + 8 * (1 + r(4)) : 8 * (2 + r(12));
+    const bool probation = r(4) != 0, reasoning = r(2);
+    size_t budget = (64 + 120 * per_token) * (3 + r(10));
+    if (r(6) == 0) budget = (64 + p1 * per_token) * (2 + r(3));  // a prefix near a third of the budget or more
+    BatchConversationCache<Snapshot> cache(budget, {}, live, kDefaultHostReserve, probation, 600.0);
+    double now = 0;
+    cache.SetClock([&] { return now; });
+    cache.SetSlotFrontiers(r(2));
+    ConversationPolicy policy;
+    policy.prefill_rows = 8;
+    std::map<std::vector<int>, uint32_t> last;  // the serial of the last save of each key
+    uint32_t serial = 0;
+    const auto make = [&](std::span<const int> ids, size_t length, bool prompt_only, uint32_t s) {
+      auto snap = std::make_shared<Snapshot>();
+      snap->hist.assign(ids.begin(), ids.begin() + length);
+      snap->resume.length = length, snap->resume.prompt_only = prompt_only;
+      if (prompt_only) snap->resume.prompt_boundary = ids.size() - 1;
+      snap->bytes.resize(4);
+      std::memcpy(snap->bytes.data(), &s, 4);
+      return std::shared_ptr<const Snapshot>(snap);
+    };
+    bool tail_hit = false;
+    const auto lookup = [&](const std::vector<int>& prompt) {
+      Hit hit = cache.FindTail(prompt, policy);
+      tail_hit = bool(hit);
+      if (!hit) hit = cache.Find(prompt, policy, prompt.size() - 1, prompt.size(), 8);
+      if (!hit) return size_t(0);
+      const auto& h = hit->snapshot->hist;
+      uint32_t s = 0;
+      std::memcpy(&s, hit->snapshot->bytes.data(), 4);
+      assert(h.size() <= prompt.size() && std::equal(h.begin(), h.end(), prompt.begin()));
+      assert(last.contains(h) && last.at(h) == s);
+      return h.size();
+    };
+    const auto save = [&](const std::vector<int>& prompt, size_t prefix, size_t restored, const std::vector<int>& tail,
+                          bool trusted) {
+      for (const auto& f : BatchCacheFrontiers(prompt.size(), prompt.size() - 1, 8, prefix)) {
+        if (f.position <= restored) continue;
+        const uint32_t s = ++serial;
+        if (cache.Capture(prompt, policy, f, 64 + f.position * per_token, uint64_t(64) << 30,
+                          [&] { return make(prompt, f.position, true, s); }))
+          last[std::vector<int>(prompt.begin(), prompt.begin() + f.position)] = s;
+        assert(cache.Bytes() <= cache.Budget());
+      }
+      const uint32_t s = ++serial;
+      if (cache.CaptureTail(tail, policy, 64 + tail.size() * per_token, uint64_t(64) << 30,
+                            [&] { return make(tail, tail.size(), false, s); }, trusted, false, false, {}, {},
+                            prompt.size()))
+        last[tail] = s;
+      assert(cache.Bytes() <= cache.Budget());
+    };
+    std::vector<int> sys0(p1), sys1(p2);
+    for (size_t i = 0; i < p1; ++i) sys0[i] = 10000000 + int(i);
+    for (size_t i = 0; i < p2; ++i) sys1[i] = nested && i < p1 ? sys0[i] : 20000000 + int(i);
+    struct Session { std::vector<int> hist; size_t prefix = 0; int base = 0, next = 0; };
+    std::vector<Session> all(sessions);
+    for (size_t i = 0; i < sessions; ++i) {
+      all[i].base = 100000 * int(i + 1);
+      const std::vector<int>* sys = (two || nested) && i % 2 ? &sys1 : &sys0;
+      if (r(5) == 0) sys = nullptr;  // a session without a system prompt
+      if (sys) all[i].hist = *sys, all[i].prefix = sys->size();
+    }
+    int onetime = 90000000;
+    for (int step = 0, steps = 40 + int(r(120)); step < steps; ++step) {
+      now += double(r(30));
+      if (r(10) == 0) {  // a one-time request
+        std::vector<int> prompt = r(2) ? sys0 : sys1;
+        const size_t prefix = prompt.size();
+        for (size_t i = 0, n = 4 + r(60); i < n; ++i) prompt.push_back(onetime++);
+        auto tail = prompt;
+        for (size_t i = 0, n = 1 + r(10); i < n; ++i) tail.push_back(onetime++);
+        save(prompt, prefix, lookup(prompt), tail, false);
+        continue;
+      }
+      Session& s = all[r(sessions)];
+      std::vector<int> prompt = s.hist;
+      for (size_t i = 0, n = 4 + r(40); i < n; ++i) prompt.push_back(s.base + s.next++);
+      const size_t restored = lookup(prompt);
+      std::vector<int> tail = prompt;
+      const size_t reply = 2 + r(30);
+      for (size_t i = 0; i < reply; ++i) tail.push_back(s.base + s.next++);
+      save(prompt, s.prefix, restored, tail, r(5) == 0 ? !tail_hit : tail_hit);
+      s.hist = tail;
+      if (reasoning && r(2))  // the client drops the first half of the reply (the reasoning)
+        s.hist.erase(s.hist.begin() + long(prompt.size()), s.hist.begin() + long(prompt.size() + reply / 2));
+      if (s.hist.size() > 900) s.hist.resize(s.prefix);  // the conversation ends; a new one starts
+    }
+  }
+}
+
+// Review L3: a Shared prefix that only one branch extends is no floor. It keeps its plain class, so a speculative save
+// may take it (with two branches, SharedPrefixFloor: the save is refused).
+static void SharedFloorNeedsTwoBranches() {
+  const auto base = Tokens(1, 8);
+  auto a = Tokens(100, 40);
+  std::copy(base.begin(), base.end(), a.begin());
+  const auto q = Tokens(7000, 40), z = Tokens(8000, 40);
+  Cache c(8, 3, true);
+  assert(c.Capture(a, 8, CacheRetention::Shared));
+  assert(c.Hit(Fork(a, 12, 900)) == 8);  // the prefix leaves probation
+  assert(c.Tail(a, 21, true) && c.Tail(q, 21, true));  // one branch extends the prefix (a); q does not
+  assert(c.Tail(z, 21));  // full: the speculative save takes the prefix
+  assert(c.Hit(Fork(a, 12, 901)) == 0 && c.HitTail(a) == 21 && c.HitTail(q) == 21 && c.HitTail(z) == 21);
+}
+
+// Review L3: ties. Two prefixes that the same number of branches extend: the longer one is the floor (a nested prefix
+// that every branch passes through), and with the same length the most recently used one is the floor. The other
+// prefix keeps its plain class and leaves first.
+static void SharedFloorTies() {
+  {  // nested: P8 and P16, both branches pass through P16
+    const auto x = Tokens(1000, 40);
+    auto y = Tokens(2000, 40);
+    std::copy(x.begin(), x.begin() + 16, y.begin());
+    Cache c(8, 4, true);
+    assert(c.Capture(x, 8, CacheRetention::Shared) && c.Capture(x, 16, CacheRetention::Shared));
+    assert(c.Hit(Fork(x, 18, 800)) == 16 && c.Hit(Fork(x, 12, 800)) == 8);  // both leave probation; P8 is newer
+    assert(c.Tail(x, 21, true) && c.Tail(y, 21, true));  // both live (kept)
+    assert(c.Tail(Tokens(5000, 40), 21, true));  // full: one prefix leaves
+    assert(c.Hit(Fork(x, 18, 700)) == 16 && c.Hit(Fork(x, 12, 700)) == 0);
+  }
+  for (const bool p_newer : {true, false}) {  // the same length: the most recently used prefix is the floor
+    const auto p = Tokens(1000, 40), q = Tokens(2000, 40);
+    auto p1 = Tokens(100, 40), p2 = Tokens(200, 40), q1 = Tokens(300, 40), q2 = Tokens(400, 40);
+    std::copy(p.begin(), p.begin() + 8, p1.begin());
+    std::copy(p.begin(), p.begin() + 8, p2.begin());
+    std::copy(q.begin(), q.begin() + 8, q1.begin());
+    std::copy(q.begin(), q.begin() + 8, q2.begin());
+    Cache c(8, 6, true);
+    assert(c.Capture(p, 8, CacheRetention::Shared) && c.Capture(q, 8, CacheRetention::Shared));
+    assert(c.Hit(Fork(p, 12, 800)) == 8 && c.Hit(Fork(q, 12, 800)) == 8);
+    assert(c.Tail(p1, 21, true) && c.Tail(p2, 21, true) && c.Tail(q1, 21, true) && c.Tail(q2, 21, true));
+    assert(c.Hit(Fork(p_newer ? p : q, 12, 801)) == 8);  // this prefix is now the most recently used
+    assert(c.Tail(Tokens(5000, 40), 21, true));  // full: one prefix leaves
+    assert(c.Hit(Fork(p, 12, 700)) == (p_newer ? 8u : 0u) && c.Hit(Fork(q, 12, 700)) == (p_newer ? 0u : 8u));
+  }
+}
+
 // Review L4: a state larger than 64 Ki tokens is named too (the record keeps a fingerprint, never the key). The shared
 // length of a lost state is the whole length when the keys are equal, else the last grid point that matched.
 static void LostFingerprint() {
@@ -1301,6 +1533,11 @@ int main() {
   LostFingerprint();
   RefusalWords();
   NewestBound();
+  SharedPrefixFloor();
+  SharedFloorSparesForeignPoint();
+  SharedFloorNeedsTwoBranches();
+  SharedFloorTies();
+  SharedPrefixProperty();
   TierCounters();
   NewestStateKept();
   SlotFrontiers();

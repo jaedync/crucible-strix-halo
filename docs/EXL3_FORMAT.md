@@ -143,6 +143,23 @@ value = fp16_add(lo, hi)            # one half addition rounding
 
 The PTX `lop3` expression with immediate `0x6a` implements `(p & mask) ^ constant`. Pair decoders use the same arithmetic lane-wise, not a separate codebook. Both alternative decoders are tested over all 65536 states against a scalar bitcast/arithmetic oracle. [`C:57-74, 93-123`; `ref/test_exl3_ref.py:47-61`.]
 
+### EXL3-INT8 mul24 (not upstream; the Hy4 full pack)
+
+Spec: github.com/jyohukuchan/rocm_exl3_forme `doc/exl3_int8.md` ("mul24 形式") and `research/codebook/README.md`. Upstream
+exllamav3 cannot read it. The pack `kusuriya-labs/Hy4-flash-EXL3-INT8-4bpw` uses it for every linear. The tensors, the
+bitstream and the state extraction are the ones above. Two things differ:
+
+* The `.mul1` value is `0x00DCD12D` (the low 24 bits of the mul1 constant; signed int32 `14471469`).
+  `p = uint32(state * 0x00DCD12D)`, `b` = the byte sum as for mul1.
+* The element order inside a tile is the WMMA B fragment order: position `i = 8*t+j` goes to
+  `r = 8*(t // 16) + j`, `c = t % 16` (equivalently `r = 8*(i // 128) + i % 8`, `c = (i // 8) % 16`).
+
+The value of a state has two forms. `mul24` (fp16): the mul1 formula on `b`, `fp16_fma(1024+b, 0x1eee, 0xc931)`; this
+is the quantizer's reconstruction and the default of `ref/exl3_ref.py` and the engine (`kCbMul24`). `int8mul24`: the INT8
+grid `q = (b - 509) >> 2` (arithmetic, -128..127) times `S_FIX = 4*887*2^-17 = 0.027069091796875` (`kCbMul24Int8`). `q` is the
+rounding of the fp16 value to the grid for every `b`. Any other `.mul1` value is refused (`ref/exl3_ref.py codebook_of`,
+`engine/exl3/kernels/codebook.h Exl3CodebookOfMarker`).
+
 ## 4. Hadamards, scales and operation order
 
 Let `H_I` and `H_O` be block-diagonal, normalized 128x128 natural-order Sylvester Hadamards. A block element is `(-1)^popcount(r&c)/sqrt(128)`; these are symmetric and their own inverse in exact arithmetic. They operate on consecutive blocks, with no full-dimension transform or bit-reversal permutation. [`Q:15, 401-419`; `exllamav3/util/hadamard.py:36-44, 116-130, 143-146`; `H:22-49, 119-149`.]

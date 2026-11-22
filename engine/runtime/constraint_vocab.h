@@ -17,6 +17,23 @@ struct ConstraintVocab;
 // legal). Of the added tokens only the call tags (<tool_call>, </tool_call>) are text; `stop` is the one stop token
 // (<|im_end|>). Every other added token is never legal inside a grammar. Throws ConstraintError.
 std::shared_ptr<ConstraintVocab> LoadConstraintVocab(const std::string& tokenizer_json_path, int rows, int stop);
+// A model family's view of its vocabulary: `rows` IDs, the one stop token, the think-end token that arms a grammar
+// (MakeConstraint, ServeConstraintFactory), and the added tokens that are text inside a grammar (the call tags).
+struct ConstraintFamily {
+  int rows = 0;
+  int stop = -1;
+  int think_end = kConstraintThinkEnd;
+  std::vector<int> text_tokens;
+};
+// Hy4-flash (tencent/Hy4-flash tokenizer.json; server/hy4_format.py SPECIAL_IDS, which a server test compares):
+// <|hy_end:opensource|>, </think:opensource>, and the call tags of server/hy4_structured.py: <tool_call>,
+// </tool_call>, <tool_calls>, </tool_calls>, <arg_key>, </arg_key>, <arg_value>, </arg_value> (each with ":opensource").
+inline ConstraintFamily Hy4ConstraintFamily() {
+  return {120832, 120025, 120030, {120033, 120034, 120035, 120036, 120040, 120041, 120042, 120043}};
+}
+// The same load for a family: its text tokens in place of the Qwen call tags.
+std::shared_ptr<ConstraintVocab> LoadConstraintVocab(const std::string& tokenizer_json_path,
+                                                     const ConstraintFamily& family);
 // A raw vocabulary (tests): token i is the text tokens[i]; an empty text is never legal; `stop` ends the grammar.
 std::shared_ptr<ConstraintVocab> MakeConstraintVocab(const std::vector<std::string>& tokens, int stop);
 int ConstraintVocabRows(const ConstraintVocab& vocab);

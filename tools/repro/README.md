@@ -27,6 +27,11 @@ or a private measurement tool.
 One `--row` name per README row: `cold32_ttft`, `cold32_prefill`, `cold130_ttft`, `cold130_prefill`, `resend32`, `dec32_code`,
 `dec32_prose`, `dec4`, `d3`, `d1_mixed`. Stop other GPU work first. A run with a platform profile other than `--profile` stops.
 
+`resend32` sends the cold 32K prompt of the run again. The first re-send starts 0.25 s after the end of the cold prompt,
+and each next re-send starts 1 s after the end of the previous one. The row value is the median of the first-token
+times of 6 re-sends. When a re-send fails or does not hit the cache, the run has no value for the row. A re-send right after a long cold reply is slower for about 40 ms. The wait keeps that delay out
+of the row.
+
 ## Quality table
 
 Capture the top-20 log-probabilities of each engine on the reference texts, then score them against the BF16 reference.

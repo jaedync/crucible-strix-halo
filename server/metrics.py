@@ -339,6 +339,7 @@ def emit_turn(turn_text, owner):
 # end tag of the think block, as think_budget.THINK_END names it). Classes count IDs, not text, so the engine thread
 # can count them when it stamps a token, before the HTTP thread has read it.
 THINK_END_ID, TOOL_START_ID, TOOL_END_ID = 248069, 248058, 248059
+MARKERS = (THINK_END_ID, TOOL_START_ID, TOOL_END_ID)  # another model family has its own (hy4_format.MARKER_IDS)
 ENGINE_ID_DIGITS = 12
 TURN_COUNTS = ("passes", "pass_decoders", "pass_rows")
 
@@ -354,19 +355,21 @@ def file_id(path):
         return None
 
 
-def count_token(turn, token_id):
+def count_token(turn, token_id, markers=MARKERS):
     """Count one generated token as thinking, tool call or answer. Counters only: nothing reads them to decide.
 
     turn["think_open"] is True from the start of a job whose output begins inside a think block. The token that
     holds the end tag still counts as thinking; a tool call runs from its start marker to its end marker.
+    markers: the (think end, tool start, tool end) IDs of the model family.
     """
+    think_end, tool_start, tool_end = markers
     try:
         if turn.get("think_open"):
             key = "think_tokens"
-            if token_id == THINK_END_ID: turn["think_open"] = False
-        elif turn.get("in_tool") or token_id == TOOL_START_ID:
+            if token_id == think_end: turn["think_open"] = False
+        elif turn.get("in_tool") or token_id == tool_start:
             key = "tool_tokens"
-            turn["in_tool"] = token_id != TOOL_END_ID
+            turn["in_tool"] = token_id != tool_end
         else:
             key = "answer_tokens"
         turn[key] = turn.get(key, 0) + 1

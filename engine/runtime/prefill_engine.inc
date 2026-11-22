@@ -559,11 +559,11 @@ std::vector<int> Engine::Prefill(const int* tokens, int R, const std::string& du
   pf_cut_={}; pf_cut_done_.clear();
   // The stacks stay in bulk_H: the head reads its row there, and readers copy rows with CopyPrefillStacks (T2).
   last_prefill_rows_=R;
-  if (!predict) { Collect(); HIP_OK(hipDeviceSynchronize()); CheckChunk(pos0,R,false); return {}; }
+  if (!predict) { SleepForDevice(); Collect(); HIP_OK(hipDeviceSynchronize()); CheckChunk(pos0,R,false); return {}; }
   HcReadR<1>(m_.final_hc,false,R-1,bulk_H+(size_t)(R-1)*ldh);
   if (R>1) HIP_OK(hipMemcpyAsync(x_,x_+(size_t)(R-1)*kHidden,kHidden*sizeof(float),hipMemcpyDeviceToDevice,0));
   Mark("hc_mix"); RunGroup(pf_head_,true,true);
-  ArgmaxKernel<<<1,1024>>>(logits_,kVocab,ids_); Mark("head"); Collect();
+  ArgmaxKernel<<<1,1024>>>(logits_,kVocab,ids_); Mark("head"); SleepForDevice(); Collect();
   CheckChunk(pos0,R,true);
   int result; HIP_OK(hipMemcpy(&result,ids_,sizeof(int),hipMemcpyDeviceToHost));
 #if CRUCIBLE_DEBUG_NONFINITE & 1

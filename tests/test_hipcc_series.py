@@ -4,7 +4,7 @@ v0.37.2 stopped make, setup and update for a ROCm 10.x hipcc (AMD clang 24), bec
 gate/up prefill kernel (P1 -42%). Trunk has the source fix of that spill (cb97f418; the t38 gate measured 10.1 P1 -1.39%
 against 7.2.4), so the stop is gone, and the words of the v0.37.2 notes (`ALLOW_ROCM10=1`, `--allow-rocm10`) are accepted
 and change nothing. The gated 10.1 binary (32a92d58) is the plain hipcc build; the clang 24 split build gives other ISA in
-92 functions and has no gate. So with clang 24, make still builds plain hipcc (SPLIT=0) (coordinator, Nov 15).
+92 functions and has no gate. So with clang 24, make still builds plain hipcc (SPLIT=0) (the decision of Nov 15).
 """
 import os
 import shutil

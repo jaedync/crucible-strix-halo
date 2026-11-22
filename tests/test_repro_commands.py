@@ -23,17 +23,40 @@ def run_help(script, *args):
     return subprocess.run([sys.executable, str(REPRO / script), *args], capture_output=True, text=True, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
 
 
+# A contributor's interpreter is often under a home directory (a venv, asdf, pyenv). The path is built here, so the
+# export and its scan see no home path in this file.
+CONTRIBUTOR_PYTHON = str(Path("/home", "contributor", ".venv", "bin", "python3"))
+PRIVATE_WORDS = ("SIDECAR", "DRAFT_HEAD", "DRAFT_CHAIN", "draft-capture", "state-dir", "/home/", "/Users/", "~")
+
+
+def private_hits(argv, env):
+    """The private words in the server command. argv[0] is the caller's own interpreter (sys.executable), so its path
+    is not a setting of this source and is not checked here. Every other word and each env name and value is."""
+    text = " ".join(argv[1:] + [f"{name}={value}" for name, value in env.items()])
+    return [word for word in PRIVATE_WORDS if word in text]
+
+
 @pytest.mark.parametrize("pack", ["4.05", "3.05"])
-def test_serve_cmd_parses_and_holds_public_settings_only(pack):
+def test_serve_cmd_parses_and_holds_public_settings_only(pack, monkeypatch):
     args = rr.build_parser().parse_args(["serve-cmd", "--ckpt", "/p", "--pack", pack])
-    argv, env = rr.server_cmd(args.ckpt, args.pack, args.engine, args.port)
+    with monkeypatch.context() as m:
+        m.setattr(rr.sys, "executable", CONTRIBUTOR_PYTHON)
+        argv, env = rr.server_cmd(args.ckpt, args.pack, args.engine, args.port)
     text = " ".join(argv) + " " + " ".join(env)
     assert "--streams 4 --ctx 262144" in text and "--vision" in text
-    for private in ("SIDECAR", "DRAFT_HEAD", "DRAFT_CHAIN", "draft-capture", "state-dir", "/home/"):
-        assert private not in text
+    assert argv[0] == CONTRIBUTOR_PYTHON and argv[1:4] == ["-m", "server", "/p"]
+    assert private_hits(argv, env) == []
     assert ("CRUCIBLE_PF_LAUNCH_ROWS" in env) == (pack == "4.05")
     out = run_help("readme_rows.py", "serve-cmd", "--ckpt", "/p", "--pack", pack)
     assert out.returncode == 0 and "-m server /p" in out.stdout
+
+
+def test_private_guard_still_finds_a_private_path_or_name(monkeypatch):
+    home_state = str(Path("/home", "someone", "state"))
+    monkeypatch.setattr(rr, "SERVER_FIXED", [*rr.SERVER_FIXED, "--state-dir", home_state, "--log", "~/x"])
+    monkeypatch.setitem(rr.SERVER_ENV, "3.05", {**rr.SERVER_ENV["3.05"], "CRUCIBLE_SIDECAR": str(Path("/Users", "x"))})
+    argv, env = rr.server_cmd("/p", "3.05", "build/engine/crucible")
+    assert private_hits(argv, env) == ["SIDECAR", "state-dir", "/home/", "/Users/", "~"]
 
 
 def test_every_readme_row_has_a_command_and_the_rows_parse():
@@ -122,3 +145,67 @@ def test_rows_against_a_stub_server(tmp_path):
     assert not result["runs"][0]["errors"], result["runs"][0]["errors"]
     missing = [r for r, v in result["median"].items() if v is None]
     assert not missing and code == 0
+
+
+class FakeClock:
+    """time.time and time.sleep on one fake clock: the re-send rule runs without a wait."""
+
+    def __init__(self, t=1000.0):
+        self.t = t
+
+    def time(self):
+        return self.t
+
+    def sleep(self, seconds):
+        assert seconds >= 0
+        self.t += seconds
+
+
+def test_resend_row_waits_then_sends_six_times_one_second_apart_and_takes_the_median(monkeypatch):
+    """The README rule of "Same 32K prompt sent again": 0.25 s after the end of the cold prompt, then 6 re-sends, each
+    1 s after the end of the previous one; the value is the median of the 6 first-token times."""
+    clock, sends = FakeClock(), []
+    latencies = iter([0.021, 0.0095, 0.009, 0.0088, 0.0092, 0.0090])
+    ends = []
+
+    def stream(url, body, timeout=900):
+        t0 = clock.t
+        sends.append(t0)
+        clock.t += next(latencies)
+        chunks = [(clock.t, 1)]
+        clock.t += 0.002
+        ends.append(clock.t)
+        usage = {"prompt_tokens": 32000, "prompt_tokens_details": {"cached_tokens": 32000}}
+        return {"t0": t0, "chunks": chunks, "usage": usage, "finish": "length", "error": None, "content": "x", "calls": []}
+
+    monkeypatch.setattr(rr, "time", clock)
+    monkeypatch.setattr(rr.h2h, "stream", stream)
+    target = {"path": "a.py", "function": "f"}
+    base = {"messages": [{"role": "system", "content": "x"}], "targets": [target]}
+    cold_end = clock.t
+    clock.t += 0.03
+    res = rr.row_resend("http://stub/v1", rr.h2h.Session(base, target, rr.MODEL, {}), cold_end=cold_end)
+    assert len(sends) == 6 and sends[0] == pytest.approx(cold_end + 0.25)
+    assert all(sends[k] == pytest.approx(ends[k - 1] + 1.0) for k in range(1, 6))
+    assert res["value"] == pytest.approx(0.0091)
+
+
+def test_resend_row_with_a_failed_resend_has_no_value(monkeypatch):
+    """The value is the median of 6 valid re-sends: with one error, the row has no value."""
+    clock, count = FakeClock(), [0]
+
+    def stream(url, body, timeout=900):
+        t0 = clock.t
+        count[0] += 1
+        clock.t += 0.01
+        usage = {"prompt_tokens": 32000, "prompt_tokens_details": {"cached_tokens": 32000}}
+        if count[0] == 1:
+            return {"t0": t0, "chunks": [], "usage": {}, "finish": None, "error": "URLError('refused')", "content": "", "calls": []}
+        return {"t0": t0, "chunks": [(clock.t, 1)], "usage": usage, "finish": "length", "error": None, "content": "x", "calls": []}
+
+    monkeypatch.setattr(rr, "time", clock)
+    monkeypatch.setattr(rr.h2h, "stream", stream)
+    target = {"path": "a.py", "function": "f"}
+    base = {"messages": [{"role": "system", "content": "x"}], "targets": [target]}
+    res = rr.row_resend("http://stub/v1", rr.h2h.Session(base, target, rr.MODEL, {}), cold_end=clock.t)
+    assert count[0] == 6 and res["n_valid"] == 5 and res["value"] is None

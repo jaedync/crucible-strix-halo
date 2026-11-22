@@ -703,6 +703,44 @@ void ReadTakesAProtectedPointOnDisk() {
   assert(!cache.Find(b, Policy(), 19, 19, 8) && cache.Find(a, Policy(), 19, 19, 8));
 }
 
+// load-miss review M1: the tier tells the cache which states it keeps (Attach, SetDiskKeeps). A waiting resume point q
+// of a session without the Shared floor's prefix leaves before the floor only when the disk keeps it (min_tokens or
+// more); else the floor's own waiting branch b2 leaves (it restores the floor), and q stays.
+void FloorOrderReadsDiskTier() {
+  for (const size_t min_tokens : {size_t(12), size_t(24)}) {
+    auto options = Options();
+    options.root = Home() / (min_tokens == 12 ? "states-floor12" : "states-floor24");
+    options.min_tokens = min_tokens;
+    Tier tier(std::move(options), false);
+    Cache cache(64 * 4, {}, 1, 0, true);  // one live session, four entries, probation on (as the server)
+    tier.Attach(cache);
+    const auto base = Tokens(1, 8);
+    const auto with = [&](int first) {
+      auto ids = Tokens(first, 40);
+      std::copy(base.begin(), base.end(), ids.begin());
+      return ids;
+    };
+    const auto b1 = with(5100), b2 = with(5200), r = with(5400), f = with(5500), q = Tokens(57000, 40);
+    const auto tail = [&](const std::vector<int>& ids) {
+      return cache.CaptureTail(std::span<const int>(ids).first(21), Policy(), 64, uint64_t(64) << 30,
+                               [&] { return Make(std::span<const int>(ids).first(21), true, 0); }, true);
+    };
+    const auto prefix = [&](int first) {
+      const auto ids = with(first);
+      const auto hit = cache.Find(ids, Policy(), ids.size() - 1, ids.size(), 8);
+      return hit ? hit->snapshot->hist.size() : 0;
+    };
+    assert(cache.Capture(f, Policy(), {8, CacheRetention::Shared}, 64, uint64_t(64) << 30,
+                         [&] { return Make(std::span<const int>(f).first(8), false, f.size() - 1); }));
+    assert(prefix(5600) == 8);  // the prefix leaves probation
+    assert(tail(q) && tail(b2) && tail(b1));  // b1 is kept; q and b2 wait (q is the least recently used)
+    assert(tail(r));  // full: one waiting point leaves
+    const bool q_left = !cache.FindTail(q, Policy()), b2_left = !cache.FindTail(b2, Policy());
+    assert(prefix(5700) == 8 && cache.FindTail(b1, Policy()) && cache.FindTail(r, Policy()));
+    assert(min_tokens == 12 ? q_left && !b2_left : !q_left && b2_left);
+  }
+}
+
 // Fix 2 (cause.md item 6; GPU test 217): while an open holds its prompt, the entries that its restore may use never
 // leave for another save (the handover copy of another session's Frontier point, or the release of its slot's tail).
 void HoldKeepsPromptEntries() {
@@ -1033,6 +1071,7 @@ int main() {
   ReadVictimRoomLeavesOutTheRead();
   ReadTakesAProtectedPointOnDisk();
   HoldKeepsPromptEntries();
+  FloorOrderReadsDiskTier();
   HoldSendsReleasedTailToDisk();
   TailTakesPrefixQueuePlace();
   PrefixStaysWithoutRoom();

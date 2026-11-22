@@ -274,3 +274,15 @@ dec32_prose	4.05	default		58.3	tok/s	v0.38.0	2026-11-19	balanced	3		stand-eval:6
 dec32_prose	3.05	default		63.4	tok/s	v0.38.0	2026-11-19	balanced	3		stand-eval:6da71e142243:table/cells.json
 dec4	4.05	default		112.8	tok/s	v0.38.0	2026-11-19	balanced	5	5 of 6 texts gave a value	stand-eval:6da71e142243:table/cells.json
 dec4	3.05	default		127.9	tok/s	v0.38.0	2026-11-19	balanced	6		stand-eval:6da71e142243:table/cells.json
+cold32_ttft	4.05	default		16.6	s	v0.38.1	2026-11-22	balanced	6		stand-eval:11c6f12c0373:table/cells.json
+cold32_ttft	3.05	default		16.5	s	v0.38.1	2026-11-22	balanced	6		stand-eval:11c6f12c0373:table/cells.json
+cold130_ttft	4.05	default		70.0	s	v0.38.1	2026-11-22	balanced	6		stand-eval:11c6f12c0373:table/cells.json
+cold130_ttft	3.05	default		69.4	s	v0.38.1	2026-11-22	balanced	6		stand-eval:11c6f12c0373:table/cells.json
+resend32	4.05	default		0.009	s	v0.38.1	2026-11-22	balanced	6		stand-eval:11c6f12c0373:table/cells.json
+resend32	3.05	default		0.009	s	v0.38.1	2026-11-22	balanced	6		stand-eval:11c6f12c0373:table/cells.json
+dec32_code	4.05	default		72.8	tok/s	v0.38.1	2026-11-22	balanced	3		stand-eval:11c6f12c0373:table/cells.json
+dec32_code	3.05	default		79.1	tok/s	v0.38.1	2026-11-22	balanced	3		stand-eval:11c6f12c0373:table/cells.json
+dec32_prose	4.05	default		58.8	tok/s	v0.38.1	2026-11-22	balanced	3		stand-eval:11c6f12c0373:table/cells.json
+dec32_prose	3.05	default		63.4	tok/s	v0.38.1	2026-11-22	balanced	3		stand-eval:11c6f12c0373:table/cells.json
+dec4	4.05	default		112.2	tok/s	v0.38.1	2026-11-22	balanced	5	5 of 6 texts gave a value	stand-eval:11c6f12c0373:table/cells.json
+dec4	3.05	default		127.8	tok/s	v0.38.1	2026-11-22	balanced	6		stand-eval:11c6f12c0373:table/cells.json

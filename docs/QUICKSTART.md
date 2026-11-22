@@ -31,7 +31,7 @@ Press Enter to take a default. It downloads the model (about 107 GB) and starts 
 folder is the folder `crucible` in your home folder, and the default port is 8790.
 
 The one command does not run `make`. It downloads the release engine (about 25 MB), checks its sha256, and puts it in
-`build/engine/`. The line `[build] done: release engine v0.38.0 (verified)` means this. So the build time of step 4
+`build/engine/`. The line `[build] done: release engine v0.38.1 (verified)` means this. So the build time of step 4
 does not apply, and no compiler is needed. In our test, with the pack already on the disk, setup took 65 seconds.
 With a new pack, the download time is added, and the first model load takes a few minutes. Add `--source-build` to
 build the engine from source instead (about 16 minutes with the ROCm 7.2.4 compiler).
@@ -224,7 +224,7 @@ and `. .venv/bin/activate` again.
 **Check:**
 
 ```sh
-python -m server --version    # expect: crucible 0.38.0 or newer
+python -m server --version    # expect: crucible 0.38.1 or newer
 hf version
 ```
 

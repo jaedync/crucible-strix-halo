@@ -1,9 +1,11 @@
 """Checkpoint tokenization and Unicode-safe incremental decoding."""
 from pathlib import Path
+from . import hy4_format
 from .api import ApiError, STOP_IDS
 from .content_tokens import ContentEncoder, MODES
-from .template import ChatTemplate
-from .vision import expand_pads
+from .template import ChatTemplate, effort_option
+from .thinking import END as THINK_END_TAG
+from .vision import HY4_VISION, QWEN_VISION, expand_pads
 
 SHARED_SENTINEL = "\u2063crucible-shared-prefix\u2063"
 
@@ -18,11 +20,18 @@ class ModelTokenizer:
         path = Path(checkpoint) / "tokenizer.json"
         self.tokenizer_path = path
         self.tokenizer = Tokenizer.from_file(str(path))
-        self.content = ContentEncoder(self.tokenizer, path) if content_special_tokens == "text" else None
         self.template = ChatTemplate(checkpoint)
         self.decode_stream = DecodeStream
-        expected = {"<|im_end|>": 248046, "<|endoftext|>": 248044,
-                    "<tool_call>": 248058, "</tool_call>": 248059}
+        self.hy4 = self.template.hy4
+        self.stop_ids = hy4_format.STOP_IDS if self.hy4 else STOP_IDS
+        # Only this token ends the reasoning (thinking.ThinkSplitter): a quoted end tag in plain pieces stays reasoning.
+        self.think_end_id = self.tokenizer.token_to_id(hy4_format.THINK_END if self.hy4 else THINK_END_TAG)
+        self.content = (ContentEncoder(self.tokenizer, path, self.stop_ids) if content_special_tokens == "text"
+                        else None)
+        self.turn_start = hy4_format.TURN_START if self.hy4 else "<|im_start|>"
+        self.vision = HY4_VISION if self.hy4 else QWEN_VISION
+        expected = hy4_format.SPECIAL_IDS if self.hy4 else {"<|im_end|>": 248046, "<|endoftext|>": 248044,
+                                                            "<tool_call>": 248058, "</tool_call>": 248059}
         for token, token_id in expected.items():
             if self.tokenizer.token_to_id(token) != token_id:
                 raise ValueError(f"The checkpoint has an unexpected special-token ID for {token}.")
@@ -37,6 +46,7 @@ class ModelTokenizer:
             (messages, tools), restore = self.content.escape(messages, tools)
         preserve = getattr(request, "preserve_thinking", None)
         options = {} if preserve is None else dict(preserve_thinking=preserve)
+        options |= effort_option(request)
         return self.template.render(messages, request.enable_thinking, request.reasoning_effort, tools,
                                     request.tool_choice, add_generation_prompt=add_generation_prompt,
                                     **options), restore
@@ -67,7 +77,7 @@ class ModelTokenizer:
 
     def encode_images(self, request):
         """(IDs with each image placeholder expanded, first-token offset of each image)."""
-        return expand_pads(self.encode(request), request.images)
+        return expand_pads(self.encode(request), request.images, getattr(self, "vision", QWEN_VISION))
 
     def cache_prefix_tokens(self, request, ids):
         if request.kind != "chat":
@@ -75,7 +85,7 @@ class ModelTokenizer:
         prefix = self.encode_prompt(*self.render_prompt(request, add_generation_prompt=False))
         images = getattr(request, "images", ())
         if images:
-            prefix = expand_pads(prefix, images)[0]
+            prefix = expand_pads(prefix, images, getattr(self, "vision", QWEN_VISION))[0]
         # Tokenizer merges at the suffix boundary can invalidate a text prefix.
         return len(prefix) if ids[:len(prefix)] == prefix else 0
 
@@ -90,7 +100,7 @@ class ModelTokenizer:
             text, restore = self.render_prompt(request, add_generation_prompt=False, messages=system + (sentinel,))
         except ApiError:
             return 0  # The shared frontier is an optimization; a template that rejects the sentinel turn skips it.
-        end = text.rfind("<|im_start|>", 0, max(text.find(SHARED_SENTINEL), 0))
+        end = text.rfind(getattr(self, "turn_start", "<|im_start|>"), 0, max(text.find(SHARED_SENTINEL), 0))
         if end <= 0:
             return 0
         prefix = self.encode_prompt(text[:end], restore)
@@ -106,7 +116,8 @@ class ModelTokenizer:
         """The forced close of a think block (see think_budget), tokenized once."""
         if not hasattr(self, "_think_close"):
             from .think_budget import close_ids
-            self._think_close = close_ids(self.tokenizer)
+            hy4 = dict(end_tag=hy4_format.THINK_END, before="", after="") if getattr(self, "hy4", False) else {}
+            self._think_close = close_ids(self.tokenizer, **hy4)
         return self._think_close
 
     def closed_think_ids(self, reasoning, ids=()):
@@ -118,15 +129,18 @@ class ModelTokenizer:
         IDs so far: an added token that the model wrote in its reasoning keeps its ID, as on the next turn.
         """
         from .think_budget import THINK_END
+        # Hy4-flash renders <think>reasoning</think>answer: no newline before or after the end tag.
+        hy4 = getattr(self, "hy4", False)
+        end_tag, newline, after = (hy4_format.THINK_END, "", "") if hy4 else (THINK_END, "\n", "\n\n")
         text, content = reasoning.strip(), getattr(self, "content", None)
         if content is not None and content.has_special(text):
             # RA-8: other special-token strings in the reasoning are text, as on the next turn.
-            body = content.encode_text(text + "\n", content.generated_strings(self.decode, ids, text) if ids else
+            body = content.encode_text(text + newline, content.generated_strings(self.decode, ids, text) if ids else
                                        frozenset())
         else:
-            body = self.tokenizer.encode(text + "\n", add_special_tokens=False).ids
-        close = self.tokenizer.encode("\n\n", add_special_tokens=False).ids
-        return tuple(body) + (self.tokenizer.token_to_id(THINK_END),) + tuple(close)
+            body = self.tokenizer.encode(text + newline, add_special_tokens=False).ids
+        close = self.tokenizer.encode(after, add_special_tokens=False).ids if after else []
+        return tuple(body) + (self.tokenizer.token_to_id(end_tag),) + tuple(close)
 
     def end_of_turn_text_ids(self, token_id):
         """The string of an end-of-turn token ("<|im_end|>") as plain characters, for the end-of-turn guard
@@ -155,9 +169,10 @@ class ModelTokenizer:
         return self.decode_stream(skip_special_tokens=False)
 
     def step(self, stream, token_id):
-        if token_id in STOP_IDS:
+        if token_id in getattr(self, "stop_ids", STOP_IDS):
             return ""
         return stream.step(self.tokenizer, token_id) or ""
 
     def decode(self, ids):
-        return self.tokenizer.decode([token for token in ids if token not in STOP_IDS], skip_special_tokens=False)
+        stop = getattr(self, "stop_ids", STOP_IDS)
+        return self.tokenizer.decode([token for token in ids if token not in stop], skip_special_tokens=False)

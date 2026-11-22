@@ -124,6 +124,29 @@ inline StateRootVerdict LinkProblem(const std::filesystem::path& link, const std
                 real);
 }
 
+}  // namespace state_root_detail
+
+// The verdict on one parent folder `current` of `real` (its lstat or fstat in `info`, not a link): a folder that only
+// a trusted owner can change, or one with the sticky bit. state_private_dir.h checks each opened parent with it too.
+inline StateRootVerdict StateRootParentFolder(const std::filesystem::path& current, const std::filesystem::path& real,
+                                              const struct stat& info, const std::set<uid_t>& owners, gid_t gid) {
+  using state_root_detail::Refuse;
+  if (!S_ISDIR(info.st_mode)) return Refuse("not-dir", current.string() + " is not a folder.", real);
+  if (!owners.count(info.st_uid))
+    return Refuse("parent-owner", current.string() + " belongs to another user, who could move or replace " +
+                                      real.string() + ".", real);
+  const mode_t open_bits = info.st_mode & (S_IWOTH | (info.st_gid != gid ? S_IWGRP : 0));
+  if (open_bits && !(info.st_mode & S_ISVTX))
+    return Refuse("parent-open", "other users can write " + current.string() + " (mode " +
+                                     state_root_detail::Mode(info.st_mode) + ", no sticky bit), so they could move or "
+                                     "replace " + real.string() + ".", real);
+  StateRootVerdict ok;
+  ok.path = real;
+  return ok;
+}
+
+namespace state_root_detail {
+
 // The first parent folder that another user could change, or an ok verdict. Missing parents are new (made 0700).
 inline StateRootVerdict ParentProblem(const std::filesystem::path& real, uid_t uid, gid_t gid) {
   const auto owners = StateRootTrustedOwners(uid);
@@ -137,14 +160,8 @@ inline StateRootVerdict ParentProblem(const std::filesystem::path& real, uid_t u
       return Refuse("unreadable", current.string() + " cannot be read (" + std::strerror(errno) + ").", real);
     }
     if (S_ISLNK(info.st_mode)) return LinkProblem(current, real);
-    if (!S_ISDIR(info.st_mode)) return Refuse("not-dir", current.string() + " is not a folder.", real);
-    if (!owners.count(info.st_uid))
-      return Refuse("parent-owner", current.string() + " belongs to another user, who could move or replace " +
-                                        real.string() + ".", real);
-    const mode_t open_bits = info.st_mode & (S_IWOTH | (info.st_gid != gid ? S_IWGRP : 0));
-    if (open_bits && !(info.st_mode & S_ISVTX))
-      return Refuse("parent-open", "other users can write " + current.string() + " (mode " + Mode(info.st_mode) +
-                                       ", no sticky bit), so they could move or replace " + real.string() + ".", real);
+    auto folder = StateRootParentFolder(current, real, info, owners, gid);
+    if (!folder.Accepted()) return folder;
   }
   StateRootVerdict ok;
   ok.path = real;

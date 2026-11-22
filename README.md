@@ -9,7 +9,7 @@ with 128 GB. Its OpenAI-compatible server gives local coding agents 4 sessions o
 <picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/decode-by-context-dark.svg"><img src="docs/img/decode-by-context-light.svg" width="412" alt="Line chart: Decode by context length, in tokens per second: 4.05 bpw from 71.7 at 32K to 62.2 at 250K; 3.05 bpw from 77.0 at 32K to 69.1 at 250K. v0.33.0, Nov 3, 2026."></picture>
 </p>
 
-<sub>One request at a time, default configuration, balanced power profile, v0.33.0 (Nov 3, 2026). No new run for v0.38.0.</sub>
+<sub>One request at a time, default configuration, balanced power profile, v0.33.0 (Nov 3, 2026). No new run for v0.38.1.</sub>
 <!-- results:end charts -->
 
 ## Install
@@ -26,7 +26,7 @@ curl -fsSL https://raw.githubusercontent.com/jaedync/crucible-strix-halo/main/in
 
 <!-- results:start clone -->
 ```sh
-git clone --branch v0.38.0 https://github.com/jaedync/crucible-strix-halo.git
+git clone --branch v0.38.1 https://github.com/jaedync/crucible-strix-halo.git
 cd crucible-strix-halo
 ./crucible setup
 ```
@@ -77,7 +77,7 @@ tokens. A longer request uses YaRN. Measured in `long`:
 | Cold prompt: prefill | 1,677.6 tok/s | 1,436.2 tok/s |
 | Decode, code | 67.7 tok/s | 59.8 tok/s |
 
-<sub>v0.37.0, measured Nov 11, 2026: 1 run, balanced power profile. No new run for v0.38.0.</sub>
+<sub>v0.37.0, measured Nov 11, 2026: 1 run, balanced power profile. No new run for v0.38.1.</sub>
 <!-- results:end long -->
 
 Read more: [long context](docs/LONG_CONTEXT.md)
@@ -89,23 +89,25 @@ Read more: [long context](docs/LONG_CONTEXT.md)
 <picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/prefill-by-release-dark.svg"><img src="docs/img/prefill-by-release-light.svg" width="412" alt="Line chart: Cold prefill of a 32K prompt, by release, in tokens per second: 4.05 bpw from 1,585 at v0.22.0 to 1,831 at v0.34.0; 3.05 bpw from 1,656 at v0.22.0 to 1,877 at v0.34.0. Oct 27 to Nov 7, 2026."></picture>
 </p>
 
-<sub>Each release ran with the settings of its own time, balanced power profile. No new run for v0.38.0.</sub>
+<sub>Each release ran with the settings of its own time, balanced power profile. No new run for v0.38.1.</sub>
 <!-- results:end releases -->
 
 <!-- results:start table -->
-| v0.38.0 | 4.05 pack | 3.05 pack |
+| v0.38.1 | 4.05 pack | 3.05 pack |
 |---|---:|---:|
-| Cold 32K prompt: first token | 16.2 s | 16.2 s |
-| Cold 130K prompt: first token | 69.3 s | 69.3 s |
-| Same 32K prompt again: first token | 0.017 s | 0.017 s |
-| Decode at 32K, 1 session, code | 72.9 tok/s | 79.1 tok/s |
-| Decode at 32K, 1 session, prose | 58.3 tok/s | 63.4 tok/s |
-| Decode, 4 sessions, total | 112.8 tok/s | 127.9 tok/s |
+| Cold 32K prompt: first token | 16.6 s | 16.5 s |
+| Cold 130K prompt: first token | 70.0 s | 69.4 s |
+| Same 32K prompt again: first token | 0.009 s | 0.009 s |
+| Decode at 32K, 1 session, code | 72.8 tok/s | 79.1 tok/s |
+| Decode at 32K, 1 session, prose | 58.8 tok/s | 63.4 tok/s |
+| Decode, 4 sessions, total | 112.2 tok/s ¹ | 127.8 tok/s |
 
-<sub>v0.38.0, measured Nov 19, 2026: median of 6 texts (decode: mean, 3 runs a text), balanced power profile, default configuration.</sub>
+<sub>v0.38.1, measured Nov 22, 2026: median of 6 texts (decode: mean, 3 runs a text), balanced power profile, default configuration.</sub>
+
+<sub>¹ 4.05 pack, Decode, 4 sessions, total: 5 of 6 texts gave a value.</sub>
 <!-- results:end table -->
 
-The 4-session row uses warm prompts and the all-4 window.
+The 4-session row uses warm prompts and the all-4 window. 4 sessions, one new 32K prompt: last first token after 17.4 s (was 79.5 s).
 
 [Method](docs/RESULTS.md) · [History](docs/HISTORY.md) ·
 [Rivals](docs/RIVALS.md) · [Development](docs/how-it-got-fast.md)

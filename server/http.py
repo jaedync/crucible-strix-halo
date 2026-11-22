@@ -34,7 +34,7 @@ NEXT_EVENT_SECONDS = 360
 # quotes a ChatML template in its reasoning writes the real end-of-turn token, and the reply ended there: finish
 # "stop", no content, no tool call. The guard keeps that token as its text and the model goes on, at most this many
 # times a reply in each place. Past the limit the token ends the reply as before. An end-of-turn token in the answer
-# itself, outside an open tool call, always ends the reply.
+# itself, outside an open tool call, always ends the reply, and so does one right after the kept text.
 END_OF_TURN_KEPT = dict(reasoning=16, tool_call=4)
 # Anthropic Messages token count (Claude-style clients and gateways ask it before each request; some add ?beta=true).
 COUNT_TOKENS_PATH = "/v1/messages/count_tokens"
@@ -234,6 +234,10 @@ class Service:
     def structured_options(self):
         """The validation argument of structured output: the engine's ready event named the constraint key."""
         return dict(structured=getattr(self.backend, "constraint_ready", False) is True)
+
+    def call_form_options(self):
+        """The validation argument of the call grammar's tag form: the Hy4-flash tags for a Hy4 tokenizer."""
+        return dict(call_form="hy4") if getattr(self.tokenizer, "hy4", False) is True else {}
 
     def ablate_options(self):
         """The validation arguments of the ablated mode: the accepted names and the engine's capability."""
@@ -781,8 +785,9 @@ def handler_for(service):
                     job, job_prompt, first_id = self.jobs[-1], resumed, len(output.ids)
                     event = self.wait_event(job, first=True)
                     continue
+                stop_ids = getattr(service.tokenizer, "stop_ids", STOP_IDS)  # the model family's (hy4_format)
                 outcome = (self.keep_end_of_turn(request, prompt_ids, job_prompt, output, job, token, first_id,
-                                                 options, cap) if token in STOP_IDS else None)
+                                                 options, cap) if token in stop_ids else None)
                 if outcome == "ended":
                     # The kept text matched the client's stop string: the reply ends here, as without the guard.
                     self.end_stopped(cap, prompt_ids, output)
@@ -855,7 +860,15 @@ def handler_for(service):
             text_ids = getattr(service.tokenizer, "end_of_turn_text_ids", None)
             where = ("reasoning" if output.think.thinking else
                      "tool_call" if output.tools is not None and output.tools.open_call() else None)
+            if where in ("reasoning", None) and output.calls_from_reasoning():
+                # The model ended its turn on complete calls, in the reasoning (Halogen) or right after </think> with
+                # an answer of whitespace only: the reply makes them.
+                return None
             if where is None or text_ids is None or output.end_of_turn_kept[where] >= END_OF_TURN_KEPT[where]:
+                return None
+            if getattr(output, "end_of_turn_at", None) == len(output.ids):
+                # The token comes right after the kept text: the model means to end its turn (a repeat would write the
+                # text again up to the limit, one engine job each, and end the same way).
                 return None
             text = list(text_ids(token))
             room = request.max_tokens - len(output.ids) - len(text)
@@ -868,6 +881,7 @@ def handler_for(service):
             for piece in text:
                 output.token(piece)
             output.end_of_turn_kept[where] += 1
+            output.end_of_turn_at = len(output.ids)
             turn = getattr(self.jobs[0], "turn", None)
             metrics.emit(metrics.end_of_turn_kept_line(turn.get("request_id") if isinstance(turn, dict) else None,
                                                         where, len(output.ids), output.end_of_turn_kept[where]))
@@ -968,7 +982,8 @@ def handler_for(service):
             return validate_request(body, "chat", service.model, default_thinking=service.default_thinking,
                                     vision=service.vision, vocab=service.vocab,
                                     default_mtp_prefix=service.default_mtp_prefix, defaults=service.defaults,
-                                    **service.ablate_options(), **service.structured_options(), **fields)
+                                    **service.ablate_options(), **service.structured_options(),
+                                    **service.call_form_options(), **fields)
 
         def tokenize(self):
             """OpenAI-compatible /tokenize: {"content": text or IDs} -> the completion prompt's IDs; {"messages": ...} (any
@@ -1046,7 +1061,7 @@ def handler_for(service):
                                            default_thinking=service.default_thinking, vision=service.vision,
                                            vocab=service.vocab, default_mtp_prefix=service.default_mtp_prefix,
                                            defaults=service.defaults, **service.ablate_options(),
-                                           **service.structured_options(), **fields)
+                                           **service.structured_options(), **service.call_form_options(), **fields)
                 finish = getattr(self.adapter, "prompt_request", None)
                 if finish is not None:
                     request = finish(request, self.api_body)  # the adapter's prompt rule (responses_api)

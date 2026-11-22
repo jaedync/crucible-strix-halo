@@ -30,14 +30,16 @@ def request(kind="completion", **options):
 def test_constructor_checks_every_special_id(checkpoint):
     expected = {"<|im_end|>": 248046, "<|endoftext|>": 248044, "<tool_call>": 248058, "</tool_call>": 248059}
     source = MagicMock(padding=None, truncation=None)
-    source.token_to_id.side_effect = expected.get
+    ids = expected | {"</think>": 248069}  # think_end_id reads the end tag too
+    source.token_to_id.side_effect = ids.get
     with patch("tokenizers.Tokenizer.from_file", return_value=source) as load:
         adapter = ModelTokenizer(checkpoint)
     load.assert_called_once_with(str(checkpoint / "tokenizer.json"))
     assert adapter.tokenizer is source
-    assert source.token_to_id.call_count == 4
+    assert source.token_to_id.call_count == 5
+    assert adapter.think_end_id == 248069
     for wrong in expected:
-        source.token_to_id.side_effect = lambda name: -1 if name == wrong else expected[name]
+        source.token_to_id.side_effect = lambda name: -1 if name == wrong else ids[name]
         with patch("tokenizers.Tokenizer.from_file", return_value=source), pytest.raises(ValueError, match="special-token ID"):
             ModelTokenizer(checkpoint)
 

@@ -21,6 +21,26 @@ VISION_END = 248054
 UNIT = 32  # patch 16 x spatial merge 2
 MIN_PIXELS = 256 * 256
 MAX_PIXELS = 2560 * 1440
+
+
+@dataclass(frozen=True)
+class VisionFamily:
+    """The image placeholder of a model family: the template writes start, pad, end for each image part, and the
+    server writes `tokens` pads in place of the one pad. row_end: each merged row has one more pad (the newline
+    embedding of the tower). min_pixels and max_pixels: the resize range of the family's image processor."""
+    start: int
+    pad: int
+    end: int
+    min_pixels: int
+    max_pixels: int
+    row_end: bool = False
+
+
+QWEN_VISION = VisionFamily(VISION_START, IMAGE_PAD, VISION_END, MIN_PIXELS, MAX_PIXELS)
+# Hy4-flash (tencent/Hy4-flash config.json; transformers PR 50903 processing_hy_v4_flash.py _num_frame_tokens and
+# image_processing_hy_v4_flash.py: patch 16, merge 2, 512 x 512 to 2048 x 2048 pixels, BICUBIC).
+HY4_VISION = VisionFamily(120118, 120120, 120119, 512 * 512, 2048 * 2048, row_end=True)
+HY4_TOWER_MISSING = "the engine does not run the Hy4-flash vision tower yet"
 MAX_ASPECT = 200
 # Decoding cost is bounded before the resize, as Halogen does.
 DECODE_FACTOR = 4
@@ -49,6 +69,9 @@ ALLOWED_FORMATS = ("PNG", "JPEG", "WEBP", "GIF", "BMP")  # no EPS (Ghostscript) 
 def tower_fault(checkpoint):
     """TOWER_MISSING when --vision cannot run on this folder, else None. Reads the index only; the engine checks the rest."""
     folder = Path(checkpoint)
+    from .hy4_format import is_hy4
+    if is_hy4(folder):
+        return HY4_TOWER_MISSING
     if (folder / "vision_k6.safetensors").exists():
         return None
     try:
@@ -66,10 +89,11 @@ class VisionImage:
     width: int
     rgb: bytes
     digest: str
+    row_end: bool = False  # VisionFamily.row_end
 
     @property
     def tokens(self):
-        return (self.height // UNIT) * (self.width // UNIT)
+        return (self.height // UNIT) * (self.width // UNIT + self.row_end)
 
 
 @dataclass(frozen=True)
@@ -78,6 +102,7 @@ class VisionSettings:
     max_images: int = MAX_IMAGES
     max_image_bytes: int = MAX_IMAGE_BYTES
     max_image_tokens: int = MAX_IMAGE_TOKENS
+    family: VisionFamily = QWEN_VISION
 
 
 def smart_resize(height, width, min_pixels=MIN_PIXELS, max_pixels=MAX_PIXELS):
@@ -157,8 +182,9 @@ def decode_bytes(raw, settings, used_tokens=0):
         if width0 * height0 > settings.max_pixels * DECODE_FACTOR:
             raise ApiError(f"The image is {width0}x{height0}. The limit before resizing is "
                            f"{settings.max_pixels * DECODE_FACTOR} pixels.", "messages")
-        height, width = smart_resize(height0, width0, max_pixels=settings.max_pixels)
-        tokens = used_tokens + (height // UNIT) * (width // UNIT)
+        family = settings.family
+        height, width = smart_resize(height0, width0, min_pixels=family.min_pixels, max_pixels=settings.max_pixels)
+        tokens = used_tokens + (height // UNIT) * (width // UNIT + family.row_end)
         if tokens > settings.max_image_tokens:
             # Clients such as Pi compact their history when the text says "exceeds the context window".
             raise ApiError(f"The images of this request need at least {tokens} tokens, which exceeds the context "
@@ -179,7 +205,7 @@ def decode_bytes(raw, settings, used_tokens=0):
     rgb = image.tobytes()
     if len(rgb) != height * width * 3:
         raise ApiError("The decoded image is not 3-channel RGB.", "messages")
-    return VisionImage(height, width, rgb, image_digest(height, width, rgb))
+    return VisionImage(height, width, rgb, image_digest(height, width, rgb), settings.family.row_end)
 
 
 def image_url_of(item):
@@ -198,8 +224,8 @@ def image_url_of(item):
     return None
 
 
-def expand_pads(ids, images):
-    """One template placeholder per image becomes `tokens` placeholders.
+def expand_pads(ids, images, family=QWEN_VISION):
+    """One template placeholder per image becomes `tokens` placeholders (the IDs of `family`).
 
     The template writes <|vision_start|><|image_pad|><|vision_end|> for each image part. Only pads
     with that pair around them count. Any other pad ID is text the user or the model wrote; it stays
@@ -208,7 +234,7 @@ def expand_pads(ids, images):
     if not images:
         return list(ids), []
     pads = [i for i in range(1, len(ids) - 1)
-            if ids[i] == IMAGE_PAD and ids[i - 1] == VISION_START and ids[i + 1] == VISION_END]
+            if ids[i] == family.pad and ids[i - 1] == family.start and ids[i + 1] == family.end]
     if len(pads) != len(images):
         raise ApiError(f"The chat template wrote {len(pads)} image placeholders for {len(images)} images. "
                        "Do not type <|vision_start|><|image_pad|><|vision_end|> in a message with images.",
@@ -217,7 +243,7 @@ def expand_pads(ids, images):
     for index, image in zip(pads, images):
         out.extend(ids[previous:index])
         offsets.append(len(out))
-        out.extend([IMAGE_PAD] * image.tokens)
+        out.extend([family.pad] * image.tokens)
         previous = index + 1
     out.extend(ids[previous:])
     return out, offsets

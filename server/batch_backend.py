@@ -76,8 +76,9 @@ STAGE_STATES = ("none", "reading", "ready", "failed")
 StageReply = namedtuple("StageReply", "state reason tokens tag best wait", defaults=("-", 0, 0, None, None))
 # The engine's stage reasons are fixed words (engine/serve/batched_serve.h Stage); anything else is logged as "other".
 STAGE_REASON = re.compile(r"[a-z0-9_]{1,24}")
-# A stopping engine writes its states to disk for up to 75 s (engine/serve/batched_serve.h kStateFlushSeconds). The server
-# waits 85 s, then kills it: the whole stop fits in a systemd TimeoutStopSec=120 with a margin.
+# A stopping engine writes its states to disk for up to 60 s (engine/serve/state_stop.h kStateFlushSeconds), after the
+# command in flight ends. The server waits 85 s after it closes stdin, then kills it: the whole stop fits in the
+# gateway's TimeoutStopSec=120 with a margin (server/tests/test_state_disk.py test_stop_fits_the_service_stop_time).
 STATE_FLUSH_SECONDS = 85
 # The idle ping (engine op "ping"): when the worker has no work and the engine sent nothing for this long, it asks. The
 # server sets a lower value from --watchdog-stall-seconds (a fifth of the stall time), so that a ping always fits it.
@@ -604,6 +605,9 @@ class BatchedEngineBackend(EngineBackend):
             try: self.waiting.append(self.jobs.get_nowait())
             except queue.Empty: break
         if self.kept and self._admit_successor(): return True
+        # The FIFO scan stops at a head turn that waits for its disk read (up to _read_bound), so cancelled
+        # turns behind it leave here. Else they hold pending_tokens, and submit refuses new work (503).
+        if self._sweep_cancelled(): return True
         if self.state_disk: self._stage_ahead()
         # FIFO among turns that fit a free slot. A skipped turn fits no free slot, so a later
         # turn never takes a slot that an earlier one could use. A kept slot is not in free_contexts.
@@ -628,6 +632,18 @@ class BatchedEngineBackend(EngineBackend):
                 return True
             return self._open(job, slot_context)
         return False
+
+    def _sweep_cancelled(self):
+        """Remove the cancelled waiting turns and give back their tokens. True when a turn left. _admit_successor
+        has already removed a cancelled kept successor (with its tokens); one that this removes first, it frees
+        without its tokens, because the turn is no longer queued."""
+        cancelled = [job for job in self.waiting if job.cancelled.is_set()]
+        if not cancelled: return False
+        gone = {id(job) for job in cancelled}
+        self.waiting = deque(job for job in self.waiting if id(job) not in gone)
+        with self.admission_lock: self.pending_tokens -= sum(len(job.payload["ids"]) for job in cancelled)
+        for job in cancelled: self._forget_job(job)
+        return True
 
     def _compile_pending(self, entry):
         """The engine refused the open because the request's grammar still compiles (engine/runtime/constraint_vocab.h

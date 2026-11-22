@@ -1,5 +1,4 @@
-"""Exact grammars for the string formats whose xgrammar 0.2.9 regex takes values that the format refuses
-.
+"""Exact grammars for the string formats whose xgrammar 0.2.9 regex takes values that the format refuses.
 
 xgrammar's converter writes each builtin `format` as a regex (third_party/xgrammar/cpp/json_schema_converter.cc,
 JSONFormatToRegexPattern). For the formats of EXACT that regex is looser than the reference validator

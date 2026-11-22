@@ -27,12 +27,14 @@ Crucible: --tree/--engine/--checkpoint start that tree's own server on 127.0.0.1
 flags. Any other server: --url. Exit 0 PASS, 1 FAIL, 2 ERROR.
 """
 import argparse
+import contextlib
 import hashlib
 import json
 import os
 import random
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import threading
@@ -268,21 +270,163 @@ raise SystemExit(entry.main())
 """
 
 
+# A copy of kill_tree and its helpers from the process tree module of the private tools (a test there checks the copy).
+# agent_soak.py runs as one file, so it cannot import that module.
+def _tree_stat(pid):
+    """(ppid, start time) of a live process, or None for a zombie or a process that is gone."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            rest = f.read().rsplit(")", 1)[1].split()
+        return None if rest[0] in ("Z", "X") else (int(rest[1]), rest[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _tree_marked(pid, mark):
+    """True when the environment of pid (a process of this user) holds the name `mark`."""
+    try:
+        if os.stat(f"/proc/{pid}").st_uid != os.getuid():
+            return False
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            return any(w.startswith(mark) for w in f.read().split(b"\0"))
+    except OSError:
+        return False
+
+
+def _tree_pids(root, mark=None):
+    """{pid: start time} of root (while it lives), of each process whose environment holds `mark`, and of all their live
+    descendants. root can be None (a child that is already reaped)."""
+    kids, tops = {}, [] if root is None else [root]
+    want = None if mark is None else (mark + "=").encode()
+    me = os.getpid()
+    for name in os.listdir("/proc"):
+        if name.isdigit():
+            pid = int(name)
+            st = _tree_stat(pid)
+            if st:
+                kids.setdefault(st[0], []).append((pid, st[1]))
+                if want and pid != me and pid != root and _tree_marked(pid, want):
+                    tops.append(pid)
+    out, todo = {}, list(tops)
+    for pid in tops:
+        st = _tree_stat(pid)
+        if st:
+            out[pid] = st[1]
+    while todo:
+        pid = todo.pop()
+        for kid, start in kids.get(pid, ()):
+            if kid != me and kid not in out:
+                out[kid] = start
+                todo.append(kid)
+    return out
+
+
+def _tree_signal(pids, sig):
+    for pid, start in pids.items():
+        st = _tree_stat(pid)
+        if st and st[1] == start:  # the same process, not a new one with a reused pid
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(pid, sig)
+
+
+def _tree_mark(env=None):
+    """(a copy of env, or of os.environ, with a new mark name for one call; the mark). A process that leaves the tree (its
+    shell exited, so init is now its parent) keeps the mark, and kill_tree finds it by the mark (review round 2, N2)."""
+    mark = f"PROC_TREE_{os.getpid()}_{os.urandom(6).hex()}"
+    return {**(os.environ if env is None else env), mark: "1"}, mark
+
+
+_TREE_HOLD = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT, signal.SIGALRM, signal.SIGUSR1, signal.SIGUSR2}
+
+
+def kill_tree(root, grace=0.0, mark=None):
+    """End root, each process that holds `mark` in its environment, and all their descendants (see the module text).
+
+    The usual stop signals wait (pthread_sigmask) until the kill is done: a handler that raises on a second SIGTERM must
+    not stop the kill half way, with the tree alive or SIGSTOPped (review round 2, N1). The finally sends SIGKILL to all
+    the processes that it found, also when an error stops the scan."""
+    old = signal.pthread_sigmask(signal.SIG_BLOCK, _TREE_HOLD)
+    seen, stopped = {}, {}
+    try:
+        if grace > 0:
+            seen = _tree_pids(root, mark)
+            _tree_signal(seen, signal.SIGTERM)
+            end = time.monotonic() + grace
+            while time.monotonic() < end and any(_tree_stat(p) for p in seen):
+                time.sleep(0.05)
+        while True:
+            new = {p: s for p, s in _tree_pids(root, mark).items() if stopped.get(p) != s}
+            if not new:
+                break
+            _tree_signal(new, signal.SIGSTOP)
+            stopped.update(new)
+    finally:
+        try:
+            _tree_signal({**seen, **stopped}, signal.SIGKILL)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old)
+
+
+FAILED_START_GRACE_S = 60   # a failed start: from SIGTERM to SIGKILL, as the 60 s wait of the stop in main
+
+
+def stop_failed_start(process, mark, grace=None):
+    """End the server of a failed start, its descendants and each process that holds this start's mark (the engine of a
+    server that already exited): SIGTERM, `grace` s to exit, then SIGKILL (kill_tree). Then reap the server. Never a
+    process that this start did not make.
+
+    The usual stop signals wait during the whole stop, but a stop signal ends the grace at once (sigtimedwait): then
+    SIGKILL to the tree, and the signal acts after the stop (its handler, or the default action). So the stop after a
+    SIGTERM takes well under the 10 s of `timeout -k 10` (horph-review M1, L2), and the tree never outlives the tool."""
+    grace = FAILED_START_GRACE_S if grace is None else grace
+    old = signal.pthread_sigmask(signal.SIG_BLOCK, _TREE_HOLD)
+    caught = None
+    try:
+        # A reaped server's pid can be a new process: then only the mark finds what is left (proc_tree L1).
+        tree = _tree_pids(process.pid if process.poll() is None else None, mark)
+        _tree_signal(tree, signal.SIGTERM)
+        end = time.monotonic() + grace
+        while time.monotonic() < end and any(_tree_stat(pid) for pid in tree):
+            info = signal.sigtimedwait(_TREE_HOLD, 0.05)
+            if info is not None:
+                caught = info.si_signo
+                break
+    finally:
+        try:
+            kill_tree(process.pid if process.poll() is None else None, 0.0, mark)
+            try:
+                process.wait(timeout=30)   # kill_tree sent SIGKILL; a process in D state can take longer
+            except subprocess.TimeoutExpired:
+                pass
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old)
+            if caught is not None:
+                os.kill(os.getpid(), caught)   # the signal that ended the grace acts now
+
+
 def start_server(args, log):
+    """(process, model id) of a ready server. A start that fails stops what it started before the error goes on: the
+    caller gets no process to stop (brief rule 3)."""
     command = [args.python, "-c", LAUNCH, str(args.tree), str(args.port), str(args.checkpoint), "--engine", str(args.engine)]
     command += shlex.split(args.server_args)
-    process = subprocess.Popen(command, cwd=args.tree, stdout=log, stderr=subprocess.STDOUT)
-    deadline = time.monotonic() + args.ready_timeout
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            raise RuntimeError(f"server exited with {process.returncode}")
-        try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{args.port}/v1/models", timeout=5) as response:
-                return process, json.loads(response.read())["data"][0]["id"]
-        except OSError:
-            time.sleep(3)
-    process.terminate()
-    raise RuntimeError("server not ready")
+    env, mark = _tree_mark()   # the engine inherits the mark, so the stop finds it after its server exited
+    process = None
+    try:
+        process = subprocess.Popen(command, cwd=args.tree, env=env, stdout=log, stderr=subprocess.STDOUT)
+        deadline = time.monotonic() + args.ready_timeout
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError(f"server exited with {process.returncode}")
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{args.port}/v1/models", timeout=5) as response:
+                    return process, json.loads(response.read())["data"][0]["id"]
+            except OSError:
+                time.sleep(3)
+        raise RuntimeError("server not ready")
+    except BaseException:
+        if process is not None:
+            stop_failed_start(process, mark)
+        raise
 
 
 def file_sha256(path):

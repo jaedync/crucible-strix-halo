@@ -97,6 +97,28 @@ def test_a_refused_submit_removes_its_files(start_backend, tmp_path):
     backend.fatal = None
 
 
+@pytest.mark.parametrize("batch", [False, True])
+def test_a_full_dev_shm_sends_the_pixels_through_the_temp_folder(start_backend, tmp_path, monkeypatch, batch):
+    from server.tests.test_pixel_files import FakeShm, files_under
+    backend = start(start_backend, tmp_path, batch)
+    shm, fallback = tmp_path / "shm", tmp_path / "tmp"
+    shm.mkdir(), fallback.mkdir()
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(fallback))
+    backend.pixels = PixelStore(root=shm)
+    FakeShm(monkeypatch, {shm: 4096})  # a /dev/shm with no room for one image
+    ids, request, offsets = image_request()
+    job = backend.submit(ids, request, image_offsets=offsets)
+    collect(job)
+    paths = [image["path"] for image in job.payload["images"]]
+    assert all(path.startswith(str(fallback)) for path in paths)
+    # The engine read the same bytes (their digests match), and the files leave after the request.
+    assert pixel_log(tmp_path) == ["ok", "ok"]
+    wait_for(lambda: no_files(paths))
+    assert files_under(shm) == []
+    backend.close()
+    assert os.listdir(fallback) == []
+
+
 def test_batch_encoder_slices_are_not_prompt_rows(start_backend, tmp_path):
     backend = start(start_backend, tmp_path, True)
     ids, request, offsets = image_request(count=2)

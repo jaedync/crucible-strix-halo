@@ -76,7 +76,7 @@ class PieceCache:
 
 
 class ContentEncoder:
-    def __init__(self, tokenizer, tokenizer_path):
+    def __init__(self, tokenizer, tokenizer_path, stop_ids=STOP_IDS):
         added = tokenizer.get_added_tokens_decoder()
         for token in added.values():
             # The split below is plain leftmost-longest matching, which is what the tokenizer does for these flags.
@@ -92,6 +92,7 @@ class ContentEncoder:
         self.pattern = re.compile("|".join(map(re.escape, sorted(self.ids, key=len, reverse=True)))) if self.ids else None
         self.tokenizer = tokenizer
         self.tokenizer_path = tokenizer_path
+        self.stop_ids = frozenset(stop_ids)  # the model family's end-of-turn IDs: not output text
         self.lock, self.plain = threading.Lock(), None
 
     def text_tokenizer(self):
@@ -214,7 +215,7 @@ class ContentEncoder:
         """
         pieces, starts, run, position = [], {}, [], 0
         for token in list(ids) + [None]:
-            if token is not None and token in STOP_IDS:
+            if token is not None and token in self.stop_ids:
                 continue
             if token is None or token in self.names:
                 piece = decode(run) if run else ""

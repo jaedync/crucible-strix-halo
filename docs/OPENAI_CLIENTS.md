@@ -504,3 +504,7 @@ Add `server.tests.test_thinking` to the command to check the thinking profile.
 
 The tests cover text, streams, multiple calls, tool policies, tool results, token limits, stops, usage, models, errors, and cancellation.
 They also check Unicode, repeated stop prefixes, and cross-request native protocol draining.
+
+To run the same SDK tests against a running server, set `CRUCIBLE_LIVE_BASE_URL` to its root URL (for example
+`http://127.0.0.1:8790`). The tests that need the CPU fake backend then skip, and `server/tests/test_sdk_live.py` runs
+its live cases.

@@ -9,6 +9,7 @@ import threading
 import time
 from . import ablation, metrics, rope, structured
 from .engine_messages import ENGINE_REJECTED, ProtocolError, AdmissionRefused
+from . import hy4_format
 from .api import LEGACY_MODEL, PENALTY_FIELDS, ApiError, ModelInfo, STOP_IDS
 from .hosts import ALLOWED_HOSTS_ENV
 from .request_id import CLIENT_REQUEST_ID_HEADER_ENV
@@ -40,6 +41,7 @@ class Job:
     # The serial worker sends think_cap as the engine's max_tokens (it cannot cancel a job); http.py then resumes the
     # turn on a second job when the model closed its own think block first. None: the engine has the request's max.
     bounded_at: object = None
+    markers: tuple = metrics.MARKERS  # the model family's token-class IDs (metrics.count_token)
 
 # A turn that waited longer than this for the device worker counts as queued.
 QUEUED_SECONDS = 0.01
@@ -104,6 +106,16 @@ def engine_environment(environ):
             if name not in removed and name not in SERVICE_ENV_NAMES}, removed_here
 
 
+def family_stop_ids(checkpoint):
+    """The stop IDs of the checkpoint's model family: Hy4-flash (hy4_format.STOP_IDS) or the Qwen default."""
+    return hy4_format.STOP_IDS if hy4_format.is_hy4(checkpoint) else STOP_IDS
+
+
+def family_markers(checkpoint):
+    """The token-class marker IDs (metrics.count_token) of the checkpoint's model family."""
+    return hy4_format.MARKER_IDS if hy4_format.is_hy4(checkpoint) else metrics.MARKERS
+
+
 class EngineBackend:
     # Client event queue size per job; a batch worker that decodes inside prefill chunks raises it.
     event_capacity = 32
@@ -140,6 +152,8 @@ class EngineBackend:
     def __init__(self, executable, checkpoint, context=32768, conversation_cache_mib=0, prefill=None, *,
                  engine_options=(), lookup=LOOKUP_DEPTH):
         self.context = context
+        self.stop_ids = family_stop_ids(checkpoint)
+        self.markers = family_markers(checkpoint)
         self.engine_id = metrics.file_id(executable)  # a number-like name for crucible_turn, read once
         self.lookup = self.check_lookup(lookup)
         self.trace = metrics.Trace()
@@ -219,18 +233,18 @@ class EngineBackend:
         # Structured output: only an engine that names the field takes the constraint keys.
         self.constraint_ready = ready.get("constraint") == 1
         if "model" in ready:
-            self.model = self._ready_model(ready["model"])
+            self.model = self._ready_model(ready["model"], getattr(self, "stop_ids", STOP_IDS))
 
     @staticmethod
-    def _ready_model(fields):
+    def _ready_model(fields, stop_ids=STOP_IDS):
         names = ("arch", "vocab", "eos", "layers", "hidden")
         if not isinstance(fields, dict) or set(fields) != set(names):
             raise ProtocolError("The engine did not return valid model fields.")
         model = ModelInfo(**fields)
         sizes = (model.vocab, model.layers, model.hidden)
-        # The server stops on STOP_IDS, so the engine's EOS must be one of them.
+        # The server stops on the family's stop IDs, so the engine's EOS must be one of them.
         if (type(model.arch) is not str or any(type(size) is not int or size < 1 for size in sizes) or
-                type(model.eos) is not int or not 0 <= model.eos < model.vocab or model.eos not in STOP_IDS):
+                type(model.eos) is not int or not 0 <= model.eos < model.vocab or model.eos not in stop_ids):
             raise ProtocolError("The engine did not return valid model fields.")
         return model
 
@@ -333,7 +347,7 @@ class EngineBackend:
         bounded = self.bounds_think_cap and think_cap is not None and 0 < think_cap < request.max_tokens
         try:
             job = Job(dict(ids=list(ids), max_tokens=think_cap if bounded else request.max_tokens, spec=request.spec,
-                           stop_ids=list(STOP_IDS),
+                           stop_ids=list(getattr(self, "stop_ids", STOP_IDS)),
                            temperature=request.temperature, top_k=request.top_k, top_p=request.top_p,
                            min_p=request.min_p, seed=request.seed, cache_control=request.cache_control,
                            cache_prefix_tokens=cache_prefix_tokens) | policy | scoring | penalties,
@@ -358,6 +372,7 @@ class EngineBackend:
             job.turn["think_open"] = after is None and getattr(request, "kind", None) == "chat" and \
                 getattr(request, "enable_thinking", False) is True
             job.think_cap = think_cap
+            job.markers = getattr(self, "markers", metrics.MARKERS)
             job.bounded_at = think_cap if bounded else None
             if getattr(request, "rope_mode", None):  # the plain_reply counter of a long profile (rope.RopeCounters)
                 job.turn["rope_mode"] = request.rope_mode
@@ -462,7 +477,7 @@ class EngineBackend:
         enabled = job.turn["enabled"]
         if event.get("event") == "token":
             if job.turn["t_first_token"] is None: job.turn["t_first_token"] = t
-            if type(event.get("id")) is int: metrics.count_token(job.turn, event["id"])
+            if type(event.get("id")) is int: metrics.count_token(job.turn, event["id"], getattr(job, "markers", metrics.MARKERS))
             metrics.note_token(job.turn, event)
             return dict(event, crucible_t=t) if enabled else event
         if event.get("event") == "done":

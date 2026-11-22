@@ -298,6 +298,12 @@ std::string Refusal(StateDiskOptions options) {
   try { Disk disk(std::move(options)); } catch (const std::invalid_argument& error) { return error.what(); }
   return "";
 }
+// The refusal of a link that came after the rule check (state_private_dir.h).
+std::string LinkRefusal(const fs::path& link, const fs::path& root) {
+  return "the state directory is not accepted: " + link.string() + " is a link, and the engine does not follow a link "
+         "while it makes " + root.string() + " (another user can make one in a shared folder). Remove the link, or use "
+         "a folder that only you can change.";
+}
 
 // Nov 12: a state root outside the home folder, for example a second SSD. The rule needs no HOME: a
 // folder that only this user (or root) can change is accepted; a place where another user could move or replace the
@@ -355,8 +361,33 @@ void RootOutsideHome() {
   race.root = outside / "race" / "states";
   race.after_root_check = [&] { fs::create_symlink(outside / "elsewhere", outside / "race"); };
   const std::string raced = Refusal(race);
-  assert(raced == "the state directory is not accepted: " + race.root.string() + " changed while the engine made it (now " +
-                      (outside / "elsewhere" / "states").string() + ").");
+  assert(raced == LinkRefusal(outside / "race", race.root));
+  assert(!fs::exists(outside / "elsewhere" / "states"));  // the engine made nothing through the link
+  // Review cache-folder-r4 L-A: the same race when the link target holds a folder of this user with the last name
+  // (mode 0755, a file in it). The start stops at the link, and that folder keeps its mode and its file.
+  const fs::path kept = outside / "elsewhere2" / "states";
+  fs::create_directories(kept);
+  fs::permissions(kept, fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec | fs::perms::others_read |
+                            fs::perms::others_exec);
+  std::ofstream(kept / "keep.txt") << "keep";
+  auto swap = Options("g", logs);
+  swap.root = outside / "swap" / "states";
+  swap.after_root_check = [&] { fs::create_symlink(outside / "elsewhere2", outside / "swap"); };
+  assert(Refusal(swap) == LinkRefusal(outside / "swap", swap.root));
+  assert(Mode(kept) == 0755 && fs::exists(kept / "keep.txt"));
+  // The race one name deeper (both parents missing at the check): the link at the first missing name stops it too.
+  auto deep = Options("g", logs);
+  deep.root = outside / "deep" / "crucible" / "states";
+  deep.after_root_check = [&] { fs::create_symlink(outside / "elsewhere2", outside / "deep"); };
+  assert(Refusal(deep) == LinkRefusal(outside / "deep", deep.root));
+  assert(!fs::exists(outside / "elsewhere2" / "crucible") && Mode(kept) == 0755);
+  // The root itself swapped for a link after the check (its parent stays): refused, the target keeps its mode.
+  fs::create_directories(outside / "last");
+  auto last = Options("g", logs);
+  last.root = outside / "last" / "states";
+  last.after_root_check = [&] { fs::create_symlink(kept, last.root); };
+  assert(Refusal(last) == LinkRefusal(last.root, last.root));
+  assert(Mode(kept) == 0755 && fs::exists(kept / "keep.txt"));
   // The home folder itself and a relative path stay refused.
   auto at_home = Options("g", logs);
   at_home.root = Root();
@@ -781,18 +812,20 @@ void EvictionScales() {
       if (ms > worst) worst = ms;
     }
   });
+  const uint64_t checks_before = disk.Stats().branch_checks;
   for (int k = 200; k < 240; ++k) Spill(disk, Make(session(k), 64, uint8_t(k)));
   assert(disk.Drain(120));
   done = true;
   probe.join();
+  const uint64_t checks = disk.Stats().branch_checks - checks_before;
   assert(disk.Entries() < 200 && disk.Stats().evicted >= 40);
-  std::printf("eviction with 200 files: worst lock wait %.2f ms\n", worst.load());
-  // The pairwise check of 76c2d0d9 waited about 38 ms here (-O2); the one-pass check about 1.3 ms. Sanitizers slow both.
-#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
-  assert(worst < 200);
-#else
-  assert(worst < 15);
-#endif
+  std::printf("eviction with 200 files: %llu branch checks for 40 writes, worst lock wait %.2f ms (not checked)\n",
+              (unsigned long long)checks, worst.load());
+  // The lock-hold work as a count, so that the check does not change with machine load (a lock wait does: under load
+  // 15 to 20 a preempted lock holder waited 15 ms and more). The pairwise check of 76c2d0d9 made one branch check for
+  // each pair of files at each eviction (about 40,000 a write at 200 files; it waited about 38 ms at -O2). The
+  // one-pass check makes a few for each file at each write.
+  assert(checks < 40 * 20 * 200);
   (void)file;
 }
 
@@ -805,6 +838,16 @@ void DirectoryModes() {
   { std::ofstream(options.root / "write-ledger") << ""; }
   Disk disk(options);
   assert(disk.Enabled() && Mode(options.root) == 0700 && Mode(disk.Directory()) == 0700);
+  // Review state-dir-race M1: a parent that this user can search but not read (mode 0311, as a root-owned /home at
+  // 0711) does not stop the start. Trunk needed only the search bit of a parent.
+  auto xonly = Options("o", logs, "xonly/states");
+  fs::create_directories(xonly.root.parent_path());
+  ::chmod(xonly.root.parent_path().c_str(), 0311);
+  {
+    Disk searched(xonly);
+    assert(searched.Enabled() && Mode(xonly.root) == 0700 && Mode(searched.Directory()) == 0700);
+  }
+  ::chmod(xonly.root.parent_path().c_str(), 0700);
   // A root that holds other files (for example --state-dir ~/.cache) is not the tier's own folder: refused, and its
   // mode stays.
   auto shared = Options("o", logs, "shared");
@@ -819,6 +862,19 @@ void DirectoryModes() {
   auto fresh = Options("o", logs, "new/states");
   Disk created(fresh);
   assert(created.Enabled() && Mode(fresh.root) == 0700 && Mode(fresh.root.parent_path()) == 0700);
+  // A new folder gets 0700 exactly, whatever the umask cuts (a umask of 0200 would leave 0500, so no file could go in).
+  const mode_t umask = ::umask(0277);
+  auto masked = Options("o", logs, "masked/states");
+  { Disk disk(masked); assert(disk.Enabled() && Mode(masked.root) == 0700 && Mode(masked.root.parent_path()) == 0700); }
+  ::umask(umask);
+  // The lock as a link (only this user can write the 0700 folder, but the engine never follows one): the tier stays
+  // off, and the link target is not made.
+  auto locked = Options("o", logs, "lock-link");
+  fs::create_directories(locked.root / locked.directory);
+  fs::permissions(locked.root, fs::perms::owner_all);
+  fs::create_symlink(locked.root.parent_path() / "lock-target", locked.root / locked.directory / ".lock");
+  { Disk disk(locked); assert(!disk.Enabled()); }
+  assert(!fs::exists(locked.root.parent_path() / "lock-target"));
 }
 
 // Fix 3 (review rev-f3 items 2 and 4): a new state takes the queue place of the first waiting prefix of its branch, and

@@ -9,7 +9,9 @@
 #include <cstdio>
 #include <fstream>
 #include <string_view>
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 namespace crucible {
 // The settings of the disk identity: the switches, the pack, the state format and the MTP slot rows. A saved state's
@@ -327,6 +329,12 @@ class BatchDiskTier {
       return disk_.Waiting(key, policy, compact_) ? 0 : -1;
     });
     cache.SetSpillWord([this] { return last_spill_; });
+    // Review M1 (load-miss): a waiting resume point that this tier keeps may leave before the Shared floor.
+    cache.SetDiskKeeps([this](std::span<const int> key, const ConversationPolicy& policy) {
+      if (!Enabled() || !DiskKeepsRope(policy)) return false;
+      return key.size() >= disk_.MinTokens() || disk_.Present(key, policy, compact_) ||
+             disk_.Waiting(key, policy, compact_);
+    });
     if (Enabled()) LoadLedger(cache);
   }
   // A stopping engine, after its flush: every host entry that is not superseded leaves with the process. Its record
@@ -346,21 +354,33 @@ class BatchDiskTier {
     std::error_code error;
     const auto bytes = cache.LedgerBytes();
     const auto folder = ledger_ / directory_;
-    for (const auto& path : {ledger_, folder})
-      if (::mkdir(path.c_str(), 0700) != 0 && errno != EEXIST) {
-        std::fprintf(stderr, "state_disk ledger_save result=refused reason=mkdir\n");
-        return false;
-      }
+    // No link at any depth, and only this user's folders (state_private_dir.h): `<root>.ledger` may sit in a shared
+    // sticky folder beside the root.
+    // The log names the reason (review state-dir-race L2): it holds only a path, a uid or an errno text.
+    if (const auto opened = OpenPrivateDirectory(folder, PrivateDirRule::Process(), true); !opened.Ok()) {
+      std::fprintf(stderr, "state_disk ledger_save result=refused reason=folder error=%s\n", opened.message.c_str());
+      return false;
+    }
     const auto file = folder / kLedgerFile, temporary = folder / (std::string(kLedgerFile) + ".tmp");
-    {
-      std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
-      out.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
-      if (!out.good()) {
-        std::fprintf(stderr, "state_disk ledger_save result=refused reason=write\n");
-        return false;
-      }
+    // A6 F5: the bytes reach the disk before the rename, and the rename before the return, so a power loss keeps the
+    // old list or the new one, never a short one. No link is followed at the temporary name.
+    const int fd = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+    bool written = fd >= 0;
+    for (size_t at = 0; written && at < bytes.size();) {
+      const ssize_t n = ::write(fd, bytes.data() + at, bytes.size() - at);
+      if (n < 0 && errno == EINTR) continue;
+      written = n > 0;
+      if (written) at += size_t(n);
+    }
+    written = written && ::fsync(fd) == 0;
+    if (fd >= 0 && ::close(fd) != 0) written = false;
+    if (!written) {
+      std::fprintf(stderr, "state_disk ledger_save result=refused reason=write\n");
+      return false;
     }
     std::filesystem::rename(temporary, file, error);
+    if (!error)
+      if (const int dir = ::open(folder.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC); dir >= 0) { ::fsync(dir); ::close(dir); }
     std::fprintf(stderr, "state_disk ledger_save result=%s records=%zu bytes=%zu\n", error ? "refused" : "saved",
                  cache.LostRecords(), bytes.size());
     return !error;
@@ -370,6 +390,12 @@ class BatchDiskTier {
   template<class Cache>
   size_t LoadLedger(Cache& cache) {
     if (ledger_.empty()) return 0;
+    const auto side = OpenPrivateDirectory(ledger_, PrivateDirRule::Process(), false);
+    if (!side.Ok()) {
+      if (!side.missing)
+        std::fprintf(stderr, "state_disk ledger_load result=refused reason=folder error=%s\n", side.message.c_str());
+      return 0;
+    }
     std::error_code error;
     std::filesystem::path from = ledger_ / directory_ / kLedgerFile;
     bool switched = false;

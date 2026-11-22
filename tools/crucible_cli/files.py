@@ -9,6 +9,8 @@ import shutil
 import tempfile
 from pathlib import Path
 
+from . import private_dir
+
 # Commands that the runner refuses: root tools and shells.
 FORBIDDEN_COMMANDS = frozenset({"sudo", "su", "doas", "pkexec", "sh", "bash", "dash", "zsh", "fish", "csh", "ksh"})
 SYSTEM_PREFIXES = ("/boot", "/efi", "/etc", "/usr", "/bin", "/sbin", "/lib", "/var/lib", "/sys", "/proc", "/dev")
@@ -37,11 +39,13 @@ class Sandbox:
             raise OutsideRoots(f"{path} is outside the folders that this tool may write")
         return Path(real)
 
-    def mkdir(self, path, mode=0o777):
-        real = self.check(path)
-        real.mkdir(parents=True, exist_ok=True, mode=mode)
-        if mode != 0o777:
-            os.chmod(real, mode)
+    def mkdir(self, path):
+        self.check(path).mkdir(parents=True, exist_ok=True)
+
+    def mkdir_private(self, path):
+        """PATH as a folder of this user with mode 0700, made one name at a time with no link (private_dir.py).
+        Raises private_dir.Refused."""
+        private_dir.make_private_dir(self.check(path))
 
     def write_text(self, path, text, executable=False, mode=None):
         real = self.check(path)

@@ -4,6 +4,11 @@ Codebook values and decoder states are bit-exact. reconstruct models the Python
 get_weight_tensor path, not the different rounding of fused CUDA reconstruction.
 matvec follows the default FP16 activation transform / decoded matmul / output
 transform order. Its middle dot uses FP32 BLAS, not NVIDIA MMA accumulation.
+
+The EXL3-INT8 mul24 codebook (github.com/jyohukuchan/rocm_exl3_forme doc/exl3_int8.md, "mul24 形式") is selected
+by the .mul1 value 0x00DCD12D: x = state * 0xDCD12D mod 2^32, B = its byte sum, the WMMA B fragment tile order
+(frag_perm). Two value forms of one state: 'mul24' is the fp16 mul1 formula on B (the quantizer's reconstruction,
+the default), 'int8mul24' the INT8 grid q = (B - 509) >> 2 times S_FIX in float32.
 """
 from __future__ import annotations
 from collections.abc import Mapping
@@ -13,6 +18,9 @@ HAD_SIZE = 128
 HAD_SCALE = np.float32(0.088388347648)
 MUL1 = 0x83DCD12D
 MCG = 0xCBAC1FED
+MUL24 = 0x00DCD12D
+S_FIX = np.float32(4 * 887 / 131072)  # 0.027069091796875, the INT8 grid step of EXL3-INT8
+MUL24_FORMS = ('mul24', 'int8mul24')
 
 
 def _bitrate(bits: float) -> tuple[int, bool]:
@@ -35,6 +43,16 @@ def tensor_core_perm() -> np.ndarray:
                      (rows + 8) * 16 + cols, (rows + 9) * 16 + cols,
                      rows * 16 + cols + 8, (rows + 1) * 16 + cols + 8,
                      (rows + 8) * 16 + cols + 8, (rows + 9) * 16 + cols + 8], axis=-1).reshape(256)
+
+
+def frag_perm() -> np.ndarray:
+    """mul24 tile order: position t = 8 L + j maps to row-major element (8 (L // 16) + j) * 16 + L % 16."""
+    t = np.arange(256)
+    return (8 * (t // 128) + t % 8) * 16 + (t // 8) % 16
+
+
+def tile_perm(codebook: str) -> np.ndarray:
+    return frag_perm() if codebook in MUL24_FORMS else tensor_core_perm()
 
 
 def decode_tile_symbols(packed: np.ndarray, bits: float | None = None) -> np.ndarray:
@@ -65,12 +83,25 @@ def decode_tile_symbols(packed: np.ndarray, bits: float | None = None) -> np.nda
     return (((a << 32 | b) >> shift.astype(np.uint64)) & 65535).astype(np.uint16)
 
 
+def _byte_sum(states: np.ndarray, mult: int) -> np.ndarray:
+    product = (np.asarray(states, dtype=np.uint16).astype(np.uint64) * mult) & 0xffffffff
+    return sum((product >> shift) & 255 for shift in [0, 8, 16, 24])
+
+
+def int8mul24_q(states: np.ndarray) -> np.ndarray:
+    """The INT8 weights q = (B - 509) >> 2 (arithmetic shift, -128 .. 127) of mul24 states."""
+    return ((_byte_sum(states, MUL24).astype(np.int64) - 509) >> 2).astype(np.int8)
+
+
 def decode_codebook(states: np.ndarray, codebook: str = 'mul1') -> np.ndarray:
-    """Decode states to exact fp16 codebook values, including half FMA rounding."""
+    """Decode states to exact fp16 codebook values, including half FMA rounding.
+
+    'int8mul24' returns float32 q * S_FIX (exact: |q * 887| < 2^17)."""
     states = np.asarray(states, dtype=np.uint16).astype(np.uint64)
-    if codebook == 'mul1':
-        product = (states * MUL1) & 0xffffffff
-        byte_sum = sum((product >> shift) & 255 for shift in [0, 8, 16, 24])
+    if codebook == 'int8mul24':
+        return int8mul24_q(states).astype(np.float32) * S_FIX
+    if codebook in ['mul1', 'mul24']:
+        byte_sum = _byte_sum(states, MUL1 if codebook == 'mul1' else MUL24)
         h = (np.uint16(0x6400) + byte_sum.astype(np.uint16)).view(np.float16)
         inv = np.array(0x1eee, dtype=np.uint16).view(np.float16).astype(np.float64)
         bias = np.array(0xc931, dtype=np.uint16).view(np.float16).astype(np.float64)
@@ -86,7 +117,34 @@ def decode_codebook(states: np.ndarray, codebook: str = 'mul1') -> np.ndarray:
     return (low.astype(np.float32) + high.astype(np.float32)).astype(np.float16)
 
 
-def _stored(stored: Mapping[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+def stored_codebook(stored: Mapping[str, np.ndarray]) -> str:
+    """The codebook that a tensor's marker selects: 'mul1', 'mul24', 'mcg' or '3inst'. Any other marker value raises."""
+    if 'mul1' in stored and 'mcg' in stored:
+        raise ValueError('Ambiguous codebook markers')
+    if 'mcg' in stored or 'mul1' not in stored:
+        codebook = 'mcg' if 'mcg' in stored else '3inst'
+        if codebook == 'mcg':
+            marker = np.asarray(stored['mcg'])
+            if marker.size != 1 or (int(marker.item()) & 0xffffffff) != MCG:
+                raise ValueError('Unsupported codebook multiplier marker')
+        return codebook
+    marker = np.asarray(stored['mul1'])
+    if marker.size != 1:
+        raise ValueError(f'Unsupported codebook multiplier marker of {marker.size} values')
+    return codebook_of(int(marker.item()))
+
+
+def codebook_of(marker: int) -> str:
+    """'mul1' or 'mul24' for a .mul1 value (signed or unsigned 32-bit); any other value raises."""
+    value = int(marker) & 0xffffffff
+    if value not in (MUL1, MUL24):
+        raise ValueError(f'Unsupported codebook multiplier marker {value:#010x}: '
+                         f'mul1 is 0x83DCD12D, mul24 is 0x00DCD12D')
+    return 'mul1' if value == MUL1 else 'mul24'
+
+
+def _stored(stored: Mapping[str, np.ndarray],
+            codebook: str | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
     trellis = np.asarray(stored['trellis'])
     suh, svh = np.asarray(stored['suh']), np.asarray(stored['svh'])
     if trellis.ndim != 3 or trellis.shape[:2] != (suh.size // 16, svh.size // 16):
@@ -95,24 +153,25 @@ def _stored(stored: Mapping[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray, n
         raise ValueError('Linear dimensions must be multiples of 128')
     if suh.dtype != np.float16 or svh.dtype != np.float16:
         raise ValueError('suh and svh must be fp16')
-    codebook = 'mul1' if 'mul1' in stored else 'mcg' if 'mcg' in stored else '3inst'
-    if 'mul1' in stored and 'mcg' in stored:
-        raise ValueError('Ambiguous codebook markers')
-    if codebook in ['mul1', 'mcg']:
-        marker = np.asarray(stored[codebook])
-        if marker.size != 1 or (int(marker.item()) & 0xffffffff) != (MUL1 if codebook == 'mul1' else MCG):
-            raise ValueError('Unsupported codebook multiplier marker')
+    marked = stored_codebook(stored)
+    if codebook is None or codebook == marked:
+        codebook = marked
+    elif not (marked == 'mul24' and codebook in MUL24_FORMS):
+        raise ValueError(f'Codebook {codebook} does not match the marker ({marked}); only a mul24 marker has the '
+                         f'forms {MUL24_FORMS}')
     if trellis.shape[-1] % 16 and codebook != 'mul1':
         raise ValueError('Half-integer bitrates require mul1')
     return trellis, suh, svh, codebook
 
 
-def reconstruct_inner(stored_tensors: Mapping[str, np.ndarray]) -> np.ndarray:
-    """Return the rotated-basis decoded fp16 matrix [input, output]."""
-    trellis, suh, svh, codebook = _stored(stored_tensors)
+def reconstruct_inner(stored_tensors: Mapping[str, np.ndarray], codebook: str | None = None) -> np.ndarray:
+    """Return the rotated-basis decoded matrix [input, output]: fp16, float32 for 'int8mul24'.
+
+    codebook: None takes the marker's codebook ('mul24' for a mul24 marker); 'int8mul24' needs a mul24 marker."""
+    trellis, suh, svh, codebook = _stored(stored_tensors, codebook)
     tiles = trellis.reshape(-1, trellis.shape[-1])
-    perm = tensor_core_perm()
-    decoded = np.empty((tiles.shape[0], 256), dtype=np.float16)
+    perm = tile_perm(codebook)
+    decoded = np.empty((tiles.shape[0], 256), dtype=np.float32 if codebook == 'int8mul24' else np.float16)
     for first in range(0, tiles.shape[0], 1024):
         states = decode_tile_symbols(tiles[first:first + 1024])
         decoded[first:first + 1024, perm] = decode_codebook(states, codebook)
@@ -126,10 +185,10 @@ def _had_matrix() -> np.ndarray:
     return h * HAD_SCALE
 
 
-def reconstruct(stored_tensors: Mapping[str, np.ndarray]) -> np.ndarray:
+def reconstruct(stored_tensors: Mapping[str, np.ndarray], codebook: str | None = None) -> np.ndarray:
     """get_weight_tensor rounding: fp32 Had matmul, fp16 after each transform/scale."""
-    _, suh, svh, _ = _stored(stored_tensors)
-    inner = reconstruct_inner(stored_tensors)
+    _, suh, svh, _ = _stored(stored_tensors, codebook)
+    inner = reconstruct_inner(stored_tensors, codebook)
     h = _had_matrix()
     left = (h @ inner.astype(np.float32).reshape(-1, 128, svh.size)).reshape(inner.shape).astype(np.float16)
     left_scaled = (left.astype(np.float32) * suh.astype(np.float32)[:, None]).astype(np.float16)
@@ -157,13 +216,14 @@ def hadamard_kernel(x: np.ndarray, pre_scale: np.ndarray | None = None,
 
 
 def matvec(x: np.ndarray, stored_tensors: Mapping[str, np.ndarray],
-           out_dtype: np.dtype = np.float16) -> np.ndarray:
+           out_dtype: np.dtype = np.float16, codebook: str | None = None) -> np.ndarray:
     """GEMV stage order; FP32 BLAS dot is a portable, not MMA-bit-exact, oracle.
 
     out_dtype is activation metadata, not encoded in the EXL3 weight tensors.
     Routed expert down projections use float32 output in ExLlamaV3.
+    codebook: as for reconstruct_inner.
     """
-    _, suh, svh, _ = _stored(stored_tensors)
+    _, suh, svh, codebook = _stored(stored_tensors, codebook)
     x = np.asarray(x, dtype=np.float16)
     if x.shape != (suh.size,):
         raise ValueError('x must be one input vector')
@@ -171,7 +231,7 @@ def matvec(x: np.ndarray, stored_tensors: Mapping[str, np.ndarray],
     dtype = np.dtype(out_dtype)
     if dtype not in [np.dtype('float16'), np.dtype('float32')]:
         raise ValueError('out_dtype must be fp16 or fp32')
-    rotated = (xh.astype(np.float32) @ reconstruct_inner(stored_tensors).astype(np.float32)).astype(dtype)
+    rotated = (xh.astype(np.float32) @ reconstruct_inner(stored_tensors, codebook).astype(np.float32)).astype(dtype)
     output = hadamard_kernel(rotated, post_scale=svh)
     if 'bias' in stored_tensors:
         output = (output.astype(np.float32) + np.asarray(stored_tensors['bias'], dtype=np.float32)).astype(dtype)

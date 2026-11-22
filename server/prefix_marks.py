@@ -17,6 +17,8 @@ import threading
 from array import array
 from collections import OrderedDict
 
+from .template import effort_option
+
 HASH_DIGITS = 10
 TOOL_HASH_CAP = 64  # the first 64 tool definitions get a hash each; prefix_tool_count gives the full count
 CACHE_ENTRIES = 64  # heads of recent sessions; a repeat turn of a session skips the renders and the encode
@@ -64,7 +66,7 @@ def _cache_key(tools, request):
     """A keyed digest of everything that the head depends on. marshal version 0 writes equal values (same key order)
     as equal bytes, about 8 times faster than json.dumps for a Pi tool list (0.12 ms, not 0.8 ms, for 50 KB)."""
     setup = [tools, request.tool_choice, request.enable_thinking, request.reasoning_effort,
-             getattr(request, "preserve_thinking", None)]
+             getattr(request, "preserve_thinking", None), getattr(request, "effort_word", None)]
     try:
         data = marshal.dumps(setup, 0)
     except ValueError:  # a value that marshal cannot write: JSON is slower but takes every request value
@@ -104,7 +106,7 @@ def _head_entry(tokenizer, request, tools):
     messages = (dict(role="system", content=SYSTEM_SENTINEL), dict(role="user", content=USER_SENTINEL))
     # The head without tools is the reasoning line (or none) that the template writes before the tools block.
     reasoning = _head(tokenizer.template.render(messages, request.enable_thinking, request.reasoning_effort, (), "auto",
-                                                add_generation_prompt=False))
+                                                add_generation_prompt=False, **effort_option(request)))
     text, restore = tokenizer.render_prompt(request, add_generation_prompt=False, messages=messages)
     head = _head(text)
     if reasoning is None or head is None:

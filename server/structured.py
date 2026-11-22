@@ -99,8 +99,9 @@ def const(value):
     return dict(type="const_string", value=value)
 
 
-def parameter_value(schema, root, field, budget):
-    """The grammar of one parameter value, between `<parameter=KEY>\\n` and `\\n</parameter>\\n`."""
+def parameter_value(schema, root, field, budget, end_tag="</parameter>"):
+    """The grammar of one parameter value, between `<parameter=KEY>\\n` and `\\n</parameter>\\n`. end_tag: the tag
+    that ends a raw string value in the call form (Hy4-flash: hy4_format.ARG_VALUE_END)."""
     if schema is True or schema == {}:
         schema = {}
     resolved = resolve(schema, root, budget=budget)
@@ -114,7 +115,7 @@ def parameter_value(schema, root, field, budget):
             if isinstance(resolved, dict) and keyword in resolved:
                 refuse(f"{keyword} (string tool parameter)", field)
         if choices is not None:
-            if any(not isinstance(item, str) or "</parameter>" in item for item in choices):
+            if any(not isinstance(item, str) or end_tag in item for item in choices):
                 # The call form cannot hold the value; the other values can still match (not constraint_impossible).
                 raise ApiError("A string tool parameter enum must hold text without a parameter end tag.", field,
                                code="constraint_keyword")
@@ -228,13 +229,18 @@ def tool_format(tools, choice, parallel):
     return ("auto", calls)
 
 
-def constraint(body, kind, tools, choice, parallel, field=FORMAT_FIELD):
+def constraint(body, kind, tools, choice, parallel, field=FORMAT_FIELD, form=None):
     """The engine constraint of a request: None, or dict(kind=..., spec=JSON text). The engine adds the phase.
-    field: the place that an error of body's response_format names."""
+    field: the place that an error of body's response_format names. form "hy4": the Hy4-flash call tags
+    (server/hy4_structured.py); None: the checkpoint's Qwen form."""
     answer = response_format(body.get("response_format"), kind, field)
     calls = None
     if kind == "chat" and tools and choice != "none" and (answer is not None or choice != "auto" or enforced(tools)):
-        calls = tool_format(tools, choice, parallel)
+        if form == "hy4":
+            from .hy4_structured import tool_format as hy4_tool_format
+            calls = ("hy4", hy4_tool_format(tools, choice, parallel))
+        else:
+            calls = tool_format(tools, choice, parallel)
     # The grammar limits of every schema that goes into this request's grammar (server/grammar_limits.py).
     budget = GrammarBudget()
     if answer is not None and answer[0] == "json_schema":
@@ -250,7 +256,15 @@ def constraint(body, kind, tools, choice, parallel, field=FORMAT_FIELD):
         if answer[0] == "json_object":
             return dict(kind="json_object", spec="")
         return dict(kind="json_schema", spec=compact(grammar_schema(answer[1])))
-    if isinstance(calls, tuple):
+    if isinstance(calls, tuple) and calls[0] == "hy4":
+        fmt = calls[1]
+        if answer is not None and fmt["type"] == "triggered_tags":
+            # auto with an answer format: the JSON answer, or text and then at least one tool block.
+            schema = {"type": "object"} if answer[0] == "json_object" else answer[1]
+            fmt = dict(type="or", elements=[
+                dict(type="json_schema", json_schema=grammar_schema(schema), max_whitespace_cnt=MAX_WHITESPACE),
+                fmt | dict(at_least_one=True)])
+    elif isinstance(calls, tuple):
         # auto: free text (or the JSON answer), then calls that open at `<tool_call>`. tool_output.py takes text
         # before the first call only, so the output ends with the calls: one call, or with parallel calls more calls
         # each after "\n", and no text after or between them.

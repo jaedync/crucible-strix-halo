@@ -124,6 +124,23 @@ class TurnLogTest(unittest.TestCase):
         self.assertTrue(first.cancelled.is_set())
         self.assertEqual(len(backend.submissions[1][0]), len(PROMPT) + 1024 + len(CLOSE))
 
+    def test_continuation_names_the_clients_boundary(self):
+        # cache-thinkcap: the engine keeps the newest slot point at or below a prompt's stable boundary when the prompt
+        # ends more than 8 rows past it (BatchSession::KeepBoundary). The continuation gets the first job's boundary and
+        # shared block (the client's history), not one of its own prompt, which runs on past the reasoning.
+        class BoundaryTokenizer(BudgetTokenizer):
+            def cache_prefix_tokens(self, request, ids):
+                return len(ids) - 1
+
+            def shared_prefix_tokens(self, request, ids):
+                return 1
+        backend = LinkedBackend(([REASON] * 1500, "length", 0), ([ANSWER, IM_END], "stop", 9))
+        invoke(backend, BoundaryTokenizer(), chat(max_tokens=2048))
+        (first_ids, _, first), (ids, _, follow) = backend.submissions
+        self.assertEqual((first["cache_prefix_tokens"], first["shared_prefix_tokens"]), (len(PROMPT) - 1, 1))
+        self.assertEqual((follow["cache_prefix_tokens"], follow["shared_prefix_tokens"]), (len(PROMPT) - 1, 1))
+        self.assertGreater(len(ids), follow["cache_prefix_tokens"] + 8)
+
     def test_closed_turn_reports_the_first_jobs_restore(self):
         # Job 1 restored 2 of the 3 prompt tokens when it opened; the continuation's own hit (9) is not the client's.
         backend = SequenceBackend(([REASON] * 1500, "length", 0, 2), ([ANSWER, IM_END], "stop", 9))

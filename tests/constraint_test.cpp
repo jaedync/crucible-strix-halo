@@ -363,6 +363,39 @@ void Real() {
   assert(mask.size() == 248320 / 32 && MaskAllows(mask, 4754) && !MaskAllows(mask, 248046));
   std::puts("PASS: real tokenizer: recorded stream, stop token, added tokens and pad rows");
 }
+std::string Hy4Tokenizer() {
+  if (const char* path = std::getenv("CRUCIBLE_HY4_TOKENIZER_JSON")) return path;
+  const char* home = std::getenv("HOME");
+  const std::string local = std::string(home ? home : "") + "/.cache/hy4-server/hf/tokenizer.json";
+  return std::filesystem::exists(local) ? local : "";
+}
+// Hy4-flash (tencent/Hy4-flash tokenizer.json): the call tags of server/hy4_structured.py are text in a grammar, the
+// reasoning phase ends at </think:opensource>, and <|hy_end:opensource|> is the stop token.
+void Hy4Real() {
+  const std::string path = Hy4Tokenizer();
+  if (path.empty()) { std::puts("SKIP: Hy4-flash tokenizer (set CRUCIBLE_HY4_TOKENIZER_JSON)"); return; }
+  const ConstraintFamily family = Hy4ConstraintFamily();
+  assert(family.rows == 120832 && family.stop == 120025 && family.think_end == 120030);
+  auto vocab = LoadConstraintVocab(path, family);
+  assert(ConstraintVocabRows(*vocab) == 120832);
+  const char* spec = R"({"type":"structural_tag","format":{"type":"sequence","elements":[)"
+                     R"({"type":"const_string","value":"<tool_calls:opensource><tool_call:opensource>read"},)"
+                     R"({"type":"tag","begin":"<arg_key:opensource>x</arg_key:opensource><arg_value:opensource>",)"
+                     R"("content":{"type":"any_text"},"end":"</arg_value:opensource>"},)"
+                     R"({"type":"const_string","value":"</tool_call:opensource></tool_calls:opensource>"}]}})";
+  auto c = MakeConstraint(*vocab, {"structural_tag", spec, true}, family.think_end);
+  assert(c->Allows(120035) && c->Allows(87));  // the reasoning phase: no mask
+  assert(c->Accept(87) && c->Accept(120030));  // </think:opensource> arms the grammar
+  assert(!c->Allows(87) && !c->Allows(120029) && !c->Allows(120025));
+  for (const int id : {120035, 120033, 1629, 120040, 87, 120041, 120042, 816, 120043, 120034, 120036})
+    assert(c->Accept(id));
+  assert(c->Accept(120025) && c->Terminated());
+  // The Qwen form of the loader keeps only the Qwen call tags: the Hy4 block tag is never legal there.
+  auto qwen = LoadConstraintVocab(path, 120832, 120025);
+  auto old = MakeConstraint(*qwen, {"structural_tag", spec, false});
+  assert(!old->Allows(120035));
+  std::puts("PASS: Hy4-flash tokenizer: call tags are text, </think:opensource> arms, <|hy_end|> stops");
+}
 }  // namespace
 
 int main() {
@@ -385,5 +418,6 @@ int main() {
   PenaltySpan(*vocab);
   LazyDraw();
   Real();
+  Hy4Real();
   std::puts("PASS: constraint");
 }

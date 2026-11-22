@@ -500,6 +500,13 @@ class BatchConversationCache {
   }
   // Whether the disk holds a state of this key: 1 on disk, 0 the writer holds it, -1 neither (a failed write).
   void SetDurable(std::function<int(std::span<const int>, const ConversationPolicy&)> durable) { durable_ = std::move(durable); }
+  // Whether the disk tier keeps a state of this key: on disk or queued, or long enough for its spill (min_tokens) and a
+  // plain rope tenant. Only the Shared floor's victim order reads it (review M1): a waiting resume point that the disk
+  // does not keep and that does not extend the floor outlasts the floor. It does not read the daily write budget, so
+  // the order does not change when the budget runs out.
+  void SetDiskKeeps(std::function<bool(std::span<const int>, const ConversationPolicy&)> keeps) {
+    disk_keeps_ = std::move(keeps);
+  }
   // The disk tier's word for its last refused spill (BatchDiskTier::LastSpill).
   void SetSpillWord(std::function<std::string()> word) { spill_word_ = std::move(word); }
   size_t LostRecords() const { return lost_->size(); }
@@ -972,7 +979,17 @@ class BatchConversationCache {
     // (kWaiting) still outlasts it. A restore of an entry that stays returns the same state as before.
     kNewest = 8,
     kWaiting = 9,    // the resume point of a recent session beyond the live count (more sessions than slots)
-    kReadAhead = 10,  // a live resume point that a disk read for a turn ahead of its session may take (MakeRoom)
+    // load-miss: the rank of the Shared prefix that the most branches extend (two or
+    // more; Plan's shared_floor_, one entry at most). It orders the victims, and a speculative save keeps it as it
+    // keeps a waiting resume point (Admit), so such a save can be refused ("protected"). It is the floor of each
+    // session whose own state left: the system prefix of the v0.38.1 load (12,288 tokens) is under the disk minimum
+    // (16,384), so no disk copy backs it, while a waiting resume point of that size or more goes to disk.
+    kSharedFloor = 10,
+    // load-miss review M1: a waiting resume point (kWaiting) that does not extend the floor and that the disk does not
+    // keep (SetDiskKeeps). The floor is no fallback for it, so the floor leaves first. A rank only, as kSharedFloor:
+    // with no floor, or when each waiting point extends the floor or has a disk copy, the order is that of the fix.
+    kWaitingAlone = 11,
+    kReadAhead = 12,  // a live resume point that a disk read for a turn ahead of its session may take (MakeRoom)
   };
   bool OnProbation(const Item& item) const { return probation_ && !item.proven; }
   // Start plan B3 (a load test): a live resume point whose state is on the disk (written, not only queued) may leave for
@@ -1072,6 +1089,30 @@ class BatchConversationCache {
       newest_.clear();
     }
     newest_last_ = newest_.size();
+    // load-miss: the Shared prefix that the most branches extend (ties: the longer one, then the first in list order).
+    // A branch is a state that no other state extends (each state that extends a branch also extends the prefix). A
+    // conversation can give more than one branch: a reasoning turn whose next prompt drops part of the reply leaves
+    // the old tail and the new frontier (review L1). The state of a one-time request is a branch too. Superseded
+    // entries do not count, and a superseded, copy, stale or probation prefix is not a floor.
+    shared_floor_ = nullptr;
+    std::vector<const Item*> branches;
+    for (const Item* item : items)
+      if (!item->superseded && std::none_of(items.begin(), items.end(), [&](const Item* other) {
+            return !other->superseded && Extends(*other, *item);
+          }))
+        branches.push_back(item);
+    size_t floor_branches = 1;  // two or more
+    for (Item* item : items) {
+      const int level = tier.at(item);
+      if (item->superseded || item->snapshot->retention != CacheRetention::Shared || level < kIdle || level > kWaiting)
+        continue;
+      const size_t count = size_t(std::count_if(branches.begin(), branches.end(), [&](const Item* branch) {
+        return Extends(*branch, *item);
+      }));
+      if (count > floor_branches ||
+          (shared_floor_ && count == floor_branches && item->ids.size() > shared_floor_->ids.size()))
+        shared_floor_ = item, floor_branches = count;
+    }
     return tier;
   }
   // Hands this save's victims to the spill hook. The save leaves available + victims - bytes above zero; the
@@ -1126,25 +1167,39 @@ class BatchConversationCache {
     const struct Reset {
       std::vector<const void*>& kept;
       std::set<const Item*>& newest;
+      const Item*& floor;
       ~Reset() {
         kept.clear();
         newest.clear();
+        floor = nullptr;
       }
-    } reset{*kept_, newest_};
+    } reset{*kept_, newest_, shared_floor_};
     const auto freed = [&](const Item& item) { return Freed(item, share.kept); };
     // No eviction needed: skip the plan.
     if (cache_.ReserveHost(bytes, host_bytes, available, reserve, [](const Item&) { return -1; }, freed)) return true;
     const auto plan = Plan();
+    // Review M1: the waiting resume points that the floor does not back (they do not extend it) and that the disk does
+    // not keep. They outlast the floor (kWaitingAlone). Each other waiting point outlasts it as before.
+    std::set<const Item*> alone;
+    if (shared_floor_)
+      for (const auto& [item, tier] : plan)
+        if (tier == kWaiting && !Extends(*item, *shared_floor_) &&
+            !(disk_keeps_ && disk_keeps_(item->ids, item->policy)))
+          alone.insert(item);
     if (cache_.ReserveHost(bytes, host_bytes, available, reserve, [&](const Item& item) {
           const int tier = plan.at(&item);
           if (Held(item)) return int(kKept);
-          // A speculative save never takes a client prompt's state that waits for its session's next turn.
-          if ((resident && tier > kSuperseded) || (speculative && (tier == kWaiting || tier == kProbation)))
+          // A speculative save never takes a client prompt's state that waits for its session's next turn, nor the
+          // Shared floor (load-miss: the tail of short-1 turn 1 took the system prefix, then left itself).
+          if ((resident && tier > kSuperseded) ||
+              (speculative && (tier == kWaiting || tier == kProbation || &item == shared_floor_)))
             return int(kKept);
           if (tier == kKept && read_ahead_ && (read_ahead_(item.ids) || OnDisk(item))) return int(kReadAhead);
           // An earlier change: the newest state of a recent conversation leaves after every older or idle entry. The guards
           // above keep their meaning, so this is the order of the victims only.
           if (newest_.contains(&item)) return int(kNewest);
+          if (&item == shared_floor_) return int(kSharedFloor);
+          if (alone.contains(&item)) return int(kWaitingAlone);
           return tier;
         }, freed, deferred)) {
       SpillVictims(available, host_bytes);
@@ -1228,5 +1283,10 @@ class BatchConversationCache {
   // The newest saved state of each recent conversation (Plan): its victims order only.
   std::set<const Item*> newest_;
   size_t newest_last_ = 0;  // the size of the last plan's set (tests only)
+  // The Shared prefix of the most branches (Plan, load-miss): a victim rank and a speculative save's guard. Lives
+  // inside Admit only.
+  const Item* shared_floor_ = nullptr;
+  // Whether the disk tier keeps a state (on disk, or an eviction would write it; review M1). Empty: no disk tier.
+  std::function<bool(std::span<const int>, const ConversationPolicy&)> disk_keeps_;
 };
 }  // namespace crucible

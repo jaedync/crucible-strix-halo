@@ -8,7 +8,7 @@ The ideas behind the numbers are in [How it got fast](how-it-got-fast.md).
 
 Contents: [release ladder](#release-ladder) · [prefill by context length](#prefill-by-context-length) ·
 [decode by context length](#decode-by-context-length) · [hardware ceilings](#hardware-ceilings) ·
-[earlier releases](#earlier-releases) ·
+[one new prompt in 4 sessions](#one-new-prompt-in-4-sessions) · [earlier releases](#earlier-releases) ·
 [measurement details](#measurement-details) · [history of earlier tables](#history-of-earlier-tables)
 
 ## Release ladder
@@ -221,6 +221,21 @@ The 3.05 lines were measured on Nov 1 to 3 (v0.32.0 and v0.33.0: Nov 3) with the
   The cause is not found. The medians above include these samples.
 - Decode falls with context: about 65 tok/s at 32K to 58 tok/s at 250K on 4.05 (v0.22.0 and v0.26.0; v0.30.0: 68 to 61 tok/s). The values of the 3.05 pack are in the table above. The draft head accepts more tokens on some contexts than on others
   (tokens per verify pass 2.5 to 3.5 on 4.05), so the curve is not smooth.
+
+## One new prompt in 4 sessions
+
+v0.38.1 sets `CRUCIBLE_EXACT_RESUME=1` and `CRUCIBLE_TWIN=1` in the release settings. When several sessions send the
+same new prompt, one session prefills it and the others copy its state. Each session gets the tokens of the prompt alone.
+
+| New prompt | Without the two settings | With the two settings |
+|---|---:|---:|
+| 32,768 tokens | 79.48 s | 17.39 s |
+| 100,000 tokens | 228.85 s | 54.92 s |
+
+Each value is the time to the first token of the last of 4 sessions that send the prompt at the same time, the mean of
+4 runs. Method: Nov 19, 2026, the v0.38.0 engine, the 4.05 pack, balanced power profile (GPU clock 2,305 to 2,327 MHz),
+4 pairs in the order AB, BA, BA, AB. In both arms the 4 sessions gave the tokens of a control run of the prompt alone.
+The v0.38.1 engine did not run this test.
 
 ## Power profile
 

@@ -58,6 +58,12 @@ The server tells you at start when a newer release exists (one request a day to 
 Use `GET /health` for a readiness check: it answers `{"status":"ok","sessions":N,"context":C}` with the real slot count
 and `--ctx` (HTTP 503 if the engine has stopped). The memory fit at start can make them smaller than the request
 (`--fit`).
+The start-time check keeps a reserve free: 9,216 MiB by default (8 GiB for the OS, 512 MiB for the engine plans and
+512 MiB for the server). `--admission-reserve-mib N` (1,024 to 1,048,576, batched server only) sets another value, and
+the engine prints it at start as `admission reserve: N MiB (...)`. A low value leaves less memory for the OS. On a
+unified-memory host the GPU uses the same memory, so use a low value only on a machine that runs little else.
+The conversation cache saves keep their own reserve, `--host-reserve-mib` (8,192 MiB by default). A low admission
+reserve can admit a cache that the saves cannot fill: to fill it, lower `--host-reserve-mib` too.
 Use `/v1/completions` with a `prompt` string for plain text.
 A completion can return the log-probabilities of its one next token. Set `logprobs` to true or `top_logprobs` to an
 integer from 0 to 20, with `max_tokens` 1, `temperature` 0 and `stream` false. The reply has `token_id`, `logprob` and
@@ -314,9 +320,24 @@ It includes terminal stop IDs.
 With thinking on, the server splits the output at `</think>`, as other engines and Halogen do:
 
 - The text before the tag goes to `message.reasoning_content` (streamed as `delta.reasoning_content`).
+- Only the end-tag token (Qwen 248069, Hy4 120030) ends the reasoning, as in the engine grammar and the forced close.
+  A `</think>` that the model quotes as plain pieces stays in `reasoning_content`. When the
+  checkpoint has no `</think>` token, the server falls back to the text match.
 - The text after the tag goes to `content`. Tool calls come only from this part.
 - `usage.completion_tokens_details.reasoning_tokens` counts the tokens before and including the tag.
 - If `max_tokens` stops the reasoning before the tag, all text is reasoning and `finish_reason` is `length`.
+- The model sometimes writes complete tool calls inside the reasoning and then ends its turn there (no `</think>`).
+  The reply then makes those calls: finish `tool_calls`, and the call text stays in `reasoning_content`. This is
+  Halogen's rule (the end-of-turn guard).
+  `usage.completion_tokens_details.tool_call_from_reasoning` gives the number of calls. The server reads the reasoning
+  with the answer's tool parser and the request's tool policy (`tool_choice`, `parallel_tool_calls`, `strict`). The
+  rule acts only when the turn ends in the reasoning, or right after `</think>` with an answer of whitespace only. A
+  call that the model quotes before `</think>` stays reasoning text when the answer has other text. The rule is part
+  of the end-of-turn guard: `--end-of-turn-guard off` turns it off.
+  Differences from Halogen (`serve_api.py` `call_in_block`), kept by decision: the reply makes all the calls of the
+  reasoning, not only the last one. From the first call on, the reasoning must be calls only: call, prose, call, end
+  of turn makes no call, and the guard keeps the token as before. The `<invoke>` form counts. A forced `tool_choice`
+  gets the policy check, and `tool_call_from_reasoning` is a count, not `true`.
 
 The server keeps room for the answer, with Halogen's rule (Halogen 0.11 to 0.15):
 
@@ -542,6 +563,9 @@ The server also reads a call in the Anthropic form (`<invoke name="read">`, then
 tags, then `</invoke>`), as some agent clients and models write it (contributed by dineshr93).
 It gets the same checks as a checkpoint call and goes out whole when the output ends, in both stream modes.
 Prose that names the tag (the start tag and then text that is not a parameter tag) stays content.
+With no grammar armed, prose that names `<tool_call>` also stays content: a `<tool_call>` whose next text that is not
+white space cannot start `<function=` opens no call, and the search for the call goes on after it.
+A start tag at the end of the output, a cut `<function=` tag and the JSON form (`{` next) stay a malformed call.
 A block that leaves the form after its first parameter tag is a malformed call (`parameter_tag`).
 `<invoke>` text inside a `<tool_call>` argument stays argument text. In auto mode the strict call grammar takes the
 text before the first `<tool_call>` as free text. So a fault in that text (or a policy fault that counts a call from it)
@@ -569,6 +593,9 @@ end-of-turn token in the answer itself always ends the reply. The guard acts on 
 with no model text. A client `stop` string that the kept text matches ends the reply. Each kept token starts a new
 engine job, so on a busy server a kept token can add a short delay (not measured). Use `--end-of-turn-guard off` for
 the old behavior: the token ends the reply.
+An end-of-turn token that comes directly after the kept text also ends the reply (in the reasoning and in a tool call):
+the model means to end its turn. Before this rule, such a model got 16 kept tokens, 16 engine jobs and the same end.
+Before the guard keeps a token in the reasoning, it checks for complete calls there (see the `</think>` split under "Supported request options").
 
 The client must execute each function and send one tool result for each call ID.
 Include the assistant message and its `tool_calls` before these results.

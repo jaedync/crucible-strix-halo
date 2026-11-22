@@ -144,6 +144,7 @@ class RequestModeTest(unittest.TestCase):
         output = SimpleNamespace(ids=list(range(10)), think=SimpleNamespace(thinking=True), tools=None,
                                  end_of_turn_kept={"reasoning": 0, "tool_call": 0}, stop_filter=SimpleNamespace(stopped=False))
         output.token = lambda piece, t=None: output.ids.append(piece)
+        output.calls_from_reasoning = lambda: False  # CompletionResponse.calls_from_reasoning (response.py)
         job = SimpleNamespace(turn={})
         fake = SimpleNamespace(jobs=[job], wait_event=lambda j, first=False: dict(event="done"))
         with patch.object(s, "validate_event", return_value=None), patch.object(metrics, "emit"):

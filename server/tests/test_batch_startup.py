@@ -1,3 +1,4 @@
+import io
 import sys
 import unittest
 from unittest.mock import MagicMock, patch
@@ -83,6 +84,35 @@ class BatchStartupTest(unittest.TestCase):
                       ['--host-reserve-mib', '4096']):
             with patch.object(sys, 'argv', ['crucible', 'checkpoint', '--streams', '2'] + extra):
                 with self.assertRaises(SystemExit): startup.main()
+
+    def test_admission_reserve_reaches_the_engine_only_when_set(self):
+        # The start-time reserve stays the engine's 9216 MiB unless the server names another; the default command is unchanged.
+        for extra, expected in (([], ()), (['--admission-reserve-mib', '4096'], ('--admission-reserve-mib', '4096')),
+                                (['--admission-reserve-mib', '1024'], ('--admission-reserve-mib', '1024')),
+                                (['--admission-reserve-mib', '1048576'], ('--admission-reserve-mib', '1048576'))):
+            listener = MagicMock()
+            listener.serve_forever.side_effect = KeyboardInterrupt
+            with patch.object(sys, 'argv', ['crucible', 'checkpoint', '--streams', '2', *extra]), \
+                    patch.object(startup, 'ModelTokenizer'), patch.object(startup, 'ThreadingHTTPServer', return_value=listener), \
+                    patch('server.batch_backend.BatchedEngineBackend') as backend:
+                self.assertEqual(startup.main(), 0)
+                self.assertEqual(backend.call_args.kwargs['engine_options'], expected)
+
+    def test_admission_reserve_is_checked(self):
+        # Out of range: the parser error, exit 2, before the engine loads. The serial engine has no start-time reserve and
+        # refuses the option, so the server refuses it with --serial.
+        for extra, needle in ((['--streams', '2', '--admission-reserve-mib', '1023'], 'must be in [1024,1048576]'),
+                              (['--streams', '2', '--admission-reserve-mib', '0'], 'must be in [1024,1048576]'),
+                              (['--streams', '2', '--admission-reserve-mib', '1048577'], 'must be in [1024,1048576]'),
+                              (['--serial', '--admission-reserve-mib', '4096'], 'do not use it with --serial')):
+            stderr = io.StringIO()
+            with patch.object(sys, 'argv', ['crucible', 'checkpoint', *extra]), patch.object(sys, 'stderr', stderr), \
+                    patch.object(startup, 'ModelTokenizer') as tokenizer:
+                with self.assertRaises(SystemExit) as stop: startup.main()
+            self.assertEqual(stop.exception.code, 2)
+            self.assertIn('--admission-reserve-mib', stderr.getvalue())
+            self.assertIn(needle, stderr.getvalue())
+            tokenizer.assert_not_called()
 
     def test_slot_classes_are_passed_and_checked(self):
         listener = MagicMock()

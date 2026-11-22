@@ -77,6 +77,20 @@ class BuildTests(unittest.TestCase):
                     else:
                         self.assertIn(relative, commands)
 
+    def test_every_hip_program_has_a_main(self):
+        # make binaries links each selected bench/tests .hip file as a program; a file with no main breaks the link.
+        commands = self.dry_run("binaries")
+        for directory in ("bench", "bench/suite", "tests"):
+            for source in sorted((ROOT / directory).glob("*.hip")):
+                relative = str(source.relative_to(ROOT))
+                if relative not in commands:
+                    continue
+                text = source.read_text()
+                for name in re.findall(r'#include "([^"]+\.hip)"', text):
+                    text += (source.parent / name).read_text()
+                has_main = re.search(r"\bint\s+main\s*\(", text) is not None
+                self.assertTrue(has_main, f"{relative} has no main; filter it out of HIP_SOURCES in the Makefile")
+
     def test_generated_driver_runs_through_python_only(self):
         commands = self.dry_run("cpu-tests")
         self.assertNotIn("tests/gen_cli_cpu_test.cpp", commands)

@@ -1,4 +1,5 @@
-// EXL3 (mul1 codebook) matrix-vector device code for gfx1151, 1-8 activation rows.
+// EXL3 matrix-vector device code for gfx1151, 1-8 activation rows. Codebook tags (engine/exl3/kernels/codebook.h): kCbMul1, the
+// standard mul1 codebook (every instance without a tag), and the EXL3-INT8 mul24 forms kCbMul24 / kCbMul24Int8.
 // The kernels that only benches launch are in bench/kernels/exl3_gemv.h.
 //
 // Decode path, per 16x16 tile and lane t (EXL3's native fragment order):
@@ -19,11 +20,10 @@
 
 #include <cstdint>
 
+#include "codebook.h"
 #include "lane_window.h"
 
 namespace crucible {
-
-constexpr uint32_t kMul1 = 0x83DCD12Du;
 
 enum MulMode { kMulLo = 0, kMulTrue16 = 1, kMulU24 = 2 };
 
@@ -67,15 +67,33 @@ __device__ __forceinline__ __half2 Mul1Pair(uint32_t p0, uint32_t p1) {
   return __hfma2(h, inv, bias);
 }
 
-// Decodes the lane's 8 weights of one tile into 4 half2:
-// P0 = rows (r0, r0+1) col c0, P1 = rows (r0+8, r0+9) col c0,
+// mul24 product: p = state * 0x00DCD12D mod 2^32 for a 16-bit state in the low half (v_mul_u32_u24 reads 24 bits,
+// so the mask clears the next state's bits).
+__device__ __forceinline__ uint32_t Mul24Product(uint32_t x) { return __umul24(x & 0xffffu, kMul24); }
+
+// kCbMul24Int8 pair: q = (B - 509) >> 2 = ((B + 3) >> 2) - 128 for 0 <= B <= 1020, as exact fp16 integers:
+// fp16 bits 0x6400 + n are 1024 + n (n <= 255), minus 1152. Low half from p0, high half from p1.
+__device__ __forceinline__ __half2 Mul24Int8Pair(uint32_t p0, uint32_t p1) {
+  uint32_t s0 = __builtin_amdgcn_sad_u8(p0, 0u, 0x00030003u);
+  uint32_t packed = __builtin_amdgcn_sad_hi_u8(p1, 0u, s0);  // (B0 + 3) | (B1 + 3) << 16
+  packed = ((packed >> 2) & 0x00ff00ffu) | 0x64006400u;
+  const __half2 h = *reinterpret_cast<__half2*>(&packed);
+  const __half2 off = __halves2half2(__ushort_as_half(0x6480), __ushort_as_half(0x6480));  // 1152
+  return __hsub2(h, off);
+}
+
+// Decodes the lane's 8 weights of one tile into 4 half2 (positions: TilePos of codebook.h, t = 8 lane + e).
+// kCbMul1: P0 = rows (r0, r0+1) col c0, P1 = rows (r0+8, r0+9) col c0,
 // P2 = rows (r0, r0+1) col c0+8, P3 = rows (r0+8, r0+9) col c0+8.
-template <int K, int MODE>
+// mul24: P[i] = rows (8 h + 2 i, 8 h + 2 i + 1) of col c, h = lane / 16, c = lane % 16; kCbMul24Int8 gives the INT8
+// grid q (the caller scales by kMul24Step).
+template <int K, int MODE, int CB = kCbMul1>
 __device__ __forceinline__ void DecodeLane(uint32_t w0, uint32_t w1, uint32_t w2,
                                            int shift, __half2 P[4]) {
   // State 0 ends at bit 16 for every width, so it is a0 >> 16 (a0 = the lane's first aligned dword). With
   // kMulTrue16, st[0] holds a0 itself and the multiplies read its high half by op_sel: one shift fewer.
-  constexpr bool kHigh0 = MODE == kMulTrue16;
+  static_assert(CB == kCbMul1 || IsMul24(CB));
+  constexpr bool kHigh0 = MODE == kMulTrue16 && CB == kCbMul1;
   uint32_t st[8];
   if constexpr (7 * K + 16 <= 64) {
     // K <= 6. Aligned big-endian stream: bit 0 of the lane's range is a0's MSB.
@@ -98,14 +116,22 @@ __device__ __forceinline__ void DecodeLane(uint32_t w0, uint32_t w1, uint32_t w2
     if constexpr (kHigh0) st[0] = __builtin_amdgcn_alignbit(w0, w1, 32 - shift);
   }
   uint32_t p[8];
-  if constexpr (kHigh0) p[0] = Mul1ProductHigh(st[0]);
-  else p[0] = Mul1Product<MODE>(st[0]);
+  if constexpr (IsMul24(CB)) {
 #pragma unroll
-  for (int j = 1; j < 8; ++j) p[j] = Mul1Product<MODE>(st[j]);
-  P[0] = Mul1Pair(p[0], p[1]);
-  P[1] = Mul1Pair(p[2], p[3]);
-  P[2] = Mul1Pair(p[4], p[5]);
-  P[3] = Mul1Pair(p[6], p[7]);
+    for (int j = 0; j < 8; ++j) p[j] = Mul24Product(st[j]);
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      P[i] = CB == kCbMul24Int8 ? Mul24Int8Pair(p[2 * i], p[2 * i + 1]) : Mul1Pair(p[2 * i], p[2 * i + 1]);
+  } else {
+    if constexpr (kHigh0) p[0] = Mul1ProductHigh(st[0]);
+    else p[0] = Mul1Product<MODE>(st[0]);
+#pragma unroll
+    for (int j = 1; j < 8; ++j) p[j] = Mul1Product<MODE>(st[j]);
+    P[0] = Mul1Pair(p[0], p[1]);
+    P[1] = Mul1Pair(p[2], p[3]);
+    P[2] = Mul1Pair(p[4], p[5]);
+    P[3] = Mul1Pair(p[6], p[7]);
+  }
 }
 
 __device__ __forceinline__ float Dot2(__half2 a, __half2 b, float c) {

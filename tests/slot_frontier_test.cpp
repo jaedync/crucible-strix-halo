@@ -540,6 +540,110 @@ void SmallestLoss() {
   assert(!Has(cache.log, "handover slot=0 at 20 speculative"));
 }
 
+// merge-pen review L1 (cache-bypass): a bypass request uses no saved state, so its open ranks the slots as a cold
+// request of another tenant does. It takes an empty slot first; else the slot with the smallest loss, then the oldest.
+// A prompt that repeats a held tail does not pull the bypass request onto that slot.
+std::vector<int> Join(std::vector<int> head, const std::vector<int>& tail);
+std::vector<int> Head(const std::vector<int>& ids, size_t count);
+void BypassTakesEmptySlot() {
+  MockEngine engine;
+  FakeCache cache{engine};
+  crucible::BatchSession<MockEngine> session(engine, 2);
+  session.SetCacheHooks(cache.Hooks());
+  const auto t1 = Finish(session, engine, 1, Request(kA1, 13));
+  assert(t1.slot == 0);
+  const auto next = Join(Join(kA1, Head(t1.out, t1.out.size() - 1)), Tokens(3, 4));
+  auto bypass = Request(next, next.size() - 1);
+  bypass.cache_control = "bypass";
+  const auto tb = Finish(session, engine, 2, bypass);
+  assert(tb.slot == 1 && tb.cached == 0);
+  // A's next turn keeps its slot tail.
+  cache.log.clear();
+  const auto ta = Finish(session, engine, 3, Request(next, next.size() - 1));
+  assert(ta.slot == 0 && ta.cached == 23 && Has(cache.log, "resume slot 23"));
+  // The same bypass turn on a fresh session (cold): the same tokens.
+  MockEngine cold_engine;
+  FakeCache cold_cache{cold_engine};
+  crucible::BatchSession<MockEngine> cold(cold_engine, 2);
+  cold.SetCacheHooks(cold_cache.Hooks());
+  assert(Finish(cold, cold_engine, 1, bypass).out == tb.out);
+}
+
+// No empty slot: the bypass request takes the slot with the smallest loss (B's point 8), not A's slot that its prompt
+// repeats (points up to 20). A's next turn then resumes its slot tail.
+void BypassSmallestLoss() {
+  MockEngine engine;
+  FakeCache cache{engine};
+  crucible::BatchSession<MockEngine> session(engine, 2);
+  session.SetCacheHooks(cache.Hooks());
+  const auto t1 = Finish(session, engine, 1, Request(kA1, 13));
+  assert(t1.slot == 0);
+  assert(Finish(session, engine, 2, Request(Tokens(5, 10), 0)).slot == 1);
+  const auto next = Join(Join(kA1, Head(t1.out, t1.out.size() - 1)), Tokens(3, 4));
+  auto bypass = Request(next, next.size() - 1);
+  bypass.cache_control = "bypass";
+  assert(Finish(session, engine, 3, bypass).slot == 1);
+  cache.log.clear();
+  const auto ta = Finish(session, engine, 4, Request(next, next.size() - 1));
+  assert(ta.slot == 0 && ta.cached == 23 && Has(cache.log, "resume slot 23"));
+}
+
+// Property (cache-bypass): a fixed random trace of auto and bypass turns of four sessions over three slots. At each
+// bypass open with an empty slot (no tail, no point), the request takes an empty slot, restores nothing, and leaves
+// the tails and points of the other slots as they were.
+void BypassPrefersEmptyProperty() {
+  MockEngine engine;
+  FakeCache cache{engine};
+  crucible::BatchSession<MockEngine> session(engine, 3);
+  session.SetCacheHooks(cache.Hooks());
+  uint32_t seed = 20261118;
+  const auto next = [&] { seed = seed * 1103515245u + 12345u; return (seed >> 16) & 0x7fffu; };
+  const auto points = [&] {
+    std::map<int, std::vector<size_t>> out;
+    for (const auto& [slot, index, point] : session.FrontierPoints()) out[slot].push_back(point.hist.size());
+    return out;
+  };
+  std::vector<std::vector<int>> history(4);
+  int checked = 0, repeated = 0;
+  for (uint64_t id = 1; id <= 200; ++id) {
+    const int s = int(next() % 4);
+    auto& h = history[size_t(s)];
+    if (h.empty() || h.size() > 40) h = Tokens(int(s % 2 * 5 + next() % 3), 9 + next() % 8);
+    const auto ids = Join(h, Tokens(int(next() % 16), 2 + next() % 6));
+    auto r = Request(ids, ids.size() - 1 - next() % 3, 2 + int(next() % 3));
+    const bool bypass = next() % 3 == 0;
+    if (bypass) r.cache_control = "bypass";
+    const auto before = points();
+    const auto held = cache.held;
+    std::set<int> empty;
+    for (int slot = 0; slot < 3; ++slot)
+      if (!held.contains(slot) && !before.contains(slot)) empty.insert(slot);
+    bool repeats = false;
+    for (const auto& [slot, tail] : held)
+      repeats |= tail.size() < ids.size() && std::equal(tail.begin(), tail.end(), ids.begin());
+    const auto turn = Finish(session, engine, id, r);
+    if (bypass) {
+      assert(turn.cached == 0 && !turn.checkpoint && !turn.copy);
+      if (!empty.empty()) {
+        assert(empty.contains(turn.slot));
+        ++checked;
+        repeated += repeats;
+      }
+      auto after = points();
+      for (int slot = 0; slot < 3; ++slot) {
+        if (slot == turn.slot) continue;
+        assert(after[slot] == (before.contains(slot) ? before.at(slot) : std::vector<size_t>{}));
+        assert(cache.held.contains(slot) == held.contains(slot));
+        if (held.contains(slot)) assert(cache.held.at(slot) == held.at(slot));
+      }
+    } else {
+      h = Join(ids, Head(turn.out, turn.out.size() - 1));
+    }
+  }
+  // The trace reaches the case of the review: a bypass prompt that repeats a held tail while a slot is empty.
+  assert(checked >= 10 && repeated >= 3);
+}
+
 // Without the slot frontier hooks the session keeps the host path (no Frontier point, no guard).
 void HooksOff() {
   MockEngine engine;
@@ -1087,6 +1191,9 @@ int main() {
   PickRule();
   GuardCases();
   SmallestLoss();
+  BypassTakesEmptySlot();
+  BypassSmallestLoss();
+  BypassPrefersEmptyProperty();
   HooksOff();
   LazyResumedOpenAgain();
   LazyResumedFromHost();

@@ -2,8 +2,10 @@
 #pragma once
 #include "ops.h"
 #include "../gfx1151/prefill_wmma.h"
+#include "hc_dots_index.h"
 
 namespace crucible {
+static_assert(kHcDotsStreams==kStreams);
 __device__ __forceinline__ prefill::H16 PrefillLoad16(const __half* p) {
   return *reinterpret_cast<const prefill::H16*>(p);
 }
@@ -106,7 +108,7 @@ __global__ void __launch_bounds__(256) PrefillHcDotsFusedKernel(const __half* fn
 #pragma unroll
       for (int z=0;z<8;++z) {
         const int r=r0+i*16+prefill::FragmentRow(z);
-        if (r<R) dots[((size_t)r*M+n)*4+s]=out[z];
+        if (r<R) dots[HcDotsAt(s,r,n,R,M)]=out[z];
       }
     }
   }
@@ -281,7 +283,7 @@ __global__ void __launch_bounds__((kHcWsCompute+LW)*32) PrefillHcDotsWsKernel(co
 #pragma unroll
       for (int z=0;z<8;++z) {
         const int r=r0+i*16+prefill::FragmentRow(z);
-        if (r<R) dots[((size_t)r*M+n)*4+s]=out[z];
+        if (r<R) dots[HcDotsAt(s,r,n,R,M)]=out[z];
       }
     }
   }
@@ -363,7 +365,7 @@ __global__ void __launch_bounds__(WAVES*32) PrefillHcDotsTileKernel(const __half
 #pragma unroll
     for (int z=0;z<8;++z) {
       const int r=r0+prefill::FragmentRow(z);
-      if (r<R) dots[((size_t)r*M+n)*4+s]=out[z];
+      if (r<R) dots[HcDotsAt(s,r,n,R,M)]=out[z];
     }
   }
 }
@@ -384,16 +386,16 @@ __global__ void __launch_bounds__(256) PrefillHcMidPackKernel(const float* dots,
 #pragma unroll
   for (int s=0;s<4;++s) inv[s]=rsqrtf(ss[r*4+s]/kHidden+kEps);
   for (int m=j;m<kRank;m+=256) {
-    const float* d=dots+((size_t)r*M+m)*4;float a=0;
+    float a=0;
 #pragma unroll
-    for (int s=0;s<4;++s) a+=inv[s]*d[s];
+    for (int s=0;s<4;++s) a+=inv[s]*dots[HcDotsAt(s,r,m,R,M)];
     const float v=Silu(a*.25f); const __half h=__float2half(v);
     thi[r*kRank+m]=h; tlo[r*kRank+m]=__float2half((v-__half2float(h))*prefill::kResidualScale);
   }
   if (j<4 && post) {
-    const float* d=dots+((size_t)r*M+kRank+j)*4;float a=0;
+    float a=0;
 #pragma unroll
-    for (int s=0;s<4;++s) a+=inv[s]*d[s];
+    for (int s=0;s<4;++s) a+=inv[s]*dots[HcDotsAt(s,r,kRank+j,R,M)];
     post[r*4+j]=2.f*Sigmoid(a*.25f);
   }
 }

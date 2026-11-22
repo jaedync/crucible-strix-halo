@@ -7,6 +7,7 @@
 // for every processed position: DIR/h_XX.f32, [positions][4][2560] float32.
 #include <algorithm>
 #include <chrono>
+#include <thread>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -31,6 +32,7 @@
 #include "cli/gen_job_state.h"
 #include "runtime/dump_io.h"
 #include "gfx1151/pinned_buffer.h"
+#include "gfx1151/sleep_wait.h"
 #include "gfx1151/pinned_allocator.h"
 #include "layers/qsa_long.h"
 #include "layers/qsa_capture.h"
@@ -65,6 +67,7 @@
 #include "layers/prefill_ple.h"
 #include "runtime/prefill_plan_budget.h"
 #include "model/flashnext/prefill_launch.h"
+#include "model/flashnext/ple_stage.h"
 #include "runtime/mtp_bulk.h"
 #include "runtime/stage_arena.h"
 #include "runtime/stage_plan.h"
@@ -165,13 +168,14 @@ class Engine {
     rows_ = Zeros<int64_t>(capacity * 16);
     if (m_.ple.host) {
       ple_packed_ = Zeros<uint16_t>((size_t)capacity * 16 * m_.ple.RowWords());
-      // A BF16 row (160 words) does not fit the K-bit stage, which keeps its size.
-      if (m_.ple.bf16) ple_stage16_ = std::make_unique<PinnedInputBuffer<uint16_t, kMaxPrefillRows * 16 * kPleRowDim>>();
+      // A BF16 row (160 words) does not fit the K-bit stage; it gets its own whole-launch stage (ple_stage.h).
+      if (m_.ple.bf16) ple_stage16_ = std::make_unique<PinnedInputBuffer<uint16_t, kPleStageRows * 16 * kPleRowDim>>();
       // An 8-bit row (the h6_ng8 table) has 81 words.
       else if (m_.ple.RowWords() > 61) ple_stage8_ = std::make_unique<PinnedInputBuffer<uint16_t, kPleStageRows * 16 * 81>>();
       else ple_stage_ = std::make_unique<PinnedInputBuffer<uint16_t, kPleStageRows * 16 * 61>>();
     }
     ids_ = Zeros<int>(kPackedRows);
+    HIP_OK(hipEventCreateWithFlags(&host_wait_, hipEventDisableTiming));
     choice_ = Zeros<DraftChoice>(kMaxRows);
     if (draft_chain_.lead) {
       HIP_OK(hipHostMalloc(reinterpret_cast<void**>(&choice_lead_), sizeof(DraftChoice)));
@@ -757,6 +761,17 @@ class Engine {
   }
   int Vocabulary() const { return kVocab; }
   void Synchronize() const { HIP_OK(hipStreamSynchronize(0)); }
+  // The host sleeps (100 us steps) until the work queued so far on stream 0 is done (sleep_wait.h, host lever H1);
+  // a sync call after it returns at once, so the calling thread does not spin for a whole prefill launch.
+  void SleepForDevice() {
+    HIP_OK(hipEventRecord(host_wait_, 0));
+    SleepUntil([&] {
+      const hipError_t e = hipEventQuery(host_wait_);
+      if (e == hipErrorNotReady) return false;
+      HIP_OK(e);
+      return true;
+    }, [] { std::this_thread::sleep_for(std::chrono::microseconds(100)); });
+  }
 
   std::vector<float> CopyLogits(int rows, int first = 0) const {
     if (rows < 1 || first < 0 || rows + first > kPackedRows)
@@ -861,7 +876,8 @@ class Engine {
   }
 
  private:
-  void EnsureMtpCache(SequenceState& state, int position) {
+  // caller: gen (a lazy cache), or the serial or batched serve start (EnsureServeMtpCaches); it selects the refusal text.
+  void EnsureMtpCache(SequenceState& state, int position, crucible::MtpCacheCaller caller = crucible::MtpCacheCaller::kGen) {
     if (state.qc.contains(kLayers)) return;
     if (position != 0)
       throw std::runtime_error("MTP cache is absent; restart prompt warmup before a nonzero MTP position");
@@ -870,9 +886,9 @@ class Engine {
     size_t free, total;
     HIP_OK(hipMemGetInfo(&free, &total));
     // Preserve the post-warm reserve for the OS, later plans and the frontend.
-    constexpr size_t reserve = 9ull << 30;
+    const size_t reserve = crucible::MtpCacheReserveBytes();
     if (!CacheAllocationFits(free, needed, reserve))
-      throw std::runtime_error("not enough device memory for the MTP cache; reduce the context, or use --spec 0 in gen");
+      throw std::runtime_error(crucible::MtpCacheRefusal(caller));
     // Reserve host registry space before device ownership changes.
     buffers_.reserve(buffers_.size() + 4);
     state.AllocateMtpCache();
@@ -2155,6 +2171,7 @@ class Engine {
   DraftChoice* choice_ = nullptr;
   DraftChoice* choice_lead_ = nullptr;  // CRUCIBLE_DRAFT_CHAIN lead only (pinned)
   hipEvent_t lead_ready_{};
+  hipEvent_t host_wait_{};  // SleepForDevice
   uint64_t lead_epoch_ = 0;
   float draft_margin_ = INFINITY;
   std::string profile_scope_;
@@ -2308,13 +2325,14 @@ class Engine {
   int *tok_, *ids_, *sel_, *nsel_, *sel_moe_, *map_;
   int64_t* rows_;
   uint16_t* ple_packed_ = nullptr;
-  // prefill-x: the K-bit and 8-bit stages hold the largest launch (CRUCIBLE_PF_LAUNCH_ROWS with its join), so the
-  // gather starts at the upload and overlaps layer 0 (about 20 ms of device idle less per 8192-row launch). 64 MiB
-  // (61-word rows) or 81 MiB (81-word rows) pinned; only one of them exists.
-  static constexpr int kPleStageRows = kMaxPrefillLaunchRows;
-  int PleStageRows() const { return ple_stage16_ ? kMaxPrefillRows : kPleStageRows; }
+  // prefill-x, prefill-plestage: every stage holds the largest launch (CRUCIBLE_PF_LAUNCH_ROWS with its join), so the
+  // gather starts at the upload and overlaps layer 0 (ple_stage.h). 64 MiB (61-word rows), 81 MiB (81-word rows) or
+  // 160 MiB (BF16 rows) pinned; only one of them exists.
+  static constexpr int kPleStageRows = PleStageRowsFor(false);
+  static_assert(PleStageRowsFor(true) == kPleStageRows);
+  int PleStageRows() const { return kPleStageRows; }
   std::unique_ptr<PinnedInputBuffer<uint16_t, kPleStageRows * 16 * 61>> ple_stage_;
-  std::unique_ptr<PinnedInputBuffer<uint16_t, kMaxPrefillRows * 16 * kPleRowDim>> ple_stage16_;
+  std::unique_ptr<PinnedInputBuffer<uint16_t, kPleStageRows * 16 * kPleRowDim>> ple_stage16_;
   std::unique_ptr<PinnedInputBuffer<uint16_t, kPleStageRows * 16 * 81>> ple_stage8_;
   std::vector<int64_t> ple_host_rows_;
   // Destroyed before the rows and the stages: a forward that threw between

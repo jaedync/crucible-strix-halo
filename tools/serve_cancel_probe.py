@@ -15,6 +15,9 @@ import time
 import urllib.request
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from agent_soak import _tree_mark, stop_failed_start  # noqa: E402
+
 LAUNCH = """import sys, http.server
 tree, port = sys.argv[1], int(sys.argv[2]); sys.path.insert(0, tree)
 import server.__main__ as entry
@@ -38,21 +41,34 @@ def get_json(port, path, timeout=10):
         return json.loads(response.read())
 
 
+FAILED_START_GRACE_S = 60   # a failed start: from SIGTERM to SIGKILL, as the 60 s wait of the stop in main
+
+
 def start_server(args, log):
+    """The process of a ready server. A start that fails stops the server, its descendants and each process that holds
+    this start's mark (the engine of a server that already exited) before the error goes on: SIGTERM, then SIGKILL after
+    FAILED_START_GRACE_S (agent_soak.stop_failed_start; a stop signal ends the grace at once). The caller gets
+    no process to stop (brief rule 3)."""
     command = [args.python, "-c", LAUNCH, str(args.tree), str(args.port), str(args.checkpoint),
                "--engine", str(args.engine), "--streams", str(args.streams), "--ctx", str(args.ctx)]
-    process = subprocess.Popen(command, cwd=args.tree, stdout=log, stderr=subprocess.STDOUT)
-    deadline = time.monotonic() + args.ready_timeout
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            raise RuntimeError(f"server exited with {process.returncode}")
-        try:
-            get_json(args.port, "/v1/models", 5)
-            return process
-        except OSError:
-            time.sleep(2)
-    process.terminate()
-    raise RuntimeError("server not ready")
+    env, mark = _tree_mark()   # the engine inherits the mark
+    process = None
+    try:
+        process = subprocess.Popen(command, cwd=args.tree, env=env, stdout=log, stderr=subprocess.STDOUT)
+        deadline = time.monotonic() + args.ready_timeout
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError(f"server exited with {process.returncode}")
+            try:
+                get_json(args.port, "/v1/models", 5)
+                return process
+            except OSError:
+                time.sleep(2)
+        raise RuntimeError("server not ready")
+    except BaseException:
+        if process is not None:
+            stop_failed_start(process, mark, FAILED_START_GRACE_S)
+        raise
 
 
 def post(port, body):

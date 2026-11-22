@@ -1,9 +1,10 @@
 """Build text and tool responses without changing accepted engine tokens."""
+import dataclasses
 import json
 import math
 import time
 import uuid
-from . import metrics
+from . import hy4_format, metrics
 from .api import ApiError
 from .timings import timings
 from .tool_output import ToolOutput
@@ -33,12 +34,20 @@ class CompletionResponse:
         # Client stop strings do not cut a constrained answer: it would no longer parse.
         self.stop_filter = StopSequences(() if getattr(request, "constraint", None) is not None else request.stop)
         stream_calls = request.stream and getattr(service, "stream_tool_calls", True)
-        self.tools = (ToolOutput(request, stream_calls, getattr(service, "extend_tool_tails", False))
+        # The Hy4-flash family has its own tool tags and think close tag (server/hy4_format.py).
+        hy4 = getattr(service.tokenizer, "hy4", False) is True
+        output = hy4_format.Hy4ToolOutput if hy4 else ToolOutput
+        self.tools = (output(request, stream_calls, getattr(service, "extend_tool_tails", False))
                       if request.kind == "chat" and request.tools else None)
-        self.think = ThinkSplitter(request.kind == "chat" and request.enable_thinking)
+        end_id = getattr(service.tokenizer, "think_end_id", None)  # None for a stub tokenizer: the text ends it
+        self.think = ThinkSplitter(request.kind == "chat" and request.enable_thinking,
+                                   end_id=end_id if type(end_id) is int else None,
+                                   **(dict(end=hy4_format.THINK_END) if hy4 else {}))
         self.reasoning_tokens = 0
         self.closed = None  # the ThinkCap when the server closed the think block
         self.end_of_turn_kept = dict(reasoning=0, tool_call=0)  # http.keep_end_of_turn
+        self.end_of_turn_at = None  # len(ids) after the last kept text (http.keep_end_of_turn)
+        self.reasoning_calls = None  # the reasoning text whose calls the reply makes (calls_from_reasoning)
         self.token_time = None
         self.headers_sent = False
 
@@ -85,7 +94,7 @@ class CompletionResponse:
         raw_delta = self.service.tokenizer.step(self.stream, token)
         self.raw_text += raw_delta
         thinking = self.think.thinking
-        reasoning, answer = self.think.feed(raw_delta)
+        reasoning, answer = self.think.feed(raw_delta, token)
         if thinking:
             # The token belongs to the reasoning; any answer text after the end tag carries no second token ID.
             self.reasoning_tokens += 1
@@ -98,6 +107,43 @@ class CompletionResponse:
             for tool_delta in self.tools.take_deltas():
                 self.chunk(tool_delta)
 
+    def calls_from_reasoning(self):
+        """Halogen's tool_call_from_reasoning (the end-of-turn guard). The
+        model ends its turn inside its reasoning: if that reasoning parses as text and then complete calls under the
+        request's tool policy (the class of self.tools, the parser of the answer), the reply makes those calls. The call
+        text stays in reasoning_content, where the stream sent it. Returns True when finish() makes the calls.
+        The rule also reads the reasoning when the turn ends right after the end tag with an answer of whitespace only:
+        those calls are then the only calls of the reply. An answer with text keeps them as reasoning text."""
+        if self.tools is None:
+            return False
+        if self.think.thinking:
+            text = self.think.reasoning + self.think.pending
+        elif self.think.enabled and not self.think.answer.strip():
+            # The splitter's answer: with an end token ID, a quoted end tag before it is reasoning.
+            text = self.think.reasoning
+        else:
+            return False
+        try:
+            calls = self.reasoning_parser(text).checked_calls()
+        except ApiError as error:
+            if error.status != 502:
+                raise
+            return False
+        if calls:
+            self.reasoning_calls = text
+        return bool(calls)
+
+    def reasoning_parser(self, text):
+        # The class of the answer parser: ToolOutput, or Hy4ToolOutput for a Hy4 tokenizer (__init__). The grammar starts
+        # after the end tag and never constrains the reasoning, so the reasoning parser reads it with no grammar: prose
+        # that names <tool_call> there is prose (ToolOutput.prose_start).
+        request = self.request
+        if getattr(request, "constraint", None) is not None:
+            request = dataclasses.replace(request, constraint=None)
+        parser = type(self.tools)(request, False, self.tools.whole)
+        parser.feed(text)
+        return parser
+
     def finish(self, event):
         decoded = self.service.tokenizer.decode(self.ids)
         if not decoded.startswith(self.raw_text):
@@ -109,7 +155,12 @@ class CompletionResponse:
         full_text = self.text + tail
         reason = "stop" if self.stop_filter.stopped else event["finish_reason"]
         deltas = []
-        if self.tools:
+        if self.reasoning_calls is not None:
+            # The calls of the reasoning (calls_from_reasoning); its text is not the answer.
+            self.tools = self.reasoning_parser(self.reasoning_calls)
+            message, deltas, reason = self.tools.finish(reason)
+            message["content"] = None
+        elif self.tools:
             self.tools.feed(tail)
             message, deltas, reason = self.tools.finish(reason)
         else:
@@ -129,6 +180,8 @@ class CompletionResponse:
                                                            reasoning_closed_by=self.closed.by)
         elif self.request.thinking_skipped_by:
             usage["completion_tokens_details"] = dict(reasoning_skipped_by=self.request.thinking_skipped_by)
+        if self.reasoning_calls is not None:
+            usage["completion_tokens_details"] |= dict(tool_call_from_reasoning=len(message.get("tool_calls") or ()))
         kept = sum(self.end_of_turn_kept.values())
         if kept:
             # Halogen's field: end-of-turn tokens that the server wrote as text instead of ending the reply.

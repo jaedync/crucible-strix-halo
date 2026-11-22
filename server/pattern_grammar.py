@@ -1,5 +1,4 @@
-"""The regex subset of a client `pattern`, and the form of it that the engine reads exactly
-.
+"""The regex subset of a client `pattern`, and the form of it that the engine reads exactly.
 
 xgrammar 0.2.9 turns a pattern into one automaton (third_party/xgrammar/cpp/fsm_builder.cc ParseRegexToIR and
 RegexIR::Build). Two of its steps take strings that the pattern refuses, and the vendored files stay byte-equal to

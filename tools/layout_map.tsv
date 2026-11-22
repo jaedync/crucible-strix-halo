@@ -19,6 +19,7 @@ engine/batch_state_disk.h	engine/serve/batch_state_disk.h	serve	Disk tier of bat
 engine/serve/handover_spill.h	engine/serve/handover_spill.h	serve	Release plan for a refused slot tail: lazy spill for every release, bounded handover drain.	New file (cache-epoch); tests/handover_spill_test.cpp.
 engine/serve/miss_ledger.h	engine/serve/miss_ledger.h	serve	Miss ledger of batched serve: closed word sets, the verdict of one open, the release line (start plan B1a).	New file; tests/miss_ledger_test.cpp.
 engine/serve/serve_line.h	engine/serve/serve_line.h	serve	Serve JSON-line limit that follows the context, and the block line reader of both serve loops.	New file; tests/serve_line_test.cpp.
+engine/serve/state_stop.h	engine/serve/state_stop.h	serve	Stop rule of the disk tier: flush time and the stop signals that a tier engine outlives.	New file (stop-fit); tests/state_stop_test.cpp.
 engine/batched_serve.h	engine/serve/batched_serve.h	serve	Batched serve protocol loop.	
 engine/batched_serve_protocol.h	engine/serve/batched_serve_protocol.h	serve	Batched serve commands.	
 engine/batched_serve_settings.h	engine/serve/batched_serve_settings.h	serve	Batched serve startup settings.	
@@ -189,6 +190,7 @@ engine/runtime/ablate_request.h	engine/runtime/ablate_request.h	runtime	Per-requ
 engine/runtime/tenant.h	engine/runtime/tenant.h	runtime	Tenant key of a request and of every cached state.	New file (w1-key); tests/tenant_test.cpp.
 engine/runtime/state_format.h	engine/runtime/state_format.h	runtime	File formats of the NVMe tier: checksums, state and block headers.	New file (ssd-blocks): moved out of state_disk.h.
 engine/runtime/state_root.h	engine/runtime/state_root.h	runtime	Where the state folder can be: the rule that the host copy (tools/crucible_cli/state_root.py) shares.	New file (cache-folder, Nov 12): moved out of state_disk.h PrepareRoot.
+engine/runtime/state_private_dir.h	engine/runtime/state_private_dir.h	runtime	The private state folders, made one name at a time from the root folder with no link (host copy: tools/crucible_cli/private_dir.py).	New file (state-dir-race, Nov 18): review cache-folder-r4 L-A.
 engine/runtime/state_epoch.h	engine/runtime/state_epoch.h	runtime	State epoch slot that tools/state_epoch.py stamps; input of the state identity.	New file (cache-epoch); tests/state_epoch_test.cpp.
 engine/runtime/state_switches.h	engine/runtime/state_switches.h	runtime	Which CRUCIBLE_* switches are part of a state identity, with a reason each.	New file (cache-epoch); tests/state_epoch_test.cpp.
 engine/exl3/kernels/lane_window.h	engine/exl3/kernels/lane_window.h	exl3/kernels	Lane geometry and trellis state extraction of DecodeLane, host-visible for tests/lane_window_test.cpp (K7, K8, K3.5).	New file (packs).
@@ -225,4 +227,8 @@ engine/runtime/constraint_helper_main.cc	engine/runtime/constraint_helper_main.c
 engine/layers/rope_tables.h	engine/layers/rope_tables.h	layers	YaRN RoPE tables (factors 2 and 4), generated from the Hugging Face reference by tools/yarn/rope_header.py.	New file; tests/test_yarn_rope_header.py, tests/rope_table_test.hip.
 engine/runtime/rope_mode.h	engine/runtime/rope_mode.h	runtime	RoPE mode of a sequence (plain, YaRN factor 2 or 4), CRUCIBLE_ROPE_MODE and the context cap.	New file; tests/rope_mode_test.cpp.
 engine/runtime/rope_policy.h	engine/runtime/rope_policy.h	runtime	Y2 host policy: the RoPE length gate (RopeModeFor), the YaRN state tenant and its mark (RopeTenant, RopeTenantMode), ApplyStreamRope for serial serve.	New file; tests/rope_policy_test.cpp.
+engine/layers/hc_dots_index.h	engine/layers/hc_dots_index.h	layers	Index of the bulk prefill HC dots buffer, stream-major (stream, row, column) order (host and device).	New file (prefill-resid); tests/hc_dots_index_test.cpp.
+engine/gfx1151/sleep_wait.h	engine/gfx1151/sleep_wait.h	gfx1151	A host wait for the device that sleeps between ready tests (prefill host lever H1).	New file (prefill-resid); tests/sleep_wait_test.cpp.
+engine/model/flashnext/ple_stage.h	engine/model/flashnext/ple_stage.h	model/flashnext	Rows of the pinned PLE host stage: a whole prefill launch for every row kind.	New file (prefill-resid); tests/ple_stage_rows_test.cpp.
 engine/runtime/fork_point.h	engine/runtime/fork_point.h	runtime	Fork point pick at a release: the longest slot point below the tail that goes to disk.	New file; tests/fork_point_test.cpp.
+engine/exl3/kernels/codebook.h	engine/exl3/kernels/codebook.h	exl3/kernels	EXL3 codebook tags kCbMul1, kCbMul24 and kCbMul24Int8, the mul24 tile order TilePos and the .mul1 marker check Exl3CodebookOfMarker.	New file.

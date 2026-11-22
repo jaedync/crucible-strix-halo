@@ -189,6 +189,59 @@ class BatchBackendTest(unittest.TestCase):
         self.assertEqual(backend.pending_tokens, 0)
         self.assertEqual(sorted(backend.free_contexts), [16])
 
+    def reading_backend(self):
+        """A state-disk backend with one free slot; every stage reply is "reading" (the read never ends here)."""
+        import threading
+        from collections import deque
+        from server import batch_backend
+        backend = object.__new__(BatchedEngineBackend)
+        backend.state_disk, backend.staging, backend.kept, backend.queued_polls = True, {}, {}, {}
+        backend.jobs, backend.waiting, backend.active, backend.free_contexts = queue.Queue(), deque(), {}, [40000]
+        backend.pending_tokens, backend.admission_lock = 0, threading.Lock()
+        backend.ownership_lock, backend.owned_jobs = threading.Lock(), {}
+        backend._stage = lambda payload, *args: batch_backend.StageReply("reading")
+        opened = []
+        backend._open = lambda job, slot_context: opened.append(job) or True
+        return backend, opened
+
+    def long_job(self, backend, **fields):
+        from server.backend import Job
+        from server.batch_backend import STAGE_MIN_TOKENS
+        job = Job(dict(ids=[1] * STAGE_MIN_TOKENS, cache_control="auto", max_tokens=8), **fields)
+        backend.pending_tokens += len(job.payload["ids"])
+        backend.jobs.put(job)
+        return job
+
+    def test_cancelled_turns_leave_the_queue_while_the_head_reads(self):
+        """The head turn holds the free slot and waits for its disk read (up to _read_bound, 60 to 180 s).
+        The cancelled turns behind it must leave the queue and give back their tokens now; before the fix they held
+        pending_tokens until the head opened, and submit refused new work with 503."""
+        backend, opened = self.reading_backend()
+        head = self.long_job(backend)
+        for _ in range(4): self.long_job(backend).cancelled.set()
+        for _ in range(3): backend._admit()
+        self.assertFalse(backend._admit())  # the head still waits for its read
+        self.assertEqual(backend.pending_tokens, len(head.payload["ids"]))
+        self.assertEqual([job is head for job in backend.waiting], [True])
+        self.assertEqual(opened, [])
+        self.assertEqual(set(backend.staging), {id(head)})
+
+    def test_a_cancelled_kept_successor_gives_back_its_tokens_once(self):
+        """A cancelled continuation of a kept slot frees the slot and leaves the queue; its tokens go back once."""
+        import time
+        from server.backend import Job
+        backend, opened = self.reading_backend()
+        head = self.long_job(backend)
+        first = Job(dict(ids=[1], max_tokens=8))
+        follow = first.successor = self.long_job(backend, after=first)
+        backend.kept = {id(first): (first, 4096, time.monotonic())}
+        follow.cancelled.set()
+        for _ in range(5): backend._admit()
+        self.assertEqual(backend.pending_tokens, len(head.payload["ids"]))
+        self.assertEqual([job is head for job in backend.waiting], [True])
+        self.assertEqual((backend.kept, opened), ({}, []))
+        self.assertEqual(sorted(backend.free_contexts), [4096, 40000])
+
     def test_unsupported_speculation_is_rejected_before_enqueue(self):
         for extra in (dict(draft_adapt=1), dict(draft_q=0), dict(draft_head="full")):
             request = validate_request(dict(prompt="x", spec=7, **extra), "completion", "crucible")

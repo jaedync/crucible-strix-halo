@@ -118,6 +118,9 @@ class Request:
     # The tools that the template renders, when they differ from `tools`: with structured output on, `strict` is left
     # out (an API control flag, not prompt content; the grammar enforces it). None: the template renders `tools`.
     render_tools: tuple | None = None
+    # The client's effort word (an EFFORTS key; the stronger one when two fields agree), None without one.
+    # A family whose template keeps the client word reads it (Hy4-flash: hy4_format.template_effort).
+    effort_word: str | None = None
     # Y2 reply reserve (server/rope.py plain_max_tokens): the max_tokens before the clamp to the plain limit, 0 when the
     # server did not clamp. The engine never sees it; the backend writes the clamp and cut lines from it.
     rope_clamped_from: int = 0
@@ -178,10 +181,12 @@ EFFORTS = {"none": None, "minimal": "low", "low": "low", "medium": "medium", "hi
 TEMPLATE_KWARGS = {"enable_thinking", "preserve_thinking", "reasoning_effort"}
 
 def thinking_controls(body, default):
-    """Resolve (enable_thinking, reasoning_effort, preserve_thinking) from every field clients use for thinking.
+    """Resolve (enable_thinking, reasoning_effort, preserve_thinking, effort word) from every field clients use for
+    thinking.
 
     An explicit enable_thinking (top level or chat_template_kwargs) wins. Otherwise a reasoning_effort turns
-    thinking on, or off for "none". Otherwise the server default applies.
+    thinking on, or off for "none". Otherwise the server default applies. The effort word is the client's word, None
+    without one; two words of one level (high and max) agree, and the later word of EFFORTS applies.
     """
     kwargs = body.get("chat_template_kwargs", {})
     if not isinstance(kwargs, dict) or set(kwargs) - TEMPLATE_KWARGS:
@@ -205,7 +210,8 @@ def thinking_controls(body, default):
     else:
         thinking = default
     preserve = boolean(kwargs["preserve_thinking"], "preserve_thinking") if "preserve_thinking" in kwargs else None
-    return thinking, level or "xhigh", preserve
+    word = max(efforts, key=list(EFFORTS).index, default=None)
+    return thinking, level or "xhigh", preserve, word
 
 BUDGET_FIELDS = ("max_thinking_tokens", "thinking_budget_tokens", "thinking_budget", "thinking_token_budget")
 
@@ -258,7 +264,7 @@ REQUEST_FIELDS = frozenset({"model", "messages", "prompt", "max_tokens", "max_co
 
 def validate_request(body, kind, model, default_thinking=False, vision=None, vocab=VOCAB,
                      default_mtp_prefix=MTP_WINDOW, defaults=DEFAULTS, ablated_names=None, ablate_available=False,
-                     structured=True, format_field="response_format", render_strict=True):
+                     structured=True, format_field="response_format", render_strict=True, call_form=None):
     """vocab: the engine's vocabulary size (the backend's ModelInfo); the default suits engines before an earlier change.
     defaults: the server's values for the fields that the request leaves out (ServerDefaults).
     ablated_names: the model names that select the ablated mode (None: the served id's form).
@@ -319,7 +325,7 @@ def validate_request(body, kind, model, default_thinking=False, vision=None, voc
     if draft_adapt == 1 and draft_head != "64k":
         raise ApiError("draft_adapt 1 requires the 64k head.", "draft_adapt")
     stream = boolean(body.get("stream", False), "stream")
-    thinking, effort, preserve = thinking_controls(body, default_thinking)
+    thinking, effort, preserve, effort_word = thinking_controls(body, default_thinking)
     budget = thinking_budget(body)
     token_ids = boolean(body.get("return_token_ids", False), "return_token_ids")
     options = body.get("stream_options", {})
@@ -347,7 +353,7 @@ def validate_request(body, kind, model, default_thinking=False, vision=None, voc
             raise ApiError("prompt must be nonempty text or one token-ID list. Batches are not supported.", "prompt")
     top = scoring_count(body, kind, count, temperature, stream)
     from .structured import constraint as structured_constraint
-    constraint = structured_constraint(body, kind, tools, choice, parallel, format_field)
+    constraint = structured_constraint(body, kind, tools, choice, parallel, format_field, form=call_form)
     if constraint is not None and not structured:
         # An engine without structured output (no ready field): tool requests run as before it, unconstrained;
         # an answer format cannot be kept without the grammar.
@@ -360,7 +366,7 @@ def validate_request(body, kind, model, default_thinking=False, vision=None, voc
                    temperature=temperature, top_k=top_k, top_p=top_p, min_p=min_p, seed=seed, cache_control=cache_control,
                    draft_q=draft_q, draft_head=draft_head, mtp_prefix=mtp_prefix, draft_adapt=draft_adapt,
                    tools=tools, tool_choice=choice, parallel_tool_calls=parallel, stop=stop,
-                   crucible_metrics=metrics, preserve_thinking=preserve,
+                   crucible_metrics=metrics, preserve_thinking=preserve, effort_word=effort_word,
                    thinking_budget=budget, images=tuple(images), top_logprobs=top, max_tokens_all=fill, ablate=ablate,
                    constraint=constraint, render_tools=rendered_tools(tools) if structured or not render_strict else None,
                    **penalties)

@@ -235,6 +235,27 @@ class SetupTest(Base):
         self.assertIn("http://127.0.0.1:8790/v1", out)
         self.assertIn("model", out)
 
+    def test_a_link_that_comes_after_the_check_stops_setup_with_the_reason(self):
+        # Review cache-folder-r4 L-A (host copy): a missing parent of the state folder that becomes a link after the
+        # check stops setup, and the other folder keeps its mode (tests/test_private_dir.py has the cases).
+        from unittest import mock
+        from crucible_cli import private_dir
+        sd, other = self.t / "home/x/states", self.t / "other"
+        (other / "states").mkdir(parents=True)
+        os.chmod(other / "states", 0o755)
+        real = private_dir.make_private_dir
+
+        def swap_then_make(path, **kw):
+            (self.t / "home/x").symlink_to(other)
+            return real(path, **kw)
+        with mock.patch.object(private_dir, "make_private_dir", swap_then_make):
+            code, host, out = self.setup(["--yes", "--state-dir", str(sd)])
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("the state folder is not accepted: ", out)
+        # The path comes from self.t: a literal home path in this file becomes ~ in the public export (rule home-path).
+        self.assertIn(f"{self.t / 'home/x'} is a link, and Crucible does not follow a link", out)
+        self.assertEqual(os.stat(other / "states").st_mode & 0o7777, 0o755)
+
     def test_without_yes_and_without_a_terminal_setup_refuses(self):
         code, host, out = self.setup([])
         self.assertEqual(code, 2)
@@ -619,8 +640,10 @@ class SafetyTest(Base):
                     via_box = (getattr(recv, "id", "") == "box") or (getattr(recv, "attr", "") == "box")
                     # box = a files.Sandbox. keyfile.py makes the API key file with O_EXCL and O_NOFOLLOW (a Sandbox
                     # cannot do that); steps.step_config calls box.check on the path first. diskmeasure.py makes its one
-                    # measure file with O_EXCL next to the state folder and removes only that file.
-                    if path.name not in ("files.py", "keyfile.py", "diskmeasure.py") and not via_box:
+                    # measure file with O_EXCL next to the state folder and removes only that file. private_dir.py (the
+                    # walk of Sandbox.mkdir_private, after box.check) changes the mode only of a folder of this user that
+                    # it opened: fchmod of its fd, or chmod of /proc/self/fd/N when the folder has no read bit.
+                    if path.name not in ("files.py", "keyfile.py", "diskmeasure.py", "private_dir.py") and not via_box:
                         self.assertNotIn(name, {"write_text", "write_bytes", "unlink", "rmtree", "rename",
                                                 "chmod", "symlink_to", "copyfile", "copy2", "move", "truncate"},
                                          f"{path.name}:{node.lineno} writes outside the sandbox helper")

@@ -101,8 +101,12 @@ class SlotCheckpoints {
   // shortest checkpoint leaves (a Frontier point in a general buffer too: the session moved past it).
   // Invariant: every point is a prefix of the rows on its slot (Keep drops the others), so a point of the same length
   // has the same key. One with another key or another tenant would be stale: it is the one to replace.
+  // `boundary` (0: none): the newest point of `tenant` at or below it
+  // stays while another general buffer can go (KeptPoint). A think-cap continuation job passes the client's stable
+  // boundary (BatchSession::KeepBoundary); without the rule its Pre and End points took both buffers from the first
+  // job's Pre point, and the client's next prompt, which resumes below the boundary, found no point.
   std::optional<int> Victim(int slot, std::span<const int> key, CheckpointKind kind, uint64_t owner,
-                            const StateTenant& tenant) const {
+                            const StateTenant& tenant, size_t boundary = 0) const {
     if (kind == CheckpointKind::Frontier) throw std::invalid_argument("a Frontier point takes FrontierVictim");
     const auto& held = Slot(slot);
     for (int i = 0; i < kSlotCheckpoints; ++i)
@@ -110,15 +114,26 @@ class SlotCheckpoints {
         if (held[i]->tenant == tenant && std::equal(key.begin(), key.end(), held[i]->key.begin())) return std::nullopt;
         if (i < kGeneralCheckpoints) return i;
       }
+    const auto kept = KeptPoint(slot, boundary, tenant);
     if (kind == CheckpointKind::Grid)
       for (int i = 0; i < kGeneralCheckpoints; ++i)
-        if (held[i] && held[i]->owner == owner && held[i]->kind == CheckpointKind::Grid) return i;
-    int victim = 0;
+        if (held[i] && i != kept && held[i]->owner == owner && held[i]->kind == CheckpointKind::Grid) return i;
+    std::optional<int> victim;
     for (int i = 0; i < kGeneralCheckpoints; ++i) {
       if (!held[i]) return i;
-      if (held[i]->hist.size() < held[victim]->hist.size()) victim = i;
+      if (i != kept && (!victim || held[i]->hist.size() < held[*victim]->hist.size())) victim = i;
     }
-    return victim;
+    return victim ? *victim : 0;
+  }
+  // The general buffer of the longest point of `tenant` at or below `boundary` rows (nullopt: none, or boundary 0).
+  std::optional<int> KeptPoint(int slot, size_t boundary, const StateTenant& tenant) const {
+    std::optional<int> kept;
+    const auto& held = Slot(slot);
+    for (int i = 0; boundary && i < kGeneralCheckpoints; ++i)
+      if (held[i] && held[i]->tenant == tenant && held[i]->hist.size() <= boundary &&
+          (!kept || held[i]->hist.size() > held[*kept]->hist.size()))
+        kept = i;
+    return kept;
   }
   // Whether any slot holds a checkpoint of `tenant` with exactly this cache key, which is the same state (save points:
   // the shared-header point is saved once, not again by every prompt that repeats the header).

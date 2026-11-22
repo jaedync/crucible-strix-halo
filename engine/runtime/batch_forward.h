@@ -78,8 +78,9 @@
   // Batch serve allocates every compact MTP cache at startup, inside the admitted budget.
   // A lazy promotion at the first speculative request could fail on memory, so that
   // request's result would depend on load. Probes that test lazy promotion skip this call.
-  void EnsureServeMtpCaches() {
-    for (auto& state : sequences_) EnsureMtpCache(*state, 0);
+  // caller: kSerialServe or kBatchedServe, for the refusal text (each names only its own options).
+  void EnsureServeMtpCaches(crucible::MtpCacheCaller caller) {
+    for (auto& state : sequences_) EnsureMtpCache(*state, 0, caller);
   }
 
   int StreamCapacity(int stream) const { return sequences_.at(size_t(stream))->capacity; }

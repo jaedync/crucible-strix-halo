@@ -401,3 +401,31 @@ def test_a_planned_file_with_no_pin_is_refused(remote, tmp_path, capsys):
     rc, out = run(Fake(repo, index, tree), tmp_path, source_sha=pins)
     assert rc == 2
     assert "pinned" in capsys.readouterr().err
+
+
+def test_a_missing_pin_list_fails_clearly_before_any_download(remote, tmp_path, capsys, monkeypatch):
+    # A tree without tools/ngram16/sources.sha256 (the v0.38.0 export before its fix) must stop with a message that
+    # names the file, not with a FileNotFoundError traceback, and download nothing.
+    repo, _, index, tree = remote
+    fake = Fake(repo, index, tree)
+    missing = tmp_path / "no-such-dir" / "sources.sha256"
+    monkeypatch.setattr(fetch, "PINS", str(missing))
+    rc, out = run(fake, tmp_path, revision=fetch.REVISION)
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert str(missing) in err and "Nothing was downloaded" in err
+    assert "Traceback" not in err
+    assert fake.downloaded == []
+    assert not (out / "src").exists()
+
+
+def test_a_broken_pin_list_line_fails_clearly(remote, tmp_path, capsys, monkeypatch):
+    repo, _, index, tree = remote
+    fake = Fake(repo, index, tree)
+    broken = tmp_path / "sources.sha256"
+    broken.write_text("not-a-pin-line-with-three words\n")
+    monkeypatch.setattr(fetch, "PINS", str(broken))
+    rc, _ = run(fake, tmp_path, revision=fetch.REVISION)
+    err = capsys.readouterr().err
+    assert rc == 2 and str(broken) in err and "Nothing was downloaded" in err
+    assert fake.downloaded == []

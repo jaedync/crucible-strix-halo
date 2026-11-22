@@ -2,6 +2,7 @@
 // The suggestion is tried with the engine's own admission calculation, so a printed value must pass
 // AdmissionFits and the next step up must fail.
 #include "../engine/runtime/batch_admission.h"
+#include "../engine/layers/cache_storage.h"
 #include <algorithm>
 #include <cassert>
 #include <cctype>
@@ -94,6 +95,21 @@ bool Has(const std::string& text, const std::string& part) {
 }
 bool HasNot(const std::string& text, const std::string& part) { return text.find(part) == std::string::npos; }
 
+// --admission-reserve-mib sets one value for the whole process. A test that changes it holds this guard, so the value
+// goes back when the test ends and does not leak into a later test.
+class ReserveGuard {
+ public:
+  explicit ReserveGuard(uint64_t mib) : saved_(AdmissionReserveBytes()) {
+    SetAdmissionReserveBytes(AdmissionReserveFromMib(mib));
+  }
+  ~ReserveGuard() { SetAdmissionReserveBytes(saved_); }
+  ReserveGuard(const ReserveGuard&) = delete;
+  ReserveGuard& operator=(const ReserveGuard&) = delete;
+
+ private:
+  uint64_t saved_;
+};
+
 // The value that the text prints after `label`, -1 for "none", -2 for a label that the text does not have.
 int Printed(const std::string& text, const char* label) {
   size_t at = text.find(label);
@@ -161,6 +177,18 @@ void CheckFormat() {
   assert(BytesText(std::numeric_limits<uint64_t>::max()).find("17179869184.0 GiB") == 0);
   assert(kAdmissionReserve == 9 * GiB);
   assert(kAdmissionOsReserve == 8 * GiB && kAdmissionPlanReserve == 512 * MiB && kAdmissionHostReserve == 512 * MiB);
+  // --admission-reserve-mib: the default until set, then the value, never below the plans and host part.
+  assert(AdmissionReserveBytes() == kAdmissionReserve);
+  assert(AdmissionReserveFromMib(4096) == 4 * GiB);
+  assert(AdmissionReserveFromMib(9216) == kAdmissionReserve);
+  assert(AdmissionReserveFromMib(1024) == 1 * GiB);
+  assert(AdmissionReserveFromMib(1023) == 1 * GiB);
+  assert(AdmissionReserveFromMib(1) == 1 * GiB);
+  {
+    const ReserveGuard guard(4096);
+    assert(AdmissionReserveBytes() == 4 * GiB);
+  }
+  assert(AdmissionReserveBytes() == kAdmissionReserve);
 }
 
 // Memory stage 2, the start-time fit (FitServeLayout). Each fitted layout must pass the check that the engine runs next,
@@ -176,6 +204,31 @@ bool FitPasses(const Pack& pack, uint64_t available, const FitLayout& layout, in
   return Passes(pack, available - kFitMargin, layout.cache_budget, layout.streams, layout.context, pack.FirstSlot(context));
 }
 constexpr uint64_t kM = kFitMargin;
+
+// --admission-reserve-mib changes what the check accepts: a layout that the default reserve refuses fits with a lower
+// one. This is the behaviour, not just the stored value.
+void CheckReserveChangesTheCheck() {
+  const uint64_t available = 6 * GiB;
+  const uint64_t states = 2 * GiB;
+  const uint64_t cache = 1 * GiB;
+  assert(AdmissionReserveBytes() == kAdmissionReserve);
+  assert(!AdmissionFits(available, states, cache));
+  const ReserveGuard guard(1024);
+  assert(AdmissionReserveBytes() == 1 * GiB);
+  assert(AdmissionFits(available, states, cache));
+  // The refusal text names the parts of the reserve in force. At 1024 MiB the plans and the host part fill it, so the
+  // system part is 0, not the whole reserve.
+  AdmissionMemory memory;
+  memory.host_free = 3 * GiB;
+  memory.device_free = 3 * GiB;
+  memory.states_bytes = 4 * GiB;
+  memory.new_states_bytes = 4 * GiB;
+  memory.streams = 1;
+  memory.context = 262144;
+  const Pack pack;
+  const std::string text = BatchAdmissionError(memory, Trial(pack));
+  assert(Has(text, "start-time reserve: 1.0 GiB (1,073,741,824 bytes): system 0.0 GiB, plans 512.0 MiB, host 512.0 MiB"));
+}
 
 void CheckFitRequested() {
   // A setting that fits keeps every value, exactly (the default stays bit-identical).
@@ -396,6 +449,128 @@ void CheckFitOrder() {
   assert(last == FitStep::kContext || last == FitStep::kRefused);
 }
 
+// --admission-reserve-mib: a layout that the default reserve refuses fits with a lower reserve, and the check, the fit,
+// the cache step and the refusal text all use the same value.
+void CheckReserveFlag() {
+  const Pack full;
+  const uint64_t cache = 9700 * MiB;
+  const AdmissionCharge four = full.Charge(4, 262144);
+  // 4 GiB of reserve, the state of 3 new slots and the cache, to the byte.
+  const uint64_t available = 4 * GiB + four.new_states_bytes + cache;
+  assert(!AdmissionFits(available, four.new_states_bytes, cache));
+  const FitLayout refused = Fit(full, available, cache, 4, 262144);
+  assert(refused.step != FitStep::kRequested);
+  assert(refused.need_bytes == kAdmissionReserve + four.new_states_bytes + cache);
+  {
+    const ReserveGuard guard(4096);
+    assert(AdmissionReserveBytes() == 4 * GiB);
+    // The check: the exact boundary moves with the reserve.
+    assert(AdmissionFits(available, four.new_states_bytes, cache));
+    assert(!AdmissionFits(available - 1, four.new_states_bytes, cache));
+    // The cache step: the whole request fits, and one MiB less of free memory gives one MiB less of cache.
+    assert(LargestAdmissionCache(available, four.new_states_bytes, cache) == cache);
+    assert(LargestAdmissionCache(available - MiB, four.new_states_bytes, cache) == cache - MiB);
+    assert(!LargestAdmissionCache(4 * GiB, four.new_states_bytes, cache));
+    // The fit keeps the request, and its need counts the same reserve.
+    const FitLayout layout = Fit(full, available, cache, 4, 262144);
+    assert(layout.step == FitStep::kRequested);
+    assert(layout.streams == 4 && layout.context == 262144 && layout.cache_budget == cache);
+    assert(layout.need_bytes == 4 * GiB + four.new_states_bytes + cache);
+    // One byte less: the fit lowers the cache only, and the result passes the check at 4 GiB.
+    const FitLayout less = Fit(full, available - 1, cache, 4, 262144);
+    assert(less.step == FitStep::kCache && less.streams == 4 && less.context == 262144);
+    assert(FitPasses(full, available - 1, less, 262144));
+    // The refusal text below the reserve names the same reserve and the same need.
+    const std::string text = BatchAdmissionError(Memory(full, 4 * GiB, 0, 1, 131072), Trial(full));
+    assert(Has(text, "start-time reserve: 4.0 GiB (4,294,967,296 bytes): system 3.0 GiB, plans 512.0 MiB, host 512.0 MiB"));
+    assert(Has(text, "Free memory is at or below the reserve"));
+    assert(Has(text, "more than 4.0 GiB (4,294,967,296 bytes) free now"));
+    CheckSuggestions(text, full, 4 * GiB, 0, 1, 131072);
+    // Above the reserve, the state of 4 slots does not fit: the suggestions pass the check at 4 GiB.
+    const uint64_t tight = 4 * GiB + full.Charge(2, 262144).new_states_bytes + MiB;
+    const std::string over = BatchAdmissionError(Memory(full, tight, 0, 4, 262144), Trial(full));
+    assert(Has(over, "start-time reserve: 4.0 GiB (4,294,967,296 bytes)"));
+    assert(Has(over, "free for new state after the reserve and the cache: " +
+                         BytesText(full.Charge(2, 262144).new_states_bytes + MiB)));
+    assert(Printed(over, "Largest --streams at --ctx") == 2);
+    CheckSuggestions(over, full, tight, 0, 4, 262144);
+  }
+  assert(AdmissionReserveBytes() == kAdmissionReserve);
+  assert(!AdmissionFits(available, four.new_states_bytes, cache));
+}
+
+// The system part is the reserve less the plans and host parts. At the lowest value (1024 MiB) it is 0, not the reserve.
+void CheckReserveParts() {
+  const Pack full;
+  for (const auto& [mib, line] : {std::tuple{uint64_t(1024), "start-time reserve: 1.0 GiB (1,073,741,824 bytes): system 0.0 GiB"},
+                                  std::tuple{uint64_t(1), "start-time reserve: 1.0 GiB (1,073,741,824 bytes): system 0.0 GiB"},
+                                  std::tuple{uint64_t(1536), "start-time reserve: 1.5 GiB (1,610,612,736 bytes): system 0.5 GiB"},
+                                  std::tuple{uint64_t(9216), "start-time reserve: 9.0 GiB (9,663,676,416 bytes): system 8.0 GiB"}}) {
+    const ReserveGuard guard(mib);
+    const std::string text = BatchAdmissionError(Memory(full, GiB / 2, 0, 1, 131072), Trial(full));
+    assert(Has(text, std::string(line) + ", plans 512.0 MiB, host 512.0 MiB"));
+    // The start line and the refusal text give the same system part.
+    const uint64_t system = AdmissionSystemReserve(AdmissionReserveBytes());
+    assert(Has(text, ": system " + GibText(system) + ","));
+    assert(Has(AdmissionReserveLine(), "(system " + std::to_string(system >> 20) + ","));
+  }
+  assert(AdmissionSystemReserve(0) == 0 && AdmissionSystemReserve(GiB) == 0 && AdmissionSystemReserve(GiB + 1) == 1);
+  // The start line (engine/serve/batched_serve.h prints it at each batched start, before the memory fit).
+  assert(AdmissionReserveLine() == "admission reserve: 9216 MiB (system 8192, plans 512, host part 512)");
+  {
+    const ReserveGuard guard(4096);
+    assert(AdmissionReserveLine() == "admission reserve: 4096 MiB (system 3072, plans 512, host part 512)");
+  }
+  {
+    const ReserveGuard guard(1024);
+    assert(AdmissionReserveLine() == "admission reserve: 1024 MiB (system 0, plans 512, host part 512)");
+  }
+  assert(AdmissionReserveBytes() == kAdmissionReserve);
+}
+
+// Compact state (CRUCIBLE_COMPACT_STATE=1): the MTP caches are allocated after the check (BatchedServe calls
+// EnsureServeMtpCaches after the slots). The check charges them, so a layout that the check accepts must also pass
+// each MTP step, at every reserve. The default stays 9 GiB, as before the option.
+void CheckMtpStepFollowsReserve() {
+  static_assert(kAdmissionReserve == 9ull << 30);
+  assert(MtpCacheReserveBytes() == kAdmissionReserve);
+  Pack compact;
+  compact.compact = true;
+  const int streams = 4, context = 131072;
+  const uint64_t mtp = compact.Missing(context);
+  assert(mtp > 0);
+  const AdmissionCharge charge = compact.Charge(streams, context);
+  for (const uint64_t mib : {uint64_t(9216), uint64_t(4096), uint64_t(1024)}) {
+    const ReserveGuard guard(mib);
+    // The free memory at the check: the reserve, the new state and no cache, to the byte (and 6 GiB above it).
+    for (const uint64_t spare : {uint64_t(0), uint64_t(1), 6 * GiB}) {
+      const uint64_t available = AdmissionReserveBytes() + charge.new_states_bytes + spare;
+      assert(AdmissionFits(available, charge.new_states_bytes, 0));
+      // The slots without their MTP caches, then one MTP cache per slot (slot 0 exists before the check).
+      uint64_t free = available - (charge.new_states_bytes - uint64_t(streams) * mtp);
+      for (int slot = 0; slot < streams; ++slot) {
+        assert(CacheAllocationFits(free, mtp, MtpCacheReserveBytes()));
+        free -= mtp;
+      }
+    }
+  }
+  assert(MtpCacheReserveBytes() == kAdmissionReserve);
+}
+
+// The MTP refusal at each start names only the options of its own command. The serial serve (serve without --streams,
+// the server's --serial) has no --streams: the server refuses that option with --serial (review pr16-2 L4).
+void CheckMtpRefusalText() {
+  const std::string batched = MtpCacheRefusal(MtpCacheCaller::kBatchedServe);
+  const std::string serial = MtpCacheRefusal(MtpCacheCaller::kSerialServe);
+  const std::string gen = MtpCacheRefusal(MtpCacheCaller::kGen);
+  assert(batched == "not enough device memory for the MTP cache at start; reduce --streams or --ctx, or stop other "
+                    "programs that use memory");
+  assert(serial == "not enough device memory for the MTP cache at start; reduce --ctx, or stop other programs that use "
+                   "memory");
+  assert(HasNot(serial, "--streams") && HasNot(serial, "--admission-reserve-mib"));
+  assert(gen == "not enough device memory for the MTP cache; reduce the context, or use --spec 0 in gen");
+}
+
 // The accept or refuse decision is the trunk one, so a change here is a change of behaviour.
 void CheckPredicate() {
   const uint64_t huge = std::numeric_limits<uint64_t>::max();
@@ -418,16 +593,15 @@ int main() {
   } catch (const AdmissionRefused& error) {
     assert(std::string(error.what()) == "batch memory does not fit: test");
   }
-  CheckFormat();
-  CheckPredicate();
-  CheckFitRequested();
-  CheckFitCache();
-  CheckFitStreams();
-  CheckFitContext();
-  CheckFitRefused();
-  CheckFitOrder();
-  CheckFitMargin();
-  CheckFitRefusalNote();
+  // Each check starts and ends at the default reserve: a check that changes it must use ReserveGuard.
+  for (void (*check)() : {CheckFormat, CheckPredicate, CheckReserveChangesTheCheck, CheckReserveFlag, CheckReserveParts,
+                          CheckMtpStepFollowsReserve, CheckMtpRefusalText,
+                          CheckFitRequested, CheckFitCache, CheckFitStreams, CheckFitContext, CheckFitRefused,
+                          CheckFitOrder, CheckFitMargin, CheckFitRefusalNote}) {
+    assert(AdmissionReserveBytes() == kAdmissionReserve);
+    check();
+    assert(AdmissionReserveBytes() == kAdmissionReserve);
+  }
   const Pack full;
   Pack compact_pack; compact_pack.compact = true;
   Pack vision_pack; vision_pack.vision = true;

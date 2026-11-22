@@ -18,7 +18,9 @@ Rows (the README row each one gives):
   cold32_prefill  Cold prompt, 32K: prefill (tok/s)                       prompt tokens / first token time
   cold130_ttft    Cold prompt, 130K: first token (s)
   cold130_prefill Cold prompt, 130K: prefill (tok/s)
-  resend32        Same 32K prompt sent again: first token (s)             median of 3
+  resend32        Same 32K prompt sent again: first token (s)             median of 6: the first re-send 0.25 s after
+                                                                          the end of the cold prompt, each next one 1 s
+                                                                          after the end of the previous one
   dec32_code      Decode at 32K, 1 session, code (tok/s)                  (tokens - 1) / (last chunk - first chunk)
   dec32_prose     Decode at 32K, 1 session, prose (tok/s)
   dec4            Decode, 4 sessions, total (tok/s)                       tokens in the window in which all four decode
@@ -52,7 +54,10 @@ D3_PROMPT = ("Write a Python function fibonacci(n) that returns the first n Fibo
              "input with ValueError. Include type hints, a short docstring, and five unit tests. Return only code.")
 D3_N, D3_REPS = 257, 2
 COLD_MAX_FRAC = 0.05
-RESEND_REPS = 3
+RESEND_REPS = 6
+RESEND_FIRST_GAP_S = 0.25        # the wait from the end of the cold prompt to the first re-send
+RESEND_GAP_S = 1.0               # the wait from the end of a re-send to the start of the next one
+RESEND_RULE = "wait0.25-6x1s-median"
 HIT_MIN_FRAC = 0.9
 SESSIONS = 4
 MODEL = "crucible"
@@ -176,17 +181,33 @@ def cold_sample(url, session, name):
     n, c, ttft = res["usage"].get("prompt_tokens"), cached_tokens(res), first_token_s(res)
     valid = bool(n and ttft) and (c or 0) <= COLD_MAX_FRAC * n
     return dict(name=name, valid=valid, prompt_tokens=n, cached_tokens=c, ttft_s=ttft,
-                tok_s=n / ttft if valid else None, error=res["error"])
+                tok_s=n / ttft if valid else None, error=res["error"], t_end=res["t_end"])
 
 
-def row_resend(url, session):
+def wait_until(t):
+    left = t - time.time()
+    if left > 0:
+        time.sleep(left)
+
+
+def row_resend(url, session, cold_end=None):
+    """The cold request again: the first re-send RESEND_FIRST_GAP_S after cold_end (the end of the cold request; None:
+    after the call), each next one RESEND_GAP_S after the end of the previous one. A re-send right after a long cold
+    reply is slower for about 40 ms; the wait keeps that out of the row. Value: the median of the 6 re-sends when all 6 are
+    valid (no error, a cache hit), else no value."""
     reps = []
-    for _ in range(RESEND_REPS):
+    prev_end = time.time() if cold_end is None else cold_end
+    for k in range(RESEND_REPS):
+        wait_until(prev_end + (RESEND_FIRST_GAP_S if k == 0 else RESEND_GAP_S))
         res = timed(url, session.body("code", 1))
         n, c = res["usage"].get("prompt_tokens"), cached_tokens(res)
         hit = not res["error"] and (c is None or (bool(n) and c >= HIT_MIN_FRAC * n))
-        reps.append(dict(valid=hit, prompt_tokens=n, cached_tokens=c, ttft_s=first_token_s(res), error=res["error"]))
-    return dict(value=med([r["ttft_s"] for r in reps if r["valid"]]), reps=reps)
+        reps.append(dict(valid=hit, prompt_tokens=n, cached_tokens=c, ttft_s=first_token_s(res), error=res["error"],
+                         gap_s=round(res["t0"] - prev_end, 4)))
+        prev_end = res["t_end"]
+    got = [r["ttft_s"] for r in reps if r["valid"]]
+    # the rule is the median of RESEND_REPS: a text with a failed or missed re-send has no value
+    return dict(value=med(got) if len(got) == RESEND_REPS else None, n_valid=len(got), reps=reps, rule=RESEND_RULE)
 
 
 def turn_rate(url, session, workload):
@@ -226,7 +247,7 @@ def run_rows(url, prompts, salt, rows, kind="crucible"):
         raw["d1"] = guarded("d1_mixed", lambda: row_d1(url, kind))
     cold0 = guarded("cold32", lambda: cold_sample(url, s0, "s0")) if "s0cold" in need else None
     if "resend" in need:
-        raw["resend"] = guarded("resend32", lambda: row_resend(url, s0))
+        raw["resend"] = guarded("resend32", lambda: row_resend(url, s0, cold0 and cold0.get("t_end")))
     if "code" in need:
         raw["code"] = guarded("dec32_code", lambda: turn_rate(url, s0, "code"))
     if "prose" in need:

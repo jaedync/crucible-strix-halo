@@ -19,10 +19,11 @@ contexts = [int(value) for value in os.environ.get("FAKE_SLOT_CONTEXTS", "128,12
 # wrote; a stage command reads the longest one that a new prompt extends (FAKE_STAGE_READS polls), and the open
 # restores it. End of input writes every finished prompt, after FAKE_FLUSH_DELAY seconds.
 state_disk = os.environ.get("FAKE_STATE_DISK") == "1"
-# A tier engine keeps running after SIGTERM until its flush ends (engine/serve/batched_serve.h KeepRunningOnTerm).
+# A tier engine keeps running after SIGTERM and SIGINT until its flush ends (engine/serve/state_stop.h KeepRunningOnTerm).
 if os.environ.get("FAKE_IGNORE_TERM") == "1":
     import signal
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 disk_file = os.environ.get("FAKE_DISK_FILE")
 # FAKE_PID_FILE: the engine writes its process ID there (a test watches or stops the engine itself).
 if os.environ.get("FAKE_PID_FILE"):
@@ -66,6 +67,7 @@ command_seconds = float(os.environ.get("FAKE_COMMAND_SECONDS", "0"))
 # FAKE_STAGE_FULL=1: the state disk is full: a stage reply names reason "full" (nothing is read) and the flush at the end
 # of input writes nothing. Needs FAKE_STATE_DISK=1.
 stage_full = os.environ.get("FAKE_STAGE_FULL") == "1"
+read_gate = os.environ.get("FAKE_READ_UNTIL_FILE")
 disk = json.load(open(disk_file)) if state_disk and disk_file and os.path.exists(disk_file) else []
 stage_polls = {}
 pending_opens = {}
@@ -264,6 +266,8 @@ for line in sys.stdin:
         stage_polls[key] = stage_polls.get(key, 0) + 1
         if stage_full: best = None
         state = "none" if best is None else "reading" if stage_polls[key] <= int(os.environ.get("FAKE_STAGE_READS", "2")) else "ready"
+        # FAKE_READ_UNTIL_FILE=PATH: a read stays "reading" until PATH exists (the test ends the read at its time).
+        if state == "ready" and read_gate and not os.path.exists(read_gate): state = "reading"
         if state == "ready": staged[key] = len(best)
         # The ledger words of the engine (start plan B1a): the best disk state and what the read waits for.
         reply = dict(event="staged", state=state, tokens=len(best) if best else 0, best=len(best) if best else 0,

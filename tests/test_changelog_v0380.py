@@ -19,9 +19,9 @@ def _flat(text: str) -> str:
     return " ".join(text.split())
 
 
-def test_v0380_is_the_newest_release_with_its_date_and_no_unreleased_section_is_left() -> None:
+def test_v0380_has_its_date_below_v0381_and_no_unreleased_section_is_left() -> None:
     heads = [line for line in TEXT.splitlines() if line.startswith("## ")]
-    assert heads[:2] == [HEAD, "## v0.37.3 (2026-11-17)"]
+    assert heads[:3] == ["## v0.38.1 (2026-11-23)", HEAD, "## v0.37.3 (2026-11-17)"]
     assert "## Unreleased" not in heads
 
 

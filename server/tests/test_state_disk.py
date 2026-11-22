@@ -557,21 +557,66 @@ class StateDiskTest(unittest.TestCase):
             else: self.assertTrue(bound < opened[0] <= bound + 1, (opened, bound))
 
     def test_stop_fits_the_service_stop_time(self):
-        """A service unit stops with TimeoutStopSec=120. The engine flushes for at most 75 s, the server
-        waits a little longer, then kills it (a tier engine waits after SIGTERM)."""
-        header = (Path(__file__).parents[2] / "engine/serve/batched_serve.h").read_text()
+        """A service unit stops with TimeoutStopSec=120. The engine flushes for at most 60 s, the server
+        waits a little longer, then kills it (a tier engine waits after SIGTERM). The flush starts only after the
+        command in flight ends: an open with a handover drain (8 s) and a prefill chunk, then the ledger write after the
+        flush. With a 75 s flush, an 8 s command already gave a SIGKILL inside the flush."""
+        root = Path(__file__).parents[2]
         import re
+        header = (root / "engine/serve/state_stop.h").read_text()
         flush, grace = map(float, re.search(r"kStateFlushSeconds = (\d+), kStateTermGrace = (\d+);", header).groups())
-        self.assertLessEqual(flush, 75)
-        self.assertLess(flush, STATE_FLUSH_SECONDS)
-        self.assertLessEqual(STATE_FLUSH_SECONDS + 10, 120 - 15)
-        self.assertLessEqual(grace, 120 - 15)
+        drain = float(re.search(r"kHandoverDrainSeconds = (\d+);", (root / "engine/serve/handover_spill.h").read_text())[1])
+        unit = (root / "deploy/user-systemd/crucible-server.service").read_text()
+        stop_unit = float(re.search(r"^TimeoutStopSec=(\d+)s?$", unit, re.M)[1])
+        chunk, ledger, kill_wait, margin = 5, 5, 10, 15   # a long prefill chunk; the ledger write and teardown; close()
+        self.assertLessEqual(flush, 60)
+        self.assertLessEqual(flush + drain + chunk + ledger, STATE_FLUSH_SECONDS)
+        self.assertLessEqual(STATE_FLUSH_SECONDS + kill_wait, stop_unit - margin)
+        # Under a group SIGTERM the engine's own exit comes after the server's kill, so the server decides.
+        self.assertGreaterEqual(grace, STATE_FLUSH_SECONDS)
+        self.assertLessEqual(grace, stop_unit - margin)
         backend = self.start(flush_delay="30", ignore_term="1")
         backend.flush_seconds = 0.5
         start = time.monotonic()
         backend.close()
         self.assertLess(time.monotonic() - start, 5)
         self.assertEqual(backend.process.returncode, -9)
+
+    def tokens(self, job):
+        ids = []
+        while True:
+            event = job.events.get(timeout=10)
+            self.assertNotEqual(event["event"], "error", event)
+            if event["event"] == "token": ids.append(event["id"])
+            if event["event"] == "done": return ids
+
+    def test_a_cancel_during_the_head_read_frees_admission_at_once(self):
+        """The head turn holds the free slot and waits for its disk read. Turns cancelled behind it give back
+        their tokens at once, so a new request is admitted (no 503) while the read runs. Admission never changes the
+        tokens: the new request and the head get the tokens of the same requests on an idle server."""
+        point = list(range(1, STAGE_MIN_TOKENS + 100))
+        self.disk.write_text(json.dumps([point]))
+        head_ids, new_ids = point + [7, 8, 9], [11] * 999 + [12]
+        idle = self.start()
+        expected = [self.tokens(idle.submit(ids, self.request)) for ids in (head_ids, new_ids)]
+        gate = Path(self.dir.name) / "read-done"
+        with patch.dict(os.environ, dict(FAKE_READ_UNTIL_FILE=str(gate))): busy = self.start()
+        busy.pending_token_limit = len(head_ids) + 4 * len(new_ids)
+        head = busy.submit(head_ids, self.request)
+        deadline = time.monotonic() + 10
+        while (busy.staging.get(id(head)) or {}).get("slot_from") is None:
+            self.assertLess(time.monotonic(), deadline, "the head turn never waited for its read on a free slot")
+            time.sleep(.01)
+        behind = [busy.submit([13] * len(new_ids), self.request) for _ in range(4)]
+        for job in behind: job.cancelled.set()
+        deadline = time.monotonic() + 2
+        while busy.pending_tokens != len(head_ids) and time.monotonic() < deadline: time.sleep(.01)
+        # The read still runs: the head has no slot yet, and only its own tokens are pending.
+        self.assertEqual((busy.pending_tokens, head.turn.get("request_id")), (len(head_ids), None))
+        new = busy.submit(new_ids, self.request)  # before the fix: ApiError 503 (the queue is full)
+        gate.touch()
+        self.assertEqual([self.tokens(head), self.tokens(new)], expected)
+        self.assertEqual(head.turn.get("opened_cached"), len(point))
 
 
 if __name__ == "__main__":

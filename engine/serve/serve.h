@@ -27,7 +27,7 @@ inline int Serve(const std::string& ckpt, const ServeSettings& settings) {
     }
   Engine eng(ckpt, ctx, settings.prefill_rows);
   // As in batch serve: a lazy compact MTP cache would fail on memory at a request, not at startup.
-  try { eng.EnsureServeMtpCaches(); }
+  try { eng.EnsureServeMtpCaches(crucible::MtpCacheCaller::kSerialServe); }
   catch (const std::exception& error) {
     std::fprintf(stderr, "serve error: %s\n", error.what());
     return 2;

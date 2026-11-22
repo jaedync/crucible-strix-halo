@@ -1900,7 +1900,9 @@ class BatchSession {
     const auto best = request.cache_control == "auto" ? BestPoint(slot, request, key) : std::nullopt;
     const size_t point = best ? checkpoints_.At(slot, *best).hist.size() : 0;
     // a tail of another tenant shares nothing with this prompt, so its slot ranks as the slot left longest ago.
-    const size_t common = held && held->tenant == request.tenant
+    // merge-pen review L1: a bypass request uses no state, so it ranks as another tenant: an empty slot first, then
+    // the smallest loss, then the oldest. It must not take the slot that holds the session's state.
+    const size_t common = held && held->tenant == request.tenant && request.cache_control != "bypass"
                               ? size_t(std::mismatch(held->key.begin(), held->key.end(), key.begin(), key.end()).first -
                                        held->key.begin()) : 0;
     if (point > size_t(request.shared_prefix_tokens)) return {3, std::max(point, common), 0};
@@ -1974,10 +1976,15 @@ class BatchSession {
       return false;
     if (exact_resume_ && (point.kind == CheckpointKind::End || point.kind == CheckpointKind::Pre) &&
         at < key.size() &&
-        !(point.replay == 0 && at % size_t(kQsaUnionTileRows) == 0 && BulkEnd(key.size()) > at + size_t(kMaxRows) &&
-          (point.kind == CheckpointKind::Pre || (at > size_t(kMaxRows) && BulkEnd(at) == at))))
+        !(point.replay == 0 && BulkEnd(key.size()) > at + size_t(kMaxRows) &&
+          (point.kind == CheckpointKind::Pre ? at % size_t(kQsaUnionTileRows) == 0 : EndExtends(at))))
       return false;
     return point.kind != CheckpointKind::Frontier || (cache_.frontier_fits && cache_.frontier_fits(request, point));
+  }
+  // Exact resume: whether an End point of `at` rows can resume a longer prompt (PointFits): on the QSA tile grid,
+  // more than 8 rows, and bulk rows only. Any other End point resumes only a prompt that repeats it (fix A).
+  bool EndExtends(size_t at) const {
+    return at % size_t(kQsaUnionTileRows) == 0 && at > size_t(kMaxRows) && BulkEnd(at) == at;
   }
   // frontier-copy: the longest Frontier point of another slot that the host rule
   // accepts for `request` (the lowest slot on a tie), when it is longer than the host state and this slot's own
@@ -2055,6 +2062,17 @@ class BatchSession {
     for (const int index : checkpoints_.Frontiers(slot))
       if (checkpoints_.At(slot, index).hist.size() > keep) cache_.handover(slot, index, checkpoints_.At(slot, index));
   }
+  // cache-thinkcap: the boundary below which a request's saves keep the newest point
+  // (SlotCheckpoints::Victim), or 0. A client prompt ends a few rows past its stable boundary (cache_prefix_tokens: the
+  // chat template's generation prompt, 3 to 7 rows), and a Pre point leaves more than 8 rows after it, so the
+  // prompt's own Pre point lies below the boundary: the old rule (the shortest point leaves) keeps it, and such a
+  // request keeps that rule. A prompt that passes its boundary by more is a server continuation job (a think cap: the
+  // reasoning and a forced close follow the client's prompt). Its Pre and End points can lie past the boundary, and the
+  // client's next prompt resumes below it.
+  static size_t KeepBoundary(const Request& state) {
+    const size_t boundary = size_t(std::max(state.options.cache_prefix_tokens, 0));
+    return boundary && state.options.ids.size() > boundary + size_t(kMaxRows) ? boundary : 0;
+  }
   // Part B: the open drops the slot's points above what it keeps (GuardFrontiers' rule). The
   // longest End, Pre or Grid point below the released tail `tail` that gains enough over the disk goes to disk. A fork
   // point is speed only: a fault in it (review M2) loses the point and must not poison the batch (DeviceUpdate).
@@ -2077,8 +2095,13 @@ class BatchSession {
                       std::shared_ptr<const PromptOutputs> outputs = nullptr, size_t cut = 0) {
     if (!cache_.checkpoint_save || state.options.cache_control == "bypass" || (cut && !cache_.cut_save)) return false;
     const std::span<const int> below(state.options.ids.data(), cut ? cut : state.cursor);
+    const size_t boundary = KeepBoundary(state);
+    // Review M1 (cache-thinkcap): a continuation's End point that does not extend (EndExtends) resumes only the
+    // continuation prompt, which no client sends. Its save would take the buffer of the continuation's Pre point (the
+    // first job's point below the boundary stays: Victim), and the client's next prompt with the reasoning resumes there.
+    if (boundary && exact_resume_ && kind == CheckpointKind::End && !cut && !EndExtends(below.size())) return false;
     auto key = Key(state.options, below);
-    const auto victim = checkpoints_.Victim(state.slot, key, kind, state.id, state.options.tenant);
+    const auto victim = checkpoints_.Victim(state.slot, key, kind, state.id, state.options.tenant, boundary);
     if (!victim) return false;
     if (cut) cache_.cut_save(state.slot, *victim);
     else cache_.checkpoint_save(state.slot, *victim);

@@ -3,6 +3,77 @@
 Releases are numbered `v0.<train>.<fix>`. This file lists the newest release first.
 The same text is in the notes of each release on GitHub.
 
+## v0.38.1 (2026-11-23)
+
+Release v0.38.1 turns on twin prompts and exact resume in the release settings: when several sessions send one new
+prompt, the last session gets its first token much sooner. The conversation cache keeps a shared system prompt longer,
+and a new option sets the start-time memory reserve. It also fixes tool calls that the model writes in its reasoning,
+the cache of think-capped turns, HTTP 503 replies after cancelled requests, image requests in a container with a small
+`/dev/shm`, the stop with a state folder and the state folder checks.
+
+### Sessions and the conversation cache
+
+- The release settings now set `CRUCIBLE_EXACT_RESUME=1` and `CRUCIBLE_TWIN=1`: `./crucible start`, the user service,
+  `serve.sh` and the run line of docs/DOCKER.md. When several sessions send the same new prompt, one session prefills
+  it and the others copy its state. Each session gets the tokens of the prompt alone.
+- 4 sessions on one new 32K prompt: the last first token went from 79.5 s to 17.4 s; at 100K from 228.9 s to 54.9 s
+  (v0.38.0 engine, 4.05 pack, with and without the two settings, 4 pairs). `CRUCIBLE_TWIN=0` turns the copy off.
+- With exact resume, a chat turn with a think cap (`thinking_budget`, or the room that the server keeps for the
+  answer) keeps a cache point at or below the end of the client's history. The same prompt again and the next turn
+  resume from it. Before, they prefilled the whole conversation again.
+- A request with `"cache_control": "bypass"` takes an empty slot first. It no longer takes the slot that holds the
+  state of the session.
+- A request that the client cancels while it waits for a slot now gives back its place in the request queue at once.
+  Before, while the first waiting turn read its state from the disk (up to 180 s), new requests got HTTP 503.
+- When most sessions share one system prompt, the conversation cache now keeps that prompt longer than its other
+  states. Under load, a short session that loses its own state resumes from the prompt and no longer needs a full
+  prefill. Sessions with other system prompts keep their states too.
+
+### Tool calls
+
+- The model sometimes writes complete tool calls in its reasoning and then ends its turn there, or right after
+  `</think>` with an answer of only white space. The reply now makes those calls: finish `tool_calls`, and the call
+  text stays in `reasoning_content`. A call that the model only quotes before `</think>` stays reasoning text.
+- `usage.completion_tokens_details.tool_call_from_reasoning` gives the number of those calls. The rule uses the
+  request's tool policy, and `--end-of-turn-guard off` turns it off (server/README.md).
+- An end-of-turn token directly after a token that the end-of-turn guard kept now ends the reply. Before, the model
+  got up to 16 kept tokens and engine jobs before the same end.
+- Only the end-of-thinking token ends the reasoning. A `</think>` that the model writes as plain text, for example in
+  a quote, stays in `reasoning_content`. The think cap still closes the reasoning at its limit.
+- Text that names `<tool_call>` before a real call no longer loses that call, in the answer and in the reasoning, also
+  with strict tools and on `/v1/responses`.
+
+### Images
+
+- An image request whose pixels do not fit in `/dev/shm` (a container gets 64 MB by default) uses the temp folder.
+  Before, it failed with an HTTP 500. The server prints one line when this occurs. When both folders are full, the
+  request gets an HTTP 503. The engine reads the same bytes, so the tokens do not change.
+
+### Engine
+
+- With the 16-bit n-gram table (`--ngram16 yes`), the prefill no longer waits for the host between the pieces of a
+  launch. That stage now holds a whole launch: 160 MiB of pinned host memory (was 20 MiB).
+- The prefill stores the HC dots of a block in one run, and the host thread sleeps while it waits for a prefill
+  launch, so it no longer keeps a CPU core busy. The speed table in the README gives the measured numbers.
+- `--admission-reserve-mib N` (1,024 to 1,048,576) sets the start-time reserve (default 9,216 MiB, no change). A machine
+  that runs only the engine can start a larger layout, but a low value leaves less memory for the OS and the GPU. Cache
+  saves keep their own `--host-reserve-mib` (8,192 MiB by default): lower it too to fill a larger conversation cache.
+  The engine prints the reserve at each batched start (thanks @enncoded).
+- The README row "Same 32K prompt again: first token" has a new method: a 0.25 s wait after the cold prompt, then the
+  median of 6 re-sends 1 s apart (tools/repro/README.md). It reads about 0.009 s, not 0.017 s. The method changed, not
+  the engine.
+
+### Stop and the state folder
+
+- With a state folder, Ctrl-C in the server's terminal no longer ends the engine before it saves the conversation
+  states. The engine treats SIGINT like SIGTERM: it saves, then exits. It saves for 60 s at most (was 75 s), so a long
+  command that runs at the stop no longer pushes the save past the server's 85 s limit.
+- The state list file is synced to the disk before its rename, and its folder after the rename.
+- The engine and setup make the state folder one name at a time and never follow a link. Before, in a shared folder
+  such as `/tmp`, another user could put a link in the path after the check, and the mode change then went to another
+  of your folders. Now a link at any depth stops the start with the name of the link.
+- A folder of another user never gets a mode change from the engine or setup.
+
 ## v0.38.0 (2026-11-19)
 
 Release v0.38.0 adds the OpenAI Responses API, the Anthropic Messages API and structured output with a grammar. The
@@ -138,8 +209,8 @@ longer spill registers. Setup gets new options, and start, stop and the memory c
 
 - The `crucible_turn` log line has `prefix_*` fields: keyed hashes of the reasoning line, the tools block and each tool
   definition, and the token ends of the tools and system blocks. They show why two new sessions share only a short
-  prefix. The line never holds the text, and the cache of recent heads keeps only hashes and counts
-.
+  prefix. The line never holds the text, and the cache of recent heads keeps only hashes and
+  counts.
 - The memory checks stop a start again, as before v0.37.3: a machine below 88 GiB, the 4.05 or 4.18 pack below 120 GiB,
   and GPU memory that another program holds. A new check warns when the available host memory is below the host
   reserve. Each memory message names the memory holders of your user and suggests a smaller pack, smaller caches or
