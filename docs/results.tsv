@@ -286,3 +286,61 @@ dec32_prose	4.05	default		58.8	tok/s	v0.38.1	2026-11-22	balanced	3		stand-eval:1
 dec32_prose	3.05	default		63.4	tok/s	v0.38.1	2026-11-22	balanced	3		stand-eval:11c6f12c0373:table/cells.json
 dec4	4.05	default		112.2	tok/s	v0.38.1	2026-11-22	balanced	5	5 of 6 texts gave a value	stand-eval:11c6f12c0373:table/cells.json
 dec4	3.05	default		127.8	tok/s	v0.38.1	2026-11-22	balanced	6		stand-eval:11c6f12c0373:table/cells.json
+ctx_prefill	4.05	default	32	1883	tok/s	v0.38.0	2026-11-22	balanced	2		chart-0380:unit-out/sum/g38.json
+ctx_prefill	4.05	default	64	1867	tok/s	v0.38.0	2026-11-22	balanced	2		chart-0380:unit-out/sum/g38.json
+ctx_prefill	4.05	default	128	1834	tok/s	v0.38.0	2026-11-22	balanced	2		chart-0380:unit-out/sum/g38.json
+ctx_prefill	4.05	default	192	1786	tok/s	v0.38.0	2026-11-22	balanced	2		chart-0380:unit-out/sum/g38.json
+ctx_prefill	4.05	default	250	1676	tok/s	v0.38.0	2026-11-22	balanced	2		chart-0380:unit-out/sum/g38.json
+ctx_prefill	3.05	default	32	1898	tok/s	v0.38.0	2026-11-22	balanced	2		chart-0380:unit-out/sum/g38.json
+ctx_prefill	3.05	default	64	1886	tok/s	v0.38.0	2026-11-22	balanced	2		chart-0380:unit-out/sum/g38.json
+ctx_prefill	3.05	default	128	1853	tok/s	v0.38.0	2026-11-22	balanced	2		chart-0380:unit-out/sum/g38.json
+ctx_prefill	3.05	default	192	1813	tok/s	v0.38.0	2026-11-22	balanced	2		chart-0380:unit-out/sum/g38.json
+ctx_prefill	3.05	default	250	1696	tok/s	v0.38.0	2026-11-22	balanced	2		chart-0380:unit-out/sum/g38.json
+ctx_decode	4.05	default	32	71.5	tok/s	v0.38.0	2026-11-22	balanced	2	5 samples	chart-0380:unit-out/sum/g38.json
+ctx_decode	4.05	default	64	69.3	tok/s	v0.38.0	2026-11-22	balanced	2	5 samples	chart-0380:unit-out/sum/g38.json
+ctx_decode	4.05	default	128	72.3	tok/s	v0.38.0	2026-11-22	balanced	2	6 samples	chart-0380:unit-out/sum/g38.json
+ctx_decode	4.05	default	192	66.5	tok/s	v0.38.0	2026-11-22	balanced	2	6 samples	chart-0380:unit-out/sum/g38.json
+ctx_decode	4.05	default	250	67.4	tok/s	v0.38.0	2026-11-22	balanced	2	6 samples	chart-0380:unit-out/sum/g38.json
+ctx_decode	3.05	default	32	79.6	tok/s	v0.38.0	2026-11-22	balanced	2	4 samples	chart-0380:unit-out/sum/g38.json
+ctx_decode	3.05	default	64	78.3	tok/s	v0.38.0	2026-11-22	balanced	2	4 samples	chart-0380:unit-out/sum/g38.json
+ctx_decode	3.05	default	128	73.4	tok/s	v0.38.0	2026-11-22	balanced	2	6 samples	chart-0380:unit-out/sum/g38.json
+ctx_decode	3.05	default	192	87.0	tok/s	v0.38.0	2026-11-22	balanced	2	4 samples	chart-0380:unit-out/sum/g38.json
+ctx_decode	3.05	default	250	67.7	tok/s	v0.38.0	2026-11-22	balanced	2	6 samples	chart-0380:unit-out/sum/g38.json
+cold_ttft	4.05	long	250	147.6	s	v0.38.0	2026-11-22	balanced	1	plain positions	chart-0380:long/y38/cell/cells.json
+cold_ttft	4.05	long	490	338.2	s	v0.38.0	2026-11-22	balanced	1	YaRN	chart-0380:long/y38/cell/cells.json
+cold_prefill	4.05	long	250	1693.5	tok/s	v0.38.0	2026-11-22	balanced	1	plain positions	chart-0380:long/y38/cell/cells.json
+cold_prefill	4.05	long	490	1445.6	tok/s	v0.38.0	2026-11-22	balanced	1	YaRN	chart-0380:long/y38/cell/cells.json
+dec_code	4.05	long	250	64.3	tok/s	v0.38.0	2026-11-22	balanced	1	plain positions	chart-0380:long/y38/cell/cells.json
+dec_code	4.05	long	490	63.6	tok/s	v0.38.0	2026-11-22	balanced	1	YaRN	chart-0380:long/y38/cell/cells.json
+dec_tool	4.05	long	250	105.1	tok/s	v0.38.0	2026-11-22	balanced	1	plain positions	chart-0380:long/y38/cell/cells.json
+dec_tool	4.05	long	490	99.1	tok/s	v0.38.0	2026-11-22	balanced	1	YaRN	chart-0380:long/y38/cell/cells.json
+ctx_prefill	4.05	default	32	1888	tok/s	v0.38.1	2026-11-22	balanced	2		chart-0380:unit-out/sum/g381.json
+ctx_prefill	4.05	default	64	1881	tok/s	v0.38.1	2026-11-22	balanced	2		chart-0380:unit-out/sum/g381.json
+ctx_prefill	4.05	default	128	1845	tok/s	v0.38.1	2026-11-22	balanced	2		chart-0380:unit-out/sum/g381.json
+ctx_prefill	4.05	default	192	1805	tok/s	v0.38.1	2026-11-22	balanced	2		chart-0380:unit-out/sum/g381.json
+ctx_prefill	4.05	default	250	1701	tok/s	v0.38.1	2026-11-22	balanced	2		chart-0380:unit-out/sum/g381.json
+ctx_prefill	3.05	default	32	1910	tok/s	v0.38.1	2026-11-22	balanced	2		chart-0380:unit-out/sum/g381.json
+ctx_prefill	3.05	default	64	1895	tok/s	v0.38.1	2026-11-22	balanced	2		chart-0380:unit-out/sum/g381.json
+ctx_prefill	3.05	default	128	1862	tok/s	v0.38.1	2026-11-22	balanced	2		chart-0380:unit-out/sum/g381.json
+ctx_prefill	3.05	default	192	1823	tok/s	v0.38.1	2026-11-22	balanced	2		chart-0380:unit-out/sum/g381.json
+ctx_prefill	3.05	default	250	1705	tok/s	v0.38.1	2026-11-22	balanced	2		chart-0380:unit-out/sum/g381.json
+ctx_decode	4.05	default	32	73.0	tok/s	v0.38.1	2026-11-22	balanced	2	6 samples	chart-0380:unit-out/sum/g381.json
+ctx_decode	4.05	default	64	70.6	tok/s	v0.38.1	2026-11-22	balanced	2	5 samples	chart-0380:unit-out/sum/g381.json
+ctx_decode	4.05	default	128	68.9	tok/s	v0.38.1	2026-11-22	balanced	2	6 samples	chart-0380:unit-out/sum/g381.json
+ctx_decode	4.05	default	192	67.1	tok/s	v0.38.1	2026-11-22	balanced	2	5 samples	chart-0380:unit-out/sum/g381.json
+ctx_decode	4.05	default	250	67.4	tok/s	v0.38.1	2026-11-22	balanced	2	6 samples	chart-0380:unit-out/sum/g381.json
+ctx_decode	3.05	default	32	79.4	tok/s	v0.38.1	2026-11-22	balanced	2	4 samples	chart-0380:unit-out/sum/g381.json
+ctx_decode	3.05	default	64	78.1	tok/s	v0.38.1	2026-11-22	balanced	2	4 samples	chart-0380:unit-out/sum/g381.json
+ctx_decode	3.05	default	128	73.6	tok/s	v0.38.1	2026-11-22	balanced	2	5 samples	chart-0380:unit-out/sum/g381.json
+ctx_decode	3.05	default	192	73.3	tok/s	v0.38.1	2026-11-22	balanced	2	4 samples	chart-0380:unit-out/sum/g381.json
+ctx_decode	3.05	default	250	67.5	tok/s	v0.38.1	2026-11-22	balanced	2	6 samples	chart-0380:unit-out/sum/g381.json
+cold_ttft	4.05	long	250	148.0	s	v0.38.1	2026-11-22	balanced	1	plain positions	chart-0380:long/y381/cell/cells.json
+cold_ttft	4.05	long	490	342.4	s	v0.38.1	2026-11-22	balanced	1	YaRN	chart-0380:long/y381/cell/cells.json
+cold_prefill	4.05	long	250	1688.9	tok/s	v0.38.1	2026-11-22	balanced	1	plain positions	chart-0380:long/y381/cell/cells.json
+cold_prefill	4.05	long	490	1427.8	tok/s	v0.38.1	2026-11-22	balanced	1	YaRN	chart-0380:long/y381/cell/cells.json
+dec_code	4.05	long	250	64.1	tok/s	v0.38.1	2026-11-22	balanced	1	plain positions	chart-0380:long/y381/cell/cells.json
+dec_code	4.05	long	490	63.4	tok/s	v0.38.1	2026-11-22	balanced	1	YaRN	chart-0380:long/y381/cell/cells.json
+dec_tool	4.05	long	250	104.9	tok/s	v0.38.1	2026-11-22	balanced	1	plain positions	chart-0380:long/y381/cell/cells.json
+dec_tool	4.05	long	490	98.9	tok/s	v0.38.1	2026-11-22	balanced	1	YaRN	chart-0380:long/y381/cell/cells.json
+cold32_prefill	4.05	default		1883	tok/s	v0.38.1	2026-11-22	balanced	2	release ladder (prompts of the v0.33.0 ladder), not the standing eval texts	chart-0380:unit-out/sum/g381.json
+cold32_prefill	3.05	default		1903	tok/s	v0.38.1	2026-11-22	balanced	2	release ladder (prompts of the v0.33.0 ladder), not the standing eval texts	chart-0380:unit-out/sum/g381.json

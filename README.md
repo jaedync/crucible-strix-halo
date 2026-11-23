@@ -5,11 +5,11 @@ with 128 GB. Its OpenAI-compatible server gives local coding agents 4 sessions o
 
 <!-- results:start charts -->
 <p>
-<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/prefill-by-context-dark.svg"><img src="docs/img/prefill-by-context-light.svg" width="412" alt="Line chart: Cold prefill by context length, in tokens per second: 4.05 bpw from 1,830 at 32K to 1,622 at 250K; 3.05 bpw from 1,855 at 32K to 1,648 at 250K. v0.33.0, Nov 3, 2026."></picture>
-<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/decode-by-context-dark.svg"><img src="docs/img/decode-by-context-light.svg" width="412" alt="Line chart: Decode by context length, in tokens per second: 4.05 bpw from 71.7 at 32K to 62.2 at 250K; 3.05 bpw from 77.0 at 32K to 69.1 at 250K. v0.33.0, Nov 3, 2026."></picture>
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/prefill-by-context-dark.svg"><img src="docs/img/prefill-by-context-light.svg" width="412" alt="Line chart: Cold prefill by context length, in tokens per second: 4.05 bpw from 1,888 at 32K to 1,701 at 250K; 3.05 bpw from 1,910 at 32K to 1,705 at 250K. v0.38.1, Nov 22, 2026."></picture>
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/decode-by-context-dark.svg"><img src="docs/img/decode-by-context-light.svg" width="412" alt="Line chart: Decode by context length, in tokens per second: 4.05 bpw from 73.0 at 32K to 67.4 at 250K; 3.05 bpw from 79.4 at 32K to 67.5 at 250K. v0.38.1, Nov 22, 2026."></picture>
 </p>
 
-<sub>One request at a time, default configuration, balanced power profile, v0.33.0 (Nov 3, 2026). No new run for v0.38.1.</sub>
+<sub>One request at a time, default configuration, balanced power profile, v0.38.1 (Nov 22, 2026).</sub>
 <!-- results:end charts -->
 
 ## Install
@@ -73,11 +73,11 @@ tokens. A longer request uses YaRN. Measured in `long`:
 <!-- results:start long -->
 | `long`, 4.05 pack | 250,000 tokens | 490,000 tokens (YaRN) |
 |---|---:|---:|
-| Cold prompt: first token | 149.0 s | 340.4 s |
-| Cold prompt: prefill | 1,677.6 tok/s | 1,436.2 tok/s |
-| Decode, code | 67.7 tok/s | 59.8 tok/s |
+| Cold prompt: first token | 148.0 s | 342.4 s |
+| Cold prompt: prefill | 1,688.9 tok/s | 1,427.8 tok/s |
+| Decode, code | 64.1 tok/s | 63.4 tok/s |
 
-<sub>v0.37.0, measured Nov 11, 2026: 1 run, balanced power profile. No new run for v0.38.1.</sub>
+<sub>v0.38.1, measured Nov 22, 2026: 1 run, balanced power profile.</sub>
 <!-- results:end long -->
 
 Read more: [long context](docs/LONG_CONTEXT.md)
@@ -86,10 +86,10 @@ Read more: [long context](docs/LONG_CONTEXT.md)
 
 <!-- results:start releases -->
 <p>
-<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/prefill-by-release-dark.svg"><img src="docs/img/prefill-by-release-light.svg" width="412" alt="Line chart: Cold prefill of a 32K prompt, by release, in tokens per second: 4.05 bpw from 1,585 at v0.22.0 to 1,831 at v0.34.0; 3.05 bpw from 1,656 at v0.22.0 to 1,877 at v0.34.0. Oct 27 to Nov 7, 2026."></picture>
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/prefill-by-release-dark.svg"><img src="docs/img/prefill-by-release-light.svg" width="412" alt="Line chart: Cold prefill of a 32K prompt, by release, in tokens per second: 4.05 bpw from 1,585 at v0.22.0 to 1,883 at v0.38.1; 3.05 bpw from 1,656 at v0.22.0 to 1,903 at v0.38.1. Oct 27 to Nov 22, 2026."></picture>
 </p>
 
-<sub>Each release ran with the settings of its own time, balanced power profile. No new run for v0.38.1.</sub>
+<sub>Each release ran with the settings of its own time, balanced power profile.</sub>
 <!-- results:end releases -->
 
 <!-- results:start table -->
