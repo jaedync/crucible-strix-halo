@@ -91,6 +91,14 @@ __global__ void __launch_bounds__(256) DraftQGemvKernel(const uint4* __restrict_
 #pragma unroll
           for (int r = 0; r < NR; ++r) part[r] = Dot2(v, xs[r * H + (wi * PPW + jj) * L + k], part[r]);
         }
+        // rocm10-retune: the row sums of rows >= n are dead, so the compiler sank every dot of a row into the store
+        // branch `r < n` below and kept all x reads live until there (NR 8: 4.5 KB of scratch). The empty asm ends
+        // each word's dots here. Same values, same order. Only the instances that spilled take it: <2, 1>, <4, 1>
+        // and <4, 2> have no scratch and were 4 to 6% slower with it (bench/retune/rk.hip, Nov 23).
+        if constexpr (NR >= (BITS == 2 ? 2 : 4)) {
+#pragma unroll
+          for (int r = 0; r < NR; ++r) asm volatile("" : "+v"(part[r]));
+        }
         // Keeps the x reads of one word together: without it the scheduler hoists all of them and spills (NR > 1).
         __builtin_amdgcn_sched_barrier(0);
       }

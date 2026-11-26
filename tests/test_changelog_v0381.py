@@ -24,9 +24,14 @@ def _topic(head: str) -> str:
 
 
 def test_v0381_is_the_newest_release_above_v0380() -> None:
+    # An "## Unreleased" section for the changes after v0.38.1 can stand above the releases (trunk, after the merge).
     heads = [line for line in TEXT.splitlines() if line.startswith("## ")]
-    assert heads[:3] == [HEAD, "## v0.38.0 (2026-11-19)", "## v0.37.3 (2026-11-17)"]
-    assert "## Unreleased" not in heads
+    releases = [line for line in heads if line != "## Unreleased"]
+    assert heads[: len(heads) - len(releases)] in ([], ["## Unreleased"])
+    # The next release (v0.39.0) can stand above v0.38.1.
+    i = releases.index(HEAD)
+    assert releases[:i] in ([], ["## v0.39.0 (2026-11-26)"])
+    assert releases[i : i + 3] == [HEAD, "## v0.38.0 (2026-11-19)", "## v0.37.3 (2026-11-17)"]
 
 
 def test_the_section_has_an_intro_and_the_topic_sections() -> None:

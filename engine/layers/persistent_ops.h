@@ -28,19 +28,54 @@ __device__ __forceinline__ void PersistentHcDots(ComputeContext& ct, int task, c
   float acc[R];
 #pragma unroll
   for (int r = 0; r < R; ++r) acc[r] = 0.f;
+  if constexpr (R >= 3) {
+    // rocm10-retune: DenseGemvKernel<3>'s order (the streams of step k + D load during the math of step k; the
+    // empty asm statements keep the unpack and each row's sum in step k). 10.1 had 88 B of scratch here, 7.2.4 256
+    // VGPR. Same per-lane expression and order, so the results are bitwise equal. D = 5 (199 VGPR): M 320 and 324,
+    // 0.958 and 0.947 of the old kernel on 7.2.4, 0.813 and 0.805 on 10.1 (bench/retune/rk.hip, 6 rotated reps).
+    constexpr int D = 5;
+    float4 a[10][R], b[10][R];
+    auto load_h = [&](int k) {
 #pragma unroll
-  for (int k = 0; k < 10; ++k) {
-    const __half* hw = reinterpret_cast<const __half*>(&raw[k]);
-    float wf[8];
+      for (int r = 0; r < R; ++r) {
+        const float4* hr = reinterpret_cast<const float4*>(H + (size_t)r * kWide + s * kHidden + k * 256 + lane * 8);
+        a[k][r] = hr[0];
+        b[k][r] = hr[1];
+      }
+    };
 #pragma unroll
-    for (int i = 0; i < 8; ++i) wf[i] = __half2float(hw[i]);
+    for (int k = 0; k < D; ++k) load_h(k);
 #pragma unroll
-    for (int r = 0; r < R; ++r) {
-      const float4* hr =
-          reinterpret_cast<const float4*>(H + (size_t)r * kWide + s * kHidden + k * 256 + lane * 8);
-      const float4 a = hr[0], b = hr[1];
-      acc[r] += wf[0] * a.x + wf[1] * a.y + wf[2] * a.z + wf[3] * a.w + wf[4] * b.x + wf[5] * b.y +
-                wf[6] * b.z + wf[7] * b.w;
+    for (int k = 0; k < 10; ++k) {
+      if (k + D < 10) load_h(k + D);
+      asm volatile("" : "+v"(raw[k].x), "+v"(raw[k].y), "+v"(raw[k].z), "+v"(raw[k].w));
+      const __half* hw = reinterpret_cast<const __half*>(&raw[k]);
+      float wf[8];
+#pragma unroll
+      for (int i = 0; i < 8; ++i) wf[i] = __half2float(hw[i]);
+#pragma unroll
+      for (int r = 0; r < R; ++r) {
+        acc[r] += wf[0] * a[k][r].x + wf[1] * a[k][r].y + wf[2] * a[k][r].z + wf[3] * a[k][r].w +
+                  wf[4] * b[k][r].x + wf[5] * b[k][r].y + wf[6] * b[k][r].z + wf[7] * b[k][r].w;
+        asm volatile("" : "+v"(acc[r]));
+      }
+      __builtin_amdgcn_sched_barrier(0);
+    }
+  } else {
+#pragma unroll
+    for (int k = 0; k < 10; ++k) {
+      const __half* hw = reinterpret_cast<const __half*>(&raw[k]);
+      float wf[8];
+#pragma unroll
+      for (int i = 0; i < 8; ++i) wf[i] = __half2float(hw[i]);
+#pragma unroll
+      for (int r = 0; r < R; ++r) {
+        const float4* hr =
+            reinterpret_cast<const float4*>(H + (size_t)r * kWide + s * kHidden + k * 256 + lane * 8);
+        const float4 a = hr[0], b = hr[1];
+        acc[r] += wf[0] * a.x + wf[1] * a.y + wf[2] * a.z + wf[3] * a.w + wf[4] * b.x + wf[5] * b.y +
+                  wf[6] * b.z + wf[7] * b.w;
+      }
     }
   }
 #pragma unroll

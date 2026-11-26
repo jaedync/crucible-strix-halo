@@ -5,11 +5,11 @@ with 128 GB. Its OpenAI-compatible server gives local coding agents 4 sessions o
 
 <!-- results:start charts -->
 <p>
-<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/prefill-by-context-dark.svg"><img src="docs/img/prefill-by-context-light.svg" width="412" alt="Line chart: Cold prefill by context length, in tokens per second: 4.05 bpw from 1,888 at 32K to 1,701 at 250K; 3.05 bpw from 1,910 at 32K to 1,705 at 250K. v0.38.1, Nov 22, 2026."></picture>
-<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/decode-by-context-dark.svg"><img src="docs/img/decode-by-context-light.svg" width="412" alt="Line chart: Decode by context length, in tokens per second: 4.05 bpw from 73.0 at 32K to 67.4 at 250K; 3.05 bpw from 79.4 at 32K to 67.5 at 250K. v0.38.1, Nov 22, 2026."></picture>
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/prefill-by-context-dark.svg"><img src="docs/img/prefill-by-context-light.svg" width="412" alt="Line chart: Cold prefill by context length, in tokens per second: 4.05 bpw from 1,966 at 32K to 1,751 at 250K; 3.05 bpw from 1,973 at 32K to 1,757 at 250K. v0.39.0, Nov 25, 2026."></picture>
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/decode-by-context-dark.svg"><img src="docs/img/decode-by-context-light.svg" width="412" alt="Line chart: Decode by context length, in tokens per second: 4.05 bpw from 65.2 at 32K to 63.7 at 250K; 3.05 bpw from 77.5 at 32K to 71.0 at 250K. v0.39.0, Nov 25, 2026."></picture>
 </p>
 
-<sub>One request at a time, default configuration, balanced power profile, v0.38.1 (Nov 22, 2026).</sub>
+<sub>One request at a time, default configuration, balanced power profile, v0.39.0 (Nov 25, 2026).</sub>
 <!-- results:end charts -->
 
 ## Install
@@ -26,7 +26,7 @@ curl -fsSL https://raw.githubusercontent.com/jaedync/crucible-strix-halo/main/in
 
 <!-- results:start clone -->
 ```sh
-git clone --branch v0.38.1 https://github.com/jaedync/crucible-strix-halo.git
+git clone --branch v0.39.0 https://github.com/jaedync/crucible-strix-halo.git
 cd crucible-strix-halo
 ./crucible setup
 ```
@@ -73,11 +73,11 @@ tokens. A longer request uses YaRN. Measured in `long`:
 <!-- results:start long -->
 | `long`, 4.05 pack | 250,000 tokens | 490,000 tokens (YaRN) |
 |---|---:|---:|
-| Cold prompt: first token | 148.0 s | 342.4 s |
-| Cold prompt: prefill | 1,688.9 tok/s | 1,427.8 tok/s |
-| Decode, code | 64.1 tok/s | 63.4 tok/s |
+| Cold prompt: first token | 143.1 s | 329.8 s |
+| Cold prompt: prefill | 1,746.7 tok/s | 1,482.4 tok/s |
+| Decode, code | 62.2 tok/s | 65.8 tok/s |
 
-<sub>v0.38.1, measured Nov 22, 2026: 1 run, balanced power profile.</sub>
+<sub>v0.39.0, measured Nov 25, 2026: 1 run, balanced power profile.</sub>
 <!-- results:end long -->
 
 Read more: [long context](docs/LONG_CONTEXT.md)
@@ -86,25 +86,23 @@ Read more: [long context](docs/LONG_CONTEXT.md)
 
 <!-- results:start releases -->
 <p>
-<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/prefill-by-release-dark.svg"><img src="docs/img/prefill-by-release-light.svg" width="412" alt="Line chart: Cold prefill of a 32K prompt, by release, in tokens per second: 4.05 bpw from 1,585 at v0.22.0 to 1,883 at v0.38.1; 3.05 bpw from 1,656 at v0.22.0 to 1,903 at v0.38.1. Oct 27 to Nov 22, 2026."></picture>
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/prefill-by-release-dark.svg"><img src="docs/img/prefill-by-release-light.svg" width="412" alt="Line chart: Cold prefill of a 32K prompt, by release, in tokens per second: 4.05 bpw from 1,613 at v0.26.0 to 1,955 at v0.39.0; 3.05 bpw from 1,628 at v0.26.0 to 1,967 at v0.39.0. Oct 27 to Nov 25, 2026."></picture>
 </p>
 
 <sub>Each release ran with the settings of its own time, balanced power profile.</sub>
 <!-- results:end releases -->
 
 <!-- results:start table -->
-| v0.38.1 | 4.05 pack | 3.05 pack |
+| v0.39.0 | 4.05 pack | 3.05 pack |
 |---|---:|---:|
-| Cold 32K prompt: first token | 16.6 s | 16.5 s |
-| Cold 130K prompt: first token | 70.0 s | 69.4 s |
+| Cold 32K prompt: first token | 16.0 s | 15.9 s |
+| Cold 130K prompt: first token | 67.3 s | 67.2 s |
 | Same 32K prompt again: first token | 0.009 s | 0.009 s |
-| Decode at 32K, 1 session, code | 72.8 tok/s | 79.1 tok/s |
-| Decode at 32K, 1 session, prose | 58.8 tok/s | 63.4 tok/s |
-| Decode, 4 sessions, total | 112.2 tok/s ¹ | 127.8 tok/s |
+| Decode at 32K, 1 session, code | 73.9 tok/s | 78.5 tok/s |
+| Decode at 32K, 1 session, prose | 59.5 tok/s | 64.0 tok/s |
+| Decode, 4 sessions, total | 115.0 tok/s | 126.8 tok/s |
 
-<sub>v0.38.1, measured Nov 22, 2026: median of 6 texts (decode: mean, 3 runs a text), balanced power profile, default configuration.</sub>
-
-<sub>¹ 4.05 pack, Decode, 4 sessions, total: 5 of 6 texts gave a value.</sub>
+<sub>v0.39.0, measured Nov 25, 2026: median of 6 texts (decode: mean, 3 runs a text), balanced power profile, default configuration.</sub>
 <!-- results:end table -->
 
 The 4-session row uses warm prompts and the all-4 window. 4 sessions, one new 32K prompt: last first token after 17.4 s (was 79.5 s).

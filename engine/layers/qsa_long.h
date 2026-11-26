@@ -50,6 +50,16 @@ __global__ void __launch_bounds__(256) QsaScoreKernel(Args args) {
 template<int R>
 __global__ void __launch_bounds__(256) QsaScoreRowsKernel(QsaArgs a) {
   constexpr int PF = 32;
+  // R = 8 (rocm10-retune): a sched_barrier after every 4 keys keeps the scheduler from hoisting the LDS reads of
+  // later keys (249 VGPR on 7.2.4; 10.1 spilled 24 B). Now 229 VGPR, no scratch on both; the FMA chains are unchanged.
+  // bench/retune/rk.hip (5 rotated reps): ctx 32K 0.999 (7.2.4) and 0.834 (10.1) of the old kernel, ctx 128K 1.004 and
+  // 0.797. PF 16 was 16% slower on 7.2.4 at 128K. The final build measured 1.008 on 7.2.4 (6 reps), so the barrier is
+  // for clang 24 only: the 7.2.4 build keeps its old code (no scratch there).
+#if defined(__clang_major__) && __clang_major__ >= 24
+  constexpr int QSB = R == 8 ? 4 : 0;
+#else
+  constexpr int QSB = 0;
+#endif
   const int b = blockIdx.x * 256 + threadIdx.x;
   const int nb_max = (a.pos0 + R) / 4;
   if (nb_max <= kSelBlocks) return;
@@ -75,6 +85,7 @@ __global__ void __launch_bounds__(256) QsaScoreRowsKernel(QsaArgs a) {
         d[r][0] = fmaf(iq[r][i], k, d[r][0]); d[r][1] = fmaf(iq[r][128+i], k, d[r][1]);
         d[r][2] = fmaf(iq[r][256+i], k, d[r][2]); d[r][3] = fmaf(iq[r][384+i], k, d[r][3]);
       }
+      if constexpr (QSB > 0) if (j % QSB == QSB - 1) __builtin_amdgcn_sched_barrier(0);
     }
 #pragma unroll
     for (int j = 0; j < PF; ++j) cur[j] = nxt[j];

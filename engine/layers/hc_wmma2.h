@@ -247,7 +247,7 @@ __device__ __forceinline__ void HcW2Mid(int g, int M, int R, float* __restrict__
         const float v = Silu(a * .25f);
         const __half h = __float2half(v);
         sc.thi[r * kRank + m] = h;
-        sc.tlo[r * kRank + m] = __float2half((v - __half2float(h)) * prefill::kResidualScale);
+        sc.tlo[r * kRank + m] = sc.hi_only ? __float2half(0.f) : __float2half((v - __half2float(h)) * prefill::kResidualScale);
       } else if (post) {
         post[r * kStreams + m - kRank] = 2.f * Sigmoid(a * .25f);
       }

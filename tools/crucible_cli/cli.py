@@ -423,7 +423,7 @@ def main(argv=None, host=None, repo=None):
             return 1 if service.start(host, s) else _ready(host, s)
         run = steps.Setup(host, s, start_timeout=args.start_timeout)
         results = doctor.run_checks(host, s)
-        warnings = [r for r in results if r.status == "warn" and r.id in ("memory", "memory-available", "gpu-free")]
+        warnings = [r for r in results if r.status == "warn" and r.id in doctor.MEMORY_WARNINGS]
         if warnings:
             host.out(doctor.format_text(warnings))
         bad = [r for r in results if r.status == "fail" and "start" in r.blocks]

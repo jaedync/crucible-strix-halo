@@ -351,20 +351,23 @@ class BatchDiskTier {
   template<class Cache>
   bool SaveLedger(Cache& cache) {
     if (!Enabled() || ledger_.empty()) return false;
-    std::error_code error;
     const auto bytes = cache.LedgerBytes();
     const auto folder = ledger_ / directory_;
     // No link at any depth, and only this user's folders (state_private_dir.h): `<root>.ledger` may sit in a shared
     // sticky folder beside the root.
     // The log names the reason (review state-dir-race L2): it holds only a path, a uid or an errno text.
-    if (const auto opened = OpenPrivateDirectory(folder, PrivateDirRule::Process(), true); !opened.Ok()) {
+    const auto opened = OpenPrivateDirectory(folder, PrivateDirRule::Process(), true);
+    if (!opened.Ok()) {
       std::fprintf(stderr, "state_disk ledger_save result=refused reason=folder error=%s\n", opened.message.c_str());
       return false;
     }
-    const auto file = folder / kLedgerFile, temporary = folder / (std::string(kLedgerFile) + ".tmp");
-    // A6 F5: the bytes reach the disk before the rename, and the rename before the return, so a power loss keeps the
-    // old list or the new one, never a short one. No link is followed at the temporary name.
-    const int fd = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+    // The file, its rename and the folder fsync go through the fd of the checked folder, never by path again: a folder
+    // that takes the path after the check gets nothing.
+    const int dir = opened.fd.Get();
+    const std::string temporary = std::string(kLedgerFile) + ".tmp";
+    // The bytes reach the disk before the rename, and the rename before the return, so a power loss keeps the old list
+    // or the new one, never a short one. No link is followed at the temporary name.
+    const int fd = ::openat(dir, temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
     bool written = fd >= 0;
     for (size_t at = 0; written && at < bytes.size();) {
       const ssize_t n = ::write(fd, bytes.data() + at, bytes.size() - at);
@@ -375,15 +378,17 @@ class BatchDiskTier {
     written = written && ::fsync(fd) == 0;
     if (fd >= 0 && ::close(fd) != 0) written = false;
     if (!written) {
+      // A full disk: the old list stays, and no partial file stays beside it.
+      if (fd >= 0) ::unlinkat(dir, temporary.c_str(), 0);
       std::fprintf(stderr, "state_disk ledger_save result=refused reason=write\n");
       return false;
     }
-    std::filesystem::rename(temporary, file, error);
-    if (!error)
-      if (const int dir = ::open(folder.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC); dir >= 0) { ::fsync(dir); ::close(dir); }
-    std::fprintf(stderr, "state_disk ledger_save result=%s records=%zu bytes=%zu\n", error ? "refused" : "saved",
+    const bool renamed = ::renameat(dir, temporary.c_str(), dir, kLedgerFile) == 0;
+    if (renamed) ::fsync(dir);
+    else ::unlinkat(dir, temporary.c_str(), 0);
+    std::fprintf(stderr, "state_disk ledger_save result=%s records=%zu bytes=%zu\n", renamed ? "saved" : "refused",
                  cache.LostRecords(), bytes.size());
-    return !error;
+    return renamed;
   }
   // At start: this identity's lost list, else the newest list of another identity (the epoch before a switch: its
   // records of states on disk are lost by the switch). Returns the records read.

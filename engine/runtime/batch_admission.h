@@ -22,18 +22,36 @@ class AdmissionRefused : public std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
-inline std::optional<uint64_t> AvailableHostMemory() {
-  std::ifstream file("/proc/meminfo");
+// The host memory that every guard reads (the start fit, the cache saves, the state-disk reads), from the text of
+// /proc/meminfo: MemAvailable less CmaFree. Free CMA pages take only movable allocations; GTT and pinned host pages
+// are not movable, so they cannot use them, but MemAvailable counts them. Issue 18: the Ubuntu 26.04 kernel 7.0 keeps
+// the Kexec HandOver scratch as CMA (7 to 13 GiB on a 128 GB machine), and a long prefill there ended in a global
+// OOM kill. No CmaFree line (a kernel without CMA) counts as 0. A malformed MemAvailable or CmaFree line: no number.
+// Not counted: page cache inside CMA pages, which MemAvailable shows as reclaimable.
+inline std::optional<uint64_t> HostMemoryFromMeminfo(const std::string& text) {
+  std::optional<uint64_t> available;
+  uint64_t cma_free = 0;
+  std::istringstream file(text);
   for (std::string line; std::getline(file, line);) {
-    if (!line.starts_with("MemAvailable:")) continue;
+    const bool is_available = line.starts_with("MemAvailable:"), is_cma = line.starts_with("CmaFree:");
+    if (!is_available && !is_cma) continue;
     std::istringstream input(line);
     std::string key, unit, extra;
     uint64_t kib;
     if (!(input >> key >> kib >> unit) || unit != "kB" || input >> extra ||
         kib > UINT64_MAX / 1024) return std::nullopt;
-    return kib * 1024;
+    if (is_available) available = kib * 1024;
+    else cma_free = kib * 1024;
   }
-  return std::nullopt;
+  if (!available) return std::nullopt;
+  return *available > cma_free ? *available - cma_free : 0;
+}
+
+inline std::optional<uint64_t> AvailableHostMemory() {
+  std::ifstream file("/proc/meminfo");
+  std::ostringstream text;
+  text << file.rdbuf();
+  return HostMemoryFromMeminfo(text.str());
 }
 
 // The reserve that start-time admission keeps free ("Memory before start"). The OS holds 8 GiB;
@@ -143,7 +161,7 @@ using AdmissionTry = std::function<AdmissionCharge(int streams, int context)>;
 
 // What the refusal needs. The caller measures the free memory and charges the requested setting.
 struct AdmissionMemory {
-  uint64_t host_free = 0;         // /proc/meminfo MemAvailable, bytes
+  uint64_t host_free = 0;         // /proc/meminfo MemAvailable less CmaFree, bytes
   uint64_t device_free = 0;       // hipMemGetInfo free, bytes
   uint64_t states_bytes = 0;      // state of every requested slot, bytes
   uint64_t allocated_bytes = 0;   // the part of that state that the slots which exist already hold

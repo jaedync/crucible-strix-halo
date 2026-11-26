@@ -215,8 +215,11 @@ inline size_t DtypeBytes(const std::string& dtype) {
 
 class Checkpoint {
  public:
-  explicit Checkpoint(const std::string& dir) : dir_(dir) {
-    const std::string path = dir + "/model.safetensors.index.json";
+  // index: the index file name in dir (a plain name; a K4-MC view names its own, model.k8.safetensors.index.json).
+  explicit Checkpoint(const std::string& dir, const std::string& index = "model.safetensors.index.json")
+      : dir_(dir), index_(index) {
+    CheckFile(index);
+    const std::string path = dir + "/" + index;
     std::ifstream f(path);
     if (!f) Fail(path, "", "cannot open index: " + std::string(std::strerror(errno)));
     std::stringstream ss;
@@ -317,7 +320,7 @@ class Checkpoint {
   }
   [[noreturn]] void Error(const std::string& name, const std::string& reason) const {
     const auto it = shard_of_.find(name);
-    Fail(it == shard_of_.end() ? dir_ + "/model.safetensors.index.json" : PathOf(it->second), name, reason);
+    Fail(it == shard_of_.end() ? dir_ + "/" + index_ : PathOf(it->second), name, reason);
   }
   const TensorInfo& Info(const std::string& name) {
     const auto it = shard_of_.find(name);
@@ -429,7 +432,7 @@ class Checkpoint {
   void CheckFile(const std::string& file) const {
     if (file.empty() || file == "." || file == ".." || file.find('/') != std::string::npos ||
         file.find('\\') != std::string::npos || file.find('\0') != std::string::npos)
-      Fail(dir_ + "/model.safetensors.index.json", "", "shard name must be a plain filename");
+      Fail(dir_ + "/" + index_, "", "shard name must be a plain filename");
   }
   void CheckTensor(const std::string& path, const std::string& name, const TensorInfo& ti,
                    const std::vector<int64_t>& offsets, uint64_t payload) {
@@ -532,6 +535,7 @@ class Checkpoint {
     return found;
   }
   std::string dir_;
+  std::string index_ = "model.safetensors.index.json";
   std::unordered_map<std::string, std::string> shard_of_;
   std::unordered_map<std::string, TensorInfo> tensors_;
   std::map<std::string, Map> maps_;

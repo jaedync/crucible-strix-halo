@@ -72,7 +72,7 @@ LOOKUP_DEPTH, LOOKUP_MIN = 7, 8
 ENGINE_KEEP_SWITCHES = frozenset({
     "CRUCIBLE_ABLATE", "CRUCIBLE_ABLATE_MODE", "CRUCIBLE_COMPACT_STATE",
     "CRUCIBLE_DECODE_RING", "CRUCIBLE_DRAFT_CHAIN", "CRUCIBLE_DRAFT_HEAD", "CRUCIBLE_EXACT", "CRUCIBLE_EXACT_RESUME", "CRUCIBLE_TWIN",
-    "CRUCIBLE_FUSE", "CRUCIBLE_GDN_VERIFY", "CRUCIBLE_HC_WMMA",
+    "CRUCIBLE_FUSE", "CRUCIBLE_GDN_VERIFY", "CRUCIBLE_HC_MIX_HI", "CRUCIBLE_HC_WMMA",
     "CRUCIBLE_LAZY_SHADOW", "CRUCIBLE_LOOKAHEAD", "CRUCIBLE_LOOKAHEAD_MIB",
     "CRUCIBLE_MOE_B128", "CRUCIBLE_MTP_SIDECAR", "CRUCIBLE_PACKED_ROWS",
     "CRUCIBLE_PERSISTENT_GDN",
@@ -92,8 +92,11 @@ ENGINE_KEEP_SWITCHES = frozenset({
 SERVER_ONLY_VARIABLES = frozenset({"CRUCIBLE_NO_UPDATE_CHECK", CLIENT_REQUEST_ID_HEADER_ENV})
 
 
-def engine_environment(environ):
+def engine_environment(environ, checkpoint=None):
     """The engine's environment with only the allowed CRUCIBLE_* switches (RA-15), and the removed names to report.
+
+    For a Hy4-flash checkpoint it adds hy4_format.ALLOCATOR_ENV where the environment has no value (an explicit value
+    stays); any other checkpoint gets no new variable.
 
     The environment always loses CRUCIBLE_ALLOWED_HOSTS and the SERVER_ONLY_VARIABLES, but the list does not name
     them: a server setting is not an ignored engine switch. The caller must pass the environment to the engine even when the list is empty, because
@@ -102,8 +105,11 @@ def engine_environment(environ):
     # A server setting, not an engine switch: the engine never sees it, and the startup line does not report it.
     removed_here = [name for name in removed if name != ALLOWED_HOSTS_ENV and name not in SERVER_ONLY_VARIABLES]
     # The engine must not notify systemd: the service names (sd_notify.py) never reach it, and no note is made for them.
-    return {name: value for name, value in environ.items()
-            if name not in removed and name not in SERVICE_ENV_NAMES}, removed_here
+    kept = {name: value for name, value in environ.items() if name not in removed and name not in SERVICE_ENV_NAMES}
+    if checkpoint is not None and hy4_format.is_hy4(checkpoint):
+        for name, value in hy4_format.ALLOCATOR_ENV.items():
+            kept.setdefault(name, value)
+    return kept, removed_here
 
 
 def family_stop_ids(checkpoint):
@@ -172,7 +178,7 @@ class EngineBackend:
         if prefill is not None:
             arguments += ["--prefill", str(prefill)]
         arguments += list(engine_options)
-        environment, removed = engine_environment(os.environ)
+        environment, removed = engine_environment(os.environ, checkpoint)
         if removed:
             # The names only: a value can be a path that names a user.
             print("crucible: serve ignores " + ", ".join(removed) + " (not on the serve allow-list of engine switches)",

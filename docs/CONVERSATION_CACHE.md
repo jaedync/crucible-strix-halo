@@ -40,6 +40,27 @@ The table is arithmetic from the state sizes and the prefill rate, not a measure
 
 States with equal blocks share the block files, so the disk gets fewer bytes than the total size of the states.
 
+## The disk limit covers the whole state folder
+
+- `--state-disk-gib` limits all the states in the state folder, not only the states of the running engine.
+- Each state identity (state epoch, pack and state settings) has its own folder in the state folder. An update or a
+  changed setting makes a new folder. The old folder stays while the limit has room, so a rollback finds its states.
+- When the total is above the limit, the engine removes the folders of other identities first, oldest first. It does
+  this at start and before each state write. Only then does it remove its own oldest states.
+- The engine never removes a folder that another running engine uses. That folder does not count against the limit
+  of this engine. Thus two servers on one state folder use at most the sum of their two limits.
+- The engine removes only the files that it writes. The `write-ledger` file and other files stay.
+- Each removed folder gives one log line with its size, its file count and the age of its newest file:
+  `state_disk remove_dir dir=<folder> reason=cap bytes=<B> files=<N> newest_age_s=<S>`.
+- When a file cannot be removed, the line also gives `left_files=<N> errno=<E>`. The bytes that stay still count, so
+  the engine removes more of its own states. The engine tries that folder again after one hour.
+- When a folder cannot be read, the engine logs `state_disk walk_error dir=<folder> errno=<E>` and continues. It does
+  not count or remove that folder.
+- A folder of another identity also leaves at start when it was not used for 7 days. The folder that was used last
+  before this start stays under that rule.
+- The removal changes no reply. A state is read only by an engine of the same identity, so this engine can never read
+  the states that it removes.
+
 ## SSD wear
 
 - A guard limits the state writes to 300 GiB (322 GB) in one local calendar day

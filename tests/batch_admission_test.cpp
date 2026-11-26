@@ -272,6 +272,40 @@ void CheckFitCache() {
   assert(below.cache_budget >= kFitCacheFloor && below.cache_budget <= cache);
 }
 
+// Issue 18: free CMA pages (Ubuntu 26.04 kernel 7.0 keeps the Kexec HandOver scratch as CMA) are in MemAvailable, but
+// GTT and pinned host pages are unmovable and cannot use them. Every guard reads HostMemoryFromMeminfo, so the reader
+// must not count them.
+std::string Meminfo(uint64_t available_kb, std::optional<uint64_t> cma_free_kb) {
+  std::string text = "MemTotal:       131156752 kB\nMemFree:        11017780 kB\nMemAvailable:   " +
+                     std::to_string(available_kb) + " kB\nCached:          1948760 kB\nCmaTotal:              0 kB\n";
+  if (cma_free_kb) text += "CmaFree:        " + std::to_string(*cma_free_kb) + " kB\n";
+  return text + "Unaccepted:            0 kB\n";
+}
+
+void CheckHostMemoryCma() {
+  // the test machine (Arch 7.2, no KHO scratch): CmaFree 0 keeps MemAvailable, so the default path does not change.
+  assert(HostMemoryFromMeminfo(Meminfo(13303604, 0)) == 13303604ull * 1024);
+  assert(HostMemoryFromMeminfo(Meminfo(13303604, std::nullopt)) == 13303604ull * 1024);  // a kernel without CMA
+  // The reporter's host, idle: MemAvailable 125,586,676 kB with CmaFree 13,771,364 kB (3 KHO scratch areas).
+  assert(HostMemoryFromMeminfo(Meminfo(125586676, 13771364)) == (125586676ull - 13771364) * 1024);
+  // At the kill (the OOM block of the kernel log): Normal free 13,118,328 kB, of it free_cma 13,041,820 kB. The
+  // guards saw about 13.4 GB; the real room for GTT pages was 76,508 kB (0.078 GB).
+  const uint64_t available_kb = 13118328, cma_kb = 13041820;
+  assert(HostMemoryFromMeminfo(Meminfo(available_kb, cma_kb)) == 76508ull * 1024);
+  assert(HostMemoryFromMeminfo(Meminfo(cma_kb - 1, cma_kb)) == 0);  // never below zero
+  assert(!HostMemoryFromMeminfo("CmaFree: 1 kB\n"));                   // no MemAvailable: no number
+  assert(!HostMemoryFromMeminfo(Meminfo(available_kb, cma_kb) + "CmaFree: x kB\n"));  // a bad line: no number
+  // The start fit on that host: MemAvailable is exactly what the default layout needs, but 13,771,364 kB of it is CMA.
+  // The fit must not start the requested layout.
+  const Pack full;
+  const uint64_t cache = 9700 * MiB;
+  const uint64_t exact = kAdmissionReserve + full.Charge(4, 262144).new_states_bytes + cache;
+  const auto free_bytes = HostMemoryFromMeminfo(Meminfo(exact / 1024 + 1, 13771364));
+  assert(free_bytes && Fit(full, *free_bytes, cache, 4, 262144).step != FitStep::kRequested);
+  const auto no_cma = HostMemoryFromMeminfo(Meminfo(exact / 1024 + 1, 0));
+  assert(no_cma && Fit(full, *no_cma, cache, 4, 262144).step == FitStep::kRequested);  // the test machine: as before
+}
+
 void CheckFitStreams() {
   // Step 2: no budget at or above the floor fits 4 slots; 3 slots at the same --ctx do. The budget then takes the
   // largest value that fits 3 slots, up to the request.
@@ -597,7 +631,7 @@ int main() {
   for (void (*check)() : {CheckFormat, CheckPredicate, CheckReserveChangesTheCheck, CheckReserveFlag, CheckReserveParts,
                           CheckMtpStepFollowsReserve, CheckMtpRefusalText,
                           CheckFitRequested, CheckFitCache, CheckFitStreams, CheckFitContext, CheckFitRefused,
-                          CheckFitOrder, CheckFitMargin, CheckFitRefusalNote}) {
+                          CheckFitOrder, CheckFitMargin, CheckFitRefusalNote, CheckHostMemoryCma}) {
     assert(AdmissionReserveBytes() == kAdmissionReserve);
     check();
     assert(AdmissionReserveBytes() == kAdmissionReserve);

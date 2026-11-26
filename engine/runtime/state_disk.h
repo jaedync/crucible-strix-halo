@@ -121,14 +121,16 @@ struct StateDiskOptions {
   std::filesystem::path root;  // parent of the identity directories; must be inside $HOME
   std::string identity;        // StateDiskIdentity::sha
   std::string directory;       // StateDiskIdentity::directory
-  uint64_t budget = uint64_t(64) << 30;        // bytes of state files on disk
+  uint64_t budget = uint64_t(64) << 30;        // bytes of state files on disk, the unheld other folders too
   size_t min_tokens = 16384;                   // smaller states are cheaper to prefill than to write and read
   uint64_t queue_bytes = uint64_t(8) << 30;    // evicted bytes that wait for the writer (held in host memory)
   uint64_t free_reserve = uint64_t(16) << 30;  // filesystem space that a spill always leaves free
   // Folders of other identities (an older epoch, another pack or setting): a rollback finds its states there, so they
-  // stay at start. The folder of the previous identity (the other one used last before this start) always stays. The
-  // other folders leave when their last use is older than keep_other_days, or when together they hold more than
-  // keep_other_bytes of state files, oldest first. A folder that a live engine holds is never touched.
+  // stay at start while the cap has room. The `budget` covers them: own states plus the other folders stay at or below
+  // it, and the other folders leave first, oldest last use first, at start and before a write (TrimOthers). Under the
+  // budget, the folder of the previous identity (the other one used last before this start) stays. The other folders
+  // leave when their last use is older than keep_other_days, or when together they hold more than keep_other_bytes of
+  // state files, oldest first. A folder that a live engine holds is never touched and does not count.
   uint64_t keep_other_bytes = uint64_t(64) << 30;
   double keep_other_days = 7;
   int io_threads = 8;                          // parallel requests of one read or write (the test machine: 8 reach 6.9 GB/s)
@@ -309,7 +311,7 @@ class StateDisk {
       return;
     }
     ::futimens(lock_, nullptr);  // this start is the "last use" of this identity (the next start reads it)
-    const auto pruned = PruneOtherIdentities();
+    const size_t aged = PruneOtherIdentities();
     const double start = Now();
     const auto rebuilt = Rebuild();
     Unlink();
@@ -318,9 +320,10 @@ class StateDisk {
     day_written_ = LedgerAdd(0);
     char ms[32];
     std::snprintf(ms, sizeof ms, "%.1f", (Now() - start) * 1e3);
+    const auto pruned = TrimOthers(0, true);  // after Rebuild: the cap needs the own bytes
     Log("state_disk start entries=" + std::to_string(index_.size()) + " blocks=" + std::to_string(blocks_.size()) +
         " bytes=" + std::to_string(bytes_) + " orphans=" + std::to_string(rebuilt.orphans) + " broken=" +
-        std::to_string(rebuilt.broken) + " rebuild_ms=" + ms + " removed_dirs=" + std::to_string(pruned.removed) +
+        std::to_string(rebuilt.broken) + " rebuild_ms=" + ms + " removed_dirs=" + std::to_string(aged + pruned.removed) +
         " kept_dirs=" + std::to_string(pruned.kept) + " kept_bytes=" + std::to_string(pruned.kept_bytes) +
         " day_written=" + std::to_string(day_written_) + " write_per_day=" + std::to_string(options_.write_per_day) +
         (options_.write_delay_ms ? " write_delay_ms=" + std::to_string(options_.write_delay_ms) : std::string()));
@@ -862,69 +865,183 @@ class StateDisk {
                                name.find(".block.dead.") != std::string::npos);
   }
   // Directories of other identities (another epoch, checkpoint or setting) stay at start, within the limits of
-  // StateDiskOptions::keep_other_*. The previous identity (the other folder with the newest last use) always stays; a
-  // folder that a live engine holds is skipped. Only state and block files, temporary files and the lock are removed;
-  // anything else stays. The last use of a folder is the newest modification time of its lock and its state files.
+  // StateDiskOptions::keep_other_* and of the disk cap. The previous identity (the other folder with the newest last use)
+  // stays under the keep_other_* rules; the cap (TrimOthers) takes it too, last. A folder that a live engine holds is
+  // skipped. Only state and block files, temporary files and the lock are removed; anything else stays. The last use of a
+  // folder is the newest modification time of its lock and its state files.
+  // A state of another identity can never be read by this process: Rebuild lists only dir_, and a state or block file
+  // must name options_.identity in its header and in its file name (Name, BlockName). So a removal changes no token.
   struct PruneCounts { size_t removed = 0, kept = 0; uint64_t kept_bytes = 0; };
-  PruneCounts PruneOtherIdentities() {
-    struct Other { std::filesystem::path path; uint64_t bytes = 0; time_t used = 0; int fd = -1; bool cut = false, gone = false; };
-    std::vector<Other> others;
+  struct Other {
+    std::filesystem::path path;
+    uint64_t bytes = 0, files = 0;                  // the tier files at the scan
+    uint64_t removed_bytes = 0, removed_files = 0;  // the tier files that RemoveOther removed
+    time_t used = 0;
+    bool lock = false;  // the folder has a .lock
+    // cut: RemoveOther ran on it; gone: its folder too; held: a live engine took it, or it went before.
+    bool cut = false, gone = false, held = false;
+    // Nothing of the tier is in it (a folder that keeps only a foreign file): no rule removes or counts it.
+    bool Empty() const { return !files && !lock; }
+  };
+  // Calls each(entry) for each entry of `dir`. Returns 0, or the errno of the error that stopped the walk. The range-for
+  // of directory_iterator throws from its increment (a read error, or ENOENT for a folder that another process removes
+  // meanwhile); this walk never throws, so an error does not stop the writer thread (review state-cap M1).
+  template<class Each> static int Walk(const std::filesystem::path& dir, Each each) {
     std::error_code error;
-    for (const auto& item : std::filesystem::directory_iterator(options_.root, error)) {
+    std::filesystem::directory_iterator it(dir, error), end;
+    for (; !error && it != end; it.increment(error)) each(*it);
+    return error.value();
+  }
+  // A folder that failed (a walk error, or tier files that did not leave) is not tried again and logs no new line for
+  // kOtherRetrySeconds. The bytes that stay in it still count against the cap. Writer thread or constructor only.
+  static constexpr double kOtherRetrySeconds = 3600;
+  bool OtherWaiting(const std::string& name) const {
+    const auto found = other_retry_.find(name);
+    return found != other_retry_.end() && Now() < found->second;
+  }
+  void OtherFailed(const std::string& name) { other_retry_[name] = Now() + kOtherRetrySeconds; }
+  // The folders of other identities that no live engine holds now, oldest last use first (a tie goes by name, so the
+  // choice does not depend on the directory order). The lock is only tested here, not kept: a start of that identity
+  // a moment later must not find it held. RemoveOther takes it again. A folder whose walk fails is left out: its bytes
+  // are not known, so it neither counts nor leaves. One `walk_error` line for each such folder (and for the root).
+  std::vector<Other> ScanOthers() {
+    std::vector<Other> others;
+    const auto failed = [&](const std::string& name, int error) {
+      if (OtherWaiting(name)) return;
+      OtherFailed(name);
+      Log("state_disk walk_error dir=" + name + " errno=" + std::to_string(error));
+    };
+    const int root_error = Walk(options_.root, [&](const std::filesystem::directory_entry& item) {
+      std::error_code error;
       const std::string name = item.path().filename();
       if (name == options_.directory || !item.is_directory(error) || item.is_symlink(error) ||
-          !IdentityDirectory(name)) continue;
+          !IdentityDirectory(name)) return;
       const int fd = ::open((item.path() / ".lock").c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW);
-      if (fd >= 0 && ::flock(fd, LOCK_EX | LOCK_NB) != 0) { ::close(fd); continue; }
-      Other other{item.path(), 0, 0, fd};
+      if (fd >= 0) {
+        const bool held = ::flock(fd, LOCK_EX | LOCK_NB) != 0;
+        ::close(fd);
+        if (held) return;
+      }
+      Other other{item.path()};
       struct stat info{};
-      if (fd >= 0 && ::fstat(fd, &info) == 0) other.used = info.st_mtim.tv_sec;
-      bool any = fd >= 0;
-      for (const auto& file : std::filesystem::directory_iterator(item.path(), error)) {
-        if (!StateFileName(file.path().filename()) || !file.is_regular_file(error) ||
-            ::lstat(file.path().c_str(), &info) != 0) continue;
+      bool any = false;
+      if (::lstat((item.path() / ".lock").c_str(), &info) == 0) other.used = info.st_mtim.tv_sec, any = other.lock = true;
+      const int walk = Walk(item.path(), [&](const std::filesystem::directory_entry& file) {
+        std::error_code file_error;
+        if (!StateFileName(file.path().filename()) || !file.is_regular_file(file_error) ||
+            ::lstat(file.path().c_str(), &info) != 0) return;
         other.bytes += uint64_t(info.st_size);
+        ++other.files;
         other.used = std::max<time_t>(other.used, info.st_mtim.tv_sec);
         any = true;
-      }
+      });
+      if (walk) return failed(name, walk);
       if (!any && ::lstat(item.path().c_str(), &info) == 0) other.used = info.st_mtim.tv_sec;
       others.push_back(std::move(other));
-    }
-    std::vector<size_t> order(others.size());
-    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
-    // Newest last use first; a tie goes by name so that the choice does not depend on the directory order.
-    std::sort(order.begin(), order.end(), [&](size_t x, size_t y) {
-      return others[x].used != others[y].used ? others[x].used > others[y].used : others[x].path > others[y].path;
     });
-    const auto remove = [&](Other& other) {
-      other.cut = true;
-      for (const auto& file : std::filesystem::directory_iterator(other.path, error))
-        if (StateFileName(file.path().filename()) && file.is_regular_file(error))
-          std::filesystem::remove(file.path(), error);
-      std::filesystem::remove(other.path / ".lock", error);
-      other.gone = std::filesystem::remove(other.path, error);
-    };
-    PruneCounts counts;
+    if (root_error) failed("root", root_error);
+    std::sort(others.begin(), others.end(), [](const Other& x, const Other& y) {
+      return x.used != y.used ? x.used < y.used : x.path < y.path;
+    });
+    return others;
+  }
+  // Removes the tier files of `other` under its lock, then the lock and the folder (it stays when other files are in it),
+  // and only then lets the lock go. false when a live engine holds it now (it started after the scan), or when it is gone
+  // (another engine on this root removed it): nothing is removed. One log line for each folder that this call works on:
+  // the bytes and files that really left, and with a failure the tier files that stay and the errno of the first one
+  // (review state-cap M2). A failed folder waits kOtherRetrySeconds before the next try.
+  bool RemoveOther(Other& other, const char* reason) {
+    const std::string name = other.path.filename();
+    const int fd = ::open((other.path / ".lock").c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+    if (fd >= 0 && ::flock(fd, LOCK_EX | LOCK_NB) != 0) { ::close(fd); other.held = true; return false; }
+    std::error_code error;
+    if (fd < 0 && !std::filesystem::is_directory(other.path, error)) { other.held = true; return false; }
+    other.cut = true;
+    int first = 0;      // the errno of the first failure
+    uint64_t left = 0;  // tier files that did not leave
+    const int walk = Walk(other.path, [&](const std::filesystem::directory_entry& file) {
+      std::error_code file_error;
+      if (!StateFileName(file.path().filename()) || !file.is_regular_file(file_error)) return;
+      struct stat info{};
+      const uint64_t size = ::lstat(file.path().c_str(), &info) == 0 ? uint64_t(info.st_size) : 0;
+      if (::unlink(file.path().c_str()) == 0) {
+        other.removed_bytes += size;
+        ++other.removed_files;
+      } else {
+        ++left;
+        if (!first) first = errno;
+      }
+    });
+    if (walk && !first) first = walk;
+    if (::unlink((other.path / ".lock").c_str()) != 0 && errno != ENOENT && !first) first = errno;
+    other.gone = ::rmdir(other.path.c_str()) == 0;  // a foreign file keeps the folder: that is not a failure
+    if (fd >= 0) ::close(fd);  // after the rmdir (review state-cap L1): a start cannot take the old lock before
+    if (first) OtherFailed(name);
+    Log("state_disk remove_dir dir=" + name + " reason=" + reason + " bytes=" + std::to_string(other.removed_bytes) +
+        " files=" + std::to_string(other.removed_files) + " newest_age_s=" +
+        std::to_string(std::max<int64_t>(0, int64_t(::time(nullptr) - other.used))) +
+        (first ? " left_files=" + std::to_string(left) + " errno=" + std::to_string(first) : std::string()));
+    return true;
+  }
+  // The start rules of StateDiskOptions::keep_other_*: the age limit, then the byte limit of the others without the
+  // previous identity, oldest first.
+  size_t PruneOtherIdentities() {
+    auto others = ScanOthers();
+    size_t removed = 0;
     const time_t now = ::time(nullptr);
     uint64_t kept_other = 0;  // bytes of the folders that the byte limit counts: all but the previous identity
-    // order[0] is the previous identity: it stays. The age limit takes the others that were not used for long.
-    for (size_t rank = 1; rank < order.size(); ++rank) {
-      Other& other = others[order[rank]];
-      if (double(now - other.used) > options_.keep_other_days * 86400) { remove(other); counts.removed += other.gone; }
-      else kept_other += other.bytes;
+    // others.back() is the previous identity: it stays. The age limit takes the others that were not used for long.
+    for (size_t rank = 0; rank + 1 < others.size(); ++rank) {
+      Other& other = others[rank];
+      if (other.Empty()) continue;
+      if (double(now - other.used) > options_.keep_other_days * 86400) {
+        if (RemoveOther(other, "age")) removed += other.gone;
+      } else {
+        kept_other += other.bytes;
+      }
     }
     // The byte limit takes the oldest of the rest first.
-    for (size_t rank = order.size(); rank-- > 1 && kept_other > options_.keep_other_bytes;) {
-      Other& other = others[order[rank]];
-      if (other.cut) continue;
+    for (size_t rank = 0; rank + 1 < others.size() && kept_other > options_.keep_other_bytes; ++rank) {
+      Other& other = others[rank];
+      if (other.cut || other.Empty()) continue;
       kept_other -= std::min(kept_other, other.bytes);
-      remove(other);
+      if (RemoveOther(other, "others")) removed += other.gone;
+    }
+    return removed;
+  }
+  // The disk cap covers the whole root: the own states (bytes_), the state files of the other
+  // folders that no live engine holds, and `need` (a write that waits) stay at or below options_.budget. When they do
+  // not, the other folders leave first, oldest last use first; MakeRoom then evicts own states only for the rest. A held
+  // folder does not count: its own engine's cap holds it. The bytes that stay in a failed folder count, so the own states
+  // make that room. Runs on the writer thread, or in the constructor before it.
+  // `force`, or a count older than kOtherScanSeconds, scans again (an engine that stopped leaves an unheld folder).
+  static constexpr double kOtherScanSeconds = 60;
+  PruneCounts TrimOthers(uint64_t need, bool force) {
+    uint64_t own;
+    {
+      std::lock_guard lock(mutex_);
+      own = bytes_;
+      if (!force && own + others_bytes_ + need <= options_.budget && Now() - others_scan_ < kOtherScanSeconds) return {};
+    }
+    auto others = ScanOthers();
+    uint64_t total = 0;
+    for (const auto& other : others) total += other.bytes;
+    PruneCounts counts;
+    for (auto& other : others) {
+      if (own + total + need <= options_.budget) break;
+      if (other.Empty() || OtherWaiting(other.path.filename())) continue;
+      if (!RemoveOther(other, "cap")) {
+        total -= std::min(total, other.bytes);  // held now, or gone: it no longer counts
+        continue;
+      }
+      total -= std::min(total, other.removed_bytes);
       counts.removed += other.gone;
     }
-    for (Other& other : others) {
-      if (other.fd >= 0) ::close(other.fd);
-      if (!other.cut) { ++counts.kept; counts.kept_bytes += other.bytes; }
-    }
+    for (const auto& other : others)
+      if (!other.cut && !other.held && !other.Empty()) { ++counts.kept; counts.kept_bytes += other.bytes; }
+    std::lock_guard lock(mutex_);
+    others_bytes_ = total;
+    others_scan_ = Now();
     return counts;
   }
 
@@ -1072,8 +1189,8 @@ class StateDisk {
   // The bytes that MakeRoom would free for a write of `file_bytes` (0 when the budget has room).
   uint64_t EvictableBytes(uint64_t file_bytes, const StateMeta& incoming) {
     std::lock_guard lock(mutex_);
-    if (bytes_ + file_bytes <= options_.budget) return 0;
-    return std::min(Evictable(incoming), bytes_ + file_bytes - options_.budget);
+    if (bytes_ + others_bytes_ + file_bytes <= options_.budget) return 0;
+    return std::min(Evictable(incoming), bytes_ + others_bytes_ + file_bytes - options_.budget);
   }
   // Disk eviction: a state that a longer state of its own branch extends leaves first (it cannot be the best
   // match any more, unless it is a shared frontier), a rung of the branch ladder next, then the least recently used. A state's blocks leave with it
@@ -1082,7 +1199,7 @@ class StateDisk {
   // (Insert, Remove), so a choice is one pass. Holds mutex_.
   bool MakeRoom(uint64_t need, const StateMeta* incoming) {
     const auto over = [&] {
-      return bytes_ + need > options_.budget || index_.size() + (incoming ? 1 : 0) > options_.max_states;
+      return bytes_ + others_bytes_ + need > options_.budget || index_.size() + (incoming ? 1 : 0) > options_.max_states;
     };
     while (over()) {
       // Class 0: superseded, not a rung; class 1: a superseded rung; class 2: all others (live and shared states).
@@ -1488,6 +1605,9 @@ class StateDisk {
       }
       if (write_bytes > options_.budget) return "result=refused reason=budget";
     }
+    // The folders of other identities leave before any own state (TrimOthers), so their space counts as free here.
+    // A write that a later check refuses can still remove them: no state of this process is lost (ScanOthers).
+    TrimOthers(write_bytes, false);
     // The space of files that eviction would free counts toward the free space (files of earlier evictions leave first).
     Unlink();
     if (options_.free_space() + EvictableBytes(write_bytes, meta) < write_bytes + options_.free_reserve)
@@ -1496,7 +1616,8 @@ class StateDisk {
     {
       // Step 5. Pinned and bad blocks cannot leave, so the room must be there without them.
       std::lock_guard lock(mutex_);
-      if (bytes_ + write_bytes > options_.budget && bytes_ - Evictable(meta) + write_bytes > options_.budget)
+      if (bytes_ + others_bytes_ + write_bytes > options_.budget &&
+          bytes_ + others_bytes_ - Evictable(meta) + write_bytes > options_.budget)
         return "result=refused reason=budget";
       if (!MakeRoom(write_bytes, &meta)) return "result=refused reason=budget";
     }
@@ -1747,6 +1868,10 @@ class StateDisk {
   std::map<std::string, StateMeta> index_;
   std::map<std::string, BlockMeta> blocks_;
   uint64_t bytes_ = 0, tick_ = 0, dead_serial_ = 0;
+  // TrimOthers: the state bytes of the other folders that no live engine held at the last scan, and the time of it.
+  uint64_t others_bytes_ = 0;
+  double others_scan_ = 0;
+  std::map<std::string, double> other_retry_;  // a failed other folder: the time of its next try (OtherWaiting)
   std::vector<std::filesystem::path> doomed_;
   std::deque<Job> jobs_;
   std::set<std::string> queued_names_;

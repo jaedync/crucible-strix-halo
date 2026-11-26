@@ -3,6 +3,48 @@
 Releases are numbered `v0.<train>.<fix>`. This file lists the newest release first.
 The same text is in the notes of each release on GitHub.
 
+## v0.39.0 (2026-11-26)
+
+Release v0.39.0 changes one default of bulk prefill: the HC mix uses only the fp16 high half of t. Several kernels no
+longer spill registers. Free CMA memory no longer counts as free host memory, and the disk limit of the
+states covers the whole state folder. It also fixes the stop of an engine with a state folder that runs without the
+server, and the temp file that a failed write of the state list left.
+
+### Engine and build
+
+- The HC mix of bulk prefill and of the WMMA HC read uses only the fp16 high half of t by default. The tokens can
+  differ; KL to BF16 moves by +0.00018. `CRUCIBLE_HC_MIX_HI=0` (the rollback) or `CRUCIBLE_EXACT=1` gives both halves.
+- The dense GEMV kernel, two MoE stage kernels and five draft GEMV kernels no longer spill registers with ROCm 7.2.4
+  and ROCm 10.1. The HC dot and QSA score kernels no longer spill with ROCm 10.1. Their output bytes do not change.
+- The speed table and the charts in the README give the measured numbers of this release.
+
+### Host memory
+
+- Free CMA memory no longer counts as free host memory. GPU memory and the conversation cache cannot use
+  it. The engine now subtracts `CmaFree` from `MemAvailable` in every memory check, so on such a host the start fits a
+  smaller layout and keeps real free memory for a long prompt. On a host without CMA memory, nothing changes.
+- `./crucible doctor`, `./crucible setup` and `./crucible start` warn (`memory-cma`) when more than 1 GiB of free memory
+  is CMA memory. On Ubuntu 26.04 (kernel 7.0), Kexec HandOver keeps 7 to 13 GiB as CMA memory. The fix is `kho=off`
+  on the kernel command line. The engine log shows `CmaFree` beside its memory lines when it is not 0.
+
+### OpenAI API
+
+- Each choice now has `stop_reason`, as in other engines: the client `stop` string that ended the reply, else `null`
+  (an end-of-turn token or `max_tokens`). A stream gives it on the chunk with `finish_reason`. `token_ids` still keep
+  the IDs of the stop string. Before, a client that rebuilt the text from them cut only the last ID: a CRUXEval run
+  counted 320 of 500 good replies as deleted text.
+
+### Stop and the state folder
+
+- An engine with a state folder that runs without the server, with its input still open, now stops 8 s after Ctrl-C or
+  SIGTERM: it saves its states and exits 0. Before, it waited 90 s, then exited with code 143 and saved nothing.
+- A failed write of the state list file (for example on a full disk) no longer leaves a `lost.ledger.tmp` file. The
+  file, its rename and the sync go through the folder that the engine checked, not through its path again.
+- `--state-disk-gib` now limits all the states in the state folder. Over the limit, the engine first removes the folders
+  of older builds or settings that no running engine uses, oldest first, then its own oldest states. `./crucible doctor`
+  shows the bytes of the older folders. Before, only the states of the running engine counted, and old folders could
+  fill the disk.
+
 ## v0.38.1 (2026-11-23)
 
 Release v0.38.1 turns on twin prompts and exact resume in the release settings: when several sessions send one new

@@ -65,6 +65,8 @@ engine/geometry.h	engine/model/flashnext/geometry.h	model/flashnext	Model config
 engine/hc_wmma.h	engine/layers/hc_wmma.h	layers	Decode HC read on WMMA.	
 engine/hc_int8.h	engine/layers/hc_int8.h	layers	Int8 HC weights: layout and host quantizer (CRUCIBLE_HC_WMMA=2).	
 engine/layers/hc_wmma2.h	engine/layers/hc_wmma2.h	layers	Decode HC read on WMMA, exact rewrite (column groups, fragment order).	
+engine/layers/hc_mix_hi.h	engine/layers/hc_mix_hi.h	layers	CRUCIBLE_HC_MIX_HI switch (HC mix with the fp16 high half of t only): read, row blocks, the VALU-read refusal.	
+engine/layers/prefill_hc_hi.h	engine/layers/prefill_hc_hi.h	layers	Bulk prefill HC mid and mix launchers, and the high-half mix kernel (CRUCIBLE_HC_MIX_HI).	
 engine/layers/hc_frag.h	engine/layers/hc_frag.h	layers	Host reorders of HC weights into WMMA fragment orders.	
 engine/exl3/hc8_layout.h	engine/exl3/hc8_layout.h	exl3	Byte sizes of an int8 HC block, for the static arena plan (CRUCIBLE_HC_WMMA=2).	New file (hc8).
 engine/load_tasks.h	engine/exl3/load_tasks.h	exl3	Weight load task split (no HIP).	

@@ -73,6 +73,7 @@
 #include "runtime/stage_plan.h"
 #include "layers/kernels/prefill_qsa_union.h"
 #include "layers/prefill_hc.h"
+#include "layers/prefill_hc_hi.h"
 #include "runtime/prefill_interleave.h"
 #include "layers/hc_wmma2.h"
 #include "layers/kernels/prefill_gdn.h"
@@ -109,6 +110,18 @@ class Engine {
       std::fprintf(stderr, "row policy error: %s; correct or unset that environment variable\n", error.what());
       std::exit(2);
     }
+    try { hc_mix_hi_ = HcMixHiFromEnv(hc_wmma_); }
+    catch (const std::invalid_argument& error) {
+      std::fprintf(stderr, "%s\n", error.what());
+      std::exit(2);
+    }
+    if (const char* conflict = HcMixHiConflict(hc_mix_hi_, hc_wmma_)) {
+      std::fprintf(stderr, "%s\n", conflict);
+      std::exit(2);
+    }
+    // Two literals: the first one stays one line of `strings` (the night unit check binary_has of hcmix-on).
+    if (hc_mix_hi_) std::fprintf(stderr, "%s; the VALU final HC of a bulk prefill chunk keeps both halves\n",
+                                 "hc mix: fp16 high half of t only (CRUCIBLE_HC_MIX_HI default on, every HC read; =0 turns it off)");
     try { compact_state_ = EngineCompactState(crucible::SwitchText("CRUCIBLE_COMPACT_STATE")); }
     catch (const std::invalid_argument& error) {
       std::fprintf(stderr, "%s\n", error.what());
@@ -210,6 +223,7 @@ class Engine {
     moe_sync_ = Zeros<unsigned>(kMoeStageWords);
     qsa_sync_ = Zeros<unsigned>(4);
     hcw_ = HcW2Alloc();
+    hcw_.hi_only = hc_mix_hi_;
     LoadAblation(capacity);
     if (prefill_rows_) InitPrefill();
     std::fprintf(stderr, "weights %.2f GB, context %d, prefill rows %d\n", m_.bytes / 1e9, ctx_, prefill_rows_);
@@ -585,8 +599,9 @@ class Engine {
     std::ifstream mem("/proc/meminfo");
     std::string line;
     while (std::getline(mem, line))
-      if (line.starts_with("MemAvailable:"))
-        std::fprintf(stderr, "memory %s: %s\n", phase, line.c_str());
+      if (line.starts_with("MemAvailable:") ||
+          (line.starts_with("CmaFree:") && line.find_first_of("123456789") != std::string::npos))
+        std::fprintf(stderr, "memory %s: %s\n", phase, line.c_str());  // free CMA: not for GPU memory (issue 18)
   }
 
   // between: optional decode passes between layers (prefill_interleave.h); ignored where InterleaveAllowed fails.
@@ -1809,10 +1824,8 @@ class Engine {
       else PrefillHcDotsWsKernel<64,0,true,2,4,false><<<kStreams*((R+kHcRows-1)/kHcRows),(kHcWsCompute+2)*32>>>(
           hc.fn,hc.M,H,dots_,ss_,R,ldh);
       Mark("hc_dots");
-      PrefillHcMidPackKernel<<<R,256>>>(dots_,hc.M,ss_,pf_thi_,pf_tlo_,inject ? post_ : nullptr,R);
-      // Fragment-order up: bench hc_frag R4096 1993 -> 1796 us, bitwise.
-      if (hc.upf) PrefillHcMixWideKernel<true,true><<<dim3(kHidden/16,(R+127)/128),256>>>(hc.upf,hc.w1,pf_thi_,pf_tlo_,ss_,H,half_only ? nullptr : x_,R,xh,ldh);
-      else PrefillHcMixWideKernel<true><<<dim3(kHidden/16,(R+127)/128),256>>>(hc.up,hc.w1,pf_thi_,pf_tlo_,ss_,H,half_only ? nullptr : x_,R,xh,ldh);
+      LaunchPrefillHcMidPack(hc_mix_hi_,dots_,hc.M,ss_,pf_thi_,pf_tlo_,inject ? post_ : nullptr,R);
+      LaunchPrefillHcMix(hc_mix_hi_,hc.up,hc.upf,hc.w1,pf_thi_,pf_tlo_,ss_,H,half_only ? nullptr : x_,R,xh,ldh);
       return;
     }
     if (H != H_ || ldh != kWide) std::abort();
@@ -2308,6 +2321,9 @@ class Engine {
   // default; option A gives 1) also loads int8 HC weights (hc_int8.h; the
   // loader reads it, and the WMMA read takes the int8 blocks).
   const bool hc_wmma_ = NumericsDefaultInt("CRUCIBLE_HC_WMMA", 2, 1, 0, 2) != 0;
+  // CRUCIBLE_HC_MIX_HI (hc_mix_hi.h, default on with the WMMA read): bulk prefill and the WMMA read mix with the fp16
+  // high half of t only. Set first in the constructor (a bad value stops the start with exit 2).
+  bool hc_mix_hi_ = false;
   HcWScratch hcw_{};
   unsigned hcw_epoch_ = 0;
   float *H_, *x_, *dots_, *ss_, *post_, *qkv_, *z_, *q_, *k_, *v_, *idx_, *rlog_, *wts_;

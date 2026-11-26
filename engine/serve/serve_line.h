@@ -12,12 +12,20 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <poll.h>
 #include <unistd.h>
 
 namespace crucible {
 inline constexpr size_t kServeLineFloorBytes = size_t(2) << 20;
 inline constexpr size_t kServeLineTokenBytes = 8;
 inline constexpr size_t kServeLineMarginBytes = size_t(1) << 20;
+
+// The stop hook of a tier engine (state_stop.h KeepRunningOnTerm sets it). When set, a reader that would wait for input
+// asks it every kServeInputPollMs, and a true answer ends the input as an end of file does. A partial line is dropped.
+// Without the hook, the reader blocks in read(2) as before.
+using ServeInputStop = bool (*)();
+inline ServeInputStop g_serve_input_stop = nullptr;
+inline constexpr int kServeInputPollMs = 200;
 
 inline size_t ServeLineBytes(int ctx) {
   return std::max(kServeLineFloorBytes, size_t(std::max(ctx, 0)) * kServeLineTokenBytes + kServeLineMarginBytes);
@@ -37,7 +45,7 @@ class ServeLineReader {
     oversized = false;
     bool any = false;
     for (;;) {
-      if (begin_ == end_ && !Fill()) return any;
+      if (begin_ == end_ && !Fill()) return any && !stopped_;
       any = true;
       const char* start = block_.data() + begin_;
       const size_t avail = end_ - begin_;
@@ -61,6 +69,11 @@ class ServeLineReader {
   bool Fill() {
     if (eof_) return false;
     for (;;) {
+      if (g_serve_input_stop && !Ready()) {
+        if (!g_serve_input_stop()) continue;
+        stopped_ = eof_ = true;
+        return false;
+      }
       const ssize_t n = read(fd_, block_.data(), block_.size());
       if (n > 0) {
         begin_ = 0;
@@ -73,10 +86,17 @@ class ServeLineReader {
     }
   }
 
+  // True when a read would not wait (input, end of file or an error), false after kServeInputPollMs without input.
+  bool Ready() const {
+    pollfd input{fd_, POLLIN, 0};
+    const int got = ::poll(&input, 1, kServeInputPollMs);
+    return got > 0 || (got < 0 && errno != EINTR);
+  }
+
   int fd_;
   size_t limit_;
   std::vector<char> block_;
   size_t begin_ = 0, end_ = 0;
-  bool eof_ = false;
+  bool eof_ = false, stopped_ = false;
 };
 }  // namespace crucible

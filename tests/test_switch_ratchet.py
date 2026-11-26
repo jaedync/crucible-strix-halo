@@ -17,7 +17,7 @@ REGISTRY = 'engine/switches.h'
 RAW_READ = re.compile(r'\b(?:secure_)?getenv\s*\(\s*([^()]*?)\s*\)|\b(environ)\b')
 
 # Lower it when a switch name leaves engine/ and kernels/. Never raise it. Target: 65 or fewer (user, Oct 10).
-SWITCH_CEILING = 64  # merge rule: retire-pf19 left 54, CRUCIBLE_DEBUG_NONFINITE adds one,
+SWITCH_CEILING = 65  # merge rule: retire-pf19 left 54, CRUCIBLE_DEBUG_NONFINITE adds one,
 # CRUCIBLE_PLE_BF16 (16-bit n-gram table) adds one,
 # CRUCIBLE_EXACT_RESUME (exact resume of off-grid End points, exactly one new switch) adds one,
 # CRUCIBLE_MOE_B128 (moe-b128: exact decode expert body A/B, default 3 in train 28, 12 in train 30, 0 is the rollback, decide_by 20) adds one
@@ -40,6 +40,10 @@ SWITCH_CEILING = 64  # merge rule: retire-pf19 left 54, CRUCIBLE_DEBUG_NONFINITE
 # the ceiling went from 63 to 64 (Nov 16). Removal condition: remove (path unconditional under
 # CRUCIBLE_EXACT_RESUME=1, ceiling back to 63) after the twin unit PASS and one daily train with CRUCIBLE_TWIN=1 and
 # clean exact gates; delete the code if the unit FAILs
+# CRUCIBLE_HC_MIX_HI (the order of Nov 18) adds one:
+# 64 to 65, the owner target of Oct 10. It needs the merge rule's OK. A later change makes it the option-B default (Q1 dKL
+# +0.00018, P1 +3.3%, unit hcmix-hi); =0 is the rollback. Removal condition: after one daily train with the default on
+# and clean exact gates, delete the switch (option A keeps the two-half path; ceiling back to 64).
 
 # (file, argument of the raw read): number of reads. Delete entries as reads move to engine/switches.h.
 RAW_READS = {}

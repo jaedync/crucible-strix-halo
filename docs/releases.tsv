@@ -1,0 +1,24 @@
+# The engine identity of each public release. One row = one release tag. The release tooling adds the row of each new tag.
+# engine_tree: sha256 of the sorted (path, git blob) list of engine/, without engine/cli/version.h and *.md.
+# kind: fix = a release that fixes a public issue (its blocks may be one engine change behind); release = every other release.
+# Rows v0.22.0 to v0.38.1: from the public tags (git ls-tree -r <tag> -- engine; date = the tag date). kind fix = a patch release whose changelog thanks an outside reporter for the report.
+release	date	engine_tree	kind
+v0.22.0	2026-10-23	f524282c913428e3a44ef3fd33713bb5b62e4c26afb3d185f8231a7bf3366797	release
+v0.22.1	2026-10-23	f524282c913428e3a44ef3fd33713bb5b62e4c26afb3d185f8231a7bf3366797	release
+v0.22.2	2026-10-23	f524282c913428e3a44ef3fd33713bb5b62e4c26afb3d185f8231a7bf3366797	release
+v0.22.3	2026-10-23	f524282c913428e3a44ef3fd33713bb5b62e4c26afb3d185f8231a7bf3366797	release
+v0.22.4	2026-10-23	f524282c913428e3a44ef3fd33713bb5b62e4c26afb3d185f8231a7bf3366797	release
+v0.26.0	2026-10-24	29920680269810269bd9c1b7abccd05624fa059301147b13f358c271afcf185c	release
+v0.26.1	2026-10-25	29920680269810269bd9c1b7abccd05624fa059301147b13f358c271afcf185c	release
+v0.30.0	2026-10-31	d34ef9434daf2da8f5e8ffecf8c75bb7d80f6df5b8c81266f3546207450a73f8	release
+v0.31.0	2026-11-02	4f66c09f44ea3fc3ab517443c4a084eb04f9bb4725201a41a78222ca3f6cfd92	release
+v0.32.0	2026-11-03	12c54c2da623dd103463f489452b0c2523afbee7ee6b70d0fb073fed22b7630d	release
+v0.33.0	2026-11-05	bf7731d4f06fd34a1d48c27b96ebd49c3215ae1ffd72d75db8f24c07b4034c6e	release
+v0.33.1	2026-11-05	d093e1bf477e6180daf37f56020ac48d404030b092c8efd37d45e13839b70213	fix
+v0.34.0	2026-11-09	e0145871ebecd07fc526a14b6625d15de2fc11ea73b28fa7df9323a70ffca3d6	release
+v0.37.0	2026-11-11	953d613de33ac7ca632720af4362071aa96e67cbc2e086ae5c3932aaec4f3988	release
+v0.37.2	2026-11-15	953d613de33ac7ca632720af4362071aa96e67cbc2e086ae5c3932aaec4f3988	fix
+v0.37.3	2026-11-17	c0920434ea661514441113de2a243e3caab833fb407886bcbf944fa262f07c59	release
+v0.38.0	2026-11-19	f4af43ac62ed789660e074fa3755e8fd4379adfb6b2eeee8509948fca4b3b3ab	release
+v0.38.1	2026-11-23	1e77d21604fc195bc0b2b204dc75094a6e5424638f8b6fac60aec3f67048cbf8	release
+v0.39.0	2026-11-26	8a36abd9f1b5f78ed80bd4404cf9ab799e5b972bc8cec15779b6f3de77c7c595	release

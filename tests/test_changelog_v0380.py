@@ -19,10 +19,14 @@ def _flat(text: str) -> str:
     return " ".join(text.split())
 
 
-def test_v0380_has_its_date_below_v0381_and_no_unreleased_section_is_left() -> None:
+def test_v0380_has_its_date_below_v0381() -> None:
+    # An "## Unreleased" section for the changes after v0.38.1 can stand above the releases (trunk, after the merge).
     heads = [line for line in TEXT.splitlines() if line.startswith("## ")]
-    assert heads[:3] == ["## v0.38.1 (2026-11-23)", HEAD, "## v0.37.3 (2026-11-17)"]
-    assert "## Unreleased" not in heads
+    releases = [line for line in heads if line != "## Unreleased"]
+    assert heads[: len(heads) - len(releases)] in ([], ["## Unreleased"])
+    i = releases.index("## v0.38.1 (2026-11-23)")
+    assert releases[:i] in ([], ["## v0.39.0 (2026-11-26)"])
+    assert releases[i : i + 3] == ["## v0.38.1 (2026-11-23)", HEAD, "## v0.37.3 (2026-11-17)"]
 
 
 def test_the_section_has_an_intro_and_the_topic_sections() -> None:

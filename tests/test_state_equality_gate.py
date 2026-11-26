@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 sys.path.insert(0, str(ROOT / 'tests'))
 import state_equality_gate as gate
+import testports  # (a free port for each fake server: no pid-based port that two runs can share)
 
 FAKE_SERVER = r'''
 import hashlib, http.server, json, os, signal, sys, threading
@@ -103,7 +104,6 @@ class World(unittest.TestCase):
         (self.tree / 'server/__init__.py').write_text('')
         (self.tree / 'server/__main__.py').write_text(FAKE_SERVER % {'tests': str(ROOT / 'tests')})
         self.out = self.root / 'out'
-        self.base_port = 18000 + (os.getpid() % 1000) * 5
 
     def engine(self, name, **knobs):
         path = self.root / name
@@ -113,7 +113,7 @@ class World(unittest.TestCase):
     def config(self, ref, cand, **kw):
         values = dict(pack='4.05', ref_bin=ref, cand_bin=cand, ckpt=self.root / 'ckpt', layout='--streams 1 --ctx 4096',
                       env='CRUCIBLE_PLE_HOST=1 CRUCIBLE_EXACT_RESUME=1', neutral_env='CRUCIBLE_FUSE=0 CRUCIBLE_PF_PRUNE=0',
-                      tree=self.tree, python=sys.executable, out=self.out, tokens=2000, port=self.base_port,
+                      tree=self.tree, python=sys.executable, out=self.out, tokens=2000, port=testports.free_port(),
                       ready_timeout_s=20, stop_timeout_s=20, request_timeout_s=30)
         values.update(kw)
         return gate.Config(**values)
@@ -235,7 +235,7 @@ class CliTests(World):
         args = [sys.executable, '-I', str(ROOT / 'tools/state_equality_gate.py'), 'run', '--pack', '4.05', '--ref-bin', str(ref),
                 '--cand-bin', str(cand), '--ckpt', str(self.root / 'ckpt'), '--layout', '--streams 1', '--env', 'CRUCIBLE_PLE_HOST=1',
                 '--neutral-env', 'CRUCIBLE_FUSE=0', '--tree', str(self.tree), '--python', sys.executable, '--out', str(self.out),
-                '--tokens', '2000', '--port', str(self.base_port + 2), '--ready-timeout', '20', '--stop-timeout', '20']
+                '--tokens', '2000', '--port', str(testports.free_port()), '--ready-timeout', '20', '--stop-timeout', '20']
         done = subprocess.run(args, capture_output=True, text=True, cwd=self.root)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertRegex(done.stdout.strip().splitlines()[-1], r'^STATE-GATE 4\.05 PASS')
@@ -253,7 +253,7 @@ class SignalTests(World):
         args = [sys.executable, '-I', str(ROOT / 'tools/state_equality_gate.py'), 'run', '--pack', '4.05', '--ref-bin', str(ref),
                 '--cand-bin', str(cand), '--ckpt', str(self.root / 'ckpt'), '--layout', '--streams 1', '--env', 'CRUCIBLE_PLE_HOST=1',
                 '--neutral-env', 'CRUCIBLE_FUSE=0', '--tree', str(self.tree), '--python', sys.executable, '--out', str(self.out),
-                '--tokens', '2000', '--port', str(self.base_port + 3), '--ready-timeout', '20', '--stop-timeout', '20']
+                '--tokens', '2000', '--port', str(testports.free_port()), '--ready-timeout', '20', '--stop-timeout', '20']
         gate_proc = subprocess.Popen(args, cwd=self.root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         pidfile = self.out / '4.05/pid-ref.txt'
         for _ in range(100):

@@ -8,6 +8,7 @@
 #include "serve_settings.h"
 #include "serve_line.h"
 #include "../runtime/conversation_admission.h"
+#include "../runtime/batch_admission.h"
 #include "../switches.h"
 
 inline std::string VisionDoneFields(size_t images, double seconds) {
@@ -137,10 +138,8 @@ inline int Serve(const std::string& ckpt, const ServeSettings& settings) {
           const size_t bytes = ConversationStateIO::Bytes(eng, eng.ActiveSequence(), state, stk, carry) +
                                crucible::kConversationPolicyBytes + policy.draft_selection.size() * sizeof(int);
           if (bytes > cache.Budget()) return;
-          std::ifstream memory("/proc/meminfo");
-          std::string key; size_t available = 0, value; std::string unit;
-          while (memory >> key >> value >> unit)
-            if (key == "MemAvailable:") { available = value * 1024; break; }
+          // MemAvailable less the free CMA pages, as every batch guard reads it (batch_admission.h, issue 18).
+          size_t available = crucible::AvailableHostMemory().value_or(0);
           available += SnapshotChunkPool::Instance().IdleBytes();  // idle chunks serve a save without the system
           // Budget and the host reserve (--host-reserve-mib) together, as in batch serve: evicted snapshots count
           // toward the reserve, and a save that cannot fit evicts nothing.

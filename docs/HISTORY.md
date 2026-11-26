@@ -9,6 +9,7 @@ page holds the run of the date in its row.
 
 | Release | Measured | Cold 32K prompt: first token (s) | Cold 32K prompt: prefill (tok/s) | Cold 130K prompt: first token (s) | Cold 130K prompt: prefill (tok/s) | Same 32K prompt again: first token (s) | Decode at 32K, 1 session, code (tok/s) | Decode at 32K, 1 session, prose (tok/s) | Decode, 4 sessions, total (tok/s) | Serial decode, no speculation (tok/s) |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| v0.39.0 | Nov 25, 2026 | 16.0 | 1,955 ¹ | 67.3 |  | 0.009 | 73.9 | 59.5 | 115.0 |  |
 | v0.38.1 | Nov 22, 2026 | 16.6 | 1,883 ¹ | 70.0 |  | 0.009 | 72.8 | 58.8 | 112.2 ¹ |  |
 | v0.38.0 | Nov 19, 2026 | 16.2 |  | 69.3 |  | 0.017 | 72.9 | 58.3 | 112.8 ¹ |  |
 | v0.37.3 | Nov 17, 2026 | 16.3 |  | 69.7 |  | 0.018 | 72.1 | 54.8 | 115.0 ¹ |  |
@@ -24,6 +25,7 @@ page holds the run of the date in its row.
 
 | Release | Measured | Cold 32K prompt: first token (s) | Cold 32K prompt: prefill (tok/s) | Cold 130K prompt: first token (s) | Cold 130K prompt: prefill (tok/s) | Same 32K prompt again: first token (s) | Decode at 32K, 1 session, code (tok/s) | Decode at 32K, 1 session, prose (tok/s) | Decode, 4 sessions, total (tok/s) | Serial decode, no speculation (tok/s) |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| v0.39.0 | Nov 25, 2026 | 15.9 | 1,967 ¹ | 67.2 |  | 0.009 | 78.5 | 64.0 | 126.8 |  |
 | v0.38.1 | Nov 22, 2026 | 16.5 | 1,903 ¹ | 69.4 |  | 0.009 | 79.1 | 63.4 | 127.8 |  |
 | v0.38.0 | Nov 19, 2026 | 16.2 |  | 69.3 |  | 0.017 | 79.1 | 63.4 | 127.9 |  |
 | v0.37.3 | Nov 17, 2026 | 16.1 |  | 68.7 |  | 0.018 | 77.0 | 61.2 | 129.3 |  |
@@ -39,6 +41,7 @@ page holds the run of the date in its row.
 
 | Pack | Release | Measured | 32K | 64K | 128K | 192K | 250K |
 |---|---|---|---:|---:|---:|---:|---:|
+| 4.05 | v0.39.0 | Nov 25, 2026 | 1,966 | 1,954 | 1,918 | 1,876 | 1,751 |
 | 4.05 | v0.38.1 | Nov 22, 2026 | 1,888 | 1,881 | 1,845 | 1,805 | 1,701 |
 | 4.05 | v0.38.0 | Nov 22, 2026 | 1,883 | 1,867 | 1,834 | 1,786 | 1,676 |
 | 4.05 | v0.33.0 | Nov 3, 2026 | 1,830 | 1,814 | 1,752 | 1,692 | 1,622 |
@@ -47,6 +50,7 @@ page holds the run of the date in its row.
 | 4.05 | v0.30.0 | Oct 31, 2026 | 1,700 | 1,701 | 1,664 | 1,624 | 1,536 |
 | 4.05 | v0.26.0 | Oct 28 to 29, 2026 | 1,626 | 1,604 | 1,567 | 1,526 | 1,448 |
 | 4.05 | v0.22.0 | Oct 28 to 29, 2026 | 1,578 | 1,564 | 1,526 | 1,490 | 1,416 |
+| 3.05 | v0.39.0 | Nov 25, 2026 | 1,973 | 1,957 | 1,923 | 1,883 | 1,757 |
 | 3.05 | v0.38.1 | Nov 22, 2026 | 1,910 | 1,895 | 1,862 | 1,823 | 1,705 |
 | 3.05 | v0.38.0 | Nov 22, 2026 | 1,898 | 1,886 | 1,853 | 1,813 | 1,696 |
 | 3.05 | v0.33.0 | Nov 3, 2026 | 1,855 | 1,840 | 1,807 | 1,767 | 1,648 |
@@ -60,6 +64,7 @@ page holds the run of the date in its row.
 
 | Pack | Release | Measured | 32K | 64K | 128K | 192K | 250K |
 |---|---|---|---:|---:|---:|---:|---:|
+| 4.05 | v0.39.0 | Nov 25, 2026 | 65.2 | 67.2 | 69.4 | 70.2 | 63.7 |
 | 4.05 | v0.38.1 | Nov 22, 2026 | 73.0 | 70.6 | 68.9 | 67.1 | 67.4 |
 | 4.05 | v0.38.0 | Nov 22, 2026 | 71.5 | 69.3 | 72.3 | 66.5 | 67.4 |
 | 4.05 | v0.33.0 | Nov 3, 2026 | 71.7 | 68.8 | 66.9 | 64.7 | 62.2 |
@@ -68,6 +73,7 @@ page holds the run of the date in its row.
 | 4.05 | v0.30.0 | Oct 31, 2026 | 68.4 | 66.1 | 63.3 | 61.9 | 61.2 |
 | 4.05 | v0.26.0 | Oct 29, 2026 | 58.4 | 55.4 | 53.8 | 53.9 | 57.9 |
 | 4.05 | v0.22.0 | Oct 29, 2026 | 64.6 | 56.1 | 57.3 | 54.0 | 58.1 |
+| 3.05 | v0.39.0 | Nov 25, 2026 | 77.5 | 78.6 | 71.4 | 72.2 | 71.0 |
 | 3.05 | v0.38.1 | Nov 22, 2026 | 79.4 | 78.1 | 73.6 | 73.3 | 67.5 |
 | 3.05 | v0.38.0 | Nov 22, 2026 | 79.6 | 78.3 | 73.4 | 87.0 | 67.7 |
 | 3.05 | v0.33.0 | Nov 3, 2026 | 77.0 | 74.0 | 73.9 | 71.2 | 69.1 |
@@ -104,6 +110,14 @@ page holds the run of the date in its row.
 | v0.38.1 | 4.05 | Nov 22, 2026 | Decode, code | 490,000 | 63.4 tok/s |
 | v0.38.1 | 4.05 | Nov 22, 2026 | Decode, tool call | 250,000 | 104.9 tok/s |
 | v0.38.1 | 4.05 | Nov 22, 2026 | Decode, tool call | 490,000 | 98.9 tok/s |
+| v0.39.0 | 4.05 | Nov 25, 2026 | Cold prompt: first token | 250,000 | 143.1 s |
+| v0.39.0 | 4.05 | Nov 25, 2026 | Cold prompt: first token | 490,000 | 329.8 s |
+| v0.39.0 | 4.05 | Nov 25, 2026 | Cold prompt: prefill | 250,000 | 1,746.7 tok/s |
+| v0.39.0 | 4.05 | Nov 25, 2026 | Cold prompt: prefill | 490,000 | 1,482.4 tok/s |
+| v0.39.0 | 4.05 | Nov 25, 2026 | Decode, code | 250,000 | 62.2 tok/s |
+| v0.39.0 | 4.05 | Nov 25, 2026 | Decode, code | 490,000 | 65.8 tok/s |
+| v0.39.0 | 4.05 | Nov 25, 2026 | Decode, tool call | 250,000 | 104.3 tok/s |
+| v0.39.0 | 4.05 | Nov 25, 2026 | Decode, tool call | 490,000 | 98.6 tok/s |
 
 ¹ Notes:
 
@@ -224,3 +238,23 @@ page holds the run of the date in its row.
 - v0.38.1, 4.05 pack, Decode, tool call, 490K: YaRN
 - v0.38.1, 4.05 pack, Cold 32K prompt: prefill: release ladder (prompts of the v0.33.0 ladder), not the standing eval texts
 - v0.38.1, 3.05 pack, Cold 32K prompt: prefill: release ladder (prompts of the v0.33.0 ladder), not the standing eval texts
+- v0.39.0, 4.05 pack, Decode by context length, 32K: 6 samples
+- v0.39.0, 4.05 pack, Decode by context length, 64K: 4 samples
+- v0.39.0, 4.05 pack, Decode by context length, 128K: 6 samples
+- v0.39.0, 4.05 pack, Decode by context length, 192K: 5 samples
+- v0.39.0, 4.05 pack, Decode by context length, 250K: 6 samples
+- v0.39.0, 3.05 pack, Decode by context length, 32K: 4 samples
+- v0.39.0, 3.05 pack, Decode by context length, 64K: 4 samples
+- v0.39.0, 3.05 pack, Decode by context length, 128K: 6 samples
+- v0.39.0, 3.05 pack, Decode by context length, 192K: 4 samples
+- v0.39.0, 3.05 pack, Decode by context length, 250K: 5 samples
+- v0.39.0, 4.05 pack, Cold 32K prompt: prefill: release ladder (prompts of the v0.33.0 ladder), not the standing eval texts
+- v0.39.0, 3.05 pack, Cold 32K prompt: prefill: release ladder (prompts of the v0.33.0 ladder), not the standing eval texts
+- v0.39.0, 4.05 pack, Cold prompt: first token, 250K: plain positions
+- v0.39.0, 4.05 pack, Cold prompt: first token, 490K: YaRN
+- v0.39.0, 4.05 pack, Cold prompt: prefill, 250K: plain positions
+- v0.39.0, 4.05 pack, Cold prompt: prefill, 490K: YaRN
+- v0.39.0, 4.05 pack, Decode, code, 250K: plain positions
+- v0.39.0, 4.05 pack, Decode, code, 490K: YaRN
+- v0.39.0, 4.05 pack, Decode, tool call, 250K: plain positions
+- v0.39.0, 4.05 pack, Decode, tool call, 490K: YaRN

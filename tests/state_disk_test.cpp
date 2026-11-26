@@ -35,6 +35,45 @@ constexpr int hipMemcpyDeviceToHost = 0, hipMemcpyHostToDevice = 1;
 int hipMemcpy(void* out, const void* in, size_t n, int) { std::memcpy(out, in, n); return 0; }
 int hipStreamSynchronize(int) { return 0; }
 #define HIP_OK(expr) assert((expr) == 0)
+#include <atomic>
+#include <string_view>
+#include <dirent.h>
+#include <dlfcn.h>
+#include <unistd.h>
+// A read error in the middle of a directory walk (review state-cap M1): while walk_fault_errno is set, readdir on a folder
+// whose path holds walk_fault_mark fails with that errno after the folder's first entry (EIO from the disk, or ENOENT:
+// getdents on a folder that another process removed). The definitions in this executable come before the C library's,
+// so they also take the calls of libstdc++'s directory_iterator. walk_fault_hits counts the failed calls.
+std::atomic<int> walk_fault_errno = 0, walk_fault_hits = 0;
+std::string walk_fault_mark;
+std::mutex walk_fault_mutex;
+std::map<DIR*, int> walk_fault_seen;
+extern "C" struct dirent64* readdir64(DIR* dir) {
+  static const auto real = reinterpret_cast<struct dirent64* (*)(DIR*)>(::dlsym(RTLD_NEXT, "readdir64"));
+  const int fault = walk_fault_errno.load();
+  if (!fault) return real(dir);
+  const int saved = errno;  // the caller reads errno after a null return: keep the value it set
+  char link[64], path[4096];
+  std::snprintf(link, sizeof link, "/proc/self/fd/%d", ::dirfd(dir));
+  const ssize_t n = ::readlink(link, path, sizeof path - 1);
+  errno = saved;
+  if (n <= 0 || std::string_view(path, size_t(n)).find(walk_fault_mark) == std::string_view::npos) return real(dir);
+  std::lock_guard lock(walk_fault_mutex);
+  int& seen = walk_fault_seen[dir];
+  if (seen >= 1) { ++walk_fault_hits; errno = fault; return nullptr; }
+  struct dirent64* entry = real(dir);
+  if (entry && std::strcmp(entry->d_name, ".") && std::strcmp(entry->d_name, "..")) ++seen;
+  return entry;
+}
+extern "C" struct dirent* readdir(DIR* dir) { return reinterpret_cast<struct dirent*>(readdir64(dir)); }
+extern "C" int closedir(DIR* dir) {
+  static const auto real = reinterpret_cast<int (*)(DIR*)>(::dlsym(RTLD_NEXT, "closedir"));
+  {
+    std::lock_guard lock(walk_fault_mutex);
+    walk_fault_seen.erase(dir);
+  }
+  return real(dir);
+}
 #include "../engine/runtime/state_disk.h"
 #include "support/disk_test_dir.h"
 #include <chrono>
@@ -1305,6 +1344,149 @@ void OtherIdentitiesStay() {
   { Disk disk(start('0', 0, 7)); assert(fs::exists(keep)); }
 }
 
+// The disk cap covers the folders of other identities too (an old build's folder of 44.5 GB stayed beside
+// the live one and the disk filled). At start and before each write, when the tier's own bytes plus the bytes of the other
+// folders pass the cap, the other folders leave first, oldest last use first, and only then the tier's own states. A folder
+// that a live engine holds is never removed and does not count (its own engine's cap holds it). Only tier files leave: a
+// note in a removed folder and the root's write-ledger stay. (A root with any other file is refused, IdentitiesAndLocks.)
+void OtherIdentitiesCountAgainstCap() {
+  constexpr double kDay = 86400;
+  const uint64_t file = 4096 + 3 * 4096;  // one state file of three payload pages
+  Logs logs;
+  auto options = Options("4", logs, "cap");
+  const fs::path root = options.root;
+  fs::remove_all(root);
+  fs::create_directories(root);
+  options.budget = 3 * file + 100;  // three own files, not four
+  const fs::path old = OtherFolder(root, '1', 3 * file, 3 * kDay), newer = OtherFolder(root, '2', file, 3600),
+                 held = OtherFolder(root, '3', 4 * file, 10 * kDay);
+  { std::ofstream(old / "notes.txt") << "keep"; }
+  Age(old, 3 * kDay);
+  { std::ofstream(root / "write-ledger") << "2000-01-01 5\n"; }
+  const int fd = ::open((held / ".lock").c_str(), O_RDWR | O_CLOEXEC);
+  assert(fd >= 0 && ::flock(fd, LOCK_EX | LOCK_NB) == 0);
+  const auto state_of = [](const fs::path& dir, char id) { return dir / (std::string(64, id) + ".state"); };
+  {
+    Disk disk(options);
+    assert(disk.Enabled());
+    // Start: the others hold 4 files, over the cap of 3: the oldest ('1', 3 files) leaves, '2' fits and stays.
+    assert(!fs::exists(state_of(old, '1')));
+    assert(fs::exists(old / "notes.txt"));  // not a tier file: it stays, and so does its folder
+    assert(fs::exists(state_of(newer, '2')));
+    assert(fs::exists(state_of(held, '3')));  // held by a live engine, and older than 7 days
+    assert(fs::exists(root / "write-ledger"));
+    assert(logs.Has("state_disk remove_dir dir=" + DirName('1') + " reason=cap bytes=" + std::to_string(3 * file) +
+                    " files=1 newest_age_s="));
+    // removed_dirs counts the folders that are gone: the note keeps folder '1'. The held folder is not "kept" by this engine.
+    assert(logs.Has("removed_dirs=0 kept_dirs=1 kept_bytes=" + std::to_string(file) + " "));
+    // Two own files: 2 + 1 (other) = 3 files, inside the cap.
+    Spill(disk, Make(Tokens(10, 1), 3 * 4096, 1));
+    Spill(disk, Make(Tokens(10, 2), 3 * 4096, 2));
+    assert(disk.Drain(30) && disk.Entries() == 2 && fs::exists(state_of(newer, '2')));
+    // A third own file would make 4: the other folder leaves first, so no own state is evicted.
+    Spill(disk, Make(Tokens(10, 3), 3 * 4096, 3));
+    assert(disk.Drain(30) && disk.Entries() == 3 && disk.Stats().evicted == 0);
+    assert(!fs::exists(newer));
+    assert(logs.Has("state_disk remove_dir dir=" + DirName('2') + " reason=cap bytes=" + std::to_string(file) +
+                    " files=1 newest_age_s="));
+    // A folder that comes later (an engine of another identity stopped) is found at the next write. It leaves first,
+    // then one own state, because the own states alone fill the cap. The held folder neither leaves nor counts.
+    const fs::path later = OtherFolder(root, '5', file, 2 * kDay);
+    Spill(disk, Make(Tokens(10, 4), 3 * 4096, 4));
+    assert(disk.Drain(30) && disk.Entries() == 3 && disk.Stats().evicted == 1);
+    assert(!fs::exists(later) && fs::exists(state_of(held, '3')) && fs::exists(root / "write-ledger"));
+    std::lock_guard lock(logs.mutex);
+    const auto at = [&](const std::string& text) {
+      for (size_t i = 0; i < logs.lines.size(); ++i) if (logs.lines[i].find(text) != std::string::npos) return i;
+      return logs.lines.size();
+    };
+    assert(at("remove_dir dir=" + DirName('5')) < at("state_disk evict"));
+  }
+  ::close(fd);
+  fs::remove_all(root);
+}
+
+// Review state-cap M1: a read error during the walk of another folder (EIO, or ENOENT when the folder is removed meanwhile)
+// in the writer thread must not stop the engine. The scan skips that folder, logs one line, and the spills go on.
+void WalkErrorKeepsServing() {
+  const uint64_t file = 4096 + 3 * 4096;
+  for (const int fault : {EIO, ENOENT}) {
+    Logs logs;
+    auto options = Options("4", logs, "walk");
+    const fs::path root = options.root;
+    fs::remove_all(root);
+    fs::create_directories(root);
+    options.budget = 2 * file + 100;  // two own files; the other folder makes the second spill scan again
+    const fs::path other = OtherFolder(root, '6', file, 3600);
+    { std::ofstream(other / "x.block.tmp.1") << "x"; }  // a second entry: the walk reads the folder again
+    {
+      Disk disk(options);
+      assert(disk.Enabled() && fs::exists(other));
+      walk_fault_mark = DirName('6');
+      walk_fault_hits = 0;
+      walk_fault_errno = fault;
+      Spill(disk, Make(Tokens(10, 1), 3 * 4096, 1));
+      assert(disk.Drain(30));
+      Spill(disk, Make(Tokens(10, 2), 3 * 4096, 2));
+      assert(disk.Drain(30));
+      walk_fault_errno = 0;
+      assert(walk_fault_hits > 0);  // the fault did fire in a walk
+      assert(disk.Entries() == 2);
+      assert(logs.Has("state_disk walk_error dir=" + DirName('6') + " errno=" + std::to_string(fault)));
+      assert(fs::exists(other / (std::string(64, '6') + ".state")));  // a folder that cannot be read is not removed
+    }
+    fs::remove_all(root);
+  }
+}
+
+// Review state-cap M2: a folder that keeps a foreign file, or whose files cannot be removed (mode 0500), gives one
+// remove_dir line, not one at each write. The line counts only what left, with the errno of the first failure. The bytes
+// that stay still count, so the own states make the room: the tier files on the root stay at or below the cap.
+void UnremovableFoldersLogOnce() {
+  constexpr double kDay = 86400;
+  const uint64_t file = 4096 + 3 * 4096;
+  Logs logs;
+  auto options = Options("5", logs, "stuck");
+  const fs::path root = options.root;
+  fs::remove_all(root);
+  fs::create_directories(root);
+  options.budget = 3 * file + 100;
+  const fs::path noted = OtherFolder(root, '1', file, 3 * kDay), stuck = OtherFolder(root, '2', file, 2 * kDay);
+  { std::ofstream(noted / "notes.txt") << "keep"; }
+  Age(noted, 3 * kDay);
+  const bool modes = ::geteuid() != 0;  // root can unlink in a folder of mode 0500
+  if (modes) assert(::chmod(stuck.c_str(), 0500) == 0);
+  const auto lines_of = [&](char id) {
+    std::lock_guard lock(logs.mutex);
+    std::vector<std::string> found;
+    for (const auto& line : logs.lines)
+      if (line.find("state_disk remove_dir dir=" + DirName(id)) != std::string::npos) found.push_back(line);
+    return found;
+  };
+  {
+    Disk disk(options);
+    assert(disk.Enabled());
+    for (int i = 1; i <= 8; ++i) {
+      Spill(disk, Make(Tokens(10, i), 3 * 4096, uint8_t(i)));
+      assert(disk.Drain(30));
+    }
+    const auto noted_lines = lines_of('1');
+    assert(noted_lines.size() == 1);
+    assert(noted_lines[0].find(" bytes=" + std::to_string(file) + " files=1 ") != std::string::npos);
+    assert(fs::exists(noted / "notes.txt") && !fs::exists(noted / (std::string(64, '1') + ".state")));
+    if (modes) {
+      const auto stuck_lines = lines_of('2');
+      assert(stuck_lines.size() == 1);
+      assert(stuck_lines[0].find(" bytes=0 files=0 ") != std::string::npos);
+      assert(stuck_lines[0].find(" left_files=1 errno=" + std::to_string(EACCES)) != std::string::npos);
+      assert(fs::exists(stuck / (std::string(64, '2') + ".state")));
+      assert(disk.Bytes() + file <= options.budget);  // the stuck bytes still count
+    }
+  }
+  ::chmod(stuck.c_str(), 0700);
+  fs::remove_all(root);
+}
+
 // tools/state_digest.py reads the real files of this writer: two identities that spill the same state give equal digests,
 // and one changed byte of the payload gives another. (The tool is the equality check of the state-equality gate.)
 void DigestIgnoresIdentity() {
@@ -1335,9 +1517,22 @@ void DigestIgnoresIdentity() {
   assert(run(a, Root() / "nothing") == 2);
 }
 
-int main() {
+int main(int argc, char** argv) {
+  // `state_disk_test NAME`: one of the review tests alone (a RED run of a test that stops the process).
+  if (argc > 1) {
+    const std::string name = argv[1];
+    if (name == "WalkErrorKeepsServing") WalkErrorKeepsServing();
+    else if (name == "UnremovableFoldersLogOnce") UnremovableFoldersLogOnce();
+    else return 2;
+    fs::remove_all(Root().parent_path());
+    std::printf("%s passed\n", name.c_str());
+    return 0;
+  }
   DigestIgnoresIdentity();
   OtherIdentitiesStay();
+  OtherIdentitiesCountAgainstCap();
+  WalkErrorKeepsServing();
+  UnremovableFoldersLogOnce();
   DirectIoFromPinnedMemory();
   IoErrorsNameErrno();
   PaddingIsZeroWithReusedBuffer();

@@ -141,13 +141,15 @@ def main():
                              "--host-reserve-mib 11264.")
     parser.add_argument("--prefill", type=int, default=None)
     parser.add_argument("--host-reserve-mib", type=int, default=None, metavar="1024..131072",
-                        help="Free host memory (MemAvailable) that each conversation cache save keeps (default 8192, "
-                             "the engine's). On a unified-memory host the GPU uses the same memory.")
+                        help="Free host memory (MemAvailable less free CMA pages (CmaFree)) that each conversation "
+                             "cache save keeps (default 8192, the engine's). On a unified-memory host the GPU uses the "
+                             "same memory.")
     parser.add_argument("--admission-reserve-mib", type=int, default=None, metavar="1024..1048576",
-                        help="Free memory (the smaller of host MemAvailable and device free) kept at each start "
-                             "(default 9216 MiB: 8 GiB OS, 512 MiB plans, 512 MiB host part). Batched server only. "
-                             "A low value leaves less memory for the OS; on a unified-memory host the GPU uses the "
-                             "same memory. Cache saves keep --host-reserve-mib separately.")
+                        help="Free memory (the smaller of host MemAvailable less free CMA pages (CmaFree) and device "
+                             "free) kept at each start (default 9216 MiB: 8 GiB OS, 512 MiB plans, 512 MiB host "
+                             "part). Batched server only. A low value leaves less memory for the OS; on a "
+                             "unified-memory host the GPU uses the same memory. Cache saves keep --host-reserve-mib "
+                             "separately.")
     parser.add_argument("--short-streams", type=int, default=0, help="Batch slots that hold only --short-ctx tokens.")
     parser.add_argument("--short-ctx", type=int, default=0)
     parser.add_argument("--packed-op", choices=("verify_step", "step"), default=None,

@@ -377,7 +377,9 @@ template<int WAVES> inline void LaunchHcDotsTile(const __half* fn,int M,const fl
 // Same work as PrefillHcDotsFusedKernel, but fn also goes through LDS. All
 // global loads for step k+1 are in flight while step k runs its WMMAs, and the
 // hot loop has no divergent branches (rows past M load row M-1; never stored).
-// Writes t directly as high/low halves for the gate GEMM.
+// Writes t directly as high/low halves for the gate GEMM. LO=false (CRUCIBLE_HC_MIX_HI, prefill_hc_hi.h) writes
+// thi and post only: the high-half mix does not read tlo.
+template<bool LO=true>
 __global__ void __launch_bounds__(256) PrefillHcMidPackKernel(const float* dots,int M,
     const float* ss,__half* thi,__half* tlo,float* post,int R) {
   const int r=blockIdx.x,j=threadIdx.x;
@@ -390,7 +392,8 @@ __global__ void __launch_bounds__(256) PrefillHcMidPackKernel(const float* dots,
 #pragma unroll
     for (int s=0;s<4;++s) a+=inv[s]*dots[HcDotsAt(s,r,m,R,M)];
     const float v=Silu(a*.25f); const __half h=__float2half(v);
-    thi[r*kRank+m]=h; tlo[r*kRank+m]=__float2half((v-__half2float(h))*prefill::kResidualScale);
+    thi[r*kRank+m]=h;
+    if (LO) tlo[r*kRank+m]=__float2half((v-__half2float(h))*prefill::kResidualScale);
   }
   if (j<4 && post) {
     float a=0;

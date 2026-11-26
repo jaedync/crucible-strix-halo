@@ -86,6 +86,24 @@ int main() {
     bool oversized = false;
     assert(!reader.Next(line, oversized));
   }
+  {
+    // The stop hook (state_stop.h): with an open input, ready lines are still read; when the hook says stop, the reader
+    // ends and drops the partial line. Without the hook it would wait for the rest of that line.
+    int fds[2];
+    assert(pipe(fds) == 0);
+    assert(write(fds[1], "one\npart", 8) == 8);
+    static int asked = 0;
+    crucible::g_serve_input_stop = [] { return ++asked >= 2; };
+    crucible::ServeLineReader reader(fds[0], limit);
+    std::string line;
+    bool oversized = false;
+    assert(reader.Next(line, oversized) && line == "one");
+    assert(!reader.Next(line, oversized) && asked == 2);
+    assert(!reader.Next(line, oversized) && asked == 2);  // the end stays
+    crucible::g_serve_input_stop = nullptr;
+    close(fds[0]);
+    close(fds[1]);
+  }
   std::puts("serve_line_test: ok");
   return 0;
 }

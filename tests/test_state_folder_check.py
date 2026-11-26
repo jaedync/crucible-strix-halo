@@ -3,6 +3,7 @@ state folder (tools/crucible_cli/settings.py state_dir_problem). The folder may 
 folder. The check follows the engine rule (engine/runtime/state_root.h; host copy tools/crucible_cli/state_root.py): a folder
 that only this user or root can change is accepted, anywhere but a system folder."""
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -53,6 +54,32 @@ class StateFolderCheckTest(unittest.TestCase):
         (sd / IDENT).mkdir(parents=True)
         (sd / "write-ledger").write_text("")
         self.assertEqual(self.doctor_row(sd).status, "pass")
+
+    def test_doctor_names_the_state_bytes_of_older_identity_folders(self):
+        # The folders of old builds and settings filled the disk. The disk limit now covers them
+        # (engine/runtime/state_disk.h TrimOthers); doctor names their bytes. The newest folder is the live one.
+        sd = self.home / "states"
+        new, old = IDENT, "-".join(["fedcba9876543210"] * 3)
+        now = 1_800_000_000
+        for name, size, age in ((new, 1_500_000_000, 60), (old, 2_000_000_000, 4 * 86400)):
+            folder = sd / name
+            folder.mkdir(parents=True)
+            state = folder / ("a" * 8 + ".state")
+            with open(state, "wb") as f:
+                f.truncate(size)  # sparse: the engine counts the file size
+            (folder / ".lock").write_text("")
+            (folder / "notes.txt").write_text("x")  # not a tier file: not counted
+            for path in (state, folder / ".lock"):
+                os.utime(path, (now - age, now - age))
+        (sd / "write-ledger").write_text("")
+        s = settings_mod.build(self.repo, self.host, state_dir=sd)
+        row = {r.id: r for r in doctor.run_checks(self.host, s)}["disk-state"]
+        self.assertIn("states 3.5 GB in 2 identity folders: the newest 1.5 GB, older ones 2.0 GB "
+                      "(old builds or settings). The limit covers the folders of stopped engines.", row.detail)
+        # One folder: no older ones.
+        shutil.rmtree(sd / old)
+        row = {r.id: r for r in doctor.run_checks(self.host, s)}["disk-state"]
+        self.assertIn("states 1.5 GB in 1 identity folder.", row.detail)
 
     def test_doctor_names_the_same_problem_as_setup(self):
         sd = self.home / "states"

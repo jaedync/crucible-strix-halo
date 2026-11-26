@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import keyfile, machine, options, packs, rocm, service, settings as settings_mod
+from . import hostcheck, keyfile, machine, options, packs, rocm, service, state_root, settings as settings_mod
 from .files import Sandbox
 from .memfit import memory_advice
 from .measured import SERVER_FLAGS
@@ -51,16 +51,23 @@ ROCM_FIX = (
 )
 
 
+def boot_loader_lines(grub_update="sudo grub-mkconfig -o /boot/grub/grub.cfg"):
+    """Where the kernel command line is, for each boot loader. GRUB_UPDATE is the command that writes the GRUB menu again."""
+    return (
+        "  - systemd-boot with entry files: the options line of your entry in /boot/loader/entries/\n"
+        f"  - GRUB: GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub, then: {grub_update}\n"
+        "  - a unified kernel image: usually /etc/kernel/cmdline, then build the image again (for example: sudo mkinitcpio -P)\n"
+        "  - another boot loader: see its documentation\n"
+    )
+
+
 def kernel_fix(params):
     """The fix text of the GTT check for the two kernel parameters PARAMS of this machine."""
     return (
         f"Add these two parameters to the kernel command line, then restart: {params}\n"
         "Keep every parameter that is already there (see: cat /proc/cmdline) and do not add one twice. "
         "Where the line is depends on how your system starts:\n"
-        "  - systemd-boot with entry files: the options line of your entry in /boot/loader/entries/\n"
-        "  - GRUB: GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub, then: sudo grub-mkconfig -o /boot/grub/grub.cfg\n"
-        "  - a unified kernel image: usually /etc/kernel/cmdline, then build the image again (for example: sudo mkinitcpio -P)\n"
-        "  - another boot loader: see its documentation\n"
+        + boot_loader_lines() +
         "Keep a working boot entry until the new one starts. A wrong command line can stop the machine from starting.\n"
         "./crucible setup shows the exact change for this machine. It applies the change with sudo only after you type yes, "
         "makes a backup first, and never restarts the machine."
@@ -68,6 +75,18 @@ def kernel_fix(params):
 
 
 KERNEL_FIX = kernel_fix(GTT_PARAMS)
+# Issue 18: Ubuntu 26.04 (kernel 7.0) starts with Kexec HandOver (KHO) on, which keeps 7 to 13 GiB of memory as CMA.
+CMA_WARN_KB = 1024 * 1024    # 1 GiB
+# The warnings that setup and start print with their fix text.
+MEMORY_WARNINGS = ("memory", "memory-available", "memory-cma", "gpu-free")
+CMA_FIX = (
+    "Only movable memory can use CMA memory. GPU memory and the conversation cache cannot use it. With the server "
+    "option --fit auto (the default), Crucible starts a smaller layout. With --fit off, the start stops. On Ubuntu 26.04 the kernel keeps "
+    "this memory for Kexec HandOver (KHO), which a normal system does not need. To make the memory usable, add kho=off "
+    "to the kernel command line, then restart. Where the line is depends on how your system starts:\n"
+    + boot_loader_lines("sudo update-grub") +
+    "Keep every parameter that is already there. After the restart, grep CmaFree /proc/meminfo shows 0 kB. "
+    "If it does not, look for a cma= parameter in /proc/cmdline: it also keeps CMA memory.")
 
 
 @dataclass
@@ -128,6 +147,20 @@ def _vram_total(host):
 
 def _gb(n):
     return f"{n / GB:.1f} GB"
+
+
+def _state_usage(state_dir):
+    """The state bytes of the identity folders, as "; states ..." ("" when there are none). The newest folder is the live
+    one in most cases; the older ones are from old builds or settings. The disk limit covers them when no running engine
+    uses them (docs/CONVERSATION_CACHE.md "The disk limit covers the whole state folder")."""
+    usage = state_root.identity_usage(state_dir)
+    if not usage:
+        return ""
+    total = sum(size for _, size in usage)
+    if len(usage) == 1:
+        return f"; states {_gb(total)} in 1 identity folder."
+    return (f"; states {_gb(total)} in {len(usage)} identity folders: the newest {_gb(usage[0][1])}, older ones "
+            f"{_gb(total - usage[0][1])} (old builds or settings). The limit covers the folders of stopped engines.")
 
 
 MEASURE_FILE = "disk-measure.json"
@@ -293,6 +326,14 @@ def run_checks(host, s, measure=False):
         add("memory", "System memory 88 GiB or more", "fail", f"this machine has {total / 1024 / 1024:.0f} GiB",
             machine.refusal(total), ("start",))
     available = _meminfo(host, "MemAvailable")
+    # Free CMA pages are in MemAvailable, but GPU memory (GTT) cannot use them; the engine's guards subtract them too
+    # (engine/runtime/batch_admission.h HostMemoryFromMeminfo, issue 18).
+    cma_free = _meminfo(host, "CmaFree") or 0
+    if available is not None:
+        available = max(available - cma_free, 0)
+    if cma_free > CMA_WARN_KB:
+        add("memory-cma", "Host memory that GPU memory cannot use (CMA)", "warn",
+            f"{cma_free / 1024 / 1024:.1f} GiB of free memory is CMA (CmaFree in /proc/meminfo)", CMA_FIX)
     reserve_kb = int(SERVER_FLAGS["--host-reserve-mib"]) * 1024
     if available is not None and available < reserve_kb and _server_alive(host, s):
         # The Crucible server itself holds that memory: no warning about it.
@@ -305,23 +346,18 @@ def run_checks(host, s, measure=False):
     else:
         add("memory-available", "Available host memory", "pass", f"{available / 1024 / 1024:.1f} GiB")
 
-    # GPU memory limit (GTT)
-    totals = [t for t in (_int(c / "mem_info_gtt_total") for c in _cards(host)) if t]
+    # GPU memory limit (GTT): the rule of hostcheck.gtt_verdict, with no pack (the memory line checks the pack)
     cmdline = _read(Path(host.proc) / "cmdline") or ""
-    has_params = "amdgpu.gttsize" in cmdline and "ttm.pages_limit" in cmdline
-    if not totals:
-        add("gtt", "GPU memory limit (GTT)", "fail", "no amdgpu memory value found in /sys/class/drm",
+    gtt = hostcheck.gtt_verdict([_int(c / "mem_info_gtt_total") for c in _cards(host)], total,
+                                params_on_cmdline="amdgpu.gttsize" in cmdline and "ttm.pages_limit" in cmdline)
+    if gtt.code == "no-gtt":
+        add("gtt", "GPU memory limit (GTT)", gtt.status, gtt.reason,
             "Check that the amdgpu driver is loaded (lsmod | grep amdgpu) and that this is a Strix Halo machine.\n"
             + KERNEL_FIX, ("start",))
-    elif max(totals) >= fit.gtt_min_bytes:
-        add("gtt", "GPU memory limit (GTT)", "pass", _gb(max(totals)))
+    elif gtt.status == "pass":
+        add("gtt", "GPU memory limit (GTT)", "pass", gtt.reason)
     else:
-        need = ("The 4.05 pack with 4 long sessions needs about 133 GB." if fit is machine.FULL else
-                f"On a {fit.name} machine, set the limit to {fit.gtt_params.split()[0].split('=')[1]} MiB.")
-        why = ("The GPU of Strix Halo uses the system memory, and Linux lets it use only part of it by default. " + need)
-        note = " The two parameters are on the command line already: restart if you changed them just now." if has_params else ""
-        add("gtt", "GPU memory limit (GTT)", "fail", f"the limit is {_gb(max(totals))}. {why}{note}",
-            kernel_fix(fit.gtt_params), ("start",))
+        add("gtt", "GPU memory limit (GTT)", gtt.status, gtt.reason, kernel_fix(gtt.params), ("start",))
 
     # GPU memory in use
     live = _server_alive(host, s)
@@ -362,11 +398,13 @@ def run_checks(host, s, measure=False):
     if s.state_dir is not None:
         free_state = host.disk_free(s.state_dir)
         want = s.state_disk_gib * 1024 ** 3
+        usage = _state_usage(s.state_dir)
         if free_state >= want:
-            add("disk-state", "Disk space for the conversation cache", "pass", f"{_gb(free_state)} free; limit {s.state_disk_gib} GiB")
+            add("disk-state", "Disk space for the conversation cache", "pass",
+                f"{_gb(free_state)} free; limit {s.state_disk_gib} GiB{usage}")
         else:
             add("disk-state", "Disk space for the conversation cache", "warn",
-                f"{_gb(free_state)} free; the limit is {s.state_disk_gib} GiB",
+                f"{_gb(free_state)} free; the limit is {s.state_disk_gib} GiB{usage}",
                 "Lower the limit: ./crucible setup --state-disk-gib N, or use --no-state-dir.")
         home = Path(os.path.abspath(host.home))
         sd = Path(os.path.abspath(s.state_dir))
@@ -553,7 +591,7 @@ def for_start(host, s, quiet=False, as_json=False, check_file=None):
         Sandbox([path.parent]).write_json(path, record)
     except (OSError, ValueError):
         pass  # a check file that cannot be written must not hide the result
-    warnings = [r for r in run_checks(host, s) if r.status == "warn" and r.id in ("memory", "memory-available", "gpu-free")]
+    warnings = [r for r in run_checks(host, s) if r.status == "warn" and r.id in MEMORY_WARNINGS]
     if as_json:
         host.out(json.dumps({"checks": [f.as_dict() for f in fails + warnings], "ok": not fails, "code": code}, indent=2))
     elif quiet:

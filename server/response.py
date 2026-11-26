@@ -70,8 +70,10 @@ class CompletionResponse:
         if self.request.kind == "chat":
             self.chunk(dict(role="assistant", content=""))
 
-    def chunk(self, delta, reason=None, token=None, extra=None):
+    def chunk(self, delta, reason=None, token=None, extra=None, ended=False):
         choice = dict(index=0, finish_reason=reason)
+        if ended:
+            choice["stop_reason"] = self.stop_reason()  # only on the chunk that ends the choice, as its finish_reason
         choice["delta" if self.request.kind == "chat" else "text"] = delta
         if token is not None and self.request.return_token_ids:
             choice["token_id"] = token
@@ -87,6 +89,12 @@ class CompletionResponse:
     def reasoning(self, text, token=None):
         if self.request.stream and (text or (token is not None and self.request.return_token_ids)):
             self.chunk(dict(reasoning_content=text), token=token)
+
+    def stop_reason(self):
+        """other engines's stop_reason: the client stop string that ended the reply, else None (an end-of-turn token or
+        max_tokens). token_ids keep the IDs of that string, as other engines keeps them: a client that rebuilds the text from
+        the IDs cuts it at this string, and with None it removes only a last end-of-turn ID."""
+        return self.stop_filter.matched if self.stop_filter.stopped else None
 
     def token(self, token, server_time=None):
         self.ids.append(token)
@@ -214,7 +222,7 @@ class CompletionResponse:
             self.reasoning(reasoning_tail)
             self.finish_stream(message, deltas, reason, usage, timing)
         else:
-            choice = dict(index=0, finish_reason=reason)
+            choice = dict(index=0, finish_reason=reason, stop_reason=self.stop_reason())
             choice["message" if self.request.kind == "chat" else "text"] = message if self.request.kind == "chat" else full_text
             if self.request.return_token_ids:
                 choice["token_ids"] = self.ids
@@ -229,7 +237,7 @@ class CompletionResponse:
         for delta in deltas:
             self.chunk(delta)
         last = timing if not self.request.include_usage else None
-        self.chunk({} if self.request.kind == "chat" else "", reason, extra=last)
+        self.chunk({} if self.request.kind == "chat" else "", reason, extra=last, ended=True)
         if self.request.include_usage:
             self.handler.sse(self.base | dict(choices=[], usage=usage) | (timing or {}))
         self.handler.sse("[DONE]")

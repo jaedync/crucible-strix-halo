@@ -70,7 +70,7 @@ struct BatchCacheStatus {
   size_t entries = 0, bytes = 0, evictions = 0;
   uint64_t attempts = 0;
   BatchCacheSave last;
-  std::optional<uint64_t> host_available;  // MemAvailable when the status was read
+  std::optional<uint64_t> host_available;  // MemAvailable less CmaFree when the status was read
   std::optional<uint64_t> pinned_bytes;    // SnapshotChunkPool::PinnedBytes when the status was read
   BatchCacheCounters counters;             // per-tier lookups, hits and reused tokens
 };

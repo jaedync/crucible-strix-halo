@@ -316,6 +316,12 @@ The server protects itself against a bad client:
 The diagnostic extension adds `token_ids` to a non-streamed choice.
 It adds `token_id` to each streamed token choice.
 It includes terminal stop IDs.
+It also includes the IDs of a client `stop` string that ended the reply, as other engines does. The text stops before that string.
+
+Each choice has `stop_reason`, as in other engines. A stream gives it on the chunk with `finish_reason`:
+
+- The client `stop` string that ended the reply. To get the text from `token_ids`, decode them and cut at the string.
+- `null` when an end-of-turn token (the last ID) or `max_tokens` ended the reply.
 
 With thinking on, the server splits the output at `</think>`, as other engines and Halogen do:
 

@@ -1,0 +1,130 @@
+{
+  "about": "Test vectors of the GTT host rule (tools/crucible_cli/hostcheck.py gtt_verdict). tests/test_host_check.py reads this file; a port of the rule to another language reads the same file. Inputs: gtt_total_bytes is the list of mem_info_gtt_total values of /sys/class/drm/card*/device (null: not readable), memtotal_kb is MemTotal of /proc/meminfo (null: not readable), pack is the pack name or null (no pack rule), container is true for a check that reads only sysfs and /proc/meminfo, params_on_cmdline is true when /proc/cmdline holds amdgpu.gttsize and ttm.pages_limit (null: not read). Output: status (pass, warn or fail), code, reason (the exact text) and params (the two kernel parameters for this machine).",
+  "vectors": [
+    {
+      "name": "128 GB machine, limit 124 GiB",
+      "input": {"gtt_total_bytes": [133143986176], "memtotal_kb": 131156752, "pack": null, "container": false, "params_on_cmdline": true},
+      "output": {"status": "pass", "code": "ok", "reason": "133.1 GB", "params": "amdgpu.gttsize=126976 ttm.pages_limit=32505856"}
+    },
+    {
+      "name": "128 GB machine, limit exactly the 130 GB minimum",
+      "input": {"gtt_total_bytes": [130000000000], "memtotal_kb": 131156752, "pack": null, "container": false, "params_on_cmdline": true},
+      "output": {"status": "pass", "code": "ok", "reason": "130.0 GB", "params": "amdgpu.gttsize=126976 ttm.pages_limit=32505856"}
+    },
+    {
+      "name": "128 GB machine, limit 1 byte below the minimum",
+      "input": {"gtt_total_bytes": [129999999999], "memtotal_kb": 131156752, "pack": null, "container": false, "params_on_cmdline": false},
+      "output": {"status": "fail", "code": "gtt-low", "reason": "the limit is 130.0 GB. The GPU of Strix Halo uses the system memory, and Linux lets it use only part of it by default. The 4.05 pack with 4 long sessions needs about 133 GB.", "params": "amdgpu.gttsize=126976 ttm.pages_limit=32505856"}
+    },
+    {
+      "name": "128 GB machine, the Linux default limit, no kernel parameters",
+      "input": {"gtt_total_bytes": [67108864000], "memtotal_kb": 131156752, "pack": null, "container": false, "params_on_cmdline": false},
+      "output": {"status": "fail", "code": "gtt-low", "reason": "the limit is 67.1 GB. The GPU of Strix Halo uses the system memory, and Linux lets it use only part of it by default. The 4.05 pack with 4 long sessions needs about 133 GB.", "params": "amdgpu.gttsize=126976 ttm.pages_limit=32505856"}
+    },
+    {
+      "name": "128 GB machine, the Linux default limit, the parameters are on the command line (no restart yet)",
+      "input": {"gtt_total_bytes": [67108864000], "memtotal_kb": 131156752, "pack": null, "container": false, "params_on_cmdline": true},
+      "output": {"status": "fail", "code": "gtt-low", "reason": "the limit is 67.1 GB. The GPU of Strix Halo uses the system memory, and Linux lets it use only part of it by default. The 4.05 pack with 4 long sessions needs about 133 GB. The two parameters are on the command line already: restart if you changed them just now.", "params": "amdgpu.gttsize=126976 ttm.pages_limit=32505856"}
+    },
+    {
+      "name": "container, 128 GB machine, the Linux default limit (the command line is not read)",
+      "input": {"gtt_total_bytes": [67108864000], "memtotal_kb": 131156752, "pack": "4.05", "container": true, "params_on_cmdline": null},
+      "output": {"status": "fail", "code": "gtt-low", "reason": "the limit is 67.1 GB. The GPU of Strix Halo uses the system memory, and Linux lets it use only part of it by default. The 4.05 pack with 4 long sessions needs about 133 GB.", "params": "amdgpu.gttsize=126976 ttm.pages_limit=32505856"}
+    },
+    {
+      "name": "two cards: the largest limit counts",
+      "input": {"gtt_total_bytes": [536870912, 133143986176], "memtotal_kb": 131156752, "pack": null, "container": false, "params_on_cmdline": true},
+      "output": {"status": "pass", "code": "ok", "reason": "133.1 GB", "params": "amdgpu.gttsize=126976 ttm.pages_limit=32505856"}
+    },
+    {
+      "name": "no readable value (0 and null do not count)",
+      "input": {"gtt_total_bytes": [0, null], "memtotal_kb": 131156752, "pack": null, "container": false, "params_on_cmdline": false},
+      "output": {"status": "fail", "code": "no-gtt", "reason": "no amdgpu memory value found in /sys/class/drm", "params": "amdgpu.gttsize=126976 ttm.pages_limit=32505856"}
+    },
+    {
+      "name": "no card",
+      "input": {"gtt_total_bytes": [], "memtotal_kb": 131156752, "pack": null, "container": false, "params_on_cmdline": false},
+      "output": {"status": "fail", "code": "no-gtt", "reason": "no amdgpu memory value found in /sys/class/drm", "params": "amdgpu.gttsize=126976 ttm.pages_limit=32505856"}
+    },
+    {
+      "name": "container, no card: a warning, the engine checks the free memory at start",
+      "input": {"gtt_total_bytes": [], "memtotal_kb": 131156752, "pack": "4.05", "container": true, "params_on_cmdline": null},
+      "output": {"status": "warn", "code": "no-gtt", "reason": "no amdgpu memory value found in /sys/class/drm. The engine checks the free memory at start.", "params": "amdgpu.gttsize=126976 ttm.pages_limit=32505856"}
+    },
+    {
+      "name": "MemTotal unknown: the 128 GB class",
+      "input": {"gtt_total_bytes": [133143986176], "memtotal_kb": null, "pack": null, "container": false, "params_on_cmdline": true},
+      "output": {"status": "pass", "code": "ok", "reason": "133.1 GB", "params": "amdgpu.gttsize=126976 ttm.pages_limit=32505856"}
+    },
+    {
+      "name": "MemTotal unknown, small limit: the 128 GB class text",
+      "input": {"gtt_total_bytes": [64424509440], "memtotal_kb": null, "pack": "4.05", "container": true, "params_on_cmdline": null},
+      "output": {"status": "fail", "code": "gtt-low", "reason": "the limit is 64.4 GB. The GPU of Strix Halo uses the system memory, and Linux lets it use only part of it by default. The 4.05 pack with 4 long sessions needs about 133 GB.", "params": "amdgpu.gttsize=126976 ttm.pages_limit=32505856"}
+    },
+    {
+      "name": "container, 128 GB machine, the 4.05 pack",
+      "input": {"gtt_total_bytes": [133143986176], "memtotal_kb": 131156752, "pack": "4.05", "container": true, "params_on_cmdline": null},
+      "output": {"status": "pass", "code": "ok", "reason": "133.1 GB", "params": "amdgpu.gttsize=126976 ttm.pages_limit=32505856"}
+    },
+    {
+      "name": "container, 128 GB machine, the 4.18 pack",
+      "input": {"gtt_total_bytes": [133143986176], "memtotal_kb": 131156752, "pack": "4.18", "container": true, "params_on_cmdline": null},
+      "output": {"status": "pass", "code": "ok", "reason": "133.1 GB", "params": "amdgpu.gttsize=126976 ttm.pages_limit=32505856"}
+    },
+    {
+      "name": "96 GB machine, limit 92 GiB",
+      "input": {"gtt_total_bytes": [98784247808], "memtotal_kb": 97602320, "pack": null, "container": false, "params_on_cmdline": true},
+      "output": {"status": "pass", "code": "ok", "reason": "98.8 GB", "params": "amdgpu.gttsize=94208 ttm.pages_limit=24117248"}
+    },
+    {
+      "name": "96 GB machine, limit exactly the 89 GiB minimum",
+      "input": {"gtt_total_bytes": [95563022336], "memtotal_kb": 97602320, "pack": null, "container": false, "params_on_cmdline": true},
+      "output": {"status": "pass", "code": "ok", "reason": "95.6 GB", "params": "amdgpu.gttsize=94208 ttm.pages_limit=24117248"}
+    },
+    {
+      "name": "96 GB machine, limit 1 byte below the minimum",
+      "input": {"gtt_total_bytes": [95563022335], "memtotal_kb": 97602320, "pack": null, "container": false, "params_on_cmdline": false},
+      "output": {"status": "fail", "code": "gtt-low", "reason": "the limit is 95.6 GB. The GPU of Strix Halo uses the system memory, and Linux lets it use only part of it by default. On a 96 GB machine, set the limit to 94208 MiB.", "params": "amdgpu.gttsize=94208 ttm.pages_limit=24117248"}
+    },
+    {
+      "name": "96 GB machine, limit 48 GiB",
+      "input": {"gtt_total_bytes": [51539607552], "memtotal_kb": 97602320, "pack": null, "container": false, "params_on_cmdline": false},
+      "output": {"status": "fail", "code": "gtt-low", "reason": "the limit is 51.5 GB. The GPU of Strix Halo uses the system memory, and Linux lets it use only part of it by default. On a 96 GB machine, set the limit to 94208 MiB.", "params": "amdgpu.gttsize=94208 ttm.pages_limit=24117248"}
+    },
+    {
+      "name": "96 GB machine, no readable value: the fix keeps the parameters of this machine",
+      "input": {"gtt_total_bytes": [], "memtotal_kb": 97602320, "pack": null, "container": false, "params_on_cmdline": false},
+      "output": {"status": "fail", "code": "no-gtt", "reason": "no amdgpu memory value found in /sys/class/drm", "params": "amdgpu.gttsize=94208 ttm.pages_limit=24117248"}
+    },
+    {
+      "name": "container, 96 GB machine, the 3.05 pack",
+      "input": {"gtt_total_bytes": [98784247808], "memtotal_kb": 97602320, "pack": "3.05", "container": true, "params_on_cmdline": null},
+      "output": {"status": "pass", "code": "ok", "reason": "98.8 GB", "params": "amdgpu.gttsize=94208 ttm.pages_limit=24117248"}
+    },
+    {
+      "name": "container, 96 GB machine, the 4.05 pack: the pack rule comes before the limit",
+      "input": {"gtt_total_bytes": [51539607552], "memtotal_kb": 97602320, "pack": "4.05", "container": true, "params_on_cmdline": null},
+      "output": {"status": "fail", "code": "pack", "reason": "the 4.05 pack needs a 128 GB machine. On a 96 GB machine, use the 3.05 pack.", "params": "amdgpu.gttsize=94208 ttm.pages_limit=24117248"}
+    },
+    {
+      "name": "96 GB machine, the 4.05 pack, a good limit",
+      "input": {"gtt_total_bytes": [98784247808], "memtotal_kb": 97602320, "pack": "4.05", "container": false, "params_on_cmdline": true},
+      "output": {"status": "fail", "code": "pack", "reason": "the 4.05 pack needs a 128 GB machine. On a 96 GB machine, use the 3.05 pack.", "params": "amdgpu.gttsize=94208 ttm.pages_limit=24117248"}
+    },
+    {
+      "name": "64 GB machine, no pack: the limit of its class",
+      "input": {"gtt_total_bytes": [64424509440], "memtotal_kb": 64047888, "pack": null, "container": false, "params_on_cmdline": true},
+      "output": {"status": "pass", "code": "ok", "reason": "64.4 GB", "params": "amdgpu.gttsize=61440 ttm.pages_limit=15728640"}
+    },
+    {
+      "name": "64 GB machine, limit below its class",
+      "input": {"gtt_total_bytes": [60129542144], "memtotal_kb": 64047888, "pack": null, "container": false, "params_on_cmdline": false},
+      "output": {"status": "fail", "code": "gtt-low", "reason": "the limit is 60.1 GB. The GPU of Strix Halo uses the system memory, and Linux lets it use only part of it by default. On a small machine, set the limit to 61440 MiB.", "params": "amdgpu.gttsize=61440 ttm.pages_limit=15728640"}
+    },
+    {
+      "name": "container, 64 GB machine, the 3.05 pack: no pack fits",
+      "input": {"gtt_total_bytes": [64424509440], "memtotal_kb": 64047888, "pack": "3.05", "container": true, "params_on_cmdline": null},
+      "output": {"status": "fail", "code": "pack", "reason": "Crucible needs a 96 GB or 128 GB machine. This machine has 61 GiB. The 3.05 pack with one session of 32,768 tokens holds about 63 GB of GPU memory, and the engine keeps 9 GiB free for the system at start. If the BIOS gives the GPU a large dedicated memory (UMA frame buffer), set it to the smallest value (512 MB): the GPU uses the system memory through the GTT.", "params": "amdgpu.gttsize=61440 ttm.pages_limit=15728640"}
+    }
+  ]
+}

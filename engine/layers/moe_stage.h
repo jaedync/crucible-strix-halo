@@ -170,16 +170,18 @@ __device__ __forceinline__ LinJob MoeStageJob(const LinJob* jobs, int index, int
                                               const ExpertPtrs* __restrict__ experts, const MoeRouteState<R>& st) {
   LinJob j = jobs[index];
   if (u >= R * kTopK) return j;
-  if (u >= st.n) {
-    j.K = 0;
-    return j;
+  // One store of K and of R on both paths (rocm10-retune): two returns gave a 12-byte stack copy of the job.
+  int K = 0, rows = j.R;
+  if (u < st.n) {
+    const ExpertPtrs& ep = experts[st.list[u]];
+    j.tiles = ep.tiles[m];
+    j.suh = ep.suh[m];
+    j.svh = ep.svh[m];
+    K = ep.K[m];
+    rows = st.count[u];
   }
-  const ExpertPtrs& ep = experts[st.list[u]];
-  j.tiles = ep.tiles[m];
-  j.suh = ep.suh[m];
-  j.svh = ep.svh[m];
-  j.K = ep.K[m];
-  j.R = st.count[u];
+  j.K = K;
+  j.R = rows;
   return j;
 }
 
@@ -264,17 +266,6 @@ __device__ __forceinline__ void MoeStageCombine(const MoeStageArgs& a, int g, co
   for (int t = threadIdx.x >> 5; t < R * 2; t += blockDim.x >> 5) {
     const int r = t >> 1, blk = 2 * g + (t & 1);
     const int c0 = blk * 128 + lane * 4;
-    // The residual streams and gates load with the first slots; the update below is unchanged.
-    float gs[kStreams], hv[kStreams][4];
-#pragma unroll
-    for (int s = 0; s < kStreams; ++s) {
-      gs[s] = a.post[r * kStreams + s];
-      const float4 h = *reinterpret_cast<const float4*>(a.H + ((size_t)r * kStreams + s) * kHidden + c0);
-      hv[s][0] = h.x;
-      hv[s][1] = h.y;
-      hv[s][2] = h.z;
-      hv[s][3] = h.w;
-    }
     float y[4] = {0.f, 0.f, 0.f, 0.f};
     // Slots in groups of kG: all loads of a group before its Hadamards. The kernel's register count is the
     // maximum over its paths, so all 11 slots in flight would cut the expert items' occupancy.
@@ -307,6 +298,19 @@ __device__ __forceinline__ void MoeStageCombine(const MoeStageArgs& a, int g, co
 #pragma unroll
         for (int i = 0; i < 4; ++i) y[i] += wk[q] * (v[i] * (kHadNorm * sv[q][i]));
       }
+    }
+    // The residual streams and gates load after the slots (rocm10-retune): loaded with the first slots, their 20
+    // VGPR stayed live through the slot groups and spilled (7.2.4 17 VGPR, 10.1 25 VGPR at the 96 VGPR cap).
+    // The update below is unchanged.
+    float gs[kStreams], hv[kStreams][4];
+#pragma unroll
+    for (int s = 0; s < kStreams; ++s) {
+      gs[s] = a.post[r * kStreams + s];
+      const float4 h = *reinterpret_cast<const float4*>(a.H + ((size_t)r * kStreams + s) * kHidden + c0);
+      hv[s][0] = h.x;
+      hv[s][1] = h.y;
+      hv[s][2] = h.z;
+      hv[s][3] = h.w;
     }
 #pragma unroll
     for (int s = 0; s < kStreams; ++s) {

@@ -166,6 +166,47 @@ def _content_problem(real, uid):
     return None
 
 
+def _tier_file(name):
+    """A file name that the engine's state tier writes (engine/runtime/state_disk.h StateFileName)."""
+    return len(name) > 6 and (name.endswith((".state", ".block")) or
+                              any(part in name for part in (".state.tmp.", ".state.dead.", ".block.tmp.", ".block.dead.")))
+
+
+def identity_usage(path):
+    """[(last_use, bytes)] for each state identity folder in PATH, newest last use first. The bytes are those of the tier's
+    files; the last use is the newest modification time of them and of the folder's .lock (the engine's rule,
+    state_disk.h ScanOthers). [] when PATH cannot be read."""
+    usage = []
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return usage
+    for name in names:
+        folder = os.path.join(path, name)
+        if not IDENTITY.match(name) or os.path.islink(folder) or not os.path.isdir(folder):
+            continue
+        used, total = 0, 0
+        try:
+            used = os.lstat(os.path.join(folder, ".lock")).st_mtime
+        except OSError:
+            pass
+        try:
+            files = os.listdir(folder)
+        except OSError:
+            files = []
+        for file in files:
+            try:
+                st = os.lstat(os.path.join(folder, file))
+            except OSError:
+                continue
+            if _tier_file(file) and stat.S_ISREG(st.st_mode):
+                total += st.st_size
+                used = max(used, st.st_mtime)
+        usage.append((used, total))
+    usage.sort(reverse=True)
+    return usage
+
+
 def state_root_verdict(path, home=None, uid=None, gid=None, contents=True):
     """The verdict on PATH as the state folder. HOME (optional) refuses the home folder itself. CONTENTS False skips the
     look inside (a folder that setup made before)."""

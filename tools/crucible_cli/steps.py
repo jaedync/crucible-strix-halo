@@ -263,7 +263,7 @@ class Setup:
         for r in results:
             if r.status in ("fail", "warn"):
                 self.say(f"  {r.status.upper()}  {r.id}: {r.detail}")
-                if r.status == "warn" and r.id in ("memory", "memory-available", "gpu-free"):
+                if r.status == "warn" and r.id in doctor.MEMORY_WARNINGS:
                     self.say(f"      {r.fix}")
         return f"{len(results) - len(bad)} of {len(results)} checks without a failure" + (f"; {len(bad)} failed" if bad else "")
 

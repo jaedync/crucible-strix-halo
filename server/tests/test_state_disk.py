@@ -21,6 +21,58 @@ STAGE_NONE_POLL_SECONDS = getattr(batch_backend, "STAGE_NONE_POLL_SECONDS", 5.0)
 FAKE = Path(__file__).parent / "fake_batch_engine.py"
 
 
+# A prefill chunk at a long context (review stop-fit L5). A chunk has 4,096 rows (--prefill 4096). docs/BENCHMARKS.md
+# gives 1,185 tok/s for a whole 65,536-token prefill, and the README chart data say that the whole prefill rate
+# falls 8 to 11% from 32K to 250K. The last chunk of a 250K prompt is slower than the mean: about 1,000 tok/s, so 4.1 s.
+# 5 s is the parameter; change it when a measurement gives more. The budget has room for max_chunk_seconds().
+LONG_CHUNK_SECONDS = 5
+LEDGER_SECONDS, KILL_WAIT_SECONDS, STOP_MARGIN_SECONDS = 5, 10, 15  # the ledger write and teardown; close(); margin
+
+
+def stop_times(root=Path(__file__).parents[2]):
+    """The stop times from the sources: the engine's flush, grace and input wait, the handover drain, the watchdog join of
+    the server's stop and the unit's TimeoutStopSec."""
+    import re
+    header = (root / "engine/serve/state_stop.h").read_text()
+    flush, grace = map(float, re.search(r"kStateFlushSeconds = (\d+), kStateTermGrace = (\d+);", header).groups())
+    input_wait = float(re.search(r"kStateInputWait = (\d+);", header)[1])
+    drain = float(re.search(r"kHandoverDrainSeconds = (\d+);", (root / "engine/serve/handover_spill.h").read_text())[1])
+    join = float(re.search(r"self\.thread\.join\(timeout=(\d+)\)", (root / "server/sd_notify.py").read_text())[1])
+    unit = (root / "deploy/user-systemd/crucible-server.service").read_text()
+    stop_unit = float(re.search(r"^TimeoutStopSec=(\d+)s?$", unit, re.M)[1])
+    return dict(flush=flush, grace=grace, input_wait=input_wait, drain=drain, join=join, stop_unit=stop_unit)
+
+
+def stop_budget_faults(*, chunk, flush, grace, input_wait, drain, join, stop_unit, ledger=LEDGER_SECONDS,
+                       kill_wait=KILL_WAIT_SECONDS, margin=STOP_MARGIN_SECONDS, wait=STATE_FLUSH_SECONDS):
+    """The rules of the stop budget that do not hold (an empty list: all hold). Times in seconds after the first signal.
+    With a server: it joins its watchdog (join), then closes stdin; a command sent just before the close (a handover
+    drain and a chunk) ends, then the flush and the ledger write run. The server kills the engine `wait` s after the
+    close. Without a server: the engine ends an open input input_wait s after the signal (state_stop.h)."""
+    command = drain + chunk
+    rules = {
+        "the flush is longer than 60 s": flush <= 60,
+        # The 85 s rule: the command, the flush and the ledger end inside the server's wait after its close.
+        "the flush ends after the server's kill": command + flush + ledger <= wait,
+        "the flush ends after the engine's own exit (server)": join + command + flush + ledger <= grace,
+        # Under a group signal the engine's own exit comes after the server's kill, so the server decides.
+        "the engine exits before the server's kill": grace >= join + wait,
+        "the server's stop ends after TimeoutStopSec": join + wait + kill_wait <= stop_unit - margin,
+        "the grace ends after TimeoutStopSec": grace <= stop_unit - margin,
+        # A server's close comes before the engine ends an open input itself, so a server's stop does not change.
+        "the engine ends the input before the server's close": input_wait > join,
+        "the flush ends after the engine's own exit (no server)": input_wait + command + flush + ledger <= grace,
+    }
+    return [rule for rule, holds in rules.items() if not holds]
+
+
+def max_chunk_seconds(**times):
+    """The longest whole-second chunk time that keeps every rule (0 when none does)."""
+    chunk = 0
+    while chunk < 60 and not stop_budget_faults(chunk=chunk + 1, **times): chunk += 1
+    return chunk
+
+
 class StateDiskTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
@@ -560,21 +612,22 @@ class StateDiskTest(unittest.TestCase):
         """A service unit stops with TimeoutStopSec=120. The engine flushes for at most 60 s, the server
         waits a little longer, then kills it (a tier engine waits after SIGTERM). The flush starts only after the
         command in flight ends: an open with a handover drain (8 s) and a prefill chunk, then the ledger write after the
-        flush. With a 75 s flush, an 8 s command already gave a SIGKILL inside the flush."""
-        root = Path(__file__).parents[2]
-        import re
-        header = (root / "engine/serve/state_stop.h").read_text()
-        flush, grace = map(float, re.search(r"kStateFlushSeconds = (\d+), kStateTermGrace = (\d+);", header).groups())
-        drain = float(re.search(r"kHandoverDrainSeconds = (\d+);", (root / "engine/serve/handover_spill.h").read_text())[1])
-        unit = (root / "deploy/user-systemd/crucible-server.service").read_text()
-        stop_unit = float(re.search(r"^TimeoutStopSec=(\d+)s?$", unit, re.M)[1])
-        chunk, ledger, kill_wait, margin = 5, 5, 10, 15   # a long prefill chunk; the ledger write and teardown; close()
-        self.assertLessEqual(flush, 60)
-        self.assertLessEqual(flush + drain + chunk + ledger, STATE_FLUSH_SECONDS)
-        self.assertLessEqual(STATE_FLUSH_SECONDS + kill_wait, stop_unit - margin)
-        # Under a group SIGTERM the engine's own exit comes after the server's kill, so the server decides.
-        self.assertGreaterEqual(grace, STATE_FLUSH_SECONDS)
-        self.assertLessEqual(grace, stop_unit - margin)
+        flush. With a 75 s flush, an 8 s command already gave a SIGKILL inside the flush. Review stop-fit L5: the
+        server closes stdin only after it joins its watchdog, and a chunk at a long context takes longer than at a short
+        one; both are counted (stop_budget_faults), for each chunk time up to LONG_CHUNK_SECONDS."""
+        times = stop_times()
+        for chunk in (1, LONG_CHUNK_SECONDS):
+            with self.subTest(chunk=chunk):
+                self.assertEqual(stop_budget_faults(chunk=chunk, **times), [])
+        # The budget has room for a chunk a little longer than the parameter, and the check finds a chunk that does not fit.
+        room = max_chunk_seconds(**times)
+        self.assertGreaterEqual(room, LONG_CHUNK_SECONDS)
+        self.assertEqual(stop_budget_faults(chunk=room, **times), [])
+        self.assertNotEqual(stop_budget_faults(chunk=room + 1, **times), [])
+        # A longer watchdog join or input wait also breaks it (each one is counted, not fixed at 5 s).
+        self.assertNotEqual(stop_budget_faults(chunk=LONG_CHUNK_SECONDS, **dict(times, join=times["input_wait"])), [])
+        self.assertNotEqual(stop_budget_faults(chunk=LONG_CHUNK_SECONDS, **dict(times, input_wait=times["join"] + 12)),
+                            [])
         backend = self.start(flush_delay="30", ignore_term="1")
         backend.flush_seconds = 0.5
         start = time.monotonic()

@@ -38,17 +38,42 @@ int hipStreamSynchronize(int) { return 0; }
 #include <atomic>
 #include <string>
 #include <string_view>
+#include <cerrno>
+#include <cstdio>
+#include <utility>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 std::atomic<int> ledger_file_syncs{0}, ledger_dir_syncs{0};
 std::string ledger_dir;   // the folder of the ledger under test (set before the save)
-extern "C" int fsync(int fd) {
+// A full disk (review stop-fit L2): the fsync of the temporary ledger file fails with ENOSPC while this is set.
+std::atomic<bool> fail_ledger_file_sync{false};
+std::string FdPath(int fd) {
   char link[4096];
   const ssize_t n = readlink(("/proc/self/fd/" + std::to_string(fd)).c_str(), link, sizeof link - 1);
-  const std::string_view path(link, n > 0 ? size_t(n) : 0);
+  return std::string(link, n > 0 ? size_t(n) : 0);
+}
+extern "C" int fsync(int fd) {
+  const std::string path = FdPath(fd);
   if (path.ends_with("/lost.ledger.tmp")) ++ledger_file_syncs;
   if (!ledger_dir.empty() && path == ledger_dir) ++ledger_dir_syncs;
+  if (fail_ledger_file_sync && path.ends_with("/lost.ledger.tmp")) {
+    errno = ENOSPC;
+    return -1;
+  }
   return int(syscall(SYS_fsync, fd));
+}
+// A folder swap after the check (review stop-fit L3): the check of a folder at mode 0750 ends with the fchmod of its fd
+// (state_private_dir.h Readable). When the fd is the folder `swap_after_mode`, the folder moves to `<name>.checked` and
+// a new empty folder takes its path, as another process of this user could do between the check and the write.
+std::string swap_after_mode;
+extern "C" int fchmod(int fd, mode_t mode) noexcept {
+  const int result = int(syscall(SYS_fchmod, fd, mode));
+  if (!swap_after_mode.empty() && FdPath(fd) == swap_after_mode) {
+    const std::string folder = std::exchange(swap_after_mode, std::string());
+    if (::rename(folder.c_str(), (folder + ".checked").c_str()) != 0 || ::mkdir(folder.c_str(), 0700) != 0) std::abort();
+  }
+  return result;
 }
 #include "../engine/serve/batch_state_disk.h"
 #include "../engine/serve/miss_ledger.h"
@@ -325,6 +350,53 @@ void LedgerLink() {
   assert(cache.LostRecords() > 0 && !saved);
   assert(fs::file_size(file) == size && fs::last_write_time(file) == time);
 }
+// A failed ledger write (a full disk) keeps the old list and leaves no temporary file (review stop-fit L2: the
+// `lost.ledger.tmp` file stayed until the next save).
+void LedgerWriteFails() {
+  const auto options = Options("states-full");
+  Tier tier(options, false);
+  Cache cache(kTwo, {}, 1, 1000, false);
+  Wire(cache, tier);
+  assert(Save(cache, Conversation(1)));
+  tier.NoteStop(cache);
+  assert(tier.SaveLedger(cache));
+  const std::string folder = fs::weakly_canonical(options.root).string() + ".ledger/" + options.directory;
+  const auto size = fs::file_size(folder + "/lost.ledger");
+  assert(Save(cache, Conversation(2)));
+  tier.NoteStop(cache);
+  fail_ledger_file_sync = true;
+  bool saved = true;
+  const auto log = Stderr([&] { saved = tier.SaveLedger(cache); });
+  fail_ledger_file_sync = false;
+  const bool left = fs::exists(folder + "/lost.ledger.tmp");
+  if (left) std::fprintf(stderr, "miss_ledger_test: a failed ledger write left lost.ledger.tmp\n");
+  assert(!saved && log.find("state_disk ledger_save result=refused reason=write") != std::string::npos);
+  assert(fs::file_size(folder + "/lost.ledger") == size && !left);
+  // The next save writes the new list.
+  assert(tier.SaveLedger(cache) && fs::file_size(folder + "/lost.ledger") > size);
+}
+// The ledger file, its rename and the folder fsync go through the fd of the folder that the check opened (review
+// stop-fit L3). A folder that takes the checked path after the check gets nothing; the checked folder gets the list.
+void LedgerSwap() {
+  const auto options = Options("states-swap");
+  Tier tier(options, false);
+  Cache cache(kTwo, {}, 1, 1000, false);
+  Wire(cache, tier);
+  assert(Save(cache, Conversation(1)));
+  tier.NoteStop(cache);
+  assert(tier.SaveLedger(cache));
+  const std::string folder = fs::weakly_canonical(options.root).string() + ".ledger/" + options.directory;
+  const auto size = fs::file_size(folder + "/lost.ledger");
+  fs::remove(folder + "/lost.ledger");
+  fs::permissions(folder, fs::perms(0750));
+  swap_after_mode = folder;
+  const bool saved = tier.SaveLedger(cache);
+  assert(swap_after_mode.empty());  // the swap came after the check
+  const bool planted = fs::exists(folder + "/lost.ledger") || fs::exists(folder + "/lost.ledger.tmp");
+  if (planted) std::fprintf(stderr, "miss_ledger_test: the folder that took the checked path got the ledger\n");
+  assert(!planted && fs::is_empty(folder));
+  assert(saved && fs::file_size(folder + ".checked/lost.ledger") == size);
+}
 // The stop flush wrote the state; the next start has another state epoch, so the state is not readable: `switch`.
 // With the same epoch the state is on disk (best tier disk, no loss).
 void Switch() {
@@ -439,6 +511,8 @@ int main() {
   Stop();
   Switch();
   LedgerLink();
+  LedgerWriteFails();
+  LedgerSwap();
   Lineage();
   Bounds();
   Stage();

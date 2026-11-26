@@ -31,6 +31,12 @@ STOP_IDS = (SPECIAL_IDS[TURN_END],)
 MARKER_IDS = (SPECIAL_IDS[THINK_END], SPECIAL_IDS[CALLS], SPECIAL_IDS[CALLS_END])
 TAGS = (CALLS, CALLS_END, CALL, CALL_END, ARG_KEY, ARG_KEY_END, ARG_VALUE, ARG_VALUE_END)
 MODEL_TYPE = "hy_v4_flash"
+# The ROCm runtime words of the engine child for a Hy4-flash checkpoint. ROCr's fragment allocator puts each hipMalloc
+# of 2 MiB or less in its own 2 MiB block: the full pack would commit 127.3 GiB, over the 121.6 GiB KFD limit of a
+# 128 GB machine; with the switch, 74.0 GiB (the test machine probe of 2026-11-19). ROCr reads it
+# at its first init, so it must be in the child's environment or set by the engine main before any HIP call (both
+# happen: engine/cli/gen_cli.h).
+ALLOCATOR_ENV = {"HSA_DISABLE_FRAGMENT_ALLOCATOR": "1"}
 
 
 def is_hy4(checkpoint):

@@ -66,6 +66,9 @@ struct HcWScratch {
   __half* tlo;      // [16][kRank] t, low half (scaled)
   unsigned* count;  // finished dots blocks (reset by the last one)
   unsigned* flag;   // last published epoch
+  // CRUCIBLE_HC_MIX_HI=1 (hc_mix_hi.h): the mid stores a zero low half of t, so the low rows of each mix tile
+  // add +0 and the mix uses the fp16 high half only. Every R keeps one arithmetic.
+  bool hi_only = false;
 };
 
 template <int KS>
@@ -285,7 +288,7 @@ __device__ __forceinline__ void HcWMid(int M, int R, float* __restrict__ post, c
         const float v = Silu(a * .25f);
         const __half h = __float2half(v);
         sc.thi[r * kRank + m] = h;
-        sc.tlo[r * kRank + m] = __float2half((v - __half2float(h)) * prefill::kResidualScale);
+        sc.tlo[r * kRank + m] = sc.hi_only ? __float2half(0.f) : __float2half((v - __half2float(h)) * prefill::kResidualScale);
       } else if (post) {
         post[r * kStreams + m - kRank] = 2.f * Sigmoid(a * .25f);
       }

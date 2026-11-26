@@ -68,3 +68,32 @@ def test_low_available_memory_is_no_warning_while_our_own_server_holds_it(tmp_pa
     checks = {r.id: r for r in doctor.run_checks(host, settings.build(repo, host))}
     assert checks['memory-available'].status == 'pass', checks['memory-available']
     assert 'Crucible server' in checks['memory-available'].detail
+
+
+def test_free_cma_memory_names_kho_off(tmp_path):
+    # Issue 18: Ubuntu 26.04 (kernel 7.0) keeps the Kexec HandOver scratch as CMA. MemAvailable counts it, but GPU
+    # memory (GTT) cannot use it, so the engine fit and its guards have less room than MemAvailable says.
+    host = wire(tmp_path)
+    s = settings.build(make_repo(tmp_path), host)
+    base = 'MemTotal: 127098440 kB\nMemAvailable: 100000000 kB\n'
+    (host.proc / 'meminfo').write_text(base + 'CmaTotal: 0 kB\nCmaFree: 13771364 kB\n')  # the reporter's host
+    checks = {r.id: r for r in doctor.run_checks(host, s)}
+    cma = checks['memory-cma']
+    assert cma.status == 'warn', cma
+    assert '13.1 GiB' in cma.detail
+    assert 'kho=off' in cma.fix and 'update-grub' in cma.fix
+    # Each boot loader gets its own steps here: the GTT check passes on this host and shows no fix text (review LOW 1).
+    for step in ('/boot/loader/entries/', '/etc/kernel/cmdline', 'mkinitcpio -P', 'another boot loader: see its documentation'):
+        assert step in cma.fix, step
+    assert 'GTT check' not in cma.fix
+    # Two facts with their condition (review LOW 3): another cma= parameter keeps CMA, and the smaller layout needs --fit auto.
+    assert 'cma=' in cma.fix and '/proc/cmdline' in cma.fix
+    assert '--fit auto' in cma.fix and '--fit off' in cma.fix
+    assert checks['memory-available'].detail.startswith('82.2 GiB'), checks['memory-available']
+    # 1 GiB or less of free CMA (the test machine: 0 kB, or no CmaFree line): no check line, the other checks as before.
+    for extra, available in (('CmaTotal: 0 kB\nCmaFree: 0 kB\n', '95.4 GiB'), ('CmaFree: 1048576 kB\n', '94.4 GiB'),
+                             ('', '95.4 GiB')):
+        (host.proc / 'meminfo').write_text(base + extra)
+        checks = {r.id: r for r in doctor.run_checks(host, s)}
+        assert 'memory-cma' not in checks
+        assert checks['memory-available'].detail.startswith(available), checks['memory-available']
