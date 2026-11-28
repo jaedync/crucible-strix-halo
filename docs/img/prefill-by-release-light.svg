@@ -1,8 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 286" width="480" height="286" role="img" aria-label="Line chart: Cold prefill of a 32K prompt, by release, in tokens per second: 4.05 bpw from 1,613 at v0.26.0 to 1,955 at v0.39.0; 3.05 bpw from 1,628 at v0.26.0 to 1,967 at v0.39.0. Oct 27 to Nov 25, 2026." font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif">
-<title>Line chart: Cold prefill of a 32K prompt, by release, in tokens per second: 4.05 bpw from 1,613 at v0.26.0 to 1,955 at v0.39.0; 3.05 bpw from 1,628 at v0.26.0 to 1,967 at v0.39.0. Oct 27 to Nov 25, 2026.</title>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 286" width="480" height="286" role="img" aria-label="Line chart: Cold prefill of a 32K prompt, by release, in tokens per second: 4.05 bpw from 1,741 at v0.30.0 to 1,972 at v0.40.0; 3.05 bpw from 1,843 at v0.30.0 to 1,982 at v0.40.0. Oct 31 to Nov 28, 2026." font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif">
+<title>Line chart: Cold prefill of a 32K prompt, by release, in tokens per second: 4.05 bpw from 1,741 at v0.30.0 to 1,972 at v0.40.0; 3.05 bpw from 1,843 at v0.30.0 to 1,982 at v0.40.0. Oct 31 to Nov 28, 2026.</title>
 <rect x="0.5" y="0.5" width="479" height="285" rx="6" fill="#ffffff" stroke="#d1d9e0"/>
 <text x="16" y="29" font-size="17" font-weight="600" fill="#1f2328">Cold prefill of a 32K prompt, by release</text>
-<text x="16" y="50" font-size="15" fill="#59636e">Oct 27 to Nov 25, 2026 · median of 2 runs</text>
+<text x="16" y="50" font-size="15" fill="#59636e">Oct 31 to Nov 28, 2026 · median of 2 runs</text>
 <line x1="52" y1="238.0" x2="402" y2="238.0" stroke="#e6eaef" stroke-width="1"/>
 <text x="44" y="243.0" font-size="15" text-anchor="end" fill="#59636e">0</text>
 <line x1="52" y1="205.2" x2="402" y2="205.2" stroke="#e6eaef" stroke-width="1"/>
@@ -16,37 +16,37 @@
 <line x1="52" y1="74.0" x2="402" y2="74.0" stroke="#e6eaef" stroke-width="1"/>
 <text x="44" y="79.0" font-size="15" text-anchor="end" fill="#59636e">2,500</text>
 <text x="464" y="29" font-size="15" text-anchor="end" fill="#59636e">tok/s</text>
-<text x="82.0" y="258" font-size="15" text-anchor="middle" fill="#59636e">v0.26</text>
-<text x="123.4" y="258" font-size="15" text-anchor="middle" fill="#59636e">v0.30</text>
-<text x="164.9" y="258" font-size="15" text-anchor="middle" fill="#59636e">v0.31</text>
-<text x="206.3" y="258" font-size="15" text-anchor="middle" fill="#59636e">v0.32</text>
-<text x="247.7" y="258" font-size="15" text-anchor="middle" fill="#59636e">v0.33</text>
-<text x="289.1" y="258" font-size="15" text-anchor="middle" fill="#59636e">v0.34</text>
-<text x="330.6" y="258" font-size="15" text-anchor="middle" fill="#59636e">v0.38</text>
-<text x="372.0" y="258" font-size="15" text-anchor="middle" fill="#59636e">v0.39</text>
+<text x="82.0" y="258" font-size="15" text-anchor="middle" fill="#59636e">v0.30</text>
+<text x="123.4" y="258" font-size="15" text-anchor="middle" fill="#59636e">v0.31</text>
+<text x="164.9" y="258" font-size="15" text-anchor="middle" fill="#59636e">v0.32</text>
+<text x="206.3" y="258" font-size="15" text-anchor="middle" fill="#59636e">v0.33</text>
+<text x="247.7" y="258" font-size="15" text-anchor="middle" fill="#59636e">v0.34</text>
+<text x="289.1" y="258" font-size="15" text-anchor="middle" fill="#59636e">v0.38</text>
+<text x="330.6" y="258" font-size="15" text-anchor="middle" fill="#59636e">v0.39</text>
+<text x="372.0" y="258" font-size="15" text-anchor="middle" fill="#59636e">v0.40</text>
 <text x="227.0" y="276" font-size="15" text-anchor="middle" fill="#59636e">release</text>
-<polyline points="82.0,132.2 123.4,123.8 164.9,122.3 206.3,117.2 247.7,116.6 289.1,117.9 330.6,114.5 372.0,109.8" fill="none" stroke="#c45a2d" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
-<circle cx="82.0" cy="132.2" r="4" fill="#c45a2d"/>
-<circle cx="123.4" cy="123.8" r="4" fill="#c45a2d"/>
-<circle cx="164.9" cy="122.3" r="4" fill="#c45a2d"/>
-<circle cx="206.3" cy="117.2" r="4" fill="#c45a2d"/>
-<circle cx="247.7" cy="116.6" r="4" fill="#c45a2d"/>
-<circle cx="289.1" cy="117.9" r="4" fill="#c45a2d"/>
-<circle cx="330.6" cy="114.5" r="4" fill="#c45a2d"/>
-<circle cx="372.0" cy="109.8" r="4" fill="#c45a2d"/>
-<text x="82.0" y="155.2" font-size="15" font-weight="600" text-anchor="middle" fill="#1f2328">1,613</text>
-<text x="360.0" y="132.8" font-size="15" font-weight="600" text-anchor="start" fill="#1f2328">1,955</text>
-<text x="411" y="124.4" font-size="15" font-weight="600" fill="#c45a2d">4.05 bpw</text>
-<polyline points="82.0,131.2 123.4,117.1 164.9,116.1 206.3,115.5 247.7,115.3 289.1,114.9 330.6,113.2 372.0,109.0" fill="none" stroke="#44576b" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7 4"/>
-<rect x="78.5" y="127.7" width="7" height="7" fill="#ffffff" stroke="#44576b" stroke-width="2"/>
-<rect x="119.9" y="113.6" width="7" height="7" fill="#ffffff" stroke="#44576b" stroke-width="2"/>
-<rect x="161.4" y="112.6" width="7" height="7" fill="#ffffff" stroke="#44576b" stroke-width="2"/>
-<rect x="202.8" y="112.0" width="7" height="7" fill="#ffffff" stroke="#44576b" stroke-width="2"/>
-<rect x="244.2" y="111.8" width="7" height="7" fill="#ffffff" stroke="#44576b" stroke-width="2"/>
-<rect x="285.6" y="111.4" width="7" height="7" fill="#ffffff" stroke="#44576b" stroke-width="2"/>
-<rect x="327.1" y="109.7" width="7" height="7" fill="#ffffff" stroke="#44576b" stroke-width="2"/>
-<rect x="368.5" y="105.5" width="7" height="7" fill="#ffffff" stroke="#44576b" stroke-width="2"/>
-<text x="82.0" y="119.2" font-size="15" font-weight="600" text-anchor="middle" fill="#1f2328">1,628</text>
-<text x="360.0" y="97.0" font-size="15" font-weight="600" text-anchor="start" fill="#1f2328">1,967</text>
-<text x="411" y="104.4" font-size="15" font-weight="600" fill="#44576b">3.05 bpw</text>
+<polyline points="82.0,123.8 123.4,122.3 164.9,117.2 206.3,116.6 247.7,117.9 289.1,114.5 330.6,109.8 372.0,108.6" fill="none" stroke="#c45a2d" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="82.0" cy="123.8" r="4" fill="#c45a2d"/>
+<circle cx="123.4" cy="122.3" r="4" fill="#c45a2d"/>
+<circle cx="164.9" cy="117.2" r="4" fill="#c45a2d"/>
+<circle cx="206.3" cy="116.6" r="4" fill="#c45a2d"/>
+<circle cx="247.7" cy="117.9" r="4" fill="#c45a2d"/>
+<circle cx="289.1" cy="114.5" r="4" fill="#c45a2d"/>
+<circle cx="330.6" cy="109.8" r="4" fill="#c45a2d"/>
+<circle cx="372.0" cy="108.6" r="4" fill="#c45a2d"/>
+<text x="82.0" y="146.8" font-size="15" font-weight="600" text-anchor="middle" fill="#1f2328">1,741</text>
+<text x="360.0" y="131.6" font-size="15" font-weight="600" text-anchor="start" fill="#1f2328">1,972</text>
+<text x="411" y="123.3" font-size="15" font-weight="600" fill="#c45a2d">4.05 bpw</text>
+<polyline points="82.0,117.1 123.4,116.1 164.9,115.5 206.3,115.3 247.7,114.9 289.1,113.2 330.6,109.0 372.0,108.0" fill="none" stroke="#44576b" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7 4"/>
+<rect x="78.5" y="113.6" width="7" height="7" fill="#ffffff" stroke="#44576b" stroke-width="2"/>
+<rect x="119.9" y="112.6" width="7" height="7" fill="#ffffff" stroke="#44576b" stroke-width="2"/>
+<rect x="161.4" y="112.0" width="7" height="7" fill="#ffffff" stroke="#44576b" stroke-width="2"/>
+<rect x="202.8" y="111.8" width="7" height="7" fill="#ffffff" stroke="#44576b" stroke-width="2"/>
+<rect x="244.2" y="111.4" width="7" height="7" fill="#ffffff" stroke="#44576b" stroke-width="2"/>
+<rect x="285.6" y="109.7" width="7" height="7" fill="#ffffff" stroke="#44576b" stroke-width="2"/>
+<rect x="327.1" y="105.5" width="7" height="7" fill="#ffffff" stroke="#44576b" stroke-width="2"/>
+<rect x="368.5" y="104.5" width="7" height="7" fill="#ffffff" stroke="#44576b" stroke-width="2"/>
+<text x="82.0" y="105.1" font-size="15" font-weight="600" text-anchor="middle" fill="#1f2328">1,843</text>
+<text x="360.0" y="96.0" font-size="15" font-weight="600" text-anchor="start" fill="#1f2328">1,982</text>
+<text x="411" y="103.3" font-size="15" font-weight="600" fill="#44576b">3.05 bpw</text>
 </svg>

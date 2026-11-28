@@ -66,6 +66,18 @@ class Sampler {
     for (const auto& s : samples_) f += s.mhz;
     return f / samples_.size();
   }
+  double MeanWatts() const {
+    if (samples_.empty()) return 0;
+    double p = 0;
+    for (const auto& s : samples_) p += s.watts;
+    return p / samples_.size();
+  }
+  double MaxTemp() const {
+    double t = 0;
+    for (const auto& s : samples_) t = std::max(t, s.temp_c);
+    return t;
+  }
+  size_t Count() const { return samples_.size(); }
 
  private:
   struct Sample {

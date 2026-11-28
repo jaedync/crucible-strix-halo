@@ -25,8 +25,8 @@
 #   it makes a replaced release file visible as a commit on main (who replaces SHA256SUMS must change this line too);
 #   it does not protect against a person who can push to main.
 # An empty pin gives a WARN line; a pin that is present and does not match stops the install (exit 4).
-PIN_TAG="v0.39.0"
-PIN_SUMS_SHA256="162703430ce0ba4d58f31e737bb21662bbf30f2e8d95456bc834e24cc4744b96"
+PIN_TAG="v0.40.0"
+PIN_SUMS_SHA256=""
 REPO_URL_DEFAULT="https://github.com/jaedync/crucible-strix-halo.git"
 RELEASE_BASE_DEFAULT="https://github.com/jaedync/crucible-strix-halo/releases/download"
 GPU_ARCH_NAME="gfx1151"

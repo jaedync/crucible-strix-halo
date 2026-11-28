@@ -28,9 +28,9 @@ def test_v0381_is_the_newest_release_above_v0380() -> None:
     heads = [line for line in TEXT.splitlines() if line.startswith("## ")]
     releases = [line for line in heads if line != "## Unreleased"]
     assert heads[: len(heads) - len(releases)] in ([], ["## Unreleased"])
-    # The next release (v0.39.0) can stand above v0.38.1.
+    # The next releases (v0.39.0, then v0.40.0) can stand above v0.38.1.
     i = releases.index(HEAD)
-    assert releases[:i] in ([], ["## v0.39.0 (2026-11-26)"])
+    assert releases[:i] in ([], ["## v0.39.0 (2026-11-26)"], ["## v0.40.0 (2026-11-28)", "## v0.39.0 (2026-11-26)"])
     assert releases[i : i + 3] == [HEAD, "## v0.38.0 (2026-11-19)", "## v0.37.3 (2026-11-17)"]
 
 

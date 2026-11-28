@@ -386,3 +386,45 @@ dec_code	4.05	long	250	62.2	tok/s	v0.39.0	2026-11-25	balanced	1	plain positions	
 dec_code	4.05	long	490	65.8	tok/s	v0.39.0	2026-11-25	balanced	1	YaRN	stand-eval:764eec220bb2f827813baa42c0724a2b4f5617ff:blocks/long/cells.json
 dec_tool	4.05	long	250	104.3	tok/s	v0.39.0	2026-11-25	balanced	1	plain positions	stand-eval:764eec220bb2f827813baa42c0724a2b4f5617ff:blocks/long/cells.json
 dec_tool	4.05	long	490	98.6	tok/s	v0.39.0	2026-11-25	balanced	1	YaRN	stand-eval:764eec220bb2f827813baa42c0724a2b4f5617ff:blocks/long/cells.json
+cold32_ttft	4.05	default		15.9	s	v0.40.0	2026-11-27	balanced	6		stand-eval:b665aa683319:table/cells.json
+cold32_ttft	3.05	default		15.7	s	v0.40.0	2026-11-27	balanced	6		stand-eval:b665aa683319:table/cells.json
+cold130_ttft	4.05	default		67.2	s	v0.40.0	2026-11-27	balanced	6		stand-eval:b665aa683319:table/cells.json
+cold130_ttft	3.05	default		66.4	s	v0.40.0	2026-11-27	balanced	6		stand-eval:b665aa683319:table/cells.json
+resend32	4.05	default		0.009	s	v0.40.0	2026-11-27	balanced	6		stand-eval:b665aa683319:table/cells.json
+resend32	3.05	default		0.009	s	v0.40.0	2026-11-27	balanced	6		stand-eval:b665aa683319:table/cells.json
+dec32_code	4.05	default		74.0	tok/s	v0.40.0	2026-11-27	balanced	3		stand-eval:b665aa683319:table/cells.json
+dec32_code	3.05	default		77.7	tok/s	v0.40.0	2026-11-27	balanced	3		stand-eval:b665aa683319:table/cells.json
+dec32_prose	4.05	default		59.6	tok/s	v0.40.0	2026-11-27	balanced	3		stand-eval:b665aa683319:table/cells.json
+dec32_prose	3.05	default		63.6	tok/s	v0.40.0	2026-11-27	balanced	3		stand-eval:b665aa683319:table/cells.json
+dec4	4.05	default		115.2	tok/s	v0.40.0	2026-11-27	balanced	6		stand-eval:b665aa683319:table/cells.json
+dec4	3.05	default		127.3	tok/s	v0.40.0	2026-11-27	balanced	6		stand-eval:b665aa683319:table/cells.json
+ctx_prefill	4.05	default	32	1978	tok/s	v0.40.0	2026-11-27	balanced	2		stand-eval:b665aa683319:blocks/summary.json
+ctx_prefill	4.05	default	64	1959	tok/s	v0.40.0	2026-11-27	balanced	2		stand-eval:b665aa683319:blocks/summary.json
+ctx_prefill	4.05	default	128	1923	tok/s	v0.40.0	2026-11-27	balanced	2		stand-eval:b665aa683319:blocks/summary.json
+ctx_prefill	4.05	default	192	1881	tok/s	v0.40.0	2026-11-27	balanced	2		stand-eval:b665aa683319:blocks/summary.json
+ctx_prefill	4.05	default	250	1753	tok/s	v0.40.0	2026-11-27	balanced	2		stand-eval:b665aa683319:blocks/summary.json
+ctx_prefill	3.05	default	32	1996	tok/s	v0.40.0	2026-11-27	balanced	2		stand-eval:b665aa683319:blocks/summary.json
+ctx_prefill	3.05	default	64	1980	tok/s	v0.40.0	2026-11-27	balanced	2		stand-eval:b665aa683319:blocks/summary.json
+ctx_prefill	3.05	default	128	1945	tok/s	v0.40.0	2026-11-27	balanced	2		stand-eval:b665aa683319:blocks/summary.json
+ctx_prefill	3.05	default	192	1900	tok/s	v0.40.0	2026-11-28	balanced	2		stand-eval:b665aa683319:blocks/summary.json
+ctx_prefill	3.05	default	250	1785	tok/s	v0.40.0	2026-11-28	balanced	2		stand-eval:b665aa683319:blocks/summary.json
+ctx_decode	4.05	default	32	65.4	tok/s	v0.40.0	2026-11-27	balanced	2	6 samples	stand-eval:b665aa683319:blocks/summary.json
+ctx_decode	4.05	default	64	65.0	tok/s	v0.40.0	2026-11-27	balanced	2	4 samples	stand-eval:b665aa683319:blocks/summary.json
+ctx_decode	4.05	default	128	66.1	tok/s	v0.40.0	2026-11-27	balanced	2	6 samples	stand-eval:b665aa683319:blocks/summary.json
+ctx_decode	4.05	default	192	65.2	tok/s	v0.40.0	2026-11-27	balanced	2	5 samples	stand-eval:b665aa683319:blocks/summary.json
+ctx_decode	4.05	default	250	63.6	tok/s	v0.40.0	2026-11-27	balanced	2	6 samples	stand-eval:b665aa683319:blocks/summary.json
+ctx_decode	3.05	default	32	77.4	tok/s	v0.40.0	2026-11-27	balanced	2	4 samples	stand-eval:b665aa683319:blocks/summary.json
+ctx_decode	3.05	default	64	78.7	tok/s	v0.40.0	2026-11-27	balanced	2	4 samples	stand-eval:b665aa683319:blocks/summary.json
+ctx_decode	3.05	default	128	71.4	tok/s	v0.40.0	2026-11-27	balanced	2	6 samples	stand-eval:b665aa683319:blocks/summary.json
+ctx_decode	3.05	default	192	72.1	tok/s	v0.40.0	2026-11-28	balanced	2	4 samples	stand-eval:b665aa683319:blocks/summary.json
+ctx_decode	3.05	default	250	71.0	tok/s	v0.40.0	2026-11-28	balanced	2	5 samples	stand-eval:b665aa683319:blocks/summary.json
+cold32_prefill	4.05	default		1972	tok/s	v0.40.0	2026-11-28	balanced	2	release ladder (prompts of the v0.33.0 ladder), not the standing eval texts	stand-eval:b665aa683319:blocks/summary.json
+cold32_prefill	3.05	default		1982	tok/s	v0.40.0	2026-11-28	balanced	2	release ladder (prompts of the v0.33.0 ladder), not the standing eval texts	stand-eval:b665aa683319:blocks/summary.json
+cold_ttft	4.05	long	250	142.6	s	v0.40.0	2026-11-28	balanced	1	plain positions	stand-eval:b665aa683319:blocks/long/cells.json
+cold_ttft	4.05	long	490	326.9	s	v0.40.0	2026-11-28	balanced	1	YaRN	stand-eval:b665aa683319:blocks/long/cells.json
+cold_prefill	4.05	long	250	1752.9	tok/s	v0.40.0	2026-11-28	balanced	1	plain positions	stand-eval:b665aa683319:blocks/long/cells.json
+cold_prefill	4.05	long	490	1495.5	tok/s	v0.40.0	2026-11-28	balanced	1	YaRN	stand-eval:b665aa683319:blocks/long/cells.json
+dec_code	4.05	long	250	61.9	tok/s	v0.40.0	2026-11-28	balanced	1	plain positions	stand-eval:b665aa683319:blocks/long/cells.json
+dec_code	4.05	long	490	65.6	tok/s	v0.40.0	2026-11-28	balanced	1	YaRN	stand-eval:b665aa683319:blocks/long/cells.json
+dec_tool	4.05	long	250	103.6	tok/s	v0.40.0	2026-11-28	balanced	1	plain positions	stand-eval:b665aa683319:blocks/long/cells.json
+dec_tool	4.05	long	490	98.6	tok/s	v0.40.0	2026-11-28	balanced	1	YaRN	stand-eval:b665aa683319:blocks/long/cells.json

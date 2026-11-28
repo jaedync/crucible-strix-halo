@@ -30,7 +30,10 @@ def test_v0390_is_the_newest_release_above_v0381() -> None:
     heads = [line for line in TEXT.splitlines() if line.startswith("## ")]
     releases = [line for line in heads if line != "## Unreleased"]
     assert heads[: len(heads) - len(releases)] in ([], ["## Unreleased"])
-    assert releases[:3] == [HEAD, "## v0.38.1 (2026-11-23)", "## v0.38.0 (2026-11-19)"]
+    # The next release (v0.40.0) can stand above v0.39.0.
+    i = releases.index(HEAD)
+    assert releases[:i] in ([], ["## v0.40.0 (2026-11-28)"])
+    assert releases[i : i + 3] == [HEAD, "## v0.38.1 (2026-11-23)", "## v0.38.0 (2026-11-19)"]
 
 
 def test_the_section_has_an_intro_and_the_topic_sections() -> None:

@@ -227,6 +227,11 @@ struct Fixture {
     LaunchPrefillMoePcEngine(set.Kmax(), a, lead);
   }
   void PcDown() { LaunchPrefillMoePcDownEngine(set.Kmax(), a.g_down, a.i_down, a.item_counts + 1); }
+  // moe-lds: the engine's fat gate/up kernel with the old 32-word A plane skew (the same bytes on other LDS banks).
+  void PcGateUpPlane32(int lead = kTileFxLead) {
+    Plan(kTileRows);
+    LaunchPrefillMoePcFatPair<kTileMutPlane32>(set.Kmax(), a, lead);
+  }
   template <int MUT = 0> void TileDown() {
     if constexpr (MUT == 0) LaunchPrefillMoeTileDown(set.Kmax(), a.g_down, a.i_down, a.item_counts + 1);
     else if (set.Kmax() == 6) PrefillMoeTileDownKernel<6, MUT><<<1024, 256>>>(a.g_down, a.i_down, a.item_counts + 1);
@@ -635,21 +640,322 @@ void PrintResources() {
   std::printf("resources TileDown<6> vgpr=%d max-threads=%d lds=%zu scratch=%zu\n", at.numRegs, at.maxThreadsPerBlock,
               at.sharedSizeBytes, at.localSizeBytes);
 }
+// p1-decode and p1-critpath: arms of the engine's MoE expert
+// kernels (the fat gate/up kernel and the tile down kernel, KMAX 6), each measured against the engine kernels (base).
+// One harness, two arm tables: `dec` (exact variants and levers; rule equal: their bytes must be trunk's) and `crit`
+// (removal mutants; rule info: wrong outputs on purpose, the time they save bounds the cost they remove).
+// Arm names say what the arm runs in this build (kTileDecodeSched, engine/layers/prefill_moe_tile.h):
+// - base, aa: the engine kernels (aa: base again, the noise floor). Since p1-decsw they run the scheduled decode.
+// - old (switch on) or sched (switch off): the other form of the decode switch (MUT kMutDecodeSched): with the switch on
+//   it is the old decode, a reference arm (not a lever); with the switch off it is the scheduled decode variant.
+// - sched-p0, sched-d3, early, early1, early2: the scheduled decode (kMutDecodeNew) with one more exact change.
+// Each arm prints a crit-arm line with the decode form of its two kernels (sched, old or none), so a read-out
+// does not take a reference arm for a lever.
+using DecFn = void (*)(Fixture&);
+template <int MUT, int D = kPcDepth, int PRIO = kPcPrio> void DecGu(Fixture& f) {
+  if constexpr (MUT == 0 && D == kPcDepth && PRIO == kPcPrio) LaunchPrefillMoePcEngine(6, f.a, kTileFxLead);
+  else PrefillMoePcFatPairKernel<6, MUT, kPcFatXDist, D, PRIO><<<512, 32 * kFatPairWaves>>>(f.a, kTileFxLead);
+}
+template <int MUT> void DecDown(Fixture& f) {
+  if constexpr (MUT == 0) f.PcDown();
+  else PrefillMoeTileDownKernel<6, MUT><<<1024, 256>>>(f.a.g_down, f.a.i_down, f.a.item_counts + 1);
+}
+// The decode form of a kernel MUT: none (the decode or the whole producer removed), sched or old.
+template <int G> constexpr const char* GuDecode() {
+  return G == kPcMutNoDecode || PcBareProducer(G) ? "none" : TileSched<G>() ? "sched" : "old";
+}
+template <int D> constexpr const char* DownDecode() {
+  return D == kTileMutNoDecode || D == kTileMutBare ? "none" : TileSched<D>() ? "sched" : "old";
+}
+// The name of the arm with MUT kMutDecodeSched in both kernels (the other form of the switch).
+constexpr const char* kDecSwitchArm = kTileDecodeSched ? "old" : "sched";
+struct DecArm {
+  const char* name;
+  DecFn gu, down;
+  const void *gk, *dk;  // the kernels (resources)
+  const char* rule;     // byte rule: equal (trunk's bytes) or info (wrong outputs on purpose)
+  const char *gdec, *ddec;  // the decode form of the gate/up and the down kernel
+};
+// G, GD, GP: the gate/up MUT, producer depth and producer priority; D: the down MUT.
+template <int G, int D, int GD = kPcDepth, int GP = kPcPrio> DecArm MakeDecArm(const char* name, const char* rule) {
+  return {name, DecGu<G, GD, GP>, DecDown<D>,
+          reinterpret_cast<const void*>(PrefillMoePcFatPairKernel<6, G, kPcFatXDist, GD, GP>),
+          reinterpret_cast<const void*>(PrefillMoeTileDownKernel<6, D>), rule, GuDecode<G>(), DownDecode<D>()};
+}
+const std::vector<DecArm>& DecArms() {
+  static const std::vector<DecArm> arms = {
+      MakeDecArm<0, 0>("base", "equal"),
+      MakeDecArm<0, 0>("aa", "equal"),
+      MakeDecArm<kMutDecodeSched, kMutDecodeSched>(kDecSwitchArm, "equal"),
+      MakeDecArm<kPcMutNoDecode, kTileMutNoDecode>("nodecode", "info"),
+      // the scheduled decode with the gate/up producers at priority 0 or at register depth 3, and the down kernel with
+      // the early fragment reads (all exact)
+      MakeDecArm<kMutDecodeNew, kMutDecodeNew, kPcDepth, 0>("sched-p0", "equal"),
+      MakeDecArm<kMutDecodeNew, kMutDecodeNew, 3, kPcPrio>("sched-d3", "equal"),
+      MakeDecArm<kMutDecodeNew, kMutDecodeEarly>("early", "equal"),
+      // early with fewer fragments read before the decode (1 or 2 A fragments and the first B fragment)
+      MakeDecArm<kMutDecodeNew, kMutDecodeEarly1>("early1", "equal"),
+      MakeDecArm<kMutDecodeNew, kMutDecodeEarly2>("early2", "equal"),
+  };
+  return arms;
+}
+// p1-critpath: each mutant removes one cost and keeps the rest (the comments at kPcMutNoDecode .. kPcMutNoPad).
+const std::vector<DecArm>& CritArms() {
+  static const std::vector<DecArm> arms = {
+      MakeDecArm<0, 0>("base", "equal"),
+      MakeDecArm<0, 0>("aa", "equal"),
+      MakeDecArm<kPcMutNoDecode, kTileMutNoDecode>("nodecode", "info"),  // raw weight words stored, no decode VALU
+      MakeDecArm<kPcMutNoStage, 0>("nostage", "info"),                   // gate/up epilogue stage stores skipped
+      MakeDecArm<kPcMutNoPad, 0>("nopad", "info"),                       // stage stores with no bank conflict
+      MakeDecArm<kPcMutNoOut, kTileMutNoStore>("noout", "info"),         // gate/up xd and down pd stores skipped
+      MakeDecArm<kPcMutNoSync, kTileMutNoSync>("nosync", "info"),        // k-loop barriers removed in all waves
+      MakeDecArm<kPcMutBare, kTileMutBare>("bare", "info"),              // ref: producers take only the barriers
+      MakeDecArm<kPcMutWmmaOnly, kTileMutBare>("wmma", "info"),          // ref floor: WMMAs and barriers only
+  };
+  return arms;
+}
+double DecEpochS() {
+  return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+void DecResources(const std::vector<DecArm>& arms) {
+  std::printf("crit-switch kTileDecodeSched=%d switch-arm=%s\n", (int)kTileDecodeSched, kDecSwitchArm);
+  for (const auto& arm : arms) {
+    std::printf("crit-arm arm=%s gateup-decode=%s down-decode=%s rule=%s\n", arm.name, arm.gdec, arm.ddec, arm.rule);
+    for (int k = 0; k < 2; ++k) {
+      hipFuncAttributes at{};
+      HIP_OK(hipFuncGetAttributes(&at, k == 0 ? arm.gk : arm.dk));
+      std::printf("crit-res arm=%s kernel=%s vgpr=%d lds=%zu scratch=%zu\n", arm.name, k == 0 ? "gateup" : "down",
+                  at.numRegs, at.sharedSizeBytes, at.localSizeBytes);
+    }
+  }
+  std::fflush(stdout);
+}
+// Bytes: trunk's RM6 path gives xd and pd; each arm runs gate/up (its xd), then down on trunk's xd (its pd). Rules:
+// equal (a pass condition), differ (a pass condition: the check sees a change), info (no condition). Twice per arm, so
+// a variant with a race shows it.
+bool DecCheck(Fixture& f, const char* tag, const std::vector<DecArm>& arms) {
+  const char* name = f.set.name;
+  f.xd.Nan(); f.pd.Nan(); f.xg.Nan(); f.xu.Nan();
+  f.TrunkGateUp(); f.TrunkDown(); CheckLaunch();
+  const auto xref = f.xd.Get(), pref = f.PdWritten(f.pd.Get());
+  bool ok = Unwritten(xref) == 0 && Unwritten(pref) == 0;
+  std::printf("crit-check set=%s R=%d routing=%s variant=trunk unwritten-xd=%zu unwritten-pd=%zu xd-hash=%016llx "
+              "pd-hash=%016llx %s\n", name, f.R, tag, Unwritten(xref), Unwritten(pref), Fnv(xref), Fnv(pref),
+              ok ? "PASS" : "FAIL");
+  auto arm = [&](const char* variant, DecFn gu, DecFn down, const char* rule) {
+    f.xd.Nan(); f.pd.Nan();
+    f.Plan(kTileRows);
+    gu(f); CheckLaunch();
+    const auto xd = f.xd.Get();
+    HIP_OK(hipMemcpy(f.xd.p, xref.data(), xref.size() * sizeof(__half), hipMemcpyHostToDevice));
+    down(f); CheckLaunch();
+    const auto pdv = f.PdWritten(f.pd.Get());
+    const size_t dx = DiffCount(xd, xref), dp = DiffCount(pdv, pref);
+    bool pass = true;
+    if (!std::strcmp(rule, "equal")) pass = dx == 0 && dp == 0 && Unwritten(xd) == 0 && Unwritten(pdv) == 0;
+    if (!std::strcmp(rule, "differ")) pass = dx + dp > 0;
+    ok = ok && pass;
+    std::printf("crit-check set=%s R=%d routing=%s variant=%s xd-diff=%zu/%zu pd-diff=%zu/%zu unwritten-xd=%zu "
+                "unwritten-pd=%zu xd-hash=%016llx pd-hash=%016llx rule=%s %s\n", name, f.R, tag, variant, dx, xd.size(),
+                dp, pdv.size(), Unwritten(xd), Unwritten(pdv), Fnv(xd), Fnv(pdv), rule, pass ? "PASS" : "FAIL");
+  };
+  for (int rep = 0; rep < 2; ++rep)
+    for (const auto& a : arms) arm(a.name, a.gu, a.down, a.rule);
+  arm("mut-korder-down", DecGu<0>, DecDown<3>, "differ");
+  arm("mut-korder-gateup", DecGu<3>, DecDown<0>, "differ");
+  std::printf("crit-checks set=%s R=%d routing=%s %s\n", name, f.R, tag, ok ? "PASS" : "FAIL");
+  std::fflush(stdout);
+  return ok;
+}
+struct DecRow {
+  double g, d, t0, t1, mhz, watts, temp;
+};
+// One measure of an arm: gate/up, then down, each a cold median of 7 (ColdTimePre: MALL flushed, the plan kernel
+// before the timer), with the hwmon clock, power and temperature of the measure.
+DecRow DecMeasure(Fixture& f, const DecArm& arm, const gm::ColdCache& cold) {
+  auto plan = [&] { f.Plan(kTileRows); };
+  DecRow r{};
+  bench::Sampler s;
+  r.t0 = DecEpochS();
+  s.Start();
+  r.g = ColdTimePre(plan, [&] { arm.gu(f); }, cold);
+  r.d = ColdTimePre(plan, [&] { arm.down(f); }, cold);
+  s.Stop();
+  r.t1 = DecEpochS();
+  r.mhz = s.MeanMhz(); r.watts = s.MeanWatts(); r.temp = s.MaxTemp();
+  return r;
+}
+// ABAB: in pair p, base and arm m one after the other; the order flips with the parity of p + m.
+void DecTime(Fixture& f, const char* tag, int pairs, double settle, const std::vector<DecArm>& arms) {
+  const auto cold = gm::MakeColdCache();
+  // Settle (SETTLE_S seconds, default 20): the base arm in a loop first, so the ABAB starts at the steady power
+  // limit (the first run of Nov 26 started at 105 to 113 W and its first 3 pairs carried the A/A outlier).
+  {
+    bench::Sampler s;
+    int calls = 0;
+    const double t0 = DecEpochS();
+    s.Start();
+    while (DecEpochS() - t0 < settle) {
+      gm::Flush(&cold);
+      f.Plan(kTileRows);
+      arms[0].gu(f);
+      f.Plan(kTileRows);
+      arms[0].down(f);
+      HIP_OK(hipDeviceSynchronize());
+      ++calls;
+    }
+    CheckLaunch();
+    s.Stop();
+    std::printf("crit-settle set=%s R=%d routing=%s secs=%.1f calls=%d sclk=%.0f pwr=%.1f temp=%.0f\n", f.set.name, f.R,
+                tag, settle, calls, s.MeanMhz(), s.MeanWatts(), s.MaxTemp());
+  }
+  for (const auto& a : arms) DecMeasure(f, a, cold);  // warm-up of each arm at this shape
+  auto row = [&](int p, const DecArm& a, const char* vs, int slot, const DecRow& r) {
+    std::printf("crit-row set=%s R=%d routing=%s pair=%d arm=%s vs=%s slot=%d gateup=%.4f down=%.4f t0=%.3f t1=%.3f "
+                "sclk=%.0f pwr=%.1f temp=%.0f\n", f.set.name, f.R, tag, p, a.name, vs, slot, r.g, r.d, r.t0, r.t1, r.mhz,
+                r.watts, r.temp);
+  };
+  for (int p = 0; p < pairs; ++p) {
+    for (size_t m = 1; m < arms.size(); ++m) {
+      const bool base_first = (p + m) % 2 == 0;
+      const DecArm& first = base_first ? arms[0] : arms[m];
+      const DecArm& second = base_first ? arms[m] : arms[0];
+      const DecRow r0 = DecMeasure(f, first, cold), r1 = DecMeasure(f, second, cold);
+      row(p, first, arms[m].name, 0, r0);
+      row(p, second, arms[m].name, 1, r1);
+    }
+    std::fflush(stdout);
+  }
+  cold.Free();
+}
+// Clock and power: each arm of ORDER in a loop for SECS seconds (flush, plan, gate/up, plan, down), base between the
+// others.
+void DecPower(Fixture& f, const char* tag, double secs, const std::vector<DecArm>& arms,
+              const std::vector<const char*>& order) {
+  const auto cold = gm::MakeColdCache();
+  int idx = 0;
+  for (const char* want : order) {
+    const DecArm* arm = nullptr;
+    for (const auto& a : arms) if (!std::strcmp(a.name, want)) arm = &a;
+    if (!arm) continue;
+    bench::EventTimer t;
+    std::vector<double> g, d;
+    bench::Sampler s;
+    const double t0 = DecEpochS();
+    s.Start();
+    while (DecEpochS() - t0 < secs) {
+      gm::Flush(&cold);
+      f.Plan(kTileRows);
+      HIP_OK(hipDeviceSynchronize());
+      t.Begin();
+      arm->gu(f);
+      g.push_back(t.EndMs());
+      f.Plan(kTileRows);
+      HIP_OK(hipDeviceSynchronize());
+      t.Begin();
+      arm->down(f);
+      d.push_back(t.EndMs());
+    }
+    CheckLaunch();
+    s.Stop();
+    const double t1 = DecEpochS();
+    std::printf("crit-power set=%s R=%d routing=%s idx=%d arm=%s calls=%zu gateup=%.4f down=%.4f t0=%.3f t1=%.3f "
+                "sclk=%.0f pwr=%.1f temp=%.0f\n", f.set.name, f.R, tag, idx++, arm->name, g.size(), bench::Median(g),
+                bench::Median(d), t0, t1, s.MeanMhz(), s.MeanWatts(), s.MaxTemp());
+    std::fflush(stdout);
+  }
+  cold.Free();
+}
 }  // namespace
 
-// prefill_moe_tile check|time|timex ROWS SETS [uniform|skew|PATH@LAYER] [PAIRS]
+// moe-lds: the engine's MoE kernels (fat gate/up, tile down) with the A plane skew of the
+// switch (B: kTileAPlaneSkew16, 16 words) against the old 32-word skew (A: kTileMutPlane32). Bytes first: trunk's RM6
+// path, B and A give the same xd and pd (pd from trunk's xd), and a k-order mutant differs. Then ABAB cold timing,
+// the arm order flipped in every other pair. Exit 1 on a byte FAIL (no timing then).
+bool LdsCheck(Fixture& f, const char* tag) {
+  const char* name = f.set.name;
+  f.xd.Nan(); f.pd.Nan(); f.xg.Nan(); f.xu.Nan();
+  f.TrunkGateUp(); f.TrunkDown(); CheckLaunch();
+  const auto xref = f.xd.Get(), pref = f.PdWritten(f.pd.Get());
+  bool ok = Unwritten(xref) == 0 && Unwritten(pref) == 0;
+  std::printf("lds-check set=%s R=%d routing=%s variant=trunk unwritten-xd=%zu unwritten-pd=%zu xd-hash=%016llx "
+              "pd-hash=%016llx %s\n", name, f.R, tag, Unwritten(xref), Unwritten(pref), Fnv(xref), Fnv(pref),
+              ok ? "PASS" : "FAIL");
+  auto arm = [&](const char* variant, auto gateup, auto down, bool expect_equal) {
+    f.xd.Nan(); f.pd.Nan();
+    gateup(); CheckLaunch();
+    const auto xd = f.xd.Get();
+    HIP_OK(hipMemcpy(f.xd.p, xref.data(), xref.size() * sizeof(__half), hipMemcpyHostToDevice));
+    down(); CheckLaunch();
+    const auto pdv = f.PdWritten(f.pd.Get());
+    const size_t dx = DiffCount(xd, xref), dp = DiffCount(pdv, pref);
+    const bool pass = expect_equal ? dx == 0 && dp == 0 : dx + dp > 0;
+    ok = ok && pass;
+    std::printf("lds-check set=%s R=%d routing=%s variant=%s xd-diff=%zu/%zu pd-diff=%zu/%zu xd-hash=%016llx "
+                "pd-hash=%016llx expect=%s %s\n", name, f.R, tag, variant, dx, xd.size(), dp, pdv.size(), Fnv(xd),
+                Fnv(pdv), expect_equal ? "equal" : "differ", pass ? "PASS" : "FAIL");
+  };
+  arm(kTileAPlaneSkew16 ? "skew16" : "switch-skew32", [&] { f.PcGateUp(); }, [&] { f.PcDown(); }, true);
+  arm("skew32", [&] { f.PcGateUpPlane32(); }, [&] { f.TileDown<kTileMutPlane32>(); }, true);
+  arm("mut-korder-down", [&] { f.PcGateUp(); }, [&] { f.TileDown<3>(); }, false);
+  std::printf("lds-checks set=%s R=%d routing=%s %s\n", name, f.R, tag, ok ? "PASS" : "FAIL");
+  std::fflush(stdout);
+  return ok;
+}
+void LdsTime(Fixture& f, const char* tag, int pairs) {
+  const auto cold = gm::MakeColdCache();
+  const double scale = 48. * 32768 / f.R;
+  auto none = [] {};
+  auto plan = [&] { f.Plan(kTileRows); };
+  auto ga = [&] { return ColdTimePre(none, [&] { f.PcGateUpPlane32(); }, cold); };
+  auto gb = [&] { return ColdTimePre(none, [&] { f.PcGateUp(); }, cold); };
+  auto da = [&] { return ColdTimePre(plan, [&] { f.TileDown<kTileMutPlane32>(); }, cold); };
+  auto db = [&] { return ColdTimePre(plan, [&] { f.PcDown(); }, cold); };
+  ga(); gb(); da(); db();  // warm-up of each arm at this shape
+  std::vector<double> GA, GB, DA, DB;
+  bench::Sampler clocks;
+  clocks.Start();
+  for (int p = 0; p < pairs; ++p) {
+    if (p % 2 == 0) { GA.push_back(ga()); GB.push_back(gb()); DA.push_back(da()); DB.push_back(db()); }
+    else { GB.push_back(gb()); GA.push_back(ga()); DB.push_back(db()); DA.push_back(da()); }
+    std::printf("lds-abab set=%s R=%d routing=%s pair=%d gateup A=%.4f B=%.4f down A=%.4f B=%.4f ms-per-call\n",
+                f.set.name, f.R, tag, p, GA.back(), GB.back(), DA.back(), DB.back());
+    std::fflush(stdout);
+  }
+  clocks.Stop();
+  const double ma = bench::Median(GA), mb = bench::Median(GB), na = bench::Median(DA), nb = bench::Median(DB);
+  int gw = 0, dw = 0;
+  for (int p = 0; p < pairs; ++p) { gw += GB[p] < GA[p]; dw += DB[p] < DA[p]; }
+  const double sum_a = ma + na, sum_b = mb + nb;
+  std::printf("lds-result set=%s R=%d routing=%s gateup A=%.4f B=%.4f ms B/A=%.4f B-faster=%d/%d | down A=%.4f B=%.4f "
+              "ms B/A=%.4f B-faster=%d/%d | moe save=%.2f%% %.0f ms-per-32k\n", f.set.name, f.R, tag, ma, mb, mb / ma, gw,
+              pairs, na, nb, nb / na, dw, pairs, 100. * (sum_a - sum_b) / sum_a, (sum_a - sum_b) * scale);
+  std::printf("clocks-lds %s\n", clocks.Summary().c_str());
+  std::fflush(stdout);
+  cold.Free();
+}
+
+// prefill_moe_tile check|time|timex|lds|dec|crit ROWS SETS [uniform|skew|PATH@LAYER] [PAIRS] [SETTLE_S] [POWER_S]
+//   dec: p1-decode arms, crit: p1-critpath removal mutants (set 4/6 only; one harness):
+//   the switch and arm lines, resources, the byte check of every arm (twice), and only
+//   when every check passes a settle loop (SETTLE_S, default 20 s), ABAB of every arm against base, then the clock and
+//   power loops (POWER_S seconds per arm, default 0: none). After a byte FAIL the set has no timing rows (exit 1).
+//   SETTLE_S and POWER_S are arguments, not environment variables (tests/test_switch_ratchet.py: no new raw read).
+//   lds: moe-lds byte check (trunk = A plane skew of the switch = skew 32) and ABAB of the two skews (only KMAX 5 and 6
+//   sets). The switch kTileAPlaneSkew16 is off, so both lds arms run the same 32-word skew (an A/A).
 //   timex: time with every routed job's X from one cached region (diagnostic bound of the X traffic, not exact).
 //   PATH@LAYER: the routes of one layer from a CRUCIBLE_ROUTE_DUMP file of the engine (prefill-rows).
 //   ROWS: "16,96,97,4096,8192,32768"; SETS: "all" or names ("3/5,4/6,3.5/7"); time adds ABAB pairs (default 5).
 int main(int argc, char** argv) {
-  if (argc < 4 || argc > 6) return 2;
+  if (argc < 4 || argc > 8) return 2;
   const std::string mode = argv[1];
   const auto rows = List(argv[2]);
   const auto sets = Sets(argv[3]);
   Routing routing;
   routing.skew = argc > 4 && !std::strcmp(argv[4], "skew");
   const std::string route_arg = argc > 4 ? argv[4] : "uniform";
-  if ((mode != "check" && mode != "time" && mode != "timex" && mode != "split" && mode != "conc" && mode != "pipe") || rows.empty() || sets.empty()) return 2;
+  if ((mode != "check" && mode != "time" && mode != "timex" && mode != "split" && mode != "conc" && mode != "pipe" &&
+       mode != "lds" && mode != "dec" && mode != "crit") || rows.empty() || sets.empty()) return 2;
   if (const auto at = route_arg.rfind('@'); at != std::string::npos) {
     routing.dumped = DumpedRoutes(route_arg.substr(0, at), std::atoi(route_arg.c_str() + at + 1));
     for (const int R : rows)
@@ -662,7 +968,17 @@ int main(int argc, char** argv) {
   }
   const int pairs = argc > 5 ? std::atoi(argv[5]) : 5;
   if (pairs < 1 || pairs > 50) return 2;
-  PrintResources();
+  const double settle = argc > 6 ? std::atof(argv[6]) : 20.0, power_s = argc > 7 ? std::atof(argv[7]) : 0.0;
+  const bool arms_mode = mode == "dec" || mode == "crit";
+  if (argc > 6 && !arms_mode) return 2;
+  if (settle < 0 || settle > 600 || power_s < 0 || power_s > 600) return 2;
+  const auto& arms = mode == "crit" ? CritArms() : DecArms();
+  const std::vector<const char*> power_order =
+      mode == "crit" ? std::vector<const char*>{"base", "nodecode", "base", "nosync", "base", "bare", "base", "wmma",
+                                                "base", "noout", "base"}
+                     : std::vector<const char*>{"base", kDecSwitchArm, "base", "nodecode", "base", kDecSwitchArm, "base"};
+  if (arms_mode) DecResources(arms);
+  else PrintResources();
   const std::string tag_text = routing.dumped.empty() ? (routing.skew ? "skew" : "uniform")
                                                       : "layer" + route_arg.substr(route_arg.rfind('@') + 1);
   const char* tag = tag_text.c_str();
@@ -679,8 +995,28 @@ int main(int argc, char** argv) {
         Pipe(f, tag, pairs);
         continue;
       }
+      if (arms_mode) {
+        if (f.set.Kmax() != 6 || !PrefillMoePcOn(6)) {
+          std::printf("%s set=%s skipped (KMAX 6 only)\n", mode.c_str(), f.set.name);
+          continue;
+        }
+        const bool ok = DecCheck(f, tag, arms);
+        rc |= !ok;
+        if (!ok) continue;  // no timing after a byte FAIL: the read-outs FAIL on the crit-check lines
+        DecTime(f, tag, pairs, settle, arms);
+        if (power_s > 0) DecPower(f, tag, power_s, arms, power_order);
+        std::printf("crit-done set=%s R=%d routing=%s\n", f.set.name, f.R, tag);
+        continue;
+      }
       if (mode == "conc") {
         Conc(f, tag, pairs);
+        continue;
+      }
+      if (mode == "lds") {
+        if (!PrefillMoePcOn(f.set.Kmax())) { std::printf("lds set=%s skipped (no pc kernels)\n", f.set.name); continue; }
+        const bool ok = LdsCheck(f, tag);
+        rc |= !ok;
+        if (ok) LdsTime(f, tag, pairs);
         continue;
       }
       if (mode == "split") {  // diagnostic: no byte check of the mutants (their outputs are wrong on purpose)

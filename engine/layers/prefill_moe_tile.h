@@ -20,11 +20,59 @@ constexpr int kTileBufWords = 8 * kGemmWaveWords;   // the 8 decoded tiles of on
 // Gate/up: 4 X transform groups of 128 threads (2 tiles of 16 x 136 halves each) or the epilogue stage
 // (32 rows of gate | up | pad) or 2 x 2 sides of decoded tiles; they never live at the same time.
 // A of one side and k step in LDS: two planes, plane h holds halves 8 h .. 8 h + 7 of the 192 rows at a 4-word
-// row stride, and plane 1 starts 32 words (half the banks) after a whole plane. So the 16 rows that one
-// ds_load_b128 reads and the 8 rows x 4 quarters that one wave's b64 stores write fall on distinct banks. The
-// 12-word row stride of the B tiles gave 9% LDS bank conflicts here (counters, Oct 24).
+// row stride, and plane 1 starts TileAPlane<MUT>() words after plane 0 (a whole plane and a skew). The 12-word row
+// stride of the B tiles gave 9% LDS bank conflicts here (counters, Oct 24). The skew of 32 words (half of 64 banks)
+// still gave 9.6% (TileDown) and 12.6% (PcFatPair) on the t41 unit of Nov 23: a wave sees 32 banks (below), so plane 1
+// fell on the banks of plane 0 in every A store. kTileAPlane is the footprint (room for the 32-word skew), so both
+// skews have the same LDS size, occupancy and buffer bases.
 constexpr int kTileAPlane = 16 * kTileRm * 4 + 32;
 constexpr int kTileAWords = 2 * kTileAPlane;
+// moe-lds: the LDS bank model of gfx11 (RDNA3 ISA, LDS chapter): 128 KB per WGP in 64 one-dword banks, in two sets of
+// 32; a wave uses the set of its SIMD pair, so for one wave the bank of dword d is d % 32 (not d % 64). One ds clock
+// serves 32 dwords: 8 lanes of a b128 op, 16 lanes of a b64 op.
+constexpr int kLdsWaveBanks = 32;
+// Plane 1 of A buffer at word p of the buffer. The A stores of one LDS clock must fall on distinct banks: the 8 lanes of
+// a PcProduce b128 store (lane l: chunk c = 32 sub + l, plane c & 1, row c >> 1) and the 16 lanes of a TileBody b64
+// store (chunk c = 32 w + l + 256 q, plane (c & 3) >> 1, row c >> 2, half c & 1). The buffer bases are multiples of 32.
+constexpr bool TileAStoresBankFree(int p) {
+  for (int sub = 0; sub < 2; ++sub)
+    for (int l0 = 0; l0 < 32; l0 += 8) {
+      bool used[kLdsWaveBanks] = {};
+      for (int l = l0; l < l0 + 8; ++l)
+        for (int d = 0; d < 4; ++d) {
+          const int c = 32 * sub + l, b = ((c & 1) * p + (c >> 1) * 4 + d) % kLdsWaveBanks;
+          if (used[b]) return false;
+          used[b] = true;
+        }
+    }
+  for (int w = 0; w < 8; ++w)
+    for (int q = 0; q < 3; ++q)
+      for (int l0 = 0; l0 < 32; l0 += 16) {
+        bool used[kLdsWaveBanks] = {};
+        for (int l = l0; l < l0 + 16; ++l)
+          for (int d = 0; d < 2; ++d) {
+            const int c = 32 * w + l + 256 * q;
+            const int b = (((c & 3) >> 1) * p + (c >> 2) * 4 + (c & 1) * 2 + d) % kLdsWaveBanks;
+            if (used[b]) return false;
+            used[b] = true;
+          }
+      }
+  return true;
+}
+// Switch (moe-lds, compile time): true puts plane 1 16 words past a whole plane (the A stores have no bank conflict);
+// false gives the old 32-word skew. Only LDS addresses change: the same bytes go to the same WMMA operands in the same
+// order, so the outputs are bitwise equal. MUT kTileMutPlane32 (bench only) is the old skew with the switch on.
+// OFF: the moe-lds bench of Nov 24 (the test machine, layer 24, 16,512 rows) gave a MoE save of -0.56%, below the kill line of
+// 1.25%, so the engine keeps the 32-word skew (the trunk device code).
+constexpr bool kTileAPlaneSkew16 = false;
+constexpr int kTileMutPlane32 = 35;
+template <int MUT> constexpr int TileAPlane() {
+  return 16 * kTileRm * 4 + (kTileAPlaneSkew16 && MUT != kTileMutPlane32 ? 16 : 32);
+}
+static_assert(TileAPlane<0>() <= kTileAPlane && TileAPlane<kTileMutPlane32>() <= kTileAPlane);
+static_assert(TileAPlane<0>() % 4 == 0 && kTileAWords % kLdsWaveBanks == 0 && kTileBufWords % kLdsWaveBanks == 0);
+static_assert(!kTileAPlaneSkew16 || TileAStoresBankFree(TileAPlane<0>()), "the A stores of one LDS clock share banks");
+static_assert(!TileAStoresBankFree(TileAPlane<kTileMutPlane32>()), "the bank model must see the old conflict");
 // The k loop of S sides: 2 decode buffers and 2 A buffers per side.
 constexpr int TileLoopWords(int S) { return 2 * S * (kTileBufWords + kTileAWords); }
 constexpr int kTilePairWords = TileLoopWords(2);
@@ -48,6 +96,9 @@ constexpr int kTileMutDeepW = 9, kTileMutDeepA = 10, kTileMutDeep = 11;
 // One A fragment (12), one B fragment (13) or one of each (15) read from LDS per k step and reused; 14: no decode, no
 // A loads, no weight loads (the WMMAs, the LDS fragment reads and the barriers only). Wrong outputs, timing bounds.
 constexpr int kTileMutOneA = 12, kTileMutOneB = 13, kTileMutBare = 14, kTileMutOneAB = 15;
+// p1-critpath (bench only, wrong outputs): the down kernel skips its pd stores; an empty asm takes the accumulators, so
+// the WMMAs stay.
+constexpr int kTileMutNoStore = 40;
 // TileBodyPipe of depth 2 (16) or 3 (17); 18 and 19: depth 1 and 2 with the fewer-VALU decode and the weight
 // stream offset in the descriptor (TileBodyPipe F); 20: depth 1 through TileBodyPipe (control). All exact.
 constexpr int kTileMutPipe2 = 16, kTileMutPipe3 = 17, kTileMutFast1 = 18, kTileMutFast2 = 19, kTileMutPipe1 = 20;
@@ -132,6 +183,158 @@ __device__ __forceinline__ void TileDecodeFast(uint32_t w0, uint32_t w1, uint32_
   TileMul1Pairs(p, P);
 }
 
+// p1-decode: TileDecodeFast's instructions in one scheduled asm block. The multiplies
+// are inline asm (op_sel and .h/.l reads), so the compiler put each v_mad_u32_u16 right after its v_pk_mul_lo_u16
+// and put no s_delay_alu next to them. On gfx11 a VALU op that reads the result of one of the 4 VALU ops before it
+// stalls the ALU, and the SIMD issues nothing else meanwhile (Mesa aco_insert_delay_alu.cpp). The ISA model of
+// trunk gives about 155 such stall cycles per k step next to 125 VALU ops in the fat gate/up producer (K4), and 45
+// next to 50 per wave and step in the tile down body. In the blocks below a VALU result is read 5 or more VALU ops
+// after its write, except in the last pair packs (7 cycles per K4 tile). The same ops on the same operands: the bits
+// of TileDecodeFast, so of DecodeLane.
+// Switch (compile time): kTileDecodeSched true gives the engine kernels the scheduled blocks. MUT kMutDecodeSched
+// (bench) is the other form of the switch, so a bench can time both forms in one build (with the switch on, MUT
+// kMutDecodeSched gives the old decode). On since p1-decsw (night unit p1-decode: layer 24 MoE save 1.85%, byte-exact).
+constexpr int kMutDecodeSched = 44;
+constexpr bool kTileDecodeSched = true;
+// Bench variant (exact): the scheduled decode, and TileBody (down) reads the A fragments and the first B fragment of
+// step a before its A copy, decode and refill (so their LDS latency is under the decode; the same reads and WMMAs).
+constexpr int kMutDecodeEarly = 45;
+// The same with fewer early fragments (fewer VGPRs live over the decode): 1 or 2 A fragments and the first B fragment.
+constexpr int kMutDecodeEarly1 = 46, kMutDecodeEarly2 = 47;
+// The A fragments that TileBody reads before the decode (0: none, the normal order).
+template <int MUT, int N> constexpr int TileEarlyA() {
+  if constexpr (N <= 0) return 0;
+  else if constexpr (MUT == kMutDecodeEarly) return N;
+  else if constexpr (MUT == kMutDecodeEarly1) return 1;
+  else if constexpr (MUT == kMutDecodeEarly2) return N < 2 ? N : 2;
+  else return 0;
+}
+template <int MUT> constexpr bool TileSched() {
+  return MUT == kMutDecodeEarly || MUT == kMutDecodeEarly1 || MUT == kMutDecodeEarly2 ||
+         kTileDecodeSched != (MUT == kMutDecodeSched);
+}
+// The bench MUT of each decode form with the switch as built (bench only: the dec arms of bench/prefill_moe_tile.hip).
+// One of the two is 0, the engine kernels; no engine launch reads them.
+constexpr int kMutDecodeNew = kTileDecodeSched ? 0 : kMutDecodeSched;  // the scheduled decode
+constexpr int kMutDecodeOld = kTileDecodeSched ? kMutDecodeSched : 0;  // the old decode (TileDecodeFast)
+static_assert(TileSched<kMutDecodeNew>() && !TileSched<kMutDecodeOld>());
+
+// K4: TileDecodeFast<4> (3 alignbits, 8 multiplies of 2 ops, 4 pair packs of 3 ops). a_i = TileMul1High(q_i) and
+// b_i = Mul1Product<kMulTrue16>(q_i) (q_3 = w1), so p = {a0, a1, a2, a3, b0, b1, b2, b3}; P0 = (a0, a1), P1 = (a2, a3),
+// P2 = (b0, b1), P3 = (b2, b3) (TileMul1Pairs). The constants are TileMul1Pairs' inv and bias.
+__device__ __forceinline__ void TileDecodeK4Sched(uint32_t w0, uint32_t w1, __half2 P[4]) {
+  uint32_t q0, q1, q2, a0, a1, a2, a3, b0, b1, b2, b3, o[4];
+  asm("v_alignbit_b32 %[q0], %[w0], %[w1], 12\n\t"
+      "v_alignbit_b32 %[q1], %[w0], %[w1], 8\n\t"
+      "v_alignbit_b32 %[q2], %[w0], %[w1], 4\n\t"
+      "v_pk_mul_lo_u16 %[a3], %[w1], %[m] op_sel_hi:[1,1]\n\t"
+      "v_pk_mul_lo_u16 %[b3], %[w1], %[m] op_sel_hi:[0,1]\n\t"
+      "v_pk_mul_lo_u16 %[a0], %[q0], %[m] op_sel_hi:[1,1]\n\t"
+      "v_pk_mul_lo_u16 %[a1], %[q1], %[m] op_sel_hi:[1,1]\n\t"
+      "v_pk_mul_lo_u16 %[a2], %[q2], %[m] op_sel_hi:[1,1]\n\t"
+      "v_pk_mul_lo_u16 %[b0], %[q0], %[m] op_sel_hi:[0,1]\n\t"
+      "v_pk_mul_lo_u16 %[b1], %[q1], %[m] op_sel_hi:[0,1]\n\t"
+      "v_pk_mul_lo_u16 %[b2], %[q2], %[m] op_sel_hi:[0,1]\n\t"
+      "v_mad_u32_u16 %[a3], %[w1].h, 0xd12d, %[a3]\n\t"
+      "v_mad_u32_u16 %[a0], %[q0].h, 0xd12d, %[a0]\n\t"
+      "v_mad_u32_u16 %[a1], %[q1].h, 0xd12d, %[a1]\n\t"
+      "v_mad_u32_u16 %[a2], %[q2].h, 0xd12d, %[a2]\n\t"
+      "v_mad_u32_u16 %[b0], %[q0].l, 0xd12d, %[b0]\n\t"
+      "v_mad_u32_u16 %[b1], %[q1].l, 0xd12d, %[b1]\n\t"
+      "v_sad_u8 %[a0], %[a0], 0, 0x64006400\n\t"
+      "v_mad_u32_u16 %[b2], %[q2].l, 0xd12d, %[b2]\n\t"
+      "v_sad_u8 %[a2], %[a2], 0, 0x64006400\n\t"
+      "v_mad_u32_u16 %[b3], %[w1].l, 0xd12d, %[b3]\n\t"
+      "v_sad_u8 %[b0], %[b0], 0, 0x64006400\n\t"
+      "v_sad_hi_u8 %[a1], %[a1], 0, %[a0]\n\t"
+      "v_sad_u8 %[b2], %[b2], 0, 0x64006400\n\t"
+      "v_sad_hi_u8 %[a3], %[a3], 0, %[a2]\n\t"
+      "v_sad_hi_u8 %[b1], %[b1], 0, %[b0]\n\t"
+      "v_pk_fma_f16 %[o0], %[a1], %[inv], 0xc931 op_sel_hi:[1,0,0]\n\t"
+      "v_sad_hi_u8 %[b3], %[b3], 0, %[b2]\n\t"
+      "v_pk_fma_f16 %[o1], %[a3], %[inv], 0xc931 op_sel_hi:[1,0,0]\n\t"
+      "v_pk_fma_f16 %[o2], %[b1], %[inv], 0xc931 op_sel_hi:[1,0,0]\n\t"
+      "v_pk_fma_f16 %[o3], %[b3], %[inv], 0xc931 op_sel_hi:[1,0,0]"
+      : [q0] "=&v"(q0), [q1] "=&v"(q1), [q2] "=&v"(q2), [a0] "=&v"(a0), [a1] "=&v"(a1), [a2] "=&v"(a2),
+        [a3] "=&v"(a3), [b0] "=&v"(b0), [b1] "=&v"(b1), [b2] "=&v"(b2), [b3] "=&v"(b3), [o0] "=v"(o[0]),
+        [o1] "=v"(o[1]), [o2] "=v"(o[2]), [o3] "=v"(o[3])
+      : [w0] "v"(w0), [w1] "v"(w1), [m] "s"(0x83DC0000u), [inv] "s"(0x1eee1eeeu));
+#pragma unroll
+  for (int i = 0; i < 4; ++i) P[i] = *reinterpret_cast<const __half2*>(&o[i]);
+}
+
+// The other K: TileDecodeFast's states (the same C code), then its 8 multiplies and 4 pair packs in one scheduled
+// block: t_0 = TileMul1High(s_0), t_j = Mul1Product<kMulTrue16>(s_j), P_i = (t_2i, t_2i+1).
+__device__ __forceinline__ void TileMulPairsSched(const uint32_t s[8], __half2 P[4]) {
+  uint32_t t0, t1, t2, t3, t4, t5, t6, t7, o[4];
+  asm("v_pk_mul_lo_u16 %[t0], %[s0], %[m] op_sel_hi:[1,1]\n\t"
+      "v_pk_mul_lo_u16 %[t1], %[s1], %[m] op_sel_hi:[0,1]\n\t"
+      "v_pk_mul_lo_u16 %[t2], %[s2], %[m] op_sel_hi:[0,1]\n\t"
+      "v_pk_mul_lo_u16 %[t3], %[s3], %[m] op_sel_hi:[0,1]\n\t"
+      "v_pk_mul_lo_u16 %[t4], %[s4], %[m] op_sel_hi:[0,1]\n\t"
+      "v_pk_mul_lo_u16 %[t5], %[s5], %[m] op_sel_hi:[0,1]\n\t"
+      "v_pk_mul_lo_u16 %[t6], %[s6], %[m] op_sel_hi:[0,1]\n\t"
+      "v_pk_mul_lo_u16 %[t7], %[s7], %[m] op_sel_hi:[0,1]\n\t"
+      "v_mad_u32_u16 %[t0], %[s0].h, 0xd12d, %[t0]\n\t"
+      "v_mad_u32_u16 %[t2], %[s2].l, 0xd12d, %[t2]\n\t"
+      "v_mad_u32_u16 %[t4], %[s4].l, 0xd12d, %[t4]\n\t"
+      "v_mad_u32_u16 %[t6], %[s6].l, 0xd12d, %[t6]\n\t"
+      "v_mad_u32_u16 %[t1], %[s1].l, 0xd12d, %[t1]\n\t"
+      "v_sad_u8 %[t0], %[t0], 0, 0x64006400\n\t"
+      "v_mad_u32_u16 %[t3], %[s3].l, 0xd12d, %[t3]\n\t"
+      "v_sad_u8 %[t2], %[t2], 0, 0x64006400\n\t"
+      "v_mad_u32_u16 %[t5], %[s5].l, 0xd12d, %[t5]\n\t"
+      "v_sad_u8 %[t4], %[t4], 0, 0x64006400\n\t"
+      "v_mad_u32_u16 %[t7], %[s7].l, 0xd12d, %[t7]\n\t"
+      "v_sad_u8 %[t6], %[t6], 0, 0x64006400\n\t"
+      "v_sad_hi_u8 %[t1], %[t1], 0, %[t0]\n\t"
+      "v_sad_hi_u8 %[t3], %[t3], 0, %[t2]\n\t"
+      "v_sad_hi_u8 %[t5], %[t5], 0, %[t4]\n\t"
+      "v_sad_hi_u8 %[t7], %[t7], 0, %[t6]\n\t"
+      "v_pk_fma_f16 %[o0], %[t1], %[inv], 0xc931 op_sel_hi:[1,0,0]\n\t"
+      "v_pk_fma_f16 %[o1], %[t3], %[inv], 0xc931 op_sel_hi:[1,0,0]\n\t"
+      "v_pk_fma_f16 %[o2], %[t5], %[inv], 0xc931 op_sel_hi:[1,0,0]\n\t"
+      "v_pk_fma_f16 %[o3], %[t7], %[inv], 0xc931 op_sel_hi:[1,0,0]"
+      : [t0] "=&v"(t0), [t1] "=&v"(t1), [t2] "=&v"(t2), [t3] "=&v"(t3), [t4] "=&v"(t4), [t5] "=&v"(t5),
+        [t6] "=&v"(t6), [t7] "=&v"(t7), [o0] "=v"(o[0]), [o1] "=v"(o[1]), [o2] "=v"(o[2]), [o3] "=v"(o[3])
+      : [s0] "v"(s[0]), [s1] "v"(s[1]), [s2] "v"(s[2]), [s3] "v"(s[3]), [s4] "v"(s[4]), [s5] "v"(s[5]),
+        [s6] "v"(s[6]), [s7] "v"(s[7]), [m] "s"(0x83DC0000u), [inv] "s"(0x1eee1eeeu));
+#pragma unroll
+  for (int i = 0; i < 4; ++i) P[i] = *reinterpret_cast<const __half2*>(&o[i]);
+}
+
+// TileDecodeFast<K> in scheduled blocks: the same states, products and pair packs.
+template <int K>
+__device__ __forceinline__ void TileDecodeSched(uint32_t w0, uint32_t w1, uint32_t w2, int shift, __half2 P[4]) {
+  if constexpr (K == 4) {
+    (void)w2;
+    (void)shift;
+    TileDecodeK4Sched(w0, w1, P);
+  } else {
+    uint32_t st[8];
+    if constexpr (7 * K + 16 <= 64) {
+      const uint32_t a0 = __builtin_amdgcn_alignbit(w0, w1, 32 - shift);
+      const uint32_t a1 = __builtin_amdgcn_alignbit(w1, w2, 32 - shift);
+      st[0] = a0;
+#pragma unroll
+      for (int j = 1; j < 8; ++j) {
+        const int end = j * K + 16;
+        st[j] = end <= 32 ? a0 >> (32 - end) : __builtin_amdgcn_alignbit(a0, a1, 64 - end);
+      }
+    } else {
+      LaneStates<K>(w0, w1, w2, shift, st);
+      st[0] = __builtin_amdgcn_alignbit(w0, w1, 32 - shift);
+    }
+    TileMulPairsSched(st, P);
+  }
+}
+// The decode of the tile bodies: TileDecodeSched or TileDecodeFast by the switch.
+template <int K, int MUT>
+__device__ __forceinline__ void TileDecodeBody(uint32_t w0, uint32_t w1, uint32_t w2, int shift, __half2 P[4]) {
+  if constexpr (TileSched<MUT>()) TileDecodeSched<K>(w0, w1, w2, shift, P);
+  else TileDecodeFast<K>(w0, w1, w2, shift, P);
+}
+
 template <int I, int N, class F> __device__ __forceinline__ void TileFor(F&& f) {
   if constexpr (I < N) {
     f(std::integral_constant<int, I>{});
@@ -195,7 +398,7 @@ __device__ __forceinline__ void TileBody(const Exl3GemmJob& j, int m0, int b0, u
   for (int q = 0; q < kChunks; ++q) {
     const int c = lt + 256 * q, row = m0 + (c >> 2);
     xo[q] = (row < j.M ? (uint32_t)row * 32 : xbytes) + (c & 3) * 8;
-    so[q] = (uint32_t)(((c & 3) >> 1) * kTileAPlane + (c >> 2) * 4 + (c & 1) * 2);
+    so[q] = (uint32_t)(((c & 3) >> 1) * TileAPlane<MUT>() + (c >> 2) * 4 + (c & 1) * 2);
   }
   uint32_t* mine = lds + (side * 8 + (w & 7)) * kGemmWaveWords;
   const uint32_t* bsrc = lds + (side * 8 + cg * kTileCols) * kGemmWaveWords;
@@ -227,7 +430,7 @@ __device__ __forceinline__ void TileBody(const Exl3GemmJob& j, int m0, int b0, u
     auto* ap = reinterpret_cast<U4*>(&af);
     const uint32_t* sp = aread + P * S * kTileAWords + i * 64 * 4;
     ap[0] = *reinterpret_cast<const U4*>(sp);
-    ap[1] = *reinterpret_cast<const U4*>(sp + kTileAPlane);
+    ap[1] = *reinterpret_cast<const U4*>(sp + TileAPlane<MUT>());
     return af;
   };
   auto load = [&](int a, uint32_t r[3]) {
@@ -242,7 +445,7 @@ __device__ __forceinline__ void TileBody(const Exl3GemmJob& j, int m0, int b0, u
   aload(0, sts[0]);
   {
     __half2 p[4];
-    TileDecodeFast<K>(raws[0][0], raws[0][1], raws[0][2], win.shift, p);
+    TileDecodeBody<K, MUT>(raws[0][0], raws[0][1], raws[0][2], win.shift, p);
     GemmNativeStore(p, mine, lane);
   }
   load(1, raws[0]);  // past the stream (A = 1) the loads return 0 and the decode is not used
@@ -264,6 +467,16 @@ __device__ __forceinline__ void TileBody(const Exl3GemmJob& j, int m0, int b0, u
     constexpr int P = decltype(pc)::value;
     auto& st = sts[kDeepA ? P : 0];
     auto& raw = raws[kDeepW ? P : 0];
+    // kMutDecodeEarly(1, 2): fragments of slot P (written before the last barrier) first; this step writes slot 1 - P.
+    constexpr int kEA = TileEarlyA<MUT, N>();
+    constexpr bool kEarly = kEA > 0;
+    GemmH16 eafr[kEarly ? kEA : 1], ebf;
+    if constexpr (kEarly) {
+#pragma unroll
+      for (int i = 0; i < kEA; ++i) eafr[i] = afrag(P, i);
+      ebf = GemmStoredFragment(bsrc + P * kBuf, lane);
+      __builtin_amdgcn_sched_barrier(0);
+    }
     astore(1 - P, st);
     __builtin_amdgcn_sched_barrier(0);
     aload(a + (kDeepA ? 3 : 2), st);
@@ -274,7 +487,7 @@ __device__ __forceinline__ void TileBody(const Exl3GemmJob& j, int m0, int b0, u
         const uint32_t v[4] = {raw[0], raw[1], raw[2], raw[0] ^ raw[1]};
         for (int z = 0; z < 4; ++z) p[z] = *reinterpret_cast<const __half2*>(&v[z]);
       } else {
-        TileDecodeFast<K>(raw[0], raw[1], raw[2], win.shift, p);
+        TileDecodeBody<K, MUT>(raw[0], raw[1], raw[2], win.shift, p);
       }
       GemmNativeStore(p, mine + (1 - P) * kBuf, lane);
     }
@@ -284,12 +497,16 @@ __device__ __forceinline__ void TileBody(const Exl3GemmJob& j, int m0, int b0, u
     if constexpr (N > 0 && MUT != kTileMutNoWmma) {
       GemmH16 afr[N];
 #pragma unroll
-      for (int i = 0; i < N; ++i) afr[i] = kOneA && i > 0 ? afr[0] : afrag(P, i);
+      for (int i = 0; i < N; ++i) {
+        if constexpr (kEarly) afr[i] = i < kEA ? eafr[i < kEA ? i : 0] : afrag(P, i);
+        else afr[i] = kOneA && i > 0 ? afr[0] : afrag(P, i);
+      }
       const uint32_t* bp = bsrc + P * kBuf;
       GemmH16 bf0;
 #pragma unroll
       for (int c = 0; c < kTileCols; ++c) {
-        if (!kOneB || c == 0) bf0 = GemmStoredFragment(bp + c * kGemmWaveWords, lane);
+        if constexpr (kEarly) bf0 = c == 0 ? ebf : GemmStoredFragment(bp + c * kGemmWaveWords, lane);
+        else if (!kOneB || c == 0) bf0 = GemmStoredFragment(bp + c * kGemmWaveWords, lane);
         const GemmH16 bf = bf0;
 #pragma unroll
         for (int i = 0; i < N; ++i) acc[i][c] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(afr[i], bf, acc[i][c]);
@@ -333,7 +550,7 @@ __device__ __forceinline__ void TileBodyPipe(const Exl3GemmJob& j, int m0, int b
   for (int q = 0; q < kChunks; ++q) {
     const int c = lt + 256 * q, row = m0 + (c >> 2);
     xo[q] = (row < j.M ? (uint32_t)row * 32 : xbytes) + (c & 3) * 8;
-    so[q] = (uint32_t)(((c & 3) >> 1) * kTileAPlane + (c >> 2) * 4 + (c & 1) * 2);
+    so[q] = (uint32_t)(((c & 3) >> 1) * TileAPlane<0>() + (c >> 2) * 4 + (c & 1) * 2);
   }
   uint32_t* mine = lds + (side * 8 + (w & 7)) * kGemmWaveWords;
   const uint32_t* bsrc = lds + (side * 8 + cg * kTileCols) * kGemmWaveWords;
@@ -358,7 +575,7 @@ __device__ __forceinline__ void TileBodyPipe(const Exl3GemmJob& j, int m0, int b
     auto* ap = reinterpret_cast<U4*>(&af);
     const uint32_t* sp = aread + P * S * kTileAWords + i * 64 * 4;
     ap[0] = *reinterpret_cast<const U4*>(sp);
-    ap[1] = *reinterpret_cast<const U4*>(sp + kTileAPlane);
+    ap[1] = *reinterpret_cast<const U4*>(sp + TileAPlane<0>());
     return af;
   };
   const uint32_t* wbase = j.tiles + (size_t)(b0 + (w & 7)) * A * T;
@@ -465,6 +682,13 @@ __device__ __forceinline__ void TileDownItem(const Exl3GemmJob& j, const Exl3Gem
     TileBodyPipe<K, N, 1, TileMutDepth(MUT), TileMutFast(MUT)>(j, it.m0, it.b0, lds, acc);
   else
     TileBody<K, N, 1, MUT>(j, it.m0, it.b0, lds, acc);
+  if constexpr (MUT == kTileMutNoStore) {
+#pragma unroll
+    for (int i = 0; i < N; ++i)
+#pragma unroll
+      for (int c = 0; c < kTileCols; ++c) asm volatile("" : : "v"(acc[i][c]));
+    return;
+  }
   const int lane = threadIdx.x & 31, w = __builtin_amdgcn_readfirstlane(threadIdx.x >> 5);
   const int cg = (w >> 2) & 1, g = TileGroup(w);
   const auto ps = StreamRsrc(reinterpret_cast<const uint32_t*>(j.partial), (uint32_t)j.M * j.O * 2);
@@ -862,6 +1086,29 @@ constexpr int kPcMutFatCs = 32;
 // issue only the WMMAs and barriers in it (NoLds), and NoLds with bare producers (WmmaOnly: the WMMA, barrier, X claim
 // and epilogue floor of the kernel structure).
 constexpr int kPcMutNoLds = 33, kPcMutWmmaOnly = 34;
+// p1-critpath removal mutants (wrong outputs, timing bounds). Each one removes
+// one cost of the fat gate/up kernel and keeps the rest. NoDecode: the producers store the raw weight words as the
+// decoded tile (the weight loads and the LDS stores stay; the trellis decode VALU goes). NoStage: the epilogue stage
+// stores (the kPairPad rows) are skipped; the mid step reads stale LDS. NoOut: the xd stores (the global output of the
+// epilogue) are skipped; the stage and the mid step stay. NoSync: the k-loop barriers of the producers and consumers are gone
+// (the prologue barrier stays, so every wave takes the same barrier count); a compiler-only fence keeps the code order.
+// The values of a skipped store go to an empty asm (PcFakeUse, one float each), so the compiler keeps the WMMAs. A
+// first form with the stores behind a run-time false condition, NoSync with no fence, fake uses of whole 8-float
+// tuples, and a mutant with no mid step spilled 336 to 1,320 VGPRs (644 to 1,316 bytes of scratch, kernel_tu ROCm
+// 7.2.4): such a mutant measures the spills, not the removed cost.
+constexpr int kPcMutNoDecode = 36, kPcMutNoStage = 37, kPcMutNoOut = 38, kPcMutNoSync = 39;
+// NoPad (H3 exact bound): the stage stores stay (the same count) at lane-linear addresses, so no store has a bank
+// conflict; the mid step reads other values (wrong outputs). 8 waves x 32 stores x 32 lanes fit the 32 kPairPad rows.
+constexpr int kPcMutNoPad = 41;
+static_assert(8 * 32 * 32 <= 32 * kPairPad);
+template <class T> __device__ __forceinline__ void PcFakeUse(const T& v) { asm volatile("" : : "v"(v)); }
+__device__ __forceinline__ void PcCompilerFence() {
+  asm volatile("" : : : "memory");
+  __builtin_amdgcn_sched_barrier(0);
+}
+__host__ __device__ constexpr bool PcEpiMut(int mut) {
+  return mut == 1 || mut == 2 || mut == kPcMutNoStage || mut == kPcMutNoOut || mut == kPcMutNoPad;
+}
 __host__ __device__ constexpr bool PcBareProducer(int mut) { return mut == kPcMutBare || mut == kPcMutWmmaOnly; }
 __host__ __device__ constexpr bool PcNoLdsConsumer(int mut) { return mut == kPcMutNoLds || mut == kPcMutWmmaOnly; }
 // Every pair finishes inside the gate/up k loop (D <= 3).
@@ -880,7 +1127,7 @@ __device__ __forceinline__ void PcProduce(const Exl3GemmJob& j, int m0, int b0, 
   const uint32_t* wbase = j.tiles + (size_t)(b0 + kPcTiles * sub) * A * T;
   const int c0 = 32 * sub + lane;
   const uint32_t xoff = (uint32_t)((c0 >> 1) * 32 + (c0 & 1) * 16);
-  uint32_t* adst = lds + 2 * kBuf + side * kTileAWords + (c0 & 1) * kTileAPlane + (c0 >> 1) * 4;
+  uint32_t* adst = lds + 2 * kBuf + side * kTileAWords + (c0 & 1) * TileAPlane<MUT>() + (c0 >> 1) * 4;
   uint32_t* bdst = lds + (side * 8 + kPcTiles * sub) * kGemmWaveWords;
   U4 av[D][kPcChunks];
   uint32_t wr[D][kPcTiles][3];
@@ -911,7 +1158,13 @@ __device__ __forceinline__ void PcProduce(const Exl3GemmJob& j, int m0, int b0, 
 #pragma unroll
     for (int n = 0; n < kPcTiles; ++n) {
       __half2 h[4];
-      TileDecodeFast<K>(r[n][0], r[n][1], r[n][2], win.shift, h);
+      if constexpr (MUT == kPcMutNoDecode) {
+        const uint32_t v[4] = {r[n][0], r[n][1], r[n][2], r[n][0] ^ r[n][1]};
+#pragma unroll
+        for (int z = 0; z < 4; ++z) h[z] = *reinterpret_cast<const __half2*>(&v[z]);
+      } else {
+        TileDecodeBody<K, MUT>(r[n][0], r[n][1], r[n][2], win.shift, h);
+      }
       GemmNativeStore(h, bdst + P * kBuf + n * kGemmWaveWords, lane);
     }
   };
@@ -943,7 +1196,8 @@ __device__ __forceinline__ void PcProduce(const Exl3GemmJob& j, int m0, int b0, 
     __builtin_amdgcn_sched_barrier(0);
     xp.template Step<Q>(a);
     __builtin_amdgcn_sched_barrier(0);
-    GemmGroupSync();
+    if constexpr (MUT != kPcMutNoSync) GemmGroupSync();
+    else PcCompilerFence();
   };
   using std::integral_constant;
   int a = 0;
@@ -981,7 +1235,7 @@ __device__ __forceinline__ void PcConsume(int A, const uint32_t* lds, GemmF8 (&a
         auto* ap = reinterpret_cast<U4*>(&afr[i]);
         const uint32_t* sp = aread + P * S * kTileAWords + i * 64 * 4;
         ap[0] = *reinterpret_cast<const U4*>(sp);
-        ap[1] = *reinterpret_cast<const U4*>(sp + kTileAPlane);
+        ap[1] = *reinterpret_cast<const U4*>(sp + TileAPlane<MUT>());
       }
       const uint32_t* bp = bsrc + P * kBuf;
       GemmH16 bf;
@@ -1052,7 +1306,7 @@ __device__ __forceinline__ void PcFatConsume(int A, const uint32_t* lds, GemmF8 
     for (int c = 0; c < kTileCols; ++c) nb[c] = GemmStoredFragment(bsrc + c * kGemmWaveWords, lane);
     auto* ap = reinterpret_cast<U4*>(&na);
     ap[0] = *reinterpret_cast<const U4*>(aread);
-    ap[1] = *reinterpret_cast<const U4*>(aread + kTileAPlane);
+    ap[1] = *reinterpret_cast<const U4*>(aread + TileAPlane<MUT>());
   }
   GemmGroupSync();  // slot 0 from the producers' prologue
   auto step = [&](auto pc) {
@@ -1063,7 +1317,7 @@ __device__ __forceinline__ void PcFatConsume(int A, const uint32_t* lds, GemmF8 
       auto load_a = [&](GemmH16& f, int i) {
         auto* ap = reinterpret_cast<U4*>(&f);
         ap[0] = *reinterpret_cast<const U4*>(as + i * 32 * 4);
-        ap[1] = *reinterpret_cast<const U4*>(as + i * 32 * 4 + kTileAPlane);
+        ap[1] = *reinterpret_cast<const U4*>(as + i * 32 * 4 + TileAPlane<MUT>());
       };
       GemmH16 bf[kTileCols], afr;
       if constexpr (PcNoLdsConsumer(MUT)) {
@@ -1098,7 +1352,8 @@ __device__ __forceinline__ void PcFatConsume(int A, const uint32_t* lds, GemmF8 
         }
       }
     }
-    GemmGroupSync();
+    if constexpr (MUT != kPcMutNoSync) GemmGroupSync();
+    else PcCompilerFence();
   };
   using P0 = std::integral_constant<int, 0>;
   using P1 = std::integral_constant<int, 1>;
@@ -1212,12 +1467,25 @@ __device__ __forceinline__ void PcFatPairEpilogue(const PrefillMoe& a, int e, in
     if (done || row0 >= M) { done = true; return; }
     __syncthreads();
     if constexpr (q < N) {
+      if constexpr (MUT == kPcMutNoStage) {
 #pragma unroll
-      for (int cc = 0; cc < kTileCols; ++cc)
+        for (int cc = 0; cc < kTileCols; ++cc)
 #pragma unroll
-        for (int z = 0; z < 8; ++z)
-          stage[(g * 16 + 2 * z + (lane >> 4)) * kPairPad + side * 128 + (cg * kTileCols + cc) * 16 + (lane & 15)] =
-              acc[q][cc][z];
+          for (int z = 0; z < 8; ++z) PcFakeUse(acc[q][cc][z]);
+      } else if constexpr (MUT == kPcMutNoPad) {
+        // the same stores at lane-linear addresses: one store's 32 lanes on 32 distinct banks (no kPairPad conflict)
+#pragma unroll
+        for (int cc = 0; cc < kTileCols; ++cc)
+#pragma unroll
+          for (int z = 0; z < 8; ++z) stage[((cc * 8 + z) * 8 + w) * 32 + lane] = acc[q][cc][z];
+      } else {
+#pragma unroll
+        for (int cc = 0; cc < kTileCols; ++cc)
+#pragma unroll
+          for (int z = 0; z < 8; ++z)
+            stage[(g * 16 + 2 * z + (lane >> 4)) * kPairPad + side * 128 + (cg * kTileCols + cc) * 16 + (lane & 15)] =
+                acc[q][cc][z];
+      }
     }
     __syncthreads();
 #pragma unroll 1
@@ -1233,6 +1501,11 @@ __device__ __forceinline__ void PcFatPairEpilogue(const PrefillMoe& a, int e, in
 #pragma unroll
       for (int i = 0; i < 4; ++i) s[i] = Silu(gv[i]) * uv[i];
       LinInLaneAt<MUT == 1>(s, ds, v, lane);
+      if constexpr (MUT == kPcMutNoOut) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) PcFakeUse(v[i]);
+        continue;
+      }
       __half* dst = xd + PackedIndex(row, c, M);
 #pragma unroll
       for (int i = 0; i < 4; ++i) dst[i] = __float2half(v[i] * kHadNorm);
@@ -1254,7 +1527,7 @@ __device__ __forceinline__ void PcFatPairItem(const PrefillMoe& a, const Exl3Gem
 #pragma unroll
     for (int c = 0; c < kTileCols; ++c) acc[i][c] = zv;
   PcFatConsume<N, 2, MUT>(j.I / 16, lds, acc);
-  PcFatPairEpilogue<N, MUT == 1 || MUT == 2 ? MUT : 0>(a, it.job >> 1, j.M, it.m0, it.b0, acc,
+  PcFatPairEpilogue<N, PcEpiMut(MUT) ? MUT : 0>(a, it.job >> 1, j.M, it.m0, it.b0, acc,
                                                        reinterpret_cast<float*>(lds), PcTid());
 }
 

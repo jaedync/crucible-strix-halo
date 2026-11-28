@@ -19,7 +19,7 @@ Other kernels and ROCm versions are not tested.
 ## Build
 
 ```sh
-docker build -t crucible:v0.39.0 .
+docker build -t crucible:v0.40.0 .
 ```
 
 The build needs no GPU. It clones the tag in `CRUCIBLE_VERSION` and runs `make engine` for gfx1151.
@@ -27,11 +27,11 @@ These build arguments change the defaults:
 
 | Argument | Default | Content |
 |---|---|---|
-| `CRUCIBLE_VERSION` | `v0.39.0` | The release tag to build |
+| `CRUCIBLE_VERSION` | `v0.40.0` | The release tag to build |
 | `BUILD_JOBS` | `1` | Parallel HIP compiles. Each compile needs some GB of RAM. |
 | `ROCM_IMAGE` | `docker.io/rocm/dev-ubuntu-24.04:7.2.4` | The base image of the build and the run |
 
-Example: `docker build --build-arg BUILD_JOBS=2 -t crucible:v0.39.0 .`
+Example: `docker build --build-arg BUILD_JOBS=2 -t crucible:v0.40.0 .`
 
 ## Model
 
@@ -53,7 +53,7 @@ docker run --rm --name crucible \
   -e CRUCIBLE_EXACT_RESUME=1 -e CRUCIBLE_TWIN=1 \
   -v "$CKPT":/models/pack:ro \
   -p 127.0.0.1:8790:8790 \
-  crucible:v0.39.0 \
+  crucible:v0.40.0 \
   /models/pack --host 0.0.0.0 --port 8790 --streams 4 --ctx 262144 --prefill 4096 \
   --conversation-cache-mib 9700 --host-reserve-mib 11264 --vision
 ```
@@ -127,7 +127,7 @@ docker run --rm \
   -v ~/.config/crucible/api-key:/run/crucible-api-key:ro \
   --user "$(id -u):$(id -g)" \
   -p 8790:8790 \
-  crucible:v0.39.0 \
+  crucible:v0.40.0 \
   /models/pack --host 0.0.0.0 --port 8790 --ctx 32768 --api-key-file /run/crucible-api-key
 ```
 

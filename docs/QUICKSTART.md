@@ -224,7 +224,7 @@ and `. .venv/bin/activate` again.
 **Check:**
 
 ```sh
-python -m server --version    # expect: crucible 0.39.0 or newer
+python -m server --version    # expect: crucible 0.40.0 or newer
 hf version
 ```
 

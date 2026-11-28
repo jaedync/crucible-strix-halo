@@ -3,6 +3,22 @@
 Releases are numbered `v0.<train>.<fix>`. This file lists the newest release first.
 The same text is in the notes of each release on GitHub.
 
+## v0.40.0 (2026-11-28)
+
+Release v0.40.0 makes bulk prefill faster: its MoE kernels decode the weights in a new instruction order. The output
+bytes do not change. The README gives the new numbers, and the 32K point of its charts now comes after a warm-up run.
+
+### Engine and build
+
+- The MoE kernels of bulk prefill decode the weights of each tile in a new instruction order, so the GPU waits less
+  between the steps of the decode. Bulk prefill is faster. The output bytes do not change. Decode speed does not change.
+
+### README
+
+- The speed table and the charts in the README give the measured numbers of this release.
+- The 32K point of each chart now comes after one warm-up run that does not count. The 32K point of v0.39.0 was the
+  cold first run of its session, so it was low.
+
 ## v0.39.0 (2026-11-26)
 
 Release v0.39.0 changes one default of bulk prefill: the HC mix uses only the fp16 high half of t. Several kernels no

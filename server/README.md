@@ -316,7 +316,7 @@ The server protects itself against a bad client:
 The diagnostic extension adds `token_ids` to a non-streamed choice.
 It adds `token_id` to each streamed token choice.
 It includes terminal stop IDs.
-It also includes the IDs of a client `stop` string that ended the reply, as other engines does. The text stops before that string.
+It also includes the IDs of a client `stop` string that ended the reply, as other engines do. The text stops before that string.
 
 Each choice has `stop_reason`, as in other engines. A stream gives it on the chunk with `finish_reason`:
 

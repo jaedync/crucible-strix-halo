@@ -25,7 +25,7 @@ def test_v0380_has_its_date_below_v0381() -> None:
     releases = [line for line in heads if line != "## Unreleased"]
     assert heads[: len(heads) - len(releases)] in ([], ["## Unreleased"])
     i = releases.index("## v0.38.1 (2026-11-23)")
-    assert releases[:i] in ([], ["## v0.39.0 (2026-11-26)"])
+    assert releases[:i] in ([], ["## v0.39.0 (2026-11-26)"], ["## v0.40.0 (2026-11-28)", "## v0.39.0 (2026-11-26)"])
     assert releases[i : i + 3] == ["## v0.38.1 (2026-11-23)", HEAD, "## v0.37.3 (2026-11-17)"]
 
 
