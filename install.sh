@@ -26,7 +26,7 @@
 #   it does not protect against a person who can push to main.
 # An empty pin gives a WARN line; a pin that is present and does not match stops the install (exit 4).
 PIN_TAG="v0.40.0"
-PIN_SUMS_SHA256=""
+PIN_SUMS_SHA256="ed507cdd22bb0fa82b02f3303a6953c00af2bd00342b31745783bad8a029d66e"
 REPO_URL_DEFAULT="https://github.com/jaedync/crucible-strix-halo.git"
 RELEASE_BASE_DEFAULT="https://github.com/jaedync/crucible-strix-halo/releases/download"
 GPU_ARCH_NAME="gfx1151"
